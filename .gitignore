@@ -1,0 +1,9 @@
+.DS_Store
+/bin/
+/dist/
+/tmp/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.bak
