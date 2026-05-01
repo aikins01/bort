@@ -16,6 +16,7 @@ Implemented now:
 - `bort plan` reads a manifest and prints a first migration readiness summary.
 - `bort export` writes a local migration bundle with compose, env, routes, storages, topology, and a report per app.
 - `bort validate` checks exported bundles for compose validity, portability risks, missing routes, and secret handling.
+- `bort prepare` reads an exported bundle and prints a dry-run target preparation plan without creating resources.
 - Source/target/gateway/sync/state packages define the shape for the live migration engine.
 
 Not implemented yet:
@@ -93,6 +94,12 @@ Validate an exported bundle:
 bin/bort validate --bundle bort-bundle
 ```
 
+Plan target-side preparation from an exported bundle without mutating the target:
+
+```sh
+bin/bort prepare --bundle bort-bundle --target dokploy
+```
+
 By default, environment variable values are redacted. If you need a full migration manifest for a trusted local workflow, opt in explicitly:
 
 ```sh
@@ -108,6 +115,7 @@ bin/bort scan --source coolify --output coolify-manifest.json
 bin/bort plan --manifest coolify-manifest.json --target dokploy
 bin/bort export --manifest coolify-manifest.json --output-dir bort-bundle
 bin/bort validate --bundle bort-bundle
+bin/bort prepare --bundle bort-bundle --target dokploy
 ```
 
 ## Direction
@@ -119,7 +127,7 @@ bort scan      # extract source platform state
 bort plan      # classify apps as green/yellow/red
 bort export    # write an inspectable local migration bundle
 bort validate  # validate exported compose, env, routes, and storage
-bort prepare   # create target resources privately
+bort prepare   # plan target resources privately before creating anything
 bort sync      # copy or replicate state
 bort cutover   # flip traffic through the migration gateway
 bort rollback  # route traffic back to the source app
