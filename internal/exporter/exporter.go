@@ -69,7 +69,8 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 			return Summary{}, err
 		}
 
-		warnings, err := exportApp(appDir, app)
+		topology := analyzer.TopologyForAppInManifest(m, app)
+		warnings, err := exportApp(appDir, app, topology)
 		if err != nil {
 			return Summary{}, err
 		}
@@ -89,15 +90,16 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 	return summary, nil
 }
 
-func exportApp(appDir string, app manifest.App) ([]string, error) {
+func exportApp(appDir string, app manifest.App, topology analyzer.Topology) ([]string, error) {
 	warnings := []string{}
 	compose, composeWarnings, serviceEnvFiles := composeForApp(app)
 	warnings = append(warnings, composeWarnings...)
 
 	files := map[string][]byte{
-		"compose.yaml":        []byte(compose),
-		".env.example":        []byte(envExample(app.Environment)),
-		"migration-report.md": []byte(report(app, warnings)),
+		"compose.yaml":         []byte(compose),
+		".env.example":         []byte(envExample(app.Environment)),
+		"migration-report.md":  []byte(report(app, warnings)),
+		"migration-runbook.md": []byte(runbook(app, topology, warnings)),
 	}
 	for _, envFile := range serviceEnvFiles {
 		files[envFile.Name] = []byte(envExample(envFile.Vars))
@@ -115,7 +117,7 @@ func exportApp(appDir string, app manifest.App) ([]string, error) {
 	if err := writeJSON(filepath.Join(appDir, "storages.json"), app.Storages); err != nil {
 		return nil, err
 	}
-	if err := writeJSON(filepath.Join(appDir, "topology.json"), analyzer.TopologyForApp(app)); err != nil {
+	if err := writeJSON(filepath.Join(appDir, "topology.json"), topology); err != nil {
 		return nil, err
 	}
 
@@ -324,6 +326,114 @@ func report(app manifest.App, warnings []string) string {
 	}
 
 	return builder.String()
+}
+
+func runbook(app manifest.App, topology analyzer.Topology, warnings []string) string {
+	var builder strings.Builder
+	builder.WriteString("# migration runbook\n\n")
+	builder.WriteString(fmt.Sprintf("app: `%s`\n\n", app.Name))
+	builder.WriteString(fmt.Sprintf("role: `%s`\n\n", fallback(app.Metadata["migrationRole"], "unknown")))
+	builder.WriteString(fmt.Sprintf("runtime: `%s`\n\n", fallback(app.Runtime, "unknown")))
+
+	builder.WriteString("## preflight\n\n")
+	if len(topology.RiskReasons) == 0 && len(warnings) == 0 {
+		builder.WriteString("- no plan risks were detected from the exported manifest.\n")
+	} else {
+		for _, risk := range topology.RiskReasons {
+			builder.WriteString(fmt.Sprintf("- `%s` `%s`: %s\n", risk.Severity, risk.Code, risk.Message))
+		}
+		for _, warning := range warnings {
+			builder.WriteString(fmt.Sprintf("- `warn` `export`: %s\n", warning))
+		}
+	}
+	builder.WriteString("\n")
+
+	builder.WriteString("## deploy artifact\n\n")
+	if app.Compose != nil && strings.TrimSpace(app.Compose.Raw) != "" {
+		builder.WriteString("- use `compose.yaml`; raw compose was captured from the source manifest.\n")
+	} else {
+		builder.WriteString("- review generated `compose.yaml` before creating target resources.\n")
+	}
+	if analyzer.HasServiceImage(app) {
+		builder.WriteString("- source image metadata was captured for at least one service.\n")
+	}
+	builder.WriteString("- fill `.env.example` and any service-specific `.env.*.example` files before deploy.\n\n")
+
+	builder.WriteString("## routes\n\n")
+	if len(topology.Routes) == 0 {
+		builder.WriteString("- no routes were detected; confirm this app is internal-only or add Dokploy domains manually.\n\n")
+	} else {
+		for _, route := range topology.Routes {
+			builder.WriteString(fmt.Sprintf("- create route `%s`", route.Host))
+			if route.ServiceName != "" {
+				builder.WriteString(fmt.Sprintf(" for service `%s`", route.ServiceName))
+			}
+			if route.Port != "" {
+				builder.WriteString(fmt.Sprintf(" on port `%s`", route.Port))
+			}
+			builder.WriteString(".\n")
+		}
+		builder.WriteString("\n")
+	}
+
+	builder.WriteString("## data stores\n\n")
+	if len(topology.DataStores) == 0 && len(topology.LinkedResources) == 0 {
+		builder.WriteString("- no data stores were inferred from this app bundle.\n\n")
+	} else {
+		for _, store := range topology.DataStores {
+			builder.WriteString(fmt.Sprintf("- `%s` service `%s`: use `%s`", store.Label(), store.Service, store.Strategy))
+			if store.Fallback != "" {
+				builder.WriteString(fmt.Sprintf(", fallback `%s`", store.Fallback))
+			}
+			builder.WriteString(fmt.Sprintf(", criticality `%s`", store.Criticality))
+			if len(store.Volumes) > 0 {
+				builder.WriteString(fmt.Sprintf(", volumes `%s`", strings.Join(store.Volumes, "`, `")))
+			}
+			builder.WriteString(".\n")
+		}
+		for _, link := range topology.LinkedResources {
+			builder.WriteString(fmt.Sprintf("- possible `%s` resource `%s` with `%s` confidence", link.Kind, link.App, link.Confidence))
+			if len(link.DataStores) > 0 {
+				builder.WriteString(fmt.Sprintf(": %s", strings.Join(runbookDataStoreLabels(link.DataStores), ", ")))
+			}
+			if len(link.Reasons) > 0 {
+				builder.WriteString(fmt.Sprintf("; reasons: %s", strings.Join(link.Reasons, ", ")))
+			}
+			builder.WriteString(".\n")
+		}
+		builder.WriteString("\n")
+	}
+
+	builder.WriteString("## stateful volumes\n\n")
+	if len(topology.StatefulVolumes) == 0 {
+		builder.WriteString("- no stateful volumes or storage records were inferred.\n\n")
+	} else {
+		for _, volume := range topology.StatefulVolumes {
+			builder.WriteString(fmt.Sprintf("- `%s` `%s`", volume.Type, fallback(volume.Name, volume.Source)))
+			if volume.Service != "" {
+				builder.WriteString(fmt.Sprintf(" from `%s`", volume.Service))
+			}
+			builder.WriteString(fmt.Sprintf(" -> `%s`.\n", volume.Target))
+		}
+		builder.WriteString("\n")
+	}
+
+	builder.WriteString("## cutover checklist\n\n")
+	builder.WriteString("- create target services privately and keep source traffic unchanged.\n")
+	builder.WriteString("- restore or sync every data store before enabling public routes.\n")
+	builder.WriteString("- run `bort validate --bundle <bundle>` after edits.\n")
+	builder.WriteString("- verify health checks and application logs before DNS or proxy cutover.\n")
+	builder.WriteString("- keep rollback route and source state untouched until the target is accepted.\n")
+
+	return builder.String()
+}
+
+func runbookDataStoreLabels(stores []analyzer.DataStore) []string {
+	labels := make([]string, 0, len(stores))
+	for _, store := range stores {
+		labels = append(labels, store.Label()+" on "+store.Service)
+	}
+	return labels
 }
 
 func selectedApps(apps []manifest.App, name string) []manifest.App {

@@ -80,6 +80,10 @@ func TestExportWritesBundleForComposeApp(t *testing.T) {
 	if len(topology.RiskReasons) == 0 {
 		t.Fatalf("expected topology risk reasons, got %#v", topology)
 	}
+	runbook := readFile(t, filepath.Join(appDir, "migration-runbook.md"))
+	if !strings.Contains(runbook, "# migration runbook") || !strings.Contains(runbook, "## cutover checklist") {
+		t.Fatalf("expected migration runbook, got:\n%s", runbook)
+	}
 }
 
 func TestExportSkipsResolvedCompose(t *testing.T) {
@@ -176,6 +180,56 @@ func TestExportGeneratesComposeFromServices(t *testing.T) {
 	for _, want := range []string{"services:", "api-web:", "image: \"example/api:latest\"", "expose:", "api_data:/data", "volumes:", "\"api_data\": {}"} {
 		if !strings.Contains(compose, want) {
 			t.Fatalf("expected compose to contain %q, got:\n%s", want, compose)
+		}
+	}
+}
+
+func TestExportRunbookIncludesLinkedResources(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local"},
+		Apps: []manifest.App{
+			{
+				Name:     "api",
+				Platform: "coolify",
+				Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "vela"},
+				Services: []manifest.Service{{
+					Name:        "web",
+					Image:       "example/api",
+					Environment: []manifest.EnvVar{{Name: "DATABASE_URL"}},
+					Networks:    []manifest.ServiceNetwork{{Name: "api-db-net"}},
+				}},
+			},
+			{
+				ID:       "compose:postgres",
+				Name:     "postgres db",
+				Runtime:  "database",
+				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "vela"},
+				Services: []manifest.Service{{
+					Name:     "postgres",
+					Image:    "postgres:16-alpine",
+					Networks: []manifest.ServiceNetwork{{Name: "api-db-net"}},
+				}},
+			},
+		},
+	}
+
+	if _, err := Export(m, Options{OutputDir: dir, AppName: "api"}); err != nil {
+		t.Fatal(err)
+	}
+
+	appDir := filepath.Join(dir, "api")
+	var topology analyzer.Topology
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(appDir, "topology.json"))), &topology); err != nil {
+		t.Fatal(err)
+	}
+	if len(topology.LinkedResources) != 1 || topology.LinkedResources[0].App != "postgres db" {
+		t.Fatalf("expected linked postgres resource, got %#v", topology.LinkedResources)
+	}
+	runbook := readFile(t, filepath.Join(appDir, "migration-runbook.md"))
+	for _, want := range []string{"possible `database` resource `postgres db`", "postgres on postgres", "shared Docker network"} {
+		if !strings.Contains(runbook, want) {
+			t.Fatalf("expected runbook to contain %q, got:\n%s", want, runbook)
 		}
 	}
 }

@@ -12,6 +12,7 @@ type AppAnalysis struct {
 	InternalDependencies []Dependency     `json:"internalDependencies,omitempty"`
 	ExternalRequirements []Requirement    `json:"externalRequirements,omitempty"`
 	DataStores           []DataStore      `json:"dataStores,omitempty"`
+	LinkedResources      []ResourceLink   `json:"linkedResources,omitempty"`
 	StatefulVolumes      []StatefulVolume `json:"statefulVolumes,omitempty"`
 	Networks             []string         `json:"networks,omitempty"`
 	RiskReasons          []RiskReason     `json:"riskReasons,omitempty"`
@@ -22,6 +23,7 @@ type Topology struct {
 	InternalDependencies []Dependency     `json:"internalDependencies"`
 	ExternalRequirements []Requirement    `json:"externalRequirements"`
 	DataStores           []DataStore      `json:"dataStores"`
+	LinkedResources      []ResourceLink   `json:"linkedResources"`
 	StatefulVolumes      []StatefulVolume `json:"statefulVolumes"`
 	Routes               []manifest.Route `json:"routes"`
 	RiskReasons          []RiskReason     `json:"riskReasons"`
@@ -47,6 +49,26 @@ type DataStore struct {
 	Strategy    string   `json:"strategy"`
 	Fallback    string   `json:"fallback,omitempty"`
 	Criticality string   `json:"criticality"`
+}
+
+func (s DataStore) Label() string {
+	label := s.Kind
+	if s.Engine != "" && s.Engine != s.Kind {
+		label += "/" + s.Engine
+	}
+	return label
+}
+
+type ResourceLink struct {
+	Kind       string      `json:"kind"`
+	App        string      `json:"app"`
+	AppID      string      `json:"appId,omitempty"`
+	Role       string      `json:"role,omitempty"`
+	Runtime    string      `json:"runtime,omitempty"`
+	Confidence string      `json:"confidence"`
+	Reasons    []string    `json:"reasons,omitempty"`
+	Networks   []string    `json:"networks,omitempty"`
+	DataStores []DataStore `json:"dataStores,omitempty"`
 }
 
 type StatefulVolume struct {
@@ -83,25 +105,46 @@ const (
 )
 
 func AnalyzeApp(app manifest.App) AppAnalysis {
+	analysis := analyzeApp(app)
+	analysis.RiskReasons = riskReasons(app, analysis)
+	return analysis
+}
+
+func AnalyzeAppInManifest(m manifest.Manifest, app manifest.App) AppAnalysis {
+	analysis := analyzeApp(app)
+	analysis.LinkedResources = linkedResources(m, app, analysis)
+	analysis.RiskReasons = riskReasons(app, analysis)
+	return analysis
+}
+
+func analyzeApp(app manifest.App) AppAnalysis {
 	dependencies := internalDependencies(app)
-	analysis := AppAnalysis{
+	return AppAnalysis{
 		InternalDependencies: dependencies,
 		ExternalRequirements: externalRequirements(app, dependencies),
 		DataStores:           dataStores(app),
 		StatefulVolumes:      statefulVolumes(app),
 		Networks:             appNetworks(app),
 	}
-	analysis.RiskReasons = riskReasons(app, analysis)
-	return analysis
 }
 
 func TopologyForApp(app manifest.App) Topology {
 	analysis := AnalyzeApp(app)
+	return topologyForApp(app, analysis)
+}
+
+func TopologyForAppInManifest(m manifest.Manifest, app manifest.App) Topology {
+	analysis := AnalyzeAppInManifest(m, app)
+	return topologyForApp(app, analysis)
+}
+
+func topologyForApp(app manifest.App, analysis AppAnalysis) Topology {
 	return Topology{
 		Networks:             analysis.Networks,
 		InternalDependencies: analysis.InternalDependencies,
 		ExternalRequirements: analysis.ExternalRequirements,
 		DataStores:           analysis.DataStores,
+		LinkedResources:      analysis.LinkedResources,
 		StatefulVolumes:      analysis.StatefulVolumes,
 		Routes:               appRoutes(app.Routes),
 		RiskReasons:          analysis.RiskReasons,
@@ -169,6 +212,136 @@ func externalRequirements(app manifest.App, dependencies []Dependency) []Require
 	}
 	sort.Slice(requirements, func(i, j int) bool { return requirements[i].Kind < requirements[j].Kind })
 	return requirements
+}
+
+func linkedResources(m manifest.Manifest, app manifest.App, analysis AppAnalysis) []ResourceLink {
+	if len(analysis.ExternalRequirements) == 0 {
+		return nil
+	}
+
+	links := []ResourceLink{}
+	for _, other := range m.Apps {
+		if sameApp(app, other) || !linkableResourceApp(other) {
+			continue
+		}
+
+		otherAnalysis := analyzeApp(other)
+		if len(otherAnalysis.DataStores) == 0 {
+			continue
+		}
+
+		for _, requirement := range analysis.ExternalRequirements {
+			stores := matchingDataStores(requirement.Kind, otherAnalysis.DataStores)
+			if len(stores) == 0 {
+				continue
+			}
+
+			reasons := resourceLinkReasons(app, other, requirement, analysis.Networks, otherAnalysis.Networks)
+			if len(reasons) == 0 {
+				continue
+			}
+
+			links = append(links, ResourceLink{
+				Kind:       requirement.Kind,
+				App:        other.Name,
+				AppID:      other.ID,
+				Role:       migrationRole(other),
+				Runtime:    other.Runtime,
+				Confidence: resourceLinkConfidence(reasons),
+				Reasons:    reasons,
+				Networks:   sharedPortableNetworks(analysis.Networks, otherAnalysis.Networks),
+				DataStores: stores,
+			})
+		}
+	}
+
+	sort.Slice(links, func(i, j int) bool {
+		if links[i].Kind == links[j].Kind {
+			return links[i].App < links[j].App
+		}
+		return links[i].Kind < links[j].Kind
+	})
+	return links
+}
+
+func matchingDataStores(kind string, stores []DataStore) []DataStore {
+	matched := []DataStore{}
+	for _, store := range stores {
+		if requirementMatchesStore(kind, store.Kind) {
+			matched = append(matched, store)
+		}
+	}
+	return matched
+}
+
+func requirementMatchesStore(requirementKind, storeKind string) bool {
+	switch requirementKind {
+	case "database":
+		return storeKind == "postgres" || storeKind == "mysql" || storeKind == "mongo" || storeKind == "sqlite"
+	case "redis", "object-storage", "vector-db", "search":
+		return storeKind == requirementKind
+	default:
+		return false
+	}
+}
+
+func resourceLinkReasons(app, other manifest.App, requirement Requirement, appNetworks, otherNetworks []string) []string {
+	reasons := []string{}
+	if len(sharedPortableNetworks(appNetworks, otherNetworks)) > 0 {
+		reasons = append(reasons, "shared Docker network")
+	}
+	if sameProject(app, other) {
+		reasons = append(reasons, "same Coolify project")
+	}
+	if len(reasons) == 0 {
+		return nil
+	}
+	if migrationRole(other) == "support" || other.Runtime == "database" || other.Runtime == "service" {
+		reasons = append(reasons, "resource is classified as "+fallback(migrationRole(other), other.Runtime))
+	}
+	if len(requirement.Evidence) > 0 {
+		reasons = append(reasons, "env evidence: "+strings.Join(requirement.Evidence, ", "))
+	}
+	return uniqueStrings(reasons)
+}
+
+func linkableResourceApp(app manifest.App) bool {
+	role := migrationRole(app)
+	return role == "support" || app.Runtime == "database" || app.Runtime == "service"
+}
+
+func resourceLinkConfidence(reasons []string) string {
+	for _, reason := range reasons {
+		if reason == "shared Docker network" {
+			return "likely"
+		}
+	}
+	return "possible"
+}
+
+func sharedPortableNetworks(a, b []string) []string {
+	seen := map[string]struct{}{}
+	for _, network := range a {
+		if !isCommonNetwork(network) {
+			seen[network] = struct{}{}
+		}
+	}
+	shared := []string{}
+	for _, network := range b {
+		if _, ok := seen[network]; ok {
+			shared = append(shared, network)
+		}
+	}
+	return uniqueStrings(shared)
+}
+
+func isCommonNetwork(network string) bool {
+	switch strings.ToLower(strings.TrimSpace(network)) {
+	case "", "bridge", "host", "none", "coolify", "coolify-proxy", "proxy":
+		return true
+	default:
+		return false
+	}
 }
 
 func dataStores(app manifest.App) []DataStore {
@@ -335,6 +508,9 @@ func riskReasons(app manifest.App, analysis AppAnalysis) []RiskReason {
 
 	for _, requirement := range analysis.ExternalRequirements {
 		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: "external." + requirement.Kind, Message: fmt.Sprintf("external %s requirement inferred from env names: %s", requirement.Kind, strings.Join(requirement.Evidence, ", "))})
+	}
+	for _, link := range analysis.LinkedResources {
+		reasons = append(reasons, RiskReason{Severity: RiskInfo, Code: "linked_resource." + link.Kind, Message: fmt.Sprintf("%s support candidate %s identified with %s confidence", link.Kind, link.App, link.Confidence)})
 	}
 
 	for _, store := range analysis.DataStores {
@@ -538,6 +714,31 @@ func migrationRole(app manifest.App) string {
 		return ""
 	}
 	return strings.ToLower(strings.TrimSpace(app.Metadata["migrationRole"]))
+}
+
+func sameApp(a, b manifest.App) bool {
+	if a.ID != "" && b.ID != "" {
+		return a.ID == b.ID
+	}
+	return a.Name == b.Name
+}
+
+func sameProject(a, b manifest.App) bool {
+	return appProject(a) != "" && appProject(a) == appProject(b)
+}
+
+func appProject(app manifest.App) string {
+	if app.Metadata == nil {
+		return ""
+	}
+	return strings.TrimSpace(app.Metadata["coolify.project"])
+}
+
+func fallback(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func uniqueStrings(values []string) []string {

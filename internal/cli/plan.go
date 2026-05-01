@@ -86,7 +86,7 @@ func writePlanWithOptions(w io.Writer, m manifest.Manifest, opts planOptions) er
 	fmt.Fprintln(w)
 
 	for _, app := range apps {
-		analysis := analyzer.AnalyzeApp(app)
+		analysis := analyzer.AnalyzeAppInManifest(m, app)
 		status := classifyApp(analysis)
 		fmt.Fprintf(w, "[%s] %s\n", status, app.Name)
 		fmt.Fprintf(w, "  platform: %s\n", fallback(app.Platform, "docker"))
@@ -120,6 +120,9 @@ func writePlanWithOptions(w io.Writer, m manifest.Manifest, opts planOptions) er
 		}
 		if len(analysis.ExternalRequirements) > 0 {
 			fmt.Fprintf(w, "  external requirements: %s\n", describeRequirements(analysis.ExternalRequirements))
+		}
+		if len(analysis.LinkedResources) > 0 {
+			fmt.Fprintf(w, "  possible linked resources: %s\n", describeLinkedResources(analysis.LinkedResources))
 		}
 		fmt.Fprintf(w, "  state: %s\n", describeState(app, analysis))
 		if len(analysis.RiskReasons) > 0 {
@@ -166,10 +169,7 @@ func describeDependencies(dependencies []analyzer.Dependency) string {
 func describeDataStores(stores []analyzer.DataStore) string {
 	items := make([]string, 0, len(stores))
 	for _, store := range stores {
-		item := store.Kind + "=" + store.Service
-		if store.Engine != "" && store.Engine != store.Kind {
-			item += " engine=" + store.Engine
-		}
+		item := store.Label() + "=" + store.Service
 		if len(store.Volumes) > 0 {
 			item += " volumes[" + summarizeList(store.Volumes, 2) + "]"
 		}
@@ -200,6 +200,29 @@ func describeRequirements(requirements []analyzer.Requirement) string {
 		items = append(items, item)
 	}
 	return strings.Join(items, "; ")
+}
+
+func describeLinkedResources(links []analyzer.ResourceLink) string {
+	items := make([]string, 0, len(links))
+	for _, link := range links {
+		item := link.Kind + "=" + link.App + " confidence=" + link.Confidence
+		if len(link.DataStores) > 0 {
+			item += " stores[" + summarizeList(dataStoreLabels(link.DataStores), 2) + "]"
+		}
+		if len(link.Reasons) > 0 {
+			item += " reasons[" + summarizeList(link.Reasons, 2) + "]"
+		}
+		items = append(items, item)
+	}
+	return summarizeList(items, 4)
+}
+
+func dataStoreLabels(stores []analyzer.DataStore) []string {
+	labels := make([]string, 0, len(stores))
+	for _, store := range stores {
+		labels = append(labels, store.Label())
+	}
+	return labels
 }
 
 func describeRiskReasons(reasons []analyzer.RiskReason) string {

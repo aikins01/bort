@@ -133,6 +133,49 @@ func TestAnalyzeAppClassifiesDataStoresAndRisks(t *testing.T) {
 	assertRisk(t, analysis.RiskReasons, "state.bind_mounts")
 }
 
+func TestAnalyzeAppInManifestLinksSupportResources(t *testing.T) {
+	app := manifest.App{
+		ID:       "compose:app",
+		Name:     "app",
+		Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "vela"},
+		Services: []manifest.Service{{
+			Name:        "web",
+			Image:       "example/web",
+			Environment: []manifest.EnvVar{{Name: "DATABASE_URL"}},
+			Networks:    []manifest.ServiceNetwork{{Name: "app-db-net"}},
+		}},
+	}
+	support := manifest.App{
+		ID:       "compose:postgres",
+		Name:     "postgres support",
+		Runtime:  "database",
+		Metadata: map[string]string{"migrationRole": "support", "coolify.project": "vela"},
+		Services: []manifest.Service{{
+			Name:     "postgres",
+			Image:    "pgvector/pgvector:pg16",
+			Networks: []manifest.ServiceNetwork{{Name: "app-db-net"}},
+		}},
+	}
+
+	analysis := AnalyzeAppInManifest(manifest.Manifest{Apps: []manifest.App{app, support}}, app)
+	if len(analysis.LinkedResources) != 1 {
+		t.Fatalf("expected one linked resource, got %#v", analysis.LinkedResources)
+	}
+	link := analysis.LinkedResources[0]
+	if link.Kind != "database" || link.App != "postgres support" || link.Confidence != "likely" {
+		t.Fatalf("unexpected link: %#v", link)
+	}
+	if len(link.DataStores) != 1 || link.DataStores[0].Engine != "pgvector" {
+		t.Fatalf("unexpected linked data stores: %#v", link.DataStores)
+	}
+	assertRisk(t, analysis.RiskReasons, "linked_resource.database")
+
+	topology := TopologyForAppInManifest(manifest.Manifest{Apps: []manifest.App{app, support}}, app)
+	if len(topology.LinkedResources) != 1 || topology.LinkedResources[0].App != "postgres support" {
+		t.Fatalf("expected topology linked resource, got %#v", topology.LinkedResources)
+	}
+}
+
 func findDataStore(t *testing.T, stores []DataStore, kind, service string) DataStore {
 	t.Helper()
 	for _, store := range stores {
