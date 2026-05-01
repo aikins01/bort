@@ -57,6 +57,8 @@ sudo bin/bort scan --source coolify-local --output manifest.json
 
 The Coolify API scan is a safe preflight, but it is not the migration source of truth. Server-local scanning can see the actual Docker containers, images, networks, volumes, bind mounts, and labels that the API may omit.
 
+`coolify-local` enriches Docker groups from Coolify labels when available, including resource names, resource type, project/environment, compose file paths, and whether a group looks like a migration candidate or Coolify platform support.
+
 Review a migration plan:
 
 ```sh

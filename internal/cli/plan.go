@@ -61,6 +61,15 @@ func writePlan(w io.Writer, m manifest.Manifest, target string) error {
 		status := classifyApp(app)
 		fmt.Fprintf(w, "[%s] %s\n", status, app.Name)
 		fmt.Fprintf(w, "  platform: %s\n", fallback(app.Platform, "docker"))
+		if app.Runtime != "" {
+			fmt.Fprintf(w, "  runtime: %s\n", app.Runtime)
+		}
+		if role := app.Metadata["migrationRole"]; role != "" {
+			fmt.Fprintf(w, "  role: %s\n", role)
+		}
+		if project := app.Metadata["coolify.project"]; project != "" {
+			fmt.Fprintf(w, "  project: %s\n", project)
+		}
 		if app.BuildPack != "" {
 			fmt.Fprintf(w, "  build pack: %s\n", app.BuildPack)
 		}
