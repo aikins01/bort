@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aikins01/bort/internal/analyzer"
 	"github.com/aikins01/bort/internal/exporter"
 	"github.com/aikins01/bort/internal/manifest"
 	"github.com/aikins01/bort/internal/secrets"
@@ -98,11 +99,14 @@ func validateApp(ctx context.Context, opts Options, app exporter.AppSummary) App
 	appDir := filepath.Join(opts.BundleDir, filepath.FromSlash(app.Directory))
 	result := AppResult{Name: app.Name, Directory: app.Directory, Status: StatusGreen}
 
-	for _, file := range []string{"compose.yaml", ".env.example", "routes.json", "storages.json", "migration-report.md"} {
+	for _, file := range []string{"compose.yaml", ".env.example", "routes.json", "storages.json", "topology.json", "migration-report.md", "migration-runbook.md"} {
 		if _, err := os.Stat(filepath.Join(appDir, file)); err != nil {
 			result.add(SeverityError, "bundle.missing_file", fmt.Sprintf("%s is missing", file))
 		}
 	}
+
+	topology, hasTopology := validateTopologyFile(&result, filepath.Join(appDir, "topology.json"))
+	validateRunbook(&result, filepath.Join(appDir, "migration-runbook.md"))
 
 	composePath := filepath.Join(appDir, "compose.yaml")
 	compose, err := os.ReadFile(composePath)
@@ -114,8 +118,11 @@ func validateApp(ctx context.Context, opts Options, app exporter.AppSummary) App
 	}
 
 	validateEnvFiles(&result, envExampleFiles(appDir))
-	validateRoutes(&result, filepath.Join(appDir, "routes.json"))
+	routes := validateRoutes(&result, filepath.Join(appDir, "routes.json"), !hasTopology || topologyHasRisk(topology, "routes.none"))
 	validateStorages(&result, filepath.Join(appDir, "storages.json"))
+	if hasTopology {
+		validateTopology(&result, topology, routes)
+	}
 	result.Status = statusFromIssues(result.Issues)
 	return result
 }
@@ -374,6 +381,186 @@ func isNamedVolumeSource(source string) bool {
 	return namedVolumeNamePattern.MatchString(source)
 }
 
+func validateTopologyFile(result *AppResult, path string) (analyzer.Topology, bool) {
+	var topology analyzer.Topology
+	if err := readJSON(path, &topology); err != nil {
+		if !os.IsNotExist(err) {
+			result.add(SeverityError, "topology.read_failed", err.Error())
+		}
+		return analyzer.Topology{}, false
+	}
+	return topology, true
+}
+
+func validateRunbook(result *AppResult, path string) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			result.add(SeverityError, "runbook.read_failed", err.Error())
+		}
+		return
+	}
+	if strings.TrimSpace(string(contents)) == "" {
+		result.add(SeverityError, "runbook.empty", "migration-runbook.md is empty")
+	}
+}
+
+func validateTopology(result *AppResult, topology analyzer.Topology, routes []manifest.Route) {
+	validateTopologyExternalRequirements(result, topology)
+	validateTopologyLinkedResources(result, topology)
+	validateTopologyDataStores(result, topology.DataStores)
+	validateTopologyStatefulVolumes(result, topology.StatefulVolumes)
+	validateTopologyEnvValues(result, topology)
+	validateTopologyRoutes(result, topology, routes)
+}
+
+func validateTopologyExternalRequirements(result *AppResult, topology analyzer.Topology) {
+	if len(topology.ExternalRequirements) == 0 {
+		return
+	}
+	result.add(SeverityWarn, "topology.external_requirements", fmt.Sprintf("external requirements inferred from env names must be resolved before deploy: %s", describeRequirements(topology.ExternalRequirements)))
+}
+
+func validateTopologyLinkedResources(result *AppResult, topology analyzer.Topology) {
+	linksByKind := map[string][]analyzer.ResourceLink{}
+	for _, link := range topology.LinkedResources {
+		linksByKind[link.Kind] = append(linksByKind[link.Kind], link)
+	}
+
+	for _, requirement := range topology.ExternalRequirements {
+		if !analyzer.IsLinkableRequirement(requirement.Kind) {
+			continue
+		}
+		links := linksByKind[requirement.Kind]
+		switch {
+		case len(links) == 0:
+			result.add(SeverityWarn, "topology.linked_resource_ambiguous", fmt.Sprintf("external %s requirement has no linked support resource candidate", requirement.Kind))
+		case len(links) > 1:
+			result.add(SeverityWarn, "topology.linked_resource_ambiguous", fmt.Sprintf("external %s requirement has multiple possible support resource candidates: %s", requirement.Kind, strings.Join(resourceLinkLabels(links), ", ")))
+		case strings.ToLower(strings.TrimSpace(links[0].Confidence)) != "likely":
+			result.add(SeverityWarn, "topology.linked_resource_ambiguous", fmt.Sprintf("external %s requirement is linked to %s with %s confidence", requirement.Kind, fallback(links[0].App, "unknown resource"), fallback(links[0].Confidence, "unknown")))
+		}
+	}
+}
+
+func validateTopologyDataStores(result *AppResult, stores []analyzer.DataStore) {
+	manualReview := []string{}
+	for _, store := range stores {
+		if store.Kind == "unknown" || store.Strategy == "manual_review" {
+			manualReview = append(manualReview, fallback(store.Service, store.Label()))
+		}
+	}
+	manualReview = uniqueStrings(manualReview)
+	if len(manualReview) > 0 {
+		result.add(SeverityWarn, "topology.data_store_manual_review", fmt.Sprintf("manual data-store review required for: %s", strings.Join(manualReview, ", ")))
+	}
+}
+
+func validateTopologyStatefulVolumes(result *AppResult, volumes []analyzer.StatefulVolume) {
+	bindMounts := []string{}
+	for _, volume := range volumes {
+		if volume.Type == "bind" {
+			bindMounts = append(bindMounts, statefulVolumeLabel(volume))
+		}
+	}
+	bindMounts = uniqueStrings(bindMounts)
+	if len(bindMounts) > 0 {
+		result.add(SeverityWarn, "topology.bind_mounts", fmt.Sprintf("bind mount state is host-specific and needs portability review: %s", strings.Join(bindMounts, ", ")))
+	}
+}
+
+func validateTopologyEnvValues(result *AppResult, topology analyzer.Topology) {
+	if risk, ok := topologyRisk(topology, "env.values_redacted"); ok {
+		result.add(SeverityWarn, "topology.env_values_redacted", risk.Message)
+	}
+}
+
+func validateTopologyRoutes(result *AppResult, topology analyzer.Topology, routes []manifest.Route) {
+	if len(topology.Routes) == 0 {
+		return
+	}
+	missing := missingRouteLabels(topology.Routes, routes)
+	if len(missing) > 0 {
+		result.add(SeverityWarn, "topology.routes_mismatch", fmt.Sprintf("topology routes are absent from routes.json: %s", strings.Join(missing, ", ")))
+	}
+}
+
+func topologyHasRisk(topology analyzer.Topology, code string) bool {
+	_, ok := topologyRisk(topology, code)
+	return ok
+}
+
+func topologyRisk(topology analyzer.Topology, code string) (analyzer.RiskReason, bool) {
+	for _, risk := range topology.RiskReasons {
+		if risk.Code == code {
+			return risk, true
+		}
+	}
+	return analyzer.RiskReason{}, false
+}
+
+func describeRequirements(requirements []analyzer.Requirement) string {
+	items := make([]string, 0, len(requirements))
+	for _, requirement := range requirements {
+		item := requirement.Kind
+		if len(requirement.Evidence) > 0 {
+			item += " via " + strings.Join(requirement.Evidence, ", ")
+		}
+		items = append(items, item)
+	}
+	return strings.Join(items, "; ")
+}
+
+func resourceLinkLabels(links []analyzer.ResourceLink) []string {
+	labels := make([]string, 0, len(links))
+	for _, link := range links {
+		label := fallback(link.App, "unknown resource")
+		if link.Confidence != "" {
+			label += " (" + link.Confidence + ")"
+		}
+		labels = append(labels, label)
+	}
+	return uniqueStrings(labels)
+}
+
+func statefulVolumeLabel(volume analyzer.StatefulVolume) string {
+	label := fallback(volume.Service, "app")
+	if volume.Target != "" {
+		label += " -> " + volume.Target
+	}
+	return label
+}
+
+func missingRouteLabels(want, got []manifest.Route) []string {
+	gotKeys := map[string]struct{}{}
+	for _, route := range got {
+		gotKeys[routeKey(route)] = struct{}{}
+	}
+
+	missing := []string{}
+	for _, route := range want {
+		if _, ok := gotKeys[routeKey(route)]; !ok {
+			missing = append(missing, routeLabel(route))
+		}
+	}
+	return uniqueStrings(missing)
+}
+
+func routeKey(route manifest.Route) string {
+	return route.Host + "\x00" + route.ServiceName + "\x00" + route.Port
+}
+
+func routeLabel(route manifest.Route) string {
+	label := fallback(route.Host, "missing host")
+	if route.ServiceName != "" {
+		label += " -> " + route.ServiceName
+	}
+	if route.Port != "" {
+		label += ":" + route.Port
+	}
+	return label
+}
+
 func validateEnvFiles(result *AppResult, paths []string) {
 	for _, path := range paths {
 		validateEnvFile(result, path)
@@ -403,14 +590,16 @@ func validateEnvFile(result *AppResult, path string) {
 	}
 }
 
-func validateRoutes(result *AppResult, path string) {
+func validateRoutes(result *AppResult, path string, warnOnEmpty bool) []manifest.Route {
 	var routes []manifest.Route
 	if err := readJSON(path, &routes); err != nil {
-		return
+		return nil
 	}
 	if len(routes) == 0 {
-		result.add(SeverityWarn, "routes.none", "no routes were exported for this app")
-		return
+		if warnOnEmpty {
+			result.add(SeverityWarn, "routes.none", "no public routes were detected; verify routing or confirm this resource is internal-only")
+		}
+		return routes
 	}
 	for i, route := range routes {
 		if route.Host == "" {
@@ -420,6 +609,7 @@ func validateRoutes(result *AppResult, path string) {
 			result.add(SeverityWarn, "routes.missing_service", fmt.Sprintf("route %s has no service mapping", route.Host))
 		}
 	}
+	return routes
 }
 
 func validateStorages(result *AppResult, path string) {

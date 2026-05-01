@@ -274,6 +274,15 @@ func matchingDataStores(kind string, stores []DataStore) []DataStore {
 	return matched
 }
 
+func IsLinkableRequirement(kind string) bool {
+	switch kind {
+	case "database", "redis", "object-storage", "vector-db", "search":
+		return true
+	default:
+		return false
+	}
+}
+
 func requirementMatchesStore(requirementKind, storeKind string) bool {
 	switch requirementKind {
 	case "database":
