@@ -9,6 +9,7 @@ import (
 	"os"
 
 	"github.com/aikins01/bort/internal/source"
+	"github.com/aikins01/bort/internal/source/coolify"
 	"github.com/aikins01/bort/internal/source/localdocker"
 )
 
@@ -20,11 +21,15 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	var outputPath string
 	var format string
 	var includeEnvValues bool
+	var coolifyURL string
+	var coolifyToken string
 
-	fs.StringVar(&sourceName, "source", "docker", "source adapter to scan: docker")
+	fs.StringVar(&sourceName, "source", "docker", "source adapter to scan: docker, coolify")
 	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
 	fs.StringVar(&format, "format", "json", "output format: json")
 	fs.BoolVar(&includeEnvValues, "include-env-values", false, "include environment variable values in the manifest")
+	fs.StringVar(&coolifyURL, "coolify-url", os.Getenv("BORT_COOLIFY_URL"), "Coolify base URL, or BORT_COOLIFY_URL")
+	fs.StringVar(&coolifyToken, "coolify-token", os.Getenv("BORT_COOLIFY_TOKEN"), "Coolify API token, or BORT_COOLIFY_TOKEN")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -34,12 +39,20 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return fmt.Errorf("unsupported scan format %q", format)
 	}
 
-	scanner, err := scannerFor(sourceName)
+	scanOptions := source.ScanOptions{
+		IncludeEnvValues: includeEnvValues,
+		Coolify: source.CoolifyOptions{
+			BaseURL: coolifyURL,
+			Token:   coolifyToken,
+		},
+	}
+
+	scanner, err := scannerFor(sourceName, scanOptions)
 	if err != nil {
 		return err
 	}
 
-	result, err := scanner.Scan(ctx, source.ScanOptions{IncludeEnvValues: includeEnvValues})
+	result, err := scanner.Scan(ctx, scanOptions)
 	if err != nil {
 		return err
 	}
@@ -68,10 +81,12 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	return nil
 }
 
-func scannerFor(name string) (source.Scanner, error) {
+func scannerFor(name string, opts source.ScanOptions) (source.Scanner, error) {
 	switch name {
 	case "docker", "local-docker":
 		return localdocker.NewScanner(), nil
+	case "coolify":
+		return coolify.NewScanner(opts.Coolify.BaseURL, opts.Coolify.Token)
 	default:
 		return nil, fmt.Errorf("unsupported source %q", name)
 	}

@@ -6,17 +6,17 @@ The project is intentionally starting as a small Go CLI. The core idea is to ext
 
 ## Current Status
 
-This repository is at the foundation stage. It can scan local Docker resources and produce a portable manifest that later source adapters, target adapters, sync strategies, and gateway cutovers will use.
+This repository is at the foundation stage. It can scan local Docker resources or the Coolify API and produce a portable manifest that later target adapters, sync strategies, and gateway cutovers will use.
 
 Implemented now:
 
-- `bort scan` discovers local Docker containers, routes, mounts, volumes, and networks.
+- `bort scan --source docker` discovers local Docker containers, routes, mounts, volumes, and networks.
+- `bort scan --source coolify` exports Coolify applications, services, databases, env vars, storages, compose config, git metadata, and domains through the Coolify API.
 - `bort plan` reads a manifest and prints a first migration readiness summary.
 - Source/target/gateway/sync/state packages define the shape for the live migration engine.
 
 Not implemented yet:
 
-- Coolify database/API extraction.
 - Dokploy resource creation.
 - Migration gateway installation.
 - Database replication adapters.
@@ -34,6 +34,14 @@ Scan the local Docker host:
 
 ```sh
 bin/bort scan --output manifest.json
+```
+
+Scan a Coolify instance:
+
+```sh
+export BORT_COOLIFY_URL=https://coolify.example.com
+export BORT_COOLIFY_TOKEN=your-token-here
+bin/bort scan --source coolify --output manifest.json
 ```
 
 Review a migration plan:

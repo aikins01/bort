@@ -61,6 +61,9 @@ func writePlan(w io.Writer, m manifest.Manifest, target string) error {
 		status := classifyApp(app)
 		fmt.Fprintf(w, "[%s] %s\n", status, app.Name)
 		fmt.Fprintf(w, "  platform: %s\n", fallback(app.Platform, "docker"))
+		if app.BuildPack != "" {
+			fmt.Fprintf(w, "  build pack: %s\n", app.BuildPack)
+		}
 		fmt.Fprintf(w, "  services: %d\n", len(app.Services))
 		if len(app.Routes) > 0 {
 			fmt.Fprintf(w, "  routes: %s\n", strings.Join(routeHosts(app.Routes), ", "))
@@ -101,6 +104,7 @@ func describeState(app manifest.App) string {
 	var volumeMounts int
 	var bindMounts int
 	var envValuesRedacted bool
+	parts := []string{}
 
 	for _, service := range app.Services {
 		for _, mount := range service.Mounts {
@@ -119,7 +123,15 @@ func describeState(app manifest.App) string {
 		}
 	}
 
-	parts := []string{}
+	for _, env := range app.Environment {
+		if !env.ValueKnown {
+			envValuesRedacted = true
+		}
+	}
+	if len(app.Storages) > 0 {
+		parts = append(parts, fmt.Sprintf("%d Coolify storage record(s)", len(app.Storages)))
+	}
+
 	if volumeMounts > 0 {
 		parts = append(parts, fmt.Sprintf("%d named volume mount(s)", volumeMounts))
 	}
@@ -136,9 +148,16 @@ func describeState(app manifest.App) string {
 }
 
 func routeHosts(routes []manifest.Route) []string {
-	hosts := make([]string, 0, len(routes))
+	seen := map[string]struct{}{}
 	for _, route := range routes {
-		hosts = append(hosts, route.Host)
+		if route.Host != "" {
+			seen[route.Host] = struct{}{}
+		}
+	}
+
+	hosts := make([]string, 0, len(seen))
+	for host := range seen {
+		hosts = append(hosts, host)
 	}
 	sort.Strings(hosts)
 	return hosts

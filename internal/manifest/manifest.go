@@ -21,14 +21,40 @@ type Source struct {
 }
 
 type App struct {
-	ID       string            `json:"id"`
-	Name     string            `json:"name"`
-	Platform string            `json:"platform,omitempty"`
-	Runtime  string            `json:"runtime,omitempty"`
-	Labels   map[string]string `json:"labels,omitempty"`
-	Services []Service         `json:"services"`
-	Routes   []Route           `json:"routes,omitempty"`
-	Warnings []Warning         `json:"warnings,omitempty"`
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Platform    string            `json:"platform,omitempty"`
+	Runtime     string            `json:"runtime,omitempty"`
+	BuildPack   string            `json:"buildPack,omitempty"`
+	Status      string            `json:"status,omitempty"`
+	Git         *GitSource        `json:"git,omitempty"`
+	Compose     *ComposeSource    `json:"compose,omitempty"`
+	Environment []EnvVar          `json:"environment,omitempty"`
+	Storages    []Storage         `json:"storages,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	Services    []Service         `json:"services"`
+	Routes      []Route           `json:"routes,omitempty"`
+	Warnings    []Warning         `json:"warnings,omitempty"`
+}
+
+type GitSource struct {
+	Repository         string `json:"repository,omitempty"`
+	Branch             string `json:"branch,omitempty"`
+	CommitSHA          string `json:"commitSha,omitempty"`
+	BaseDirectory      string `json:"baseDirectory,omitempty"`
+	DockerfileLocation string `json:"dockerfileLocation,omitempty"`
+	ComposeLocation    string `json:"composeLocation,omitempty"`
+}
+
+type ComposeSource struct {
+	Raw      string                   `json:"raw,omitempty"`
+	Resolved string                   `json:"resolved,omitempty"`
+	Domains  map[string]ComposeDomain `json:"domains,omitempty"`
+}
+
+type ComposeDomain struct {
+	Domain string `json:"domain,omitempty"`
 }
 
 type Service struct {
@@ -56,6 +82,17 @@ type Mount struct {
 	Source string `json:"source,omitempty"`
 	Target string `json:"target"`
 	RW     bool   `json:"rw"`
+}
+
+type Storage struct {
+	ID        string            `json:"id,omitempty"`
+	Name      string            `json:"name,omitempty"`
+	Type      string            `json:"type,omitempty"`
+	Source    string            `json:"source,omitempty"`
+	Target    string            `json:"target,omitempty"`
+	Content   string            `json:"content,omitempty"`
+	Directory bool              `json:"directory,omitempty"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
 }
 
 type Port struct {

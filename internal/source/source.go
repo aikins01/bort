@@ -8,6 +8,12 @@ import (
 
 type ScanOptions struct {
 	IncludeEnvValues bool
+	Coolify          CoolifyOptions
+}
+
+type CoolifyOptions struct {
+	BaseURL string
+	Token   string
 }
 
 type Scanner interface {
