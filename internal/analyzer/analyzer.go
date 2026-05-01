@@ -50,6 +50,7 @@ type DataStore struct {
 }
 
 type StatefulVolume struct {
+	Origin  string `json:"origin,omitempty"`
 	Service string `json:"service"`
 	Type    string `json:"type"`
 	Name    string `json:"name,omitempty"`
@@ -218,8 +219,7 @@ func classifiedDataStore(service manifest.Service) (DataStore, bool) {
 	case strings.Contains(combined, "minio"):
 		return newDataStore(service, "object-storage", "minio", "mc_mirror", "volume_sync", "critical_if_uploads_or_files"), true
 	case strings.Contains(combined, "qdrant") || strings.Contains(combined, "weaviate"):
-		engine := databaseEngine(combined, "vector-db")
-		return newDataStore(service, "vector-db", engine, "snapshot_or_collection_export", "stopped_volume_copy", "critical"), true
+		return newDataStore(service, "vector-db", databaseEngine(combined, "vector-db"), "snapshot_or_collection_export", "stopped_volume_copy", "critical"), true
 	}
 	return DataStore{}, false
 }
@@ -278,6 +278,7 @@ func statefulVolumes(app manifest.App) []StatefulVolume {
 			storageType = "storage"
 		}
 		volumes = append(volumes, StatefulVolume{
+			Origin:  "storage",
 			Service: "app",
 			Type:    storageType,
 			Name:    storage.Name,
@@ -305,6 +306,7 @@ func serviceStatefulVolumes(service manifest.Service) []StatefulVolume {
 			continue
 		}
 		volumes = append(volumes, StatefulVolume{
+			Origin:  "mount",
 			Service: serviceName(service),
 			Type:    mount.Type,
 			Name:    mount.Name,
@@ -361,7 +363,7 @@ func riskReasons(app manifest.App, analysis AppAnalysis) []RiskReason {
 	if bindMounts > 0 {
 		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: "state.bind_mounts", Message: fmt.Sprintf("%d bind mount(s) are host-specific and need portability review", bindMounts)})
 	}
-	if hasRedactedEnvironment(app) {
+	if HasRedactedEnvironment(app) {
 		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: "env.values_redacted", Message: "environment values are redacted and must be supplied before deploy"})
 	}
 	for _, warning := range app.Warnings {
@@ -515,7 +517,7 @@ func appRoutes(routes []manifest.Route) []manifest.Route {
 	return sorted
 }
 
-func hasRedactedEnvironment(app manifest.App) bool {
+func HasRedactedEnvironment(app manifest.App) bool {
 	for _, env := range app.Environment {
 		if !env.ValueKnown {
 			return true

@@ -121,7 +121,7 @@ func writePlanWithOptions(w io.Writer, m manifest.Manifest, opts planOptions) er
 		if len(analysis.ExternalRequirements) > 0 {
 			fmt.Fprintf(w, "  external requirements: %s\n", describeRequirements(analysis.ExternalRequirements))
 		}
-		fmt.Fprintf(w, "  state: %s\n", describeState(app))
+		fmt.Fprintf(w, "  state: %s\n", describeState(app, analysis))
 		if len(analysis.RiskReasons) > 0 {
 			fmt.Fprintf(w, "  risk reasons: %s\n", describeRiskReasons(analysis.RiskReasons))
 		}
@@ -239,32 +239,20 @@ func describeDeploy(app manifest.App) string {
 	}
 }
 
-func describeState(app manifest.App) string {
+func describeState(app manifest.App, analysis analyzer.AppAnalysis) string {
 	var volumeMounts int
 	var bindMounts int
-	var envValuesRedacted bool
 	parts := []string{}
 
-	for _, service := range app.Services {
-		for _, mount := range service.Mounts {
-			switch mount.Type {
-			case "volume":
-				volumeMounts++
-			case "bind":
-				bindMounts++
-			}
+	for _, volume := range analysis.StatefulVolumes {
+		if volume.Origin == "storage" {
+			continue
 		}
-
-		for _, env := range service.Environment {
-			if !env.ValueKnown {
-				envValuesRedacted = true
-			}
-		}
-	}
-
-	for _, env := range app.Environment {
-		if !env.ValueKnown {
-			envValuesRedacted = true
+		switch volume.Type {
+		case "volume":
+			volumeMounts++
+		case "bind":
+			bindMounts++
 		}
 	}
 	if len(app.Storages) > 0 {
@@ -277,7 +265,7 @@ func describeState(app manifest.App) string {
 	if bindMounts > 0 {
 		parts = append(parts, fmt.Sprintf("%d bind mount(s)", bindMounts))
 	}
-	if envValuesRedacted {
+	if analyzer.HasRedactedEnvironment(app) {
 		parts = append(parts, "environment values redacted")
 	}
 	if len(parts) == 0 {
