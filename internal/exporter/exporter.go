@@ -18,6 +18,11 @@ type Options struct {
 	AppName   string
 }
 
+const (
+	privateDirMode  os.FileMode = 0o700
+	privateFileMode os.FileMode = 0o600
+)
+
 type Summary struct {
 	OutputDir   string       `json:"outputDir"`
 	GeneratedAt time.Time    `json:"generatedAt"`
@@ -45,7 +50,7 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 		return Summary{}, fmt.Errorf("manifest has no apps to export")
 	}
 
-	if err := os.MkdirAll(opts.OutputDir, 0o755); err != nil {
+	if err := ensurePrivateDir(opts.OutputDir); err != nil {
 		return Summary{}, err
 	}
 
@@ -59,7 +64,7 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 	for _, app := range apps {
 		dirName := uniqueDirName(slug(app.Name), usedDirs)
 		appDir := filepath.Join(opts.OutputDir, dirName)
-		if err := os.MkdirAll(appDir, 0o755); err != nil {
+		if err := ensurePrivateDir(appDir); err != nil {
 			return Summary{}, err
 		}
 
@@ -85,17 +90,20 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 
 func exportApp(appDir string, app manifest.App) ([]string, error) {
 	warnings := []string{}
-	compose, composeWarnings := composeForApp(app)
+	compose, composeWarnings, serviceEnvFiles := composeForApp(app)
 	warnings = append(warnings, composeWarnings...)
 
 	files := map[string][]byte{
 		"compose.yaml":        []byte(compose),
-		".env.example":        []byte(envExample(app)),
+		".env.example":        []byte(envExample(app.Environment)),
 		"migration-report.md": []byte(report(app, warnings)),
+	}
+	for _, envFile := range serviceEnvFiles {
+		files[envFile.Name] = []byte(envExample(envFile.Vars))
 	}
 
 	for name, contents := range files {
-		if err := os.WriteFile(filepath.Join(appDir, name), contents, 0o644); err != nil {
+		if err := writePrivateFile(filepath.Join(appDir, name), contents); err != nil {
 			return nil, err
 		}
 	}
@@ -110,24 +118,32 @@ func exportApp(appDir string, app manifest.App) ([]string, error) {
 	return warnings, nil
 }
 
-func composeForApp(app manifest.App) (string, []string) {
+type envFile struct {
+	Name string
+	Vars []manifest.EnvVar
+}
+
+func composeForApp(app manifest.App) (string, []string, []envFile) {
+	warnings := []string{}
 	if app.Compose != nil {
-		if strings.TrimSpace(app.Compose.Resolved) != "" {
-			return ensureTrailingNewline(app.Compose.Resolved), nil
-		}
 		if strings.TrimSpace(app.Compose.Raw) != "" {
-			return ensureTrailingNewline(app.Compose.Raw), []string{"using raw compose because resolved compose was not present"}
+			return ensureTrailingNewline(app.Compose.Raw), nil, nil
+		}
+		if strings.TrimSpace(app.Compose.Resolved) != "" {
+			warnings = append(warnings, "skipped resolved compose because it may contain interpolated secret values")
 		}
 	}
 
 	if len(app.Services) == 0 {
-		return "services: {}\n", []string{"no services were present in the manifest"}
+		warnings = append(warnings, "no services were present in the manifest")
+		return "services: {}\n", warnings, nil
 	}
 
 	var builder strings.Builder
 	volumes := map[string]struct{}{}
+	serviceEnvFileMap := serviceEnvFiles(app.Services)
 	builder.WriteString("services:\n")
-	for _, service := range app.Services {
+	for index, service := range app.Services {
 		name := slug(service.Name)
 		if name == "" {
 			name = "app"
@@ -139,9 +155,18 @@ func composeForApp(app manifest.App) (string, []string) {
 			builder.WriteString("    image: TODO_REPLACE_IMAGE\n")
 		}
 		builder.WriteString("    restart: unless-stopped\n")
-		if len(service.Environment) > 0 {
+		envFiles := []string{}
+		if len(app.Environment) > 0 {
+			envFiles = append(envFiles, ".env.example")
+		}
+		if envFile, ok := serviceEnvFileMap[index]; ok {
+			envFiles = append(envFiles, envFile.Name)
+		}
+		if len(envFiles) > 0 {
 			builder.WriteString("    env_file:\n")
-			builder.WriteString("      - .env.example\n")
+			for _, envFile := range envFiles {
+				builder.WriteString(fmt.Sprintf("      - %s\n", quoteYAML(envFile)))
+			}
 		}
 		if len(service.Ports) > 0 {
 			builder.WriteString("    expose:\n")
@@ -175,18 +200,44 @@ func composeForApp(app manifest.App) (string, []string) {
 		}
 	}
 
-	return builder.String(), []string{"generated compose from discovered container metadata"}
+	warnings = append(warnings, "generated compose from discovered container metadata")
+	return builder.String(), warnings, sortedEnvFiles(serviceEnvFileMap)
 }
 
-func envExample(app manifest.App) string {
-	vars := map[string]manifest.EnvVar{}
-	for _, env := range app.Environment {
-		vars[env.Name] = env
-	}
-	for _, service := range app.Services {
-		for _, env := range service.Environment {
-			vars[env.Name] = env
+func serviceEnvFiles(services []manifest.Service) map[int]envFile {
+	usedNames := map[string]int{}
+	files := map[int]envFile{}
+	for index, service := range services {
+		if len(service.Environment) == 0 {
+			continue
 		}
+		base := slug(service.Name)
+		if base == "" {
+			base = "service"
+		}
+		files[index] = envFile{Name: ".env." + uniqueDirName(base, usedNames) + ".example", Vars: service.Environment}
+	}
+	return files
+}
+
+func sortedEnvFiles(files map[int]envFile) []envFile {
+	indexes := make([]int, 0, len(files))
+	for index := range files {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+
+	sorted := make([]envFile, 0, len(indexes))
+	for _, index := range indexes {
+		sorted = append(sorted, files[index])
+	}
+	return sorted
+}
+
+func envExample(envs []manifest.EnvVar) string {
+	vars := map[string]manifest.EnvVar{}
+	for _, env := range envs {
+		vars[env.Name] = env
 	}
 
 	names := make([]string, 0, len(vars))
@@ -291,7 +342,30 @@ func writeJSON(path string, value any) error {
 		return err
 	}
 	contents = append(contents, '\n')
-	return os.WriteFile(path, contents, 0o644)
+	return writePrivateFile(path, contents)
+}
+
+func ensurePrivateDir(path string) error {
+	if err := os.MkdirAll(path, privateDirMode); err != nil {
+		return err
+	}
+	return os.Chmod(path, privateDirMode)
+}
+
+func writePrivateFile(path string, contents []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, privateFileMode)
+	if err != nil {
+		return err
+	}
+	if err := file.Chmod(privateFileMode); err != nil {
+		file.Close()
+		return err
+	}
+	if _, err := file.Write(contents); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 func uniqueDirName(base string, used map[string]int) string {

@@ -22,14 +22,12 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	var format string
 	var includeEnvValues bool
 	var coolifyURL string
-	var coolifyToken string
 
 	fs.StringVar(&sourceName, "source", "docker", "source adapter to scan: docker, coolify")
 	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
 	fs.StringVar(&format, "format", "json", "output format: json")
 	fs.BoolVar(&includeEnvValues, "include-env-values", false, "include environment variable values in the manifest")
 	fs.StringVar(&coolifyURL, "coolify-url", os.Getenv("BORT_COOLIFY_URL"), "Coolify base URL, or BORT_COOLIFY_URL")
-	fs.StringVar(&coolifyToken, "coolify-token", os.Getenv("BORT_COOLIFY_TOKEN"), "Coolify API token, or BORT_COOLIFY_TOKEN")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -43,7 +41,7 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		IncludeEnvValues: includeEnvValues,
 		Coolify: source.CoolifyOptions{
 			BaseURL: coolifyURL,
-			Token:   coolifyToken,
+			Token:   os.Getenv("BORT_COOLIFY_TOKEN"),
 		},
 	}
 
@@ -60,8 +58,12 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	var out io.Writer = stdout
 	var file *os.File
 	if outputPath != "-" {
-		file, err = os.Create(outputPath)
+		file, err = os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 		if err != nil {
+			return err
+		}
+		if err := file.Chmod(0o600); err != nil {
+			file.Close()
 			return err
 		}
 		defer file.Close()

@@ -15,6 +15,8 @@ import (
 
 	"github.com/aikins01/bort/internal/exporter"
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/secrets"
+	"gopkg.in/yaml.v3"
 )
 
 type Status string
@@ -105,13 +107,13 @@ func validateApp(ctx context.Context, opts Options, app exporter.AppSummary) App
 	composePath := filepath.Join(appDir, "compose.yaml")
 	compose, err := os.ReadFile(composePath)
 	if err == nil {
-		validateComposeText(&result, string(compose), envKeys(filepath.Join(appDir, ".env.example")))
+		validateComposeText(&result, string(compose), envKeys(envExampleFiles(appDir)))
 		validateDockerCompose(ctx, &result, opts.DockerPath, appDir)
 	} else {
 		result.add(SeverityError, "compose.read_failed", err.Error())
 	}
 
-	validateEnvFile(&result, filepath.Join(appDir, ".env.example"))
+	validateEnvFiles(&result, envExampleFiles(appDir))
 	validateRoutes(&result, filepath.Join(appDir, "routes.json"))
 	validateStorages(&result, filepath.Join(appDir, "storages.json"))
 	result.Status = statusFromIssues(result.Issues)
@@ -143,6 +145,7 @@ var (
 	absoluteBindPattern    = regexp.MustCompile(`(?m)^\s*-\s*["']?(/[^:\n]+):(/[^:\n]+)`)
 	composeVariablePattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::[-?][^}]*)?\}`)
 	namedVolumePattern     = regexp.MustCompile(`(?m)^\s*-\s*["']?([A-Za-z0-9_.-]+):/[^\n"']+`)
+	namedVolumeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 	topLevelVolumesPattern = regexp.MustCompile(`(?m)^volumes:\s*$`)
 )
 
@@ -153,18 +156,12 @@ func validateComposeText(result *AppResult, compose string, envKeys map[string]s
 	if strings.Contains(compose, "TODO_REPLACE_SOURCE") {
 		result.add(SeverityError, "compose.missing_volume_source", "compose contains TODO_REPLACE_SOURCE")
 	}
-	if strings.Contains(compose, "container_name:") {
-		result.add(SeverityWarn, "compose.container_name", "container_name can break Dokploy logs, metrics, and service recreation")
-	}
-	if hostPortPattern.MatchString(compose) {
-		result.add(SeverityWarn, "compose.host_port", "host port bindings can conflict on Dokploy; prefer internal ports and Dokploy domains")
-	}
-	if matches := absoluteBindPattern.FindAllStringSubmatch(compose, -1); len(matches) > 0 {
-		sources := uniqueMatches(matches, 1)
-		result.add(SeverityWarn, "compose.absolute_bind_mount", fmt.Sprintf("absolute bind mounts are not portable: %s", strings.Join(sources, ", ")))
-	}
-	if namedVolumePattern.MatchString(compose) && !topLevelVolumesPattern.MatchString(compose) {
-		result.add(SeverityWarn, "compose.undeclared_named_volume", "named volume mounts were found but no top-level volumes section was detected")
+
+	analysis, err := analyzeCompose(compose)
+	if err != nil {
+		validateComposeTextWithPatterns(result, compose)
+	} else {
+		addComposeAnalysisIssues(result, analysis)
 	}
 
 	missingEnv := []string{}
@@ -178,7 +175,208 @@ func validateComposeText(result *AppResult, compose string, envKeys map[string]s
 	}
 	missingEnv = uniqueStrings(missingEnv)
 	if len(missingEnv) > 0 {
-		result.add(SeverityWarn, "env.missing_referenced_values", fmt.Sprintf("compose references env vars absent from .env.example: %s", strings.Join(missingEnv, ", ")))
+		result.add(SeverityWarn, "env.missing_referenced_values", fmt.Sprintf("compose references env vars absent from exported env example files: %s", strings.Join(missingEnv, ", ")))
+	}
+}
+
+func validateComposeTextWithPatterns(result *AppResult, compose string) {
+	if strings.Contains(compose, "container_name:") {
+		result.add(SeverityWarn, "compose.container_name", "container_name can break Dokploy logs, metrics, and service recreation")
+	}
+	if hostPortPattern.MatchString(compose) {
+		result.add(SeverityWarn, "compose.host_port", "host port bindings can conflict on Dokploy; prefer internal ports and Dokploy domains")
+	}
+	if matches := absoluteBindPattern.FindAllStringSubmatch(compose, -1); len(matches) > 0 {
+		sources := uniqueMatches(matches, 1)
+		result.add(SeverityWarn, "compose.absolute_bind_mount", fmt.Sprintf("absolute bind mounts are not portable: %s", strings.Join(sources, ", ")))
+	}
+	if namedVolumePattern.MatchString(compose) && !topLevelVolumesPattern.MatchString(compose) {
+		result.add(SeverityWarn, "compose.undeclared_named_volume", "named volume mounts were found but no top-level volumes section was detected")
+	}
+}
+
+func addComposeAnalysisIssues(result *AppResult, analysis composeAnalysis) {
+	if analysis.HasContainerName {
+		result.add(SeverityWarn, "compose.container_name", "container_name can break Dokploy logs, metrics, and service recreation")
+	}
+	if analysis.HasHostPortBinding {
+		result.add(SeverityWarn, "compose.host_port", "host port bindings can conflict on Dokploy; prefer internal ports and Dokploy domains")
+	}
+	if len(analysis.AbsoluteBindSources) > 0 {
+		result.add(SeverityWarn, "compose.absolute_bind_mount", fmt.Sprintf("absolute bind mounts are not portable: %s", strings.Join(analysis.AbsoluteBindSources, ", ")))
+	}
+	if len(analysis.UndeclaredNamedVolumes) > 0 {
+		result.add(SeverityWarn, "compose.undeclared_named_volume", fmt.Sprintf("named volume mounts are missing top-level volume declarations: %s", strings.Join(analysis.UndeclaredNamedVolumes, ", ")))
+	}
+}
+
+type composeAnalysis struct {
+	HasContainerName       bool
+	HasHostPortBinding     bool
+	AbsoluteBindSources    []string
+	UndeclaredNamedVolumes []string
+}
+
+type composeFile struct {
+	Services map[string]composeService `yaml:"services"`
+	Volumes  map[string]any            `yaml:"volumes"`
+}
+
+type composeService struct {
+	ContainerName string          `yaml:"container_name"`
+	Ports         []composePort   `yaml:"ports"`
+	Volumes       []composeVolume `yaml:"volumes"`
+}
+
+type composePort struct {
+	Short     string
+	Published string
+}
+
+func (p *composePort) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		p.Short = value.Value
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if value.Content[i].Value == "published" {
+				p.Published = value.Content[i+1].Value
+			}
+		}
+	}
+	return nil
+}
+
+type composeVolume struct {
+	Short  string
+	Type   string
+	Source string
+	Target string
+}
+
+func (v *composeVolume) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		v.Short = value.Value
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			switch value.Content[i].Value {
+			case "type":
+				v.Type = value.Content[i+1].Value
+			case "source":
+				v.Source = value.Content[i+1].Value
+			case "target":
+				v.Target = value.Content[i+1].Value
+			}
+		}
+	}
+	return nil
+}
+
+func analyzeCompose(compose string) (composeAnalysis, error) {
+	var file composeFile
+	if err := yaml.Unmarshal([]byte(compose), &file); err != nil {
+		return composeAnalysis{}, err
+	}
+
+	analysis := composeAnalysis{}
+	declaredVolumes := map[string]struct{}{}
+	for name := range file.Volumes {
+		declaredVolumes[name] = struct{}{}
+	}
+
+	absoluteBindSources := []string{}
+	undeclaredNamedVolumes := []string{}
+	for _, service := range file.Services {
+		if service.ContainerName != "" {
+			analysis.HasContainerName = true
+		}
+		for _, port := range service.Ports {
+			if port.hasHostBinding() {
+				analysis.HasHostPortBinding = true
+			}
+		}
+		for _, volume := range service.Volumes {
+			if source := volume.absoluteBindSource(); source != "" {
+				absoluteBindSources = append(absoluteBindSources, source)
+			}
+			if name := volume.namedVolume(); name != "" {
+				if _, ok := declaredVolumes[name]; !ok {
+					undeclaredNamedVolumes = append(undeclaredNamedVolumes, name)
+				}
+			}
+		}
+	}
+
+	analysis.AbsoluteBindSources = uniqueStrings(absoluteBindSources)
+	analysis.UndeclaredNamedVolumes = uniqueStrings(undeclaredNamedVolumes)
+	return analysis, nil
+}
+
+func (p composePort) hasHostBinding() bool {
+	if strings.TrimSpace(p.Published) != "" {
+		return true
+	}
+	short := strings.TrimSpace(p.Short)
+	if before, _, found := strings.Cut(short, "/"); found {
+		short = before
+	}
+	return strings.Contains(short, ":")
+}
+
+func (v composeVolume) absoluteBindSource() string {
+	source, _ := v.parts()
+	if source == "" || !filepath.IsAbs(source) {
+		return ""
+	}
+	if v.Type == "" || v.Type == "bind" {
+		return source
+	}
+	return ""
+}
+
+func (v composeVolume) namedVolume() string {
+	if v.Type == "bind" || v.Type == "tmpfs" {
+		return ""
+	}
+	source, _ := v.parts()
+	if isNamedVolumeSource(source) {
+		return source
+	}
+	return ""
+}
+
+func (v composeVolume) parts() (string, string) {
+	if v.Source != "" || v.Target != "" {
+		return strings.TrimSpace(v.Source), strings.TrimSpace(v.Target)
+	}
+	short := strings.TrimSpace(v.Short)
+	if short == "" {
+		return "", ""
+	}
+	parts := strings.Split(short, ":")
+	if len(parts) < 2 {
+		return "", ""
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+}
+
+func isNamedVolumeSource(source string) bool {
+	if source == "" {
+		return false
+	}
+	if strings.HasPrefix(source, "/") || strings.HasPrefix(source, ".") || strings.HasPrefix(source, "~") || strings.HasPrefix(source, "${") {
+		return false
+	}
+	if strings.Contains(source, "/") {
+		return false
+	}
+	return namedVolumeNamePattern.MatchString(source)
+}
+
+func validateEnvFiles(result *AppResult, paths []string) {
+	for _, path := range paths {
+		validateEnvFile(result, path)
 	}
 }
 
@@ -196,11 +394,11 @@ func validateEnvFile(result *AppResult, path string) {
 			continue
 		}
 		key, value, _ := strings.Cut(line, "=")
-		if isSensitiveName(key) && value == "" {
-			result.add(SeverityWarn, "env.sensitive_blank", fmt.Sprintf("%s is sensitive and must be set before deploy", key))
+		if secrets.IsSensitiveName(key) && value == "" {
+			result.add(SeverityWarn, "env.sensitive_blank", fmt.Sprintf("%s in %s is sensitive and must be set before deploy", key, filepath.Base(path)))
 		}
-		if isSensitiveName(key) && value != "" {
-			result.add(SeverityError, "env.sensitive_value_present", fmt.Sprintf("%s appears sensitive but is populated in .env.example", key))
+		if secrets.IsSensitiveName(key) && value != "" {
+			result.add(SeverityError, "env.sensitive_value_present", fmt.Sprintf("%s appears sensitive but is populated in %s", key, filepath.Base(path)))
 		}
 	}
 }
@@ -256,11 +454,27 @@ func readJSON(path string, out any) error {
 	return json.NewDecoder(file).Decode(out)
 }
 
-func envKeys(path string) map[string]struct{} {
+func envExampleFiles(appDir string) []string {
+	paths, err := filepath.Glob(filepath.Join(appDir, ".env*.example"))
+	if err != nil {
+		return nil
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func envKeys(paths []string) map[string]struct{} {
 	keys := map[string]struct{}{}
+	for _, path := range paths {
+		readEnvKeys(path, keys)
+	}
+	return keys
+}
+
+func readEnvKeys(path string, keys map[string]struct{}) {
 	file, err := os.Open(path)
 	if err != nil {
-		return keys
+		return
 	}
 	defer file.Close()
 
@@ -275,7 +489,6 @@ func envKeys(path string) map[string]struct{} {
 			keys[key] = struct{}{}
 		}
 	}
-	return keys
 }
 
 func (r *AppResult) add(severity Severity, code, message string) {
@@ -339,16 +552,6 @@ func slug(value string) string {
 	value = slugPattern.ReplaceAllString(value, "-")
 	value = strings.Trim(value, "-._")
 	return value
-}
-
-func isSensitiveName(name string) bool {
-	lower := strings.ToLower(name)
-	for _, token := range []string{"password", "passwd", "secret", "token", "key", "credential"} {
-		if strings.Contains(lower, token) {
-			return true
-		}
-	}
-	return false
 }
 
 func fallback(value, fallback string) string {

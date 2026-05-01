@@ -14,13 +14,17 @@ import (
 	"time"
 
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/secrets"
 	"github.com/aikins01/bort/internal/source"
 )
 
 type Scanner struct {
 	DockerPath string
 	Now        func() time.Time
+	runCommand func(context.Context, ...string) ([]byte, error)
 }
+
+const dockerInspectChunkSize = 100
 
 func NewScanner() *Scanner {
 	return &Scanner{
@@ -121,15 +125,19 @@ func (s *Scanner) inspectContainers(ctx context.Context) ([]containerInspect, er
 		return nil, nil
 	}
 
-	args := append([]string{"inspect"}, ids...)
-	raw, err := s.run(ctx, args...)
-	if err != nil {
-		return nil, fmt.Errorf("inspect docker containers: %w", err)
-	}
+	containers := []containerInspect{}
+	for _, chunk := range chunks(ids, dockerInspectChunkSize) {
+		args := append([]string{"inspect"}, chunk...)
+		raw, err := s.run(ctx, args...)
+		if err != nil {
+			return nil, fmt.Errorf("inspect docker containers: %w", err)
+		}
 
-	var containers []containerInspect
-	if err := json.Unmarshal(raw, &containers); err != nil {
-		return nil, err
+		var inspected []containerInspect
+		if err := json.Unmarshal(raw, &inspected); err != nil {
+			return nil, err
+		}
+		containers = append(containers, inspected...)
 	}
 	return containers, nil
 }
@@ -145,15 +153,19 @@ func (s *Scanner) inspectVolumes(ctx context.Context) ([]manifest.Volume, error)
 		return nil, nil
 	}
 
-	args := append([]string{"volume", "inspect"}, names...)
-	raw, err := s.run(ctx, args...)
-	if err != nil {
-		return nil, fmt.Errorf("inspect docker volumes: %w", err)
-	}
+	inspected := []volumeInspect{}
+	for _, chunk := range chunks(names, dockerInspectChunkSize) {
+		args := append([]string{"volume", "inspect"}, chunk...)
+		raw, err := s.run(ctx, args...)
+		if err != nil {
+			return nil, fmt.Errorf("inspect docker volumes: %w", err)
+		}
 
-	var inspected []volumeInspect
-	if err := json.Unmarshal(raw, &inspected); err != nil {
-		return nil, err
+		var chunkInspected []volumeInspect
+		if err := json.Unmarshal(raw, &chunkInspected); err != nil {
+			return nil, err
+		}
+		inspected = append(inspected, chunkInspected...)
 	}
 
 	volumes := make([]manifest.Volume, 0, len(inspected))
@@ -182,15 +194,19 @@ func (s *Scanner) inspectNetworks(ctx context.Context) ([]manifest.Network, erro
 		return nil, nil
 	}
 
-	args := append([]string{"network", "inspect"}, ids...)
-	raw, err := s.run(ctx, args...)
-	if err != nil {
-		return nil, fmt.Errorf("inspect docker networks: %w", err)
-	}
+	inspected := []networkInspect{}
+	for _, chunk := range chunks(ids, dockerInspectChunkSize) {
+		args := append([]string{"network", "inspect"}, chunk...)
+		raw, err := s.run(ctx, args...)
+		if err != nil {
+			return nil, fmt.Errorf("inspect docker networks: %w", err)
+		}
 
-	var inspected []networkInspect
-	if err := json.Unmarshal(raw, &inspected); err != nil {
-		return nil, err
+		var chunkInspected []networkInspect
+		if err := json.Unmarshal(raw, &chunkInspected); err != nil {
+			return nil, err
+		}
+		inspected = append(inspected, chunkInspected...)
 	}
 
 	networks := make([]manifest.Network, 0, len(inspected))
@@ -209,6 +225,10 @@ func (s *Scanner) inspectNetworks(ctx context.Context) ([]manifest.Network, erro
 }
 
 func (s *Scanner) run(ctx context.Context, args ...string) ([]byte, error) {
+	if s.runCommand != nil {
+		return s.runCommand(ctx, args...)
+	}
+
 	cmd := exec.CommandContext(ctx, s.DockerPath, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -363,7 +383,7 @@ func envVars(raw []string, includeValues bool) []manifest.EnvVar {
 			continue
 		}
 
-		env := manifest.EnvVar{Name: name, Sensitive: isSensitiveName(name)}
+		env := manifest.EnvVar{Name: name, Sensitive: secrets.IsSensitiveName(name)}
 		if includeValues && hasValue {
 			env.Value = value
 			env.ValueKnown = true
@@ -525,19 +545,25 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func chunks(values []string, size int) [][]string {
+	if size <= 0 {
+		size = len(values)
+	}
+
+	chunked := [][]string{}
+	for start := 0; start < len(values); start += size {
+		end := start + size
+		if end > len(values) {
+			end = len(values)
+		}
+		chunked = append(chunked, values[start:end])
+	}
+	return chunked
+}
+
 func shortID(id string) string {
 	if len(id) <= 12 {
 		return id
 	}
 	return id[:12]
-}
-
-func isSensitiveName(name string) bool {
-	lower := strings.ToLower(name)
-	for _, token := range []string{"password", "passwd", "secret", "token", "key", "credential"} {
-		if strings.Contains(lower, token) {
-			return true
-		}
-	}
-	return false
 }

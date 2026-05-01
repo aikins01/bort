@@ -1,6 +1,12 @@
 package localdocker
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestRoutesFromLabelsExtractsHostsAndServicePort(t *testing.T) {
 	labels := map[string]string{
@@ -54,4 +60,63 @@ func TestEnvVarsCanIncludeValues(t *testing.T) {
 	if !vars[0].ValueKnown || vars[0].Value != "3000" {
 		t.Fatalf("expected PORT value to be included, got %#v", vars[0])
 	}
+}
+
+func TestInspectContainersChunksIDs(t *testing.T) {
+	ids := make([]string, 205)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("container-%03d", i)
+	}
+
+	inspectCalls := []int{}
+	scanner := &Scanner{
+		runCommand: func(_ context.Context, args ...string) ([]byte, error) {
+			switch {
+			case len(args) == 2 && args[0] == "ps" && args[1] == "-aq":
+				return []byte(strings.Join(ids, "\n")), nil
+			case len(args) > 0 && args[0] == "inspect":
+				inspectCalls = append(inspectCalls, len(args)-1)
+				return inspectContainersJSON(t, args[1:]), nil
+			default:
+				return nil, fmt.Errorf("unexpected docker args: %v", args)
+			}
+		},
+	}
+
+	containers, err := scanner.inspectContainers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(containers) != len(ids) {
+		t.Fatalf("expected %d containers, got %d", len(ids), len(containers))
+	}
+	wantCalls := []int{100, 100, 5}
+	if fmt.Sprint(inspectCalls) != fmt.Sprint(wantCalls) {
+		t.Fatalf("expected inspect chunks %v, got %v", wantCalls, inspectCalls)
+	}
+}
+
+func inspectContainersJSON(t *testing.T, ids []string) []byte {
+	t.Helper()
+	items := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		items = append(items, map[string]any{
+			"Id": id,
+			"Config": map[string]any{
+				"Labels": map[string]string{},
+			},
+			"State": map[string]any{
+				"Status": "running",
+			},
+			"NetworkSettings": map[string]any{
+				"Ports":    map[string]any{},
+				"Networks": map[string]any{},
+			},
+		})
+	}
+	encoded, err := json.Marshal(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }

@@ -71,6 +71,46 @@ func TestValidateErrorsOnSensitiveValue(t *testing.T) {
 	assertIssue(t, result.Apps[0], "env.sensitive_value_present")
 }
 
+func TestValidateParsesLongComposeSyntax(t *testing.T) {
+	dir := t.TempDir()
+	appDir := filepath.Join(dir, "api")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "index.json"), `{"outputDir":"`+dir+`","source":"test","apps":[{"name":"api","directory":"api"}]}`)
+	writeFile(t, filepath.Join(appDir, "compose.yaml"), `services:
+  api:
+    image: example/api
+    container_name: api
+    ports:
+      - target: 3000
+        published: 8080
+    volumes:
+      - type: bind
+        source: /var/lib/api
+        target: /data
+      - type: volume
+        source: db-data
+        target: /var/lib/db
+`)
+	writeFile(t, filepath.Join(appDir, ".env.example"), "")
+	writeFile(t, filepath.Join(appDir, "routes.json"), `[{"host":"api.example.com","serviceName":"api"}]`)
+	writeFile(t, filepath.Join(appDir, "storages.json"), `[]`)
+	writeFile(t, filepath.Join(appDir, "migration-report.md"), "# report\n")
+
+	result, err := Validate(context.Background(), Options{BundleDir: dir, DockerPath: "definitely-not-docker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != StatusYellow {
+		t.Fatalf("expected yellow status, got %#v", result)
+	}
+	assertIssue(t, result.Apps[0], "compose.container_name")
+	assertIssue(t, result.Apps[0], "compose.host_port")
+	assertIssue(t, result.Apps[0], "compose.absolute_bind_mount")
+	assertIssue(t, result.Apps[0], "compose.undeclared_named_volume")
+}
+
 func assertIssue(t *testing.T, app AppResult, code string) {
 	t.Helper()
 	for _, issue := range app.Issues {

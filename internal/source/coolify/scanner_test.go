@@ -28,6 +28,7 @@ func TestScanApplicationsFromCoolifyAPI(t *testing.T) {
 				"fqdn":                    "https://blog.example.com,https://www.blog.example.com",
 				"git_repository":          "https://github.com/example/ghost-stack",
 				"git_branch":              "main",
+				"docker_compose":          "services:\n  ghost:\n    image: ghost:5\n    environment:\n      DATABASE_PASSWORD: secret\n",
 				"docker_compose_raw":      "services:\n  ghost:\n    image: ghost:5\n",
 				"docker_compose_domains":  `{"ghost":{"domain":"https://blog.example.com:2368"}}`,
 				"docker_compose_location": "/docker-compose.yml",
@@ -68,6 +69,9 @@ func TestScanApplicationsFromCoolifyAPI(t *testing.T) {
 	if app.Compose == nil || app.Compose.Raw == "" {
 		t.Fatalf("expected compose source, got %#v", app.Compose)
 	}
+	if app.Compose.Resolved != "" {
+		t.Fatalf("expected resolved compose to be omitted by default, got %#v", app.Compose)
+	}
 	if len(app.Routes) != 3 {
 		t.Fatalf("expected fqdn and compose-domain routes, got %#v", app.Routes)
 	}
@@ -89,6 +93,61 @@ func TestEnvVarsIncludeValuesWhenRequested(t *testing.T) {
 	}
 	if !vars[0].ValueKnown || vars[0].Value != "abc" || !vars[0].Sensitive {
 		t.Fatalf("unexpected var: %#v", vars[0])
+	}
+}
+
+func TestComposeSourceIncludesResolvedOnlyWhenRequested(t *testing.T) {
+	resource := map[string]any{
+		"docker_compose":     "services:\n  api:\n    environment:\n      API_TOKEN: secret\n",
+		"docker_compose_raw": "services:\n  api:\n    image: example/api\n",
+	}
+
+	redacted := composeSource(resource, false)
+	if redacted == nil || redacted.Raw == "" || redacted.Resolved != "" {
+		t.Fatalf("expected only raw compose by default, got %#v", redacted)
+	}
+
+	included := composeSource(resource, true)
+	if included == nil || included.Resolved == "" {
+		t.Fatalf("expected resolved compose when requested, got %#v", included)
+	}
+}
+
+func TestGetListFollowsPagination(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/applications" {
+			http.NotFound(w, r)
+			return
+		}
+
+		switch r.URL.Query().Get("page") {
+		case "", "1":
+			writeJSON(t, w, map[string]any{
+				"data":  []map[string]any{{"uuid": "app-1"}},
+				"links": map[string]any{"next": server.URL + "/api/v1/applications?page=2"},
+			})
+		case "2":
+			writeJSON(t, w, map[string]any{
+				"data":  []map[string]any{{"uuid": "app-2"}},
+				"links": map[string]any{"next": nil},
+			})
+		default:
+			t.Fatalf("unexpected page %q", r.URL.Query().Get("page"))
+		}
+	}))
+	defer server.Close()
+
+	scanner, err := NewScanner(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := scanner.getList(context.Background(), "/api/v1/applications")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || getString(items[0], "uuid") != "app-1" || getString(items[1], "uuid") != "app-2" {
+		t.Fatalf("unexpected items: %#v", items)
 	}
 }
 

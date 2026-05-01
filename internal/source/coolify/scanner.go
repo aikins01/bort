@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/secrets"
 	"github.com/aikins01/bort/internal/source"
 )
 
@@ -27,7 +29,7 @@ func NewScanner(baseURL, token string) (*Scanner, error) {
 		return nil, fmt.Errorf("--coolify-url or BORT_COOLIFY_URL is required for --source coolify")
 	}
 	if strings.TrimSpace(token) == "" {
-		return nil, fmt.Errorf("--coolify-token or BORT_COOLIFY_TOKEN is required for --source coolify")
+		return nil, fmt.Errorf("BORT_COOLIFY_TOKEN is required for --source coolify")
 	}
 
 	return &Scanner{
@@ -102,7 +104,7 @@ func (s *Scanner) scanKind(ctx context.Context, kind resourceKind, opts source.S
 			}
 		}
 
-		app := appFromResource(kind.Runtime, resource)
+		app := appFromResource(kind.Runtime, resource, opts.IncludeEnvValues)
 		if uuid != "" {
 			app.Environment = s.envsFor(ctx, kind, uuid, opts, &warnings)
 			app.Storages = s.storagesFor(ctx, kind, uuid, opts, &warnings)
@@ -132,11 +134,22 @@ func (s *Scanner) storagesFor(ctx context.Context, kind resourceKind, uuid strin
 }
 
 func (s *Scanner) getList(ctx context.Context, path string) ([]map[string]any, error) {
-	var payload any
-	if err := s.get(ctx, path, &payload); err != nil {
-		return nil, err
+	items := []map[string]any{}
+	seenPages := map[string]struct{}{}
+	for path != "" {
+		if _, ok := seenPages[path]; ok {
+			return nil, fmt.Errorf("pagination loop while reading %s", path)
+		}
+		seenPages[path] = struct{}{}
+
+		var payload any
+		if err := s.get(ctx, path, &payload); err != nil {
+			return nil, err
+		}
+		items = append(items, asObjectList(payload)...)
+		path = nextListPath(payload, path)
 	}
-	return asObjectList(payload), nil
+	return items, nil
 }
 
 func (s *Scanner) getObject(ctx context.Context, path string) (map[string]any, error) {
@@ -148,7 +161,11 @@ func (s *Scanner) getObject(ctx context.Context, path string) (map[string]any, e
 }
 
 func (s *Scanner) get(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.BaseURL+path, nil)
+	endpoint, err := s.endpoint(path)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return err
 	}
@@ -168,7 +185,28 @@ func (s *Scanner) get(ctx context.Context, path string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-func appFromResource(runtime string, resource map[string]any) manifest.App {
+func (s *Scanner) endpoint(path string) (string, error) {
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		parsed, err := url.Parse(path)
+		if err != nil {
+			return "", err
+		}
+		base, err := url.Parse(s.BaseURL)
+		if err != nil {
+			return "", err
+		}
+		if parsed.Host != base.Host {
+			return "", fmt.Errorf("refusing Coolify pagination URL outside %s: %s", base.Host, parsed.Host)
+		}
+		return path, nil
+	}
+	if strings.HasPrefix(path, "/") || strings.HasPrefix(path, "?") {
+		return s.BaseURL + path, nil
+	}
+	return s.BaseURL + "/" + path, nil
+}
+
+func appFromResource(runtime string, resource map[string]any, includeResolvedCompose bool) manifest.App {
 	uuid := getString(resource, "uuid", "id")
 	name := getString(resource, "name")
 	if name == "" {
@@ -183,7 +221,7 @@ func appFromResource(runtime string, resource map[string]any) manifest.App {
 		BuildPack: getString(resource, "build_pack", "buildPack"),
 		Status:    getString(resource, "status"),
 		Git:       gitSource(resource),
-		Compose:   composeSource(resource),
+		Compose:   composeSource(resource, includeResolvedCompose),
 		Metadata:  metadata(resource, "uuid", "id", "server_uuid", "project_uuid", "environment_name", "environment_uuid", "service_type", "type"),
 		Services: []manifest.Service{
 			{
@@ -214,11 +252,13 @@ func gitSource(resource map[string]any) *manifest.GitSource {
 	return git
 }
 
-func composeSource(resource map[string]any) *manifest.ComposeSource {
+func composeSource(resource map[string]any, includeResolved bool) *manifest.ComposeSource {
 	compose := &manifest.ComposeSource{
-		Raw:      getString(resource, "docker_compose_raw", "dockerComposeRaw"),
-		Resolved: getString(resource, "docker_compose", "dockerCompose"),
-		Domains:  composeDomains(resource),
+		Raw:     getString(resource, "docker_compose_raw", "dockerComposeRaw"),
+		Domains: composeDomains(resource),
+	}
+	if includeResolved {
+		compose.Resolved = getString(resource, "docker_compose", "dockerCompose")
 	}
 	if compose.Raw == "" && compose.Resolved == "" && len(compose.Domains) == 0 {
 		return nil
@@ -258,7 +298,7 @@ func envVars(items []map[string]any, includeValues bool) []manifest.EnvVar {
 		}
 
 		value := getString(item, "real_value", "realValue", "value")
-		env := manifest.EnvVar{Name: name, Sensitive: isSensitiveName(name) || getBool(item, "is_shown_once", "isShownOnce")}
+		env := manifest.EnvVar{Name: name, Sensitive: secrets.IsSensitiveName(name) || getBool(item, "is_shown_once", "isShownOnce")}
 		if includeValues {
 			env.Value = value
 			env.ValueKnown = value != ""
@@ -304,12 +344,10 @@ func routes(resource map[string]any, serviceName string) []manifest.Route {
 		routes = append(routes, routeFromURL(fqdn, serviceName, "fqdn"))
 	}
 
-	if compose := composeSource(resource); compose != nil {
-		for name, domain := range compose.Domains {
-			for _, fqdn := range splitCSV(domain.Domain) {
-				route := routeFromURL(fqdn, name, "docker_compose_domains")
-				routes = append(routes, route)
-			}
+	for name, domain := range composeDomains(resource) {
+		for _, fqdn := range splitCSV(domain.Domain) {
+			route := routeFromURL(fqdn, name, "docker_compose_domains")
+			routes = append(routes, route)
 		}
 	}
 
@@ -366,14 +404,99 @@ func asObjectList(payload any) []map[string]any {
 		return items
 	case map[string]any:
 		for _, key := range []string{"data", "items", "resources"} {
-			if items := asObjectList(value[key]); len(items) > 0 {
-				return items
+			if nested, ok := value[key]; ok {
+				return asObjectList(nested)
 			}
 		}
 		return []map[string]any{value}
 	default:
 		return nil
 	}
+}
+
+func nextListPath(payload any, currentPath string) string {
+	object, ok := payload.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	for _, key := range []string{"next_page_url", "nextPageUrl", "next_url", "nextUrl"} {
+		if next := stringValue(object[key]); next != "" {
+			return next
+		}
+	}
+	if links, ok := object["links"].(map[string]any); ok {
+		if next := stringValue(links["next"]); next != "" {
+			return next
+		}
+		if next, ok := links["next"].(map[string]any); ok {
+			for _, key := range []string{"href", "url"} {
+				if value := stringValue(next[key]); value != "" {
+					return value
+				}
+			}
+		}
+	}
+
+	current, last, ok := pageNumbers(object)
+	if !ok || current >= last {
+		return ""
+	}
+	return pathWithPage(currentPath, current+1)
+}
+
+func pageNumbers(object map[string]any) (int, int, bool) {
+	current, hasCurrent := intField(object, "current_page", "currentPage")
+	last, hasLast := intField(object, "last_page", "lastPage")
+	if hasCurrent && hasLast {
+		return current, last, true
+	}
+	meta, ok := object["meta"].(map[string]any)
+	if !ok {
+		return 0, 0, false
+	}
+	current, hasCurrent = intField(meta, "current_page", "currentPage")
+	last, hasLast = intField(meta, "last_page", "lastPage")
+	return current, last, hasCurrent && hasLast
+}
+
+func intField(object map[string]any, keys ...string) (int, bool) {
+	for _, key := range keys {
+		if value, ok := intValue(object[key]); ok {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func intValue(value any) (int, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed), true
+	case string:
+		parsed, err := strconv.Atoi(typed)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func stringValue(value any) string {
+	if typed, ok := value.(string); ok {
+		return strings.TrimSpace(typed)
+	}
+	return ""
+}
+
+func pathWithPage(raw string, page int) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	query := parsed.Query()
+	query.Set("page", strconv.Itoa(page))
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 func mergeObjects(first, second map[string]any) map[string]any {
@@ -490,14 +613,4 @@ func netSplitHostPort(host string) (string, string, error) {
 		return "", "", fmt.Errorf("no host port")
 	}
 	return parsed.Hostname(), parsed.Port(), nil
-}
-
-func isSensitiveName(name string) bool {
-	lower := strings.ToLower(name)
-	for _, token := range []string{"password", "passwd", "secret", "token", "key", "credential"} {
-		if strings.Contains(lower, token) {
-			return true
-		}
-	}
-	return false
 }

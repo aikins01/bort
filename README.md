@@ -46,6 +46,8 @@ export BORT_COOLIFY_TOKEN=your-token-here
 bin/bort scan --source coolify --output manifest.json
 ```
 
+Coolify API tokens are only read from `BORT_COOLIFY_TOKEN`, not from a command-line flag, so they do not appear in the process table. Scan manifests are written with private file permissions.
+
 Review a migration plan:
 
 ```sh
@@ -74,6 +76,17 @@ By default, environment variable values are redacted. If you need a full migrati
 
 ```sh
 bin/bort scan --include-env-values --output manifest.json
+```
+
+Exported bundles are local artifacts with private directory and file permissions. When raw and resolved Coolify compose are both present, `bort export` uses raw compose; resolved compose is skipped unless it was explicitly included in the manifest, because it may contain interpolated secret values. Generated Docker bundles write service-specific env examples such as `.env.web.example` to avoid collisions between services.
+
+For the current safe audit loop, run only read-only/local commands:
+
+```sh
+bin/bort scan --source coolify --output coolify-manifest.json
+bin/bort plan --manifest coolify-manifest.json --target dokploy
+bin/bort export --manifest coolify-manifest.json --output-dir bort-bundle
+bin/bort validate --bundle bort-bundle
 ```
 
 ## Direction
