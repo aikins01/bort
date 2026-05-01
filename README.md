@@ -14,7 +14,7 @@ Implemented now:
 - `bort scan --source coolify` exports Coolify applications, services, databases, env vars, storages, compose config, git metadata, and domains through the Coolify API.
 - `bort scan --source coolify-local` is intended to run on the source Coolify server and uses local Docker state as the migration-grade inventory path.
 - `bort plan` reads a manifest and prints a first migration readiness summary.
-- `bort export` writes a local migration bundle with compose, env, routes, storages, and a report per app.
+- `bort export` writes a local migration bundle with compose, env, routes, storages, topology, and a report per app.
 - `bort validate` checks exported bundles for compose validity, portability risks, missing routes, and secret handling.
 - Source/target/gateway/sync/state packages define the shape for the live migration engine.
 
@@ -59,12 +59,20 @@ The Coolify API scan is a safe preflight, but it is not the migration source of 
 
 `coolify-local` enriches Docker groups from Coolify labels when available, including resource names, resource type, project/environment, compose file paths, and whether a group looks like a migration candidate or Coolify platform support.
 
-`bort plan` also infers topology from the manifest: Docker networks, internal dependencies such as Postgres or Redis services, stateful volumes, and likely external requirements from redacted env var names such as `DATABASE_URL`, `REDIS_URL`, `MINIO_ENDPOINT`, or SMTP settings.
+`bort plan` also infers topology from the manifest: Docker networks, internal dependencies such as Postgres or Redis services, first-class data stores with migration strategies, stateful volumes, risk reasons, and likely external requirements from redacted env var names such as `DATABASE_URL`, `REDIS_URL`, `MINIO_ENDPOINT`, or SMTP settings.
 
 Review a migration plan:
 
 ```sh
 bin/bort plan --manifest manifest.json --target dokploy
+```
+
+Filter a migration plan to a single app or migration role:
+
+```sh
+bin/bort plan --manifest manifest.json --app new-marketmap-dj
+bin/bort plan --manifest manifest.json --role candidate
+bin/bort plan --manifest manifest.json --role support
 ```
 
 Export an inspectable migration bundle:
@@ -91,7 +99,7 @@ By default, environment variable values are redacted. If you need a full migrati
 bin/bort scan --include-env-values --output manifest.json
 ```
 
-Exported bundles are local artifacts with private directory and file permissions. When raw and resolved Coolify compose are both present, `bort export` uses raw compose; resolved compose is skipped unless it was explicitly included in the manifest, because it may contain interpolated secret values. Generated Docker bundles write service-specific env examples such as `.env.web.example` to avoid collisions between services.
+Exported bundles are local artifacts with private directory and file permissions. When raw and resolved Coolify compose are both present, `bort export` uses raw compose; resolved compose is skipped unless it was explicitly included in the manifest, because it may contain interpolated secret values. Generated Docker bundles write service-specific env examples such as `.env.web.example` to avoid collisions between services. Each app bundle also includes `topology.json`, a machine-readable summary of networks, dependencies, external requirements, data stores, stateful volumes, routes, and risk reasons for later prepare/sync/cutover steps.
 
 For the current safe audit loop, run only read-only/local commands:
 

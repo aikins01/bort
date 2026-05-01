@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aikins01/bort/internal/analyzer"
 	"github.com/aikins01/bort/internal/manifest"
 )
 
@@ -112,6 +113,9 @@ func exportApp(appDir string, app manifest.App) ([]string, error) {
 		return nil, err
 	}
 	if err := writeJSON(filepath.Join(appDir, "storages.json"), app.Storages); err != nil {
+		return nil, err
+	}
+	if err := writeJSON(filepath.Join(appDir, "topology.json"), analyzer.TopologyForApp(app)); err != nil {
 		return nil, err
 	}
 

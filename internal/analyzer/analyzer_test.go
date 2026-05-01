@@ -81,3 +81,75 @@ func TestAnalyzeAppFindsExternalRequirements(t *testing.T) {
 		}
 	}
 }
+
+func TestAnalyzeAppClassifiesDataStoresAndRisks(t *testing.T) {
+	analysis := AnalyzeApp(manifest.App{
+		Services: []manifest.Service{
+			{
+				Name:  "postgres-1",
+				Image: "pgvector/pgvector:pg16",
+				Mounts: []manifest.Mount{
+					{Type: "volume", Name: "pgdata", Target: "/var/lib/postgresql/data"},
+				},
+				Labels: map[string]string{"com.docker.compose.service": "postgres"},
+			},
+			{
+				Name:  "redis-1",
+				Image: "docker.dragonflydb.io/dragonflydb/dragonfly",
+				Mounts: []manifest.Mount{
+					{Type: "volume", Name: "redis-data", Target: "/data"},
+				},
+				Labels: map[string]string{"com.docker.compose.service": "redis"},
+			},
+			{
+				Name:  "uploads",
+				Image: "example/uploads",
+				Mounts: []manifest.Mount{
+					{Type: "bind", Source: "/srv/uploads", Target: "/uploads"},
+				},
+			},
+		},
+		Routes: []manifest.Route{{Host: "app.example.com"}},
+	})
+
+	postgres := findDataStore(t, analysis.DataStores, "postgres", "postgres")
+	if postgres.Engine != "pgvector" || postgres.Strategy != "pg_dump_restore_or_logical_replication" || postgres.Criticality != "critical" {
+		t.Fatalf("unexpected postgres data store: %#v", postgres)
+	}
+	redis := findDataStore(t, analysis.DataStores, "redis", "redis")
+	if redis.Engine != "dragonfly" || redis.Fallback != "recreate_if_cache_only" || redis.Criticality != "unknown" {
+		t.Fatalf("unexpected redis data store: %#v", redis)
+	}
+	unknown := findDataStore(t, analysis.DataStores, "unknown", "uploads")
+	if unknown.Strategy != "manual_review" {
+		t.Fatalf("unexpected unknown data store: %#v", unknown)
+	}
+	if len(analysis.StatefulVolumes) != 3 {
+		t.Fatalf("expected three stateful volumes, got %#v", analysis.StatefulVolumes)
+	}
+	assertRisk(t, analysis.RiskReasons, "data_store.postgres")
+	assertRisk(t, analysis.RiskReasons, "data_store.redis")
+	assertRisk(t, analysis.RiskReasons, "data_store.manual_review")
+	assertRisk(t, analysis.RiskReasons, "state.bind_mounts")
+}
+
+func findDataStore(t *testing.T, stores []DataStore, kind, service string) DataStore {
+	t.Helper()
+	for _, store := range stores {
+		if store.Kind == kind && store.Service == service {
+			return store
+		}
+	}
+	t.Fatalf("expected %s data store for %s in %#v", kind, service, stores)
+	return DataStore{}
+}
+
+func assertRisk(t *testing.T, risks []RiskReason, code string) {
+	t.Helper()
+	for _, risk := range risks {
+		if risk.Code == code {
+			return
+		}
+	}
+	t.Fatalf("expected risk %s in %#v", code, risks)
+}

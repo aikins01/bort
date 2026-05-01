@@ -97,10 +97,63 @@ func TestWritePlanShowsTopologyAnalysis(t *testing.T) {
 		"[yellow] stack",
 		"networks: stack-net",
 		"internal dependencies: database=postgres volumes[pgdata -> /var/lib/postgresql/data]; redis=redis volumes[redis-data -> /data]",
+		"data stores: postgres=postgres volumes[pgdata -> /var/lib/postgresql/data] strategy=pg_dump_restore_or_logical_replication fallback=stopped_volume_copy criticality=critical; redis=redis volumes[redis-data -> /data] strategy=snapshot_aof_or_volume_copy fallback=recreate_if_cache_only criticality=unknown",
 		"external requirements: object-storage via MINIO_ENDPOINT",
+		"risk reasons:",
 	} {
 		if !strings.Contains(plan, want) {
 			t.Fatalf("expected plan to contain %q, got:\n%s", want, plan)
 		}
+	}
+}
+
+func TestWritePlanFiltersByAppAndRole(t *testing.T) {
+	m := manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local", Hostname: "example.com"},
+		Apps: []manifest.App{
+			{
+				ID:       "compose:candidate-1",
+				Name:     "new marketmap dj",
+				Platform: "coolify",
+				Metadata: map[string]string{"migrationRole": "candidate", "coolify.uuid": "candidate-1"},
+				Services: []manifest.Service{{Name: "web", Image: "example/web"}},
+				Routes:   []manifest.Route{{Host: "candidate.example.com"}},
+			},
+			{
+				ID:       "compose:support-1",
+				Name:     "postgresql database",
+				Platform: "coolify",
+				Runtime:  "database",
+				Metadata: map[string]string{"migrationRole": "support"},
+				Services: []manifest.Service{{Name: "postgres", Image: "postgres:16-alpine"}},
+			},
+		},
+	}
+
+	var out bytes.Buffer
+	if err := writePlanWithOptions(&out, m, planOptions{Target: "dokploy", AppName: "new-marketmap-dj", Role: "candidate"}); err != nil {
+		t.Fatal(err)
+	}
+	plan := out.String()
+	for _, want := range []string{"Apps: 1", "Filters: app=new-marketmap-dj, role=candidate", "[green] new marketmap dj"} {
+		if !strings.Contains(plan, want) {
+			t.Fatalf("expected filtered plan to contain %q, got:\n%s", want, plan)
+		}
+	}
+	if strings.Contains(plan, "postgresql database") {
+		t.Fatalf("expected app filter to exclude support app, got:\n%s", plan)
+	}
+
+	out.Reset()
+	if err := writePlanWithOptions(&out, m, planOptions{Target: "dokploy", Role: "support"}); err != nil {
+		t.Fatal(err)
+	}
+	plan = out.String()
+	if !strings.Contains(plan, "[yellow] postgresql database") || strings.Contains(plan, "new marketmap dj") {
+		t.Fatalf("expected role filter to include only support app, got:\n%s", plan)
+	}
+
+	if err := writePlanWithOptions(&out, m, planOptions{Target: "dokploy", AppName: "missing"}); err == nil {
+		t.Fatal("expected missing app filter to fail")
 	}
 }

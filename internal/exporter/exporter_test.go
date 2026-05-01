@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aikins01/bort/internal/analyzer"
 	"github.com/aikins01/bort/internal/manifest"
 )
 
@@ -64,6 +65,20 @@ func TestExportWritesBundleForComposeApp(t *testing.T) {
 	}
 	if len(routes) != 1 || routes[0].Host != "blog.example.com" {
 		t.Fatalf("unexpected routes: %#v", routes)
+	}
+
+	var topology analyzer.Topology
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(appDir, "topology.json"))), &topology); err != nil {
+		t.Fatal(err)
+	}
+	if len(topology.Routes) != 1 || topology.Routes[0].Host != "blog.example.com" {
+		t.Fatalf("unexpected topology routes: %#v", topology.Routes)
+	}
+	if len(topology.StatefulVolumes) != 1 || topology.StatefulVolumes[0].Name != "ghost_content" {
+		t.Fatalf("unexpected topology stateful volumes: %#v", topology.StatefulVolumes)
+	}
+	if len(topology.RiskReasons) == 0 {
+		t.Fatalf("expected topology risk reasons, got %#v", topology)
 	}
 }
 

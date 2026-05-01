@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -20,9 +21,13 @@ func runPlan(_ context.Context, args []string, stdout, stderr io.Writer) error {
 
 	var manifestPath string
 	var target string
+	var appName string
+	var role string
 
 	fs.StringVar(&manifestPath, "manifest", "", "migration manifest path")
 	fs.StringVar(&target, "target", "dokploy", "target platform")
+	fs.StringVar(&appName, "app", "", "optional app name to plan")
+	fs.StringVar(&role, "role", "", "optional migration role to plan: candidate, support, platform")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -43,24 +48,46 @@ func runPlan(_ context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	return writePlan(stdout, m, target)
+	return writePlanWithOptions(stdout, m, planOptions{Target: target, AppName: appName, Role: role})
 }
 
 func writePlan(w io.Writer, m manifest.Manifest, target string) error {
+	return writePlanWithOptions(w, m, planOptions{Target: target})
+}
+
+type planOptions struct {
+	Target  string
+	AppName string
+	Role    string
+}
+
+func writePlanWithOptions(w io.Writer, m manifest.Manifest, opts planOptions) error {
+	if opts.Target == "" {
+		opts.Target = "dokploy"
+	}
+	apps := filteredPlanApps(m.Apps, opts)
+	if len(apps) == 0 && (opts.AppName != "" || opts.Role != "") {
+		return planFilterError(opts)
+	}
+
 	volumeCount := len(m.Volumes)
 	networkCount := len(m.Networks)
 	routeCount := 0
-	for _, app := range m.Apps {
+	for _, app := range apps {
 		routeCount += len(app.Routes)
 	}
 
-	fmt.Fprintf(w, "Migration plan: %s -> %s\n", m.Source.Platform, target)
+	fmt.Fprintf(w, "Migration plan: %s -> %s\n", m.Source.Platform, opts.Target)
 	fmt.Fprintf(w, "Host: %s\n", fallback(m.Source.Hostname, "unknown"))
-	fmt.Fprintf(w, "Apps: %d, routes: %d, volumes: %d, networks: %d\n\n", len(m.Apps), routeCount, volumeCount, networkCount)
+	fmt.Fprintf(w, "Apps: %d, routes: %d, volumes: %d, networks: %d\n", len(apps), routeCount, volumeCount, networkCount)
+	if opts.AppName != "" || opts.Role != "" {
+		fmt.Fprintf(w, "Filters: %s\n", describePlanFilters(opts))
+	}
+	fmt.Fprintln(w)
 
-	for _, app := range m.Apps {
+	for _, app := range apps {
 		analysis := analyzer.AnalyzeApp(app)
-		status := classifyApp(app, analysis)
+		status := classifyApp(analysis)
 		fmt.Fprintf(w, "[%s] %s\n", status, app.Name)
 		fmt.Fprintf(w, "  platform: %s\n", fallback(app.Platform, "docker"))
 		if app.Runtime != "" {
@@ -88,10 +115,16 @@ func writePlan(w io.Writer, m manifest.Manifest, target string) error {
 		if len(analysis.InternalDependencies) > 0 {
 			fmt.Fprintf(w, "  %s: %s\n", dependencyLabel(app), describeDependencies(analysis.InternalDependencies))
 		}
+		if len(analysis.DataStores) > 0 {
+			fmt.Fprintf(w, "  data stores: %s\n", describeDataStores(analysis.DataStores))
+		}
 		if len(analysis.ExternalRequirements) > 0 {
 			fmt.Fprintf(w, "  external requirements: %s\n", describeRequirements(analysis.ExternalRequirements))
 		}
 		fmt.Fprintf(w, "  state: %s\n", describeState(app))
+		if len(analysis.RiskReasons) > 0 {
+			fmt.Fprintf(w, "  risk reasons: %s\n", describeRiskReasons(analysis.RiskReasons))
+		}
 		fmt.Fprintln(w)
 	}
 
@@ -105,31 +138,17 @@ func writePlan(w io.Writer, m manifest.Manifest, target string) error {
 	return nil
 }
 
-func classifyApp(app manifest.App, analysis analyzer.AppAnalysis) string {
-	deploy := deployReadiness(app)
-	if deploy == deployMissing {
-		return "red"
-	}
-	if deploy != deployReady {
-		return "yellow"
-	}
-	if len(analysis.ExternalRequirements) > 0 {
-		return "yellow"
-	}
-
-	if len(app.Routes) == 0 {
-		return "yellow"
-	}
-
-	for _, service := range app.Services {
-		for _, mount := range service.Mounts {
-			if mount.Type == "bind" || mount.Type == "volume" {
-				return "yellow"
-			}
+func classifyApp(analysis analyzer.AppAnalysis) string {
+	status := "green"
+	for _, reason := range analysis.RiskReasons {
+		switch reason.Severity {
+		case analyzer.RiskError:
+			return "red"
+		case analyzer.RiskWarn:
+			status = "yellow"
 		}
 	}
-
-	return "green"
+	return status
 }
 
 func describeDependencies(dependencies []analyzer.Dependency) string {
@@ -139,6 +158,26 @@ func describeDependencies(dependencies []analyzer.Dependency) string {
 		if len(dependency.Volumes) > 0 {
 			item += " volumes[" + summarizeList(dependency.Volumes, 2) + "]"
 		}
+		items = append(items, item)
+	}
+	return strings.Join(items, "; ")
+}
+
+func describeDataStores(stores []analyzer.DataStore) string {
+	items := make([]string, 0, len(stores))
+	for _, store := range stores {
+		item := store.Kind + "=" + store.Service
+		if store.Engine != "" && store.Engine != store.Kind {
+			item += " engine=" + store.Engine
+		}
+		if len(store.Volumes) > 0 {
+			item += " volumes[" + summarizeList(store.Volumes, 2) + "]"
+		}
+		item += " strategy=" + store.Strategy
+		if store.Fallback != "" {
+			item += " fallback=" + store.Fallback
+		}
+		item += " criticality=" + store.Criticality
 		items = append(items, item)
 	}
 	return strings.Join(items, "; ")
@@ -163,6 +202,14 @@ func describeRequirements(requirements []analyzer.Requirement) string {
 	return strings.Join(items, "; ")
 }
 
+func describeRiskReasons(reasons []analyzer.RiskReason) string {
+	items := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		items = append(items, string(reason.Severity)+" "+reason.Code+": "+reason.Message)
+	}
+	return strings.Join(items, "; ")
+}
+
 func summarizeList(values []string, limit int) string {
 	if len(values) <= limit {
 		return strings.Join(values, ", ")
@@ -172,73 +219,24 @@ func summarizeList(values []string, limit int) string {
 	return strings.Join(visible, ", ")
 }
 
-type deployStatus int
-
-const (
-	deployReady deployStatus = iota
-	deploySourceOnly
-	deployResolvedOnly
-	deployMissing
-)
-
-func deployReadiness(app manifest.App) deployStatus {
-	if hasRawCompose(app) || hasServiceImage(app) {
-		return deployReady
-	}
-	if hasSourceBuildMetadata(app) {
-		return deploySourceOnly
-	}
-	if hasResolvedCompose(app) {
-		return deployResolvedOnly
-	}
-	return deployMissing
-}
-
 func describeDeploy(app manifest.App) string {
-	switch deployReadiness(app) {
-	case deployReady:
+	switch analyzer.DeployReadiness(app) {
+	case analyzer.DeployReady:
 		parts := []string{}
-		if hasRawCompose(app) {
+		if analyzer.HasRawCompose(app) {
 			parts = append(parts, "raw compose captured")
 		}
-		if hasServiceImage(app) {
+		if analyzer.HasServiceImage(app) {
 			parts = append(parts, "image metadata captured")
 		}
 		return strings.Join(parts, "; ")
-	case deploySourceOnly:
+	case analyzer.DeploySourceOnly:
 		return "source build metadata only; run server-local scan or repository export before migration"
-	case deployResolvedOnly:
+	case analyzer.DeployResolvedOnly:
 		return "resolved compose only; raw compose or server-local scan is required before migration"
 	default:
 		return "missing image or raw compose; server-local scan is required before migration"
 	}
-}
-
-func hasRawCompose(app manifest.App) bool {
-	return app.Compose != nil && strings.TrimSpace(app.Compose.Raw) != ""
-}
-
-func hasResolvedCompose(app manifest.App) bool {
-	return app.Compose != nil && strings.TrimSpace(app.Compose.Resolved) != ""
-}
-
-func hasServiceImage(app manifest.App) bool {
-	for _, service := range app.Services {
-		if strings.TrimSpace(service.Image) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-func hasSourceBuildMetadata(app manifest.App) bool {
-	if app.Git == nil || strings.TrimSpace(app.Git.Repository) == "" || strings.TrimSpace(app.BuildPack) == "" {
-		return false
-	}
-	if app.BuildPack == "dockercompose" {
-		return strings.TrimSpace(app.Git.ComposeLocation) != ""
-	}
-	return true
 }
 
 func describeState(app manifest.App) string {
@@ -302,6 +300,55 @@ func routeHosts(routes []manifest.Route) []string {
 	}
 	sort.Strings(hosts)
 	return hosts
+}
+
+func filteredPlanApps(apps []manifest.App, opts planOptions) []manifest.App {
+	filtered := []manifest.App{}
+	for _, app := range apps {
+		if opts.AppName != "" && !matchesPlanApp(app, opts.AppName) {
+			continue
+		}
+		if opts.Role != "" && !strings.EqualFold(app.Metadata["migrationRole"], opts.Role) {
+			continue
+		}
+		filtered = append(filtered, app)
+	}
+	return filtered
+}
+
+func matchesPlanApp(app manifest.App, name string) bool {
+	return app.Name == name || app.ID == name || slug(app.Name) == slug(name) || app.Metadata["coolify.uuid"] == name
+}
+
+func planFilterError(opts planOptions) error {
+	if opts.AppName != "" && opts.Role != "" {
+		return fmt.Errorf("no apps matched --app %q and --role %q", opts.AppName, opts.Role)
+	}
+	if opts.AppName != "" {
+		return fmt.Errorf("app %q not found in manifest", opts.AppName)
+	}
+	return fmt.Errorf("no apps with role %q found in manifest", opts.Role)
+}
+
+func describePlanFilters(opts planOptions) string {
+	filters := []string{}
+	if opts.AppName != "" {
+		filters = append(filters, "app="+opts.AppName)
+	}
+	if opts.Role != "" {
+		filters = append(filters, "role="+opts.Role)
+	}
+	return strings.Join(filters, ", ")
+}
+
+var slugPattern = regexp.MustCompile(`[^a-z0-9._-]+`)
+
+func slug(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, " ", "-")
+	value = slugPattern.ReplaceAllString(value, "-")
+	value = strings.Trim(value, "-._")
+	return value
 }
 
 func fallback(value, fallback string) string {
