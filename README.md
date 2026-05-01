@@ -14,6 +14,7 @@ Implemented now:
 - `bort scan --source coolify` exports Coolify applications, services, databases, env vars, storages, compose config, git metadata, and domains through the Coolify API.
 - `bort plan` reads a manifest and prints a first migration readiness summary.
 - `bort export` writes a local migration bundle with compose, env, routes, storages, and a report per app.
+- `bort validate` checks exported bundles for compose validity, portability risks, missing routes, and secret handling.
 - Source/target/gateway/sync/state packages define the shape for the live migration engine.
 
 Not implemented yet:
@@ -63,6 +64,12 @@ Export only one app:
 bin/bort export --manifest manifest.json --app my-app --output-dir bort-bundle
 ```
 
+Validate an exported bundle:
+
+```sh
+bin/bort validate --bundle bort-bundle
+```
+
 By default, environment variable values are redacted. If you need a full migration manifest for a trusted local workflow, opt in explicitly:
 
 ```sh
@@ -77,6 +84,7 @@ The intended migration flow is:
 bort scan      # extract source platform state
 bort plan      # classify apps as green/yellow/red
 bort export    # write an inspectable local migration bundle
+bort validate  # validate exported compose, env, routes, and storage
 bort prepare   # create target resources privately
 bort sync      # copy or replicate state
 bort cutover   # flip traffic through the migration gateway
