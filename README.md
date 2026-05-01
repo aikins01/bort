@@ -12,6 +12,7 @@ Implemented now:
 
 - `bort scan --source docker` discovers local Docker containers, routes, mounts, volumes, and networks.
 - `bort scan --source coolify` exports Coolify applications, services, databases, env vars, storages, compose config, git metadata, and domains through the Coolify API.
+- `bort scan --source coolify-local` is intended to run on the source Coolify server and uses local Docker state as the migration-grade inventory path.
 - `bort plan` reads a manifest and prints a first migration readiness summary.
 - `bort export` writes a local migration bundle with compose, env, routes, storages, and a report per app.
 - `bort validate` checks exported bundles for compose validity, portability risks, missing routes, and secret handling.
@@ -47,6 +48,14 @@ bin/bort scan --source coolify --output manifest.json
 ```
 
 Coolify API tokens are only read from `BORT_COOLIFY_TOKEN`, not from a command-line flag, so they do not appear in the process table. Scan manifests are written with private file permissions.
+
+Scan from the source Coolify server for a more complete migration inventory:
+
+```sh
+sudo bin/bort scan --source coolify-local --output manifest.json
+```
+
+The Coolify API scan is a safe preflight, but it is not the migration source of truth. Server-local scanning can see the actual Docker containers, images, networks, volumes, bind mounts, and labels that the API may omit.
 
 Review a migration plan:
 

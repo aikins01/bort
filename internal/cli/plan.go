@@ -70,6 +70,7 @@ func writePlan(w io.Writer, m manifest.Manifest, target string) error {
 		} else {
 			fmt.Fprintln(w, "  routes: none detected")
 		}
+		fmt.Fprintf(w, "  deploy: %s\n", describeDeploy(app))
 		fmt.Fprintf(w, "  state: %s\n", describeState(app))
 		fmt.Fprintln(w)
 	}
@@ -85,6 +86,14 @@ func writePlan(w io.Writer, m manifest.Manifest, target string) error {
 }
 
 func classifyApp(app manifest.App) string {
+	deploy := deployReadiness(app)
+	if deploy == deployMissing {
+		return "red"
+	}
+	if deploy != deployReady {
+		return "yellow"
+	}
+
 	if len(app.Routes) == 0 {
 		return "yellow"
 	}
@@ -98,6 +107,75 @@ func classifyApp(app manifest.App) string {
 	}
 
 	return "green"
+}
+
+type deployStatus int
+
+const (
+	deployReady deployStatus = iota
+	deploySourceOnly
+	deployResolvedOnly
+	deployMissing
+)
+
+func deployReadiness(app manifest.App) deployStatus {
+	if hasRawCompose(app) || hasServiceImage(app) {
+		return deployReady
+	}
+	if hasSourceBuildMetadata(app) {
+		return deploySourceOnly
+	}
+	if hasResolvedCompose(app) {
+		return deployResolvedOnly
+	}
+	return deployMissing
+}
+
+func describeDeploy(app manifest.App) string {
+	switch deployReadiness(app) {
+	case deployReady:
+		parts := []string{}
+		if hasRawCompose(app) {
+			parts = append(parts, "raw compose captured")
+		}
+		if hasServiceImage(app) {
+			parts = append(parts, "image metadata captured")
+		}
+		return strings.Join(parts, "; ")
+	case deploySourceOnly:
+		return "source build metadata only; run server-local scan or repository export before migration"
+	case deployResolvedOnly:
+		return "resolved compose only; raw compose or server-local scan is required before migration"
+	default:
+		return "missing image or raw compose; server-local scan is required before migration"
+	}
+}
+
+func hasRawCompose(app manifest.App) bool {
+	return app.Compose != nil && strings.TrimSpace(app.Compose.Raw) != ""
+}
+
+func hasResolvedCompose(app manifest.App) bool {
+	return app.Compose != nil && strings.TrimSpace(app.Compose.Resolved) != ""
+}
+
+func hasServiceImage(app manifest.App) bool {
+	for _, service := range app.Services {
+		if strings.TrimSpace(service.Image) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSourceBuildMetadata(app manifest.App) bool {
+	if app.Git == nil || strings.TrimSpace(app.Git.Repository) == "" || strings.TrimSpace(app.BuildPack) == "" {
+		return false
+	}
+	if app.BuildPack == "dockercompose" {
+		return strings.TrimSpace(app.Git.ComposeLocation) != ""
+	}
+	return true
 }
 
 func describeState(app manifest.App) string {

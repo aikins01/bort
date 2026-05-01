@@ -10,6 +10,7 @@ import (
 
 	"github.com/aikins01/bort/internal/source"
 	"github.com/aikins01/bort/internal/source/coolify"
+	"github.com/aikins01/bort/internal/source/coolifylocal"
 	"github.com/aikins01/bort/internal/source/localdocker"
 )
 
@@ -23,7 +24,7 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	var includeEnvValues bool
 	var coolifyURL string
 
-	fs.StringVar(&sourceName, "source", "docker", "source adapter to scan: docker, coolify")
+	fs.StringVar(&sourceName, "source", "docker", "source adapter to scan: docker, coolify, coolify-local")
 	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
 	fs.StringVar(&format, "format", "json", "output format: json")
 	fs.BoolVar(&includeEnvValues, "include-env-values", false, "include environment variable values in the manifest")
@@ -89,6 +90,8 @@ func scannerFor(name string, opts source.ScanOptions) (source.Scanner, error) {
 		return localdocker.NewScanner(), nil
 	case "coolify":
 		return coolify.NewScanner(opts.Coolify.BaseURL, opts.Coolify.Token)
+	case "coolify-local":
+		return coolifylocal.NewScanner(), nil
 	default:
 		return nil, fmt.Errorf("unsupported source %q", name)
 	}
