@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aikins01/bort/internal/analyzer"
 	"github.com/aikins01/bort/internal/manifest"
 )
 
@@ -58,7 +59,8 @@ func writePlan(w io.Writer, m manifest.Manifest, target string) error {
 	fmt.Fprintf(w, "Apps: %d, routes: %d, volumes: %d, networks: %d\n\n", len(m.Apps), routeCount, volumeCount, networkCount)
 
 	for _, app := range m.Apps {
-		status := classifyApp(app)
+		analysis := analyzer.AnalyzeApp(app)
+		status := classifyApp(app, analysis)
 		fmt.Fprintf(w, "[%s] %s\n", status, app.Name)
 		fmt.Fprintf(w, "  platform: %s\n", fallback(app.Platform, "docker"))
 		if app.Runtime != "" {
@@ -80,6 +82,15 @@ func writePlan(w io.Writer, m manifest.Manifest, target string) error {
 			fmt.Fprintln(w, "  routes: none detected")
 		}
 		fmt.Fprintf(w, "  deploy: %s\n", describeDeploy(app))
+		if len(analysis.Networks) > 0 {
+			fmt.Fprintf(w, "  networks: %s\n", summarizeList(analysis.Networks, 4))
+		}
+		if len(analysis.InternalDependencies) > 0 {
+			fmt.Fprintf(w, "  %s: %s\n", dependencyLabel(app), describeDependencies(analysis.InternalDependencies))
+		}
+		if len(analysis.ExternalRequirements) > 0 {
+			fmt.Fprintf(w, "  external requirements: %s\n", describeRequirements(analysis.ExternalRequirements))
+		}
 		fmt.Fprintf(w, "  state: %s\n", describeState(app))
 		fmt.Fprintln(w)
 	}
@@ -94,12 +105,15 @@ func writePlan(w io.Writer, m manifest.Manifest, target string) error {
 	return nil
 }
 
-func classifyApp(app manifest.App) string {
+func classifyApp(app manifest.App, analysis analyzer.AppAnalysis) string {
 	deploy := deployReadiness(app)
 	if deploy == deployMissing {
 		return "red"
 	}
 	if deploy != deployReady {
+		return "yellow"
+	}
+	if len(analysis.ExternalRequirements) > 0 {
 		return "yellow"
 	}
 
@@ -116,6 +130,46 @@ func classifyApp(app manifest.App) string {
 	}
 
 	return "green"
+}
+
+func describeDependencies(dependencies []analyzer.Dependency) string {
+	items := make([]string, 0, len(dependencies))
+	for _, dependency := range dependencies {
+		item := dependency.Kind + "=" + dependency.Service
+		if len(dependency.Volumes) > 0 {
+			item += " volumes[" + summarizeList(dependency.Volumes, 2) + "]"
+		}
+		items = append(items, item)
+	}
+	return strings.Join(items, "; ")
+}
+
+func dependencyLabel(app manifest.App) string {
+	if app.Metadata["migrationRole"] == "support" || app.Runtime == "database" {
+		return "detected services"
+	}
+	return "internal dependencies"
+}
+
+func describeRequirements(requirements []analyzer.Requirement) string {
+	items := make([]string, 0, len(requirements))
+	for _, requirement := range requirements {
+		item := requirement.Kind
+		if len(requirement.Evidence) > 0 {
+			item += " via " + summarizeList(requirement.Evidence, 3)
+		}
+		items = append(items, item)
+	}
+	return strings.Join(items, "; ")
+}
+
+func summarizeList(values []string, limit int) string {
+	if len(values) <= limit {
+		return strings.Join(values, ", ")
+	}
+	visible := append([]string{}, values[:limit]...)
+	visible = append(visible, fmt.Sprintf("+%d more", len(values)-limit))
+	return strings.Join(visible, ", ")
 }
 
 type deployStatus int

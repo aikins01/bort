@@ -59,6 +59,8 @@ The Coolify API scan is a safe preflight, but it is not the migration source of 
 
 `coolify-local` enriches Docker groups from Coolify labels when available, including resource names, resource type, project/environment, compose file paths, and whether a group looks like a migration candidate or Coolify platform support.
 
+`bort plan` also infers topology from the manifest: Docker networks, internal dependencies such as Postgres or Redis services, stateful volumes, and likely external requirements from redacted env var names such as `DATABASE_URL`, `REDIS_URL`, `MINIO_ENDPOINT`, or SMTP settings.
+
 Review a migration plan:
 
 ```sh
