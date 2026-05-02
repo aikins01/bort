@@ -100,6 +100,8 @@ Plan target-side preparation from an exported bundle without mutating the target
 bin/bort prepare --bundle bort-bundle --target dokploy
 ```
 
+`bort prepare --format json` emits a versioned dry-run contract with structured target resource specs, heuristic linked-resource candidates, and readiness gates. The app shell can be ready to create while gates still require env input, resource decisions, or manual data-store review before migration proceeds.
+
 By default, environment variable values are redacted. If you need a full migration manifest for a trusted local workflow, opt in explicitly:
 
 ```sh

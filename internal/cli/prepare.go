@@ -55,6 +55,16 @@ func writePrepareText(w io.Writer, result preparer.Result) {
 
 	for _, app := range result.Apps {
 		fmt.Fprintf(w, "[%s] %s\n", app.Status, app.Name)
+		fmt.Fprintf(w, "  readiness: %s\n", app.Readiness)
+		if app.Resources.App.Type != "" {
+			fmt.Fprintf(w, "  target shell: %s %s from %s\n", app.Resources.App.Readiness, app.Resources.App.Type, app.Resources.App.ComposePath)
+		}
+		if len(app.Gates) > 0 {
+			fmt.Fprintln(w, "  gates:")
+			for _, gate := range app.Gates {
+				fmt.Fprintf(w, "    %s %s: %s\n", gate.Severity, gate.Code, gate.Message)
+			}
+		}
 		if len(app.Actions) == 0 {
 			fmt.Fprintln(w, "  no actions")
 		} else {
