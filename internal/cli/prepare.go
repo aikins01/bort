@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -38,22 +37,7 @@ func runPrepare(_ context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 
-	return writeOutput(stdout, outputPath, func(out io.Writer) error {
-		switch format {
-		case "text":
-			writePrepareText(out, result)
-		case "json":
-			encoder := json.NewEncoder(out)
-			encoder.SetIndent("", "  ")
-			if err := encoder.Encode(result); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unsupported prepare format %q", format)
-		}
-
-		return nil
-	})
+	return writeFormattedOutput(stdout, outputPath, format, result, writePrepareText)
 }
 
 func writePrepareText(w io.Writer, result preparer.Result) {

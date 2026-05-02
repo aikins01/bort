@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -48,22 +47,7 @@ func runCutover(_ context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 
-	return writeOutput(stdout, outputPath, func(out io.Writer) error {
-		switch format {
-		case "text":
-			writeCutoverText(out, result)
-		case "json":
-			encoder := json.NewEncoder(out)
-			encoder.SetIndent("", "  ")
-			if err := encoder.Encode(result); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unsupported cutover format %q", format)
-		}
-
-		return nil
-	})
+	return writeFormattedOutput(stdout, outputPath, format, result, writeCutoverText)
 }
 
 func cutoverResultFromOptions(bundleDir, target, appName, preparePlanPath, syncPlanPath string, bundleSet, targetSet bool, observationWindowSeconds, rollbackWindowSeconds int) (gateway.Result, error) {

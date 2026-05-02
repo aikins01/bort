@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -66,22 +65,7 @@ func runCommit(_ context.Context, args []string, stdout, stderr io.Writer) error
 		}
 	}
 
-	return writeOutput(stdout, outputPath, func(out io.Writer) error {
-		switch format {
-		case "text":
-			writeCommitText(out, result)
-		case "json":
-			encoder := json.NewEncoder(out)
-			encoder.SetIndent("", "  ")
-			if err := encoder.Encode(result); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unsupported commit format %q", format)
-		}
-
-		return nil
-	})
+	return writeFormattedOutput(stdout, outputPath, format, result, writeCommitText)
 }
 
 func withCutoverRollbackWindow(plan gateway.Result, seconds int) gateway.Result {

@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -57,22 +56,7 @@ func runSync(_ context.Context, args []string, stdout, stderr io.Writer) error {
 		}
 	}
 
-	return writeOutput(stdout, outputPath, func(out io.Writer) error {
-		switch format {
-		case "text":
-			writeSyncText(out, result)
-		case "json":
-			encoder := json.NewEncoder(out)
-			encoder.SetIndent("", "  ")
-			if err := encoder.Encode(result); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unsupported sync format %q", format)
-		}
-
-		return nil
-	})
+	return writeFormattedOutput(stdout, outputPath, format, result, writeSyncText)
 }
 
 func writeSyncText(w io.Writer, result syncplan.Result) {

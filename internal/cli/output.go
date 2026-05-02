@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -42,4 +43,20 @@ func checkOutputFormat(command, format string) error {
 	default:
 		return fmt.Errorf("unsupported %s format %q", command, format)
 	}
+}
+
+func writeFormattedOutput[T any](stdout io.Writer, outputPath, format string, result T, writeText func(io.Writer, T)) error {
+	return writeOutput(stdout, outputPath, func(out io.Writer) error {
+		switch format {
+		case "text":
+			writeText(out, result)
+			return nil
+		case "json":
+			encoder := json.NewEncoder(out)
+			encoder.SetIndent("", "  ")
+			return encoder.Encode(result)
+		default:
+			return fmt.Errorf("unsupported format %q", format)
+		}
+	})
 }
