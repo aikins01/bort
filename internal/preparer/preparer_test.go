@@ -45,11 +45,11 @@ func TestPlanBuildsDryRunActionsFromTopology(t *testing.T) {
 	if result.APIVersion != APIVersion {
 		t.Fatalf("unexpected api version: %q", result.APIVersion)
 	}
-	if result.Status != StatusRed || len(result.Apps) != 1 {
+	if result.Status != StatusYellow || len(result.Apps) != 1 {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 	app := result.Apps[0]
-	if app.Readiness != ReadinessBlocked || app.Resources.App.Readiness != ReadinessReadyToCreate {
+	if app.Readiness != ReadinessNeedsInput || app.Resources.App.Readiness != ReadinessReadyToCreate {
 		t.Fatalf("unexpected readiness: %#v", app)
 	}
 	if app.Resources.App.Type != "compose" || app.Resources.App.ComposePath != "compose.yaml" {
@@ -61,7 +61,7 @@ func TestPlanBuildsDryRunActionsFromTopology(t *testing.T) {
 	if len(app.Resources.EnvFiles) != 1 || app.Resources.EnvFiles[0].Path != ".env.web.example" || !slices.Contains(app.Resources.EnvFiles[0].Keys, "DATABASE_URL") || !slices.Contains(app.Resources.EnvFiles[0].MissingValues, "DATABASE_URL") {
 		t.Fatalf("unexpected env resources: %#v", app.Resources.EnvFiles)
 	}
-	if len(app.Resources.DataStores) != 1 || app.Resources.DataStores[0].Kind != "unknown" || app.Resources.DataStores[0].Readiness != ReadinessBlocked {
+	if len(app.Resources.DataStores) != 0 {
 		t.Fatalf("unexpected data-store resources: %#v", app.Resources.DataStores)
 	}
 	if len(app.Resources.LinkedResources) != 1 || app.Resources.LinkedResources[0].Source != "heuristic" || !app.Resources.LinkedResources[0].RequiresConfirmation || app.Resources.LinkedResources[0].Confidence != "possible" {
@@ -86,20 +86,19 @@ func TestPlanBuildsDryRunActionsFromTopology(t *testing.T) {
 	if len(dokploy.Volumes) != 1 || dokploy.Volumes[0].Action != "review_bind_mount_portability" {
 		t.Fatalf("unexpected dokploy volumes: %#v", dokploy.Volumes)
 	}
-	if len(dokploy.DataStores) != 1 || dokploy.DataStores[0].Action != "manual_data_store_review" {
+	if len(dokploy.DataStores) != 0 {
 		t.Fatalf("unexpected dokploy data stores: %#v", dokploy.DataStores)
 	}
 	if len(dokploy.LinkedResources) != 1 || !dokploy.LinkedResources[0].RequiresConfirmation || dokploy.LinkedResources[0].Source != "heuristic" {
 		t.Fatalf("unexpected dokploy linked resources: %#v", dokploy.LinkedResources)
 	}
-	for _, code := range []string{"env.values_required", "env.values_redacted", "data_store.manual_review", "linked_resource.confirm_candidate", "volume.bind_mount_review"} {
+	for _, code := range []string{"env.values_required", "env.values_redacted", "linked_resource.confirm_candidate", "volume.bind_mount_review"} {
 		assertGate(t, app, code)
 	}
 	for _, want := range []string{
 		"compose|would create dokploy compose app from compose.yaml",
 		"environment|review and fill exported env examples before deploy: .env.web.example (1 vars)",
 		"route|would create dokploy domain web.example.com for service web on port 3000",
-		"data-store|needs unknown data store preparation for service web with manual_review; fallback stopped_volume_copy; criticality unknown",
 		"linked-resource|needs confirmation of database support resource postgres support with possible confidence",
 		"volume|review bind mount portability for web -> /uploads",
 	} {

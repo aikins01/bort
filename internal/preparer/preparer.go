@@ -58,6 +58,7 @@ type Result struct {
 type AppPlan struct {
 	Name            string           `json:"name"`
 	Directory       string           `json:"directory"`
+	Role            string           `json:"role,omitempty"`
 	Status          Status           `json:"status"`
 	Readiness       Readiness        `json:"readiness"`
 	Resources       ResourceSpecs    `json:"resources"`
@@ -203,7 +204,7 @@ func planApp(bundleDir, target string, app exporter.AppSummary) (AppPlan, error)
 		return AppPlan{}, fmt.Errorf("read topology for %s: %w", app.Name, err)
 	}
 
-	plan := AppPlan{Name: app.Name, Directory: app.Directory, Status: StatusGreen, Readiness: ReadinessReadyToCreate}
+	plan := AppPlan{Name: app.Name, Directory: app.Directory, Role: app.Role, Status: StatusGreen, Readiness: ReadinessReadyToCreate}
 	plan.Resources = resourceSpecs(app, appDir, topology)
 	addReadinessGates(&plan, topology)
 	plan.add(SeverityInfo, "compose", fmt.Sprintf("would create %s compose app from compose.yaml", target))
@@ -230,7 +231,7 @@ func targetResources(target string, plan AppPlan) *TargetResources {
 func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Topology) ResourceSpecs {
 	resources := ResourceSpecs{
 		App:      appResource(app.Name, appDir),
-		EnvFiles: envFileResources(appDir),
+		EnvFiles: envFileResources(appDir, app.PrivateEnvValues),
 	}
 
 	for _, route := range topology.Routes {
@@ -301,8 +302,8 @@ func appResource(name, appDir string) AppResource {
 	return resource
 }
 
-func envFileResources(appDir string) []EnvFileResource {
-	paths := envExampleFiles(appDir)
+func envFileResources(appDir string, privateEnvValues bool) []EnvFileResource {
+	paths := envFiles(appDir, privateEnvValues)
 	resources := make([]EnvFileResource, 0, len(paths))
 	for _, path := range paths {
 		resource := envFileResource(path)
@@ -627,6 +628,10 @@ func readJSON(path string, out any) error {
 }
 
 func envExampleFiles(appDir string) []string {
+	return envFiles(appDir, false)
+}
+
+func envFiles(appDir string, privateEnvValues bool) []string {
 	entries, err := os.ReadDir(appDir)
 	if err != nil {
 		return nil
@@ -634,7 +639,7 @@ func envExampleFiles(appDir string) []string {
 	paths := []string{}
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, ".env") || !strings.HasSuffix(name, ".example") {
+		if entry.IsDir() || !strings.HasPrefix(name, ".env") || (privateEnvValues && strings.HasSuffix(name, ".example")) || (!privateEnvValues && !strings.HasSuffix(name, ".example")) {
 			continue
 		}
 		paths = append(paths, filepath.Join(appDir, name))

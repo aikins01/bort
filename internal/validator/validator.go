@@ -112,13 +112,13 @@ func validateApp(ctx context.Context, opts Options, app exporter.AppSummary) App
 	composePath := filepath.Join(appDir, "compose.yaml")
 	compose, err := os.ReadFile(composePath)
 	if err == nil {
-		validateComposeText(&result, string(compose), envKeys(envExampleFiles(appDir)))
+		validateComposeText(&result, string(compose), envKeys(envFiles(appDir, app.PrivateEnvValues)))
 		validateDockerCompose(ctx, &result, opts.DockerPath, appDir)
 	} else {
 		result.add(SeverityError, "compose.read_failed", err.Error())
 	}
 
-	validateEnvFiles(&result, envExampleFiles(appDir))
+	validateEnvFiles(&result, envFiles(appDir, app.PrivateEnvValues), app.PrivateEnvValues)
 	routes := validateRoutes(&result, filepath.Join(appDir, "routes.json"), !hasTopology || topologyHasRisk(topology, "routes.none"))
 	validateStorages(&result, filepath.Join(appDir, "storages.json"))
 	if hasTopology {
@@ -562,13 +562,13 @@ func routeLabel(route manifest.Route) string {
 	return label
 }
 
-func validateEnvFiles(result *AppResult, paths []string) {
+func validateEnvFiles(result *AppResult, paths []string, privateEnvValues bool) {
 	for _, path := range paths {
-		validateEnvFile(result, path)
+		validateEnvFile(result, path, privateEnvValues)
 	}
 }
 
-func validateEnvFile(result *AppResult, path string) {
+func validateEnvFile(result *AppResult, path string, privateEnvValues bool) {
 	file, err := os.Open(path)
 	if err != nil {
 		return
@@ -586,6 +586,10 @@ func validateEnvFile(result *AppResult, path string) {
 			result.add(SeverityWarn, "env.sensitive_blank", fmt.Sprintf("%s in %s is sensitive and must be set before deploy", key, filepath.Base(path)))
 		}
 		if secrets.IsSensitiveName(key) && value != "" {
+			if privateEnvValues {
+				result.add(SeverityInfo, "env.private_value_present", fmt.Sprintf("%s has a private value in %s", key, filepath.Base(path)))
+				continue
+			}
 			result.add(SeverityError, "env.sensitive_value_present", fmt.Sprintf("%s appears sensitive but is populated in %s", key, filepath.Base(path)))
 		}
 	}
@@ -646,9 +650,21 @@ func readJSON(path string, out any) error {
 }
 
 func envExampleFiles(appDir string) []string {
-	paths, err := filepath.Glob(filepath.Join(appDir, ".env*.example"))
+	return envFiles(appDir, false)
+}
+
+func envFiles(appDir string, privateEnvValues bool) []string {
+	entries, err := os.ReadDir(appDir)
 	if err != nil {
 		return nil
+	}
+	paths := []string{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, ".env") || (privateEnvValues && strings.HasSuffix(name, ".example")) || (!privateEnvValues && !strings.HasSuffix(name, ".example")) {
+			continue
+		}
+		paths = append(paths, filepath.Join(appDir, name))
 	}
 	sort.Strings(paths)
 	return paths

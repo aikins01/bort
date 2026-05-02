@@ -43,6 +43,7 @@ type Result struct {
 type AppPlan struct {
 	Name                     string             `json:"name"`
 	Directory                string             `json:"directory"`
+	Role                     string             `json:"role,omitempty"`
 	Status                   preparer.Status    `json:"status"`
 	Readiness                preparer.Readiness `json:"readiness"`
 	CutoverReadiness         preparer.Readiness `json:"cutoverReadiness"`
@@ -119,6 +120,7 @@ func planApp(cutoverApp gateway.AppPlan, observationWindowSeconds int) AppPlan {
 	plan := AppPlan{
 		Name:                     cutoverApp.Name,
 		Directory:                cutoverApp.Directory,
+		Role:                     cutoverApp.Role,
 		Status:                   cutoverApp.Status,
 		Readiness:                cutoverApp.Readiness,
 		CutoverReadiness:         cutoverApp.Readiness,

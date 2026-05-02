@@ -98,17 +98,16 @@ func TestPlanCarriesSyncBlockersIntoCutoverPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != preparer.StatusRed || len(result.Apps) != 1 {
+	if result.Status != preparer.StatusYellow || len(result.Apps) != 1 {
 		t.Fatalf("unexpected cutover result: %#v", result)
 	}
 	app := result.Apps[0]
-	if app.PrepareReadiness != preparer.ReadinessBlocked || app.SyncReadiness != preparer.ReadinessBlocked || app.Readiness != preparer.ReadinessBlocked {
-		t.Fatalf("expected cutover to carry sync blocker, got %#v", app)
+	if app.PrepareReadiness != preparer.ReadinessNeedsInput || app.SyncReadiness != preparer.ReadinessNeedsInput || app.Readiness != preparer.ReadinessNeedsInput {
+		t.Fatalf("expected cutover to carry sync input needs, got %#v", app)
 	}
-	assertGate(t, app, "data_store.manual_review")
 	assertGate(t, app, "cutover.sync_not_ready")
 	preflight := findStep(t, app, PhasePreflight)
-	if preflight.Readiness != preparer.ReadinessBlocked {
+	if preflight.Readiness != preparer.ReadinessNeedsInput {
 		t.Fatalf("unexpected preflight step: %#v", preflight)
 	}
 }

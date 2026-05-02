@@ -75,6 +75,31 @@ func TestValidateErrorsOnSensitiveValue(t *testing.T) {
 	assertIssue(t, result.Apps[0], "env.sensitive_value_present")
 }
 
+func TestValidateAllowsPrivateSensitiveValueFiles(t *testing.T) {
+	dir := t.TempDir()
+	appDir := filepath.Join(dir, "api")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "index.json"), `{"outputDir":"`+dir+`","source":"test","apps":[{"name":"api","directory":"api","privateEnvValues":true}]}`)
+	writeFile(t, filepath.Join(appDir, "compose.yaml"), "services:\n  api:\n    image: example/api\n    env_file:\n      - .env\n")
+	writeFile(t, filepath.Join(appDir, ".env.example"), "API_TOKEN=\n")
+	writeFile(t, filepath.Join(appDir, ".env"), "API_TOKEN=secret\n")
+	writeFile(t, filepath.Join(appDir, "routes.json"), `[{"host":"api.example.com","serviceName":"api"}]`)
+	writeFile(t, filepath.Join(appDir, "storages.json"), `[]`)
+	writeMinimalTopology(t, appDir, []manifest.Route{{Host: "api.example.com", ServiceName: "api"}})
+	writeFile(t, filepath.Join(appDir, "migration-report.md"), "# report\n")
+	writeRunbook(t, appDir)
+
+	result, err := Validate(context.Background(), Options{BundleDir: dir, DockerPath: "definitely-not-docker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertIssue(t, result.Apps[0], "env.private_value_present")
+	assertNoIssue(t, result.Apps[0], "env.sensitive_value_present")
+	assertNoIssue(t, result.Apps[0], "env.sensitive_blank")
+}
+
 func TestValidateParsesLongComposeSyntax(t *testing.T) {
 	dir := t.TempDir()
 	appDir := filepath.Join(dir, "api")
@@ -186,7 +211,6 @@ func TestValidateFlagsTopologyIssues(t *testing.T) {
 	}
 	assertIssue(t, result.Apps[0], "topology.external_requirements")
 	assertIssue(t, result.Apps[0], "topology.linked_resource_ambiguous")
-	assertIssue(t, result.Apps[0], "topology.data_store_manual_review")
 	assertIssue(t, result.Apps[0], "topology.bind_mounts")
 	assertIssue(t, result.Apps[0], "topology.env_values_redacted")
 	assertNoIssue(t, result.Apps[0], "routes.none")

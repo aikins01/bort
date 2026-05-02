@@ -355,6 +355,10 @@ func isCommonNetwork(network string) bool {
 }
 
 func dataStores(app manifest.App) []DataStore {
+	if migrationRole(app) == "platform" {
+		return nil
+	}
+
 	stores := []DataStore{}
 	for _, service := range app.Services {
 		if store, ok := classifiedDataStore(service); ok {
@@ -365,7 +369,7 @@ func dataStores(app manifest.App) []DataStore {
 			stores = append(stores, store)
 			continue
 		}
-		if len(serviceStatefulVolumes(service)) > 0 {
+		if looksLikeDatabaseResource(service) {
 			stores = append(stores, unknownDataStore(service))
 		}
 	}
@@ -379,30 +383,54 @@ func dataStores(app manifest.App) []DataStore {
 }
 
 func classifiedDataStore(service manifest.Service) (DataStore, bool) {
+	if knownApplicationImage(service.Image) {
+		return DataStore{}, false
+	}
+
 	name := strings.ToLower(serviceName(service))
-	image := strings.ToLower(service.Image)
+	image := normalizedImageName(service.Image)
 	combined := name + " " + image
 	switch {
-	case strings.Contains(combined, "postgres") || strings.Contains(combined, "pgvector"):
+	case containsAny(combined, "postgres", "postgresql", "pgvector", "postgis", "timescaledb"):
 		engine := "postgres"
-		if strings.Contains(combined, "pgvector") {
+		switch {
+		case strings.Contains(combined, "pgvector"):
 			engine = "pgvector"
+		case strings.Contains(combined, "postgis"):
+			engine = "postgis"
+		case strings.Contains(combined, "timescaledb"):
+			engine = "timescaledb"
 		}
 		return newDataStore(service, "postgres", engine, "pg_dump_restore_or_logical_replication", "stopped_volume_copy", "critical"), true
 	case strings.Contains(combined, "mysql") || strings.Contains(combined, "mariadb"):
 		return newDataStore(service, "mysql", databaseEngine(combined, "mysql"), "mysqldump_restore", "stopped_volume_copy", "critical"), true
 	case strings.Contains(combined, "mongo"):
 		return newDataStore(service, "mongo", "mongo", "mongodump_restore", "stopped_volume_copy", "critical"), true
-	case strings.Contains(combined, "redis") || strings.Contains(combined, "dragonfly"):
+	case containsAny(combined, "redis", "keydb", "dragonfly"):
 		engine := "redis"
-		if strings.Contains(combined, "dragonfly") {
+		switch {
+		case strings.Contains(combined, "dragonfly"):
 			engine = "dragonfly"
+		case strings.Contains(combined, "keydb"):
+			engine = "keydb"
 		}
 		return newDataStore(service, "redis", engine, "snapshot_aof_or_volume_copy", "recreate_if_cache_only", "unknown"), true
-	case strings.Contains(combined, "minio"):
-		return newDataStore(service, "object-storage", "minio", "mc_mirror", "volume_sync", "critical_if_uploads_or_files"), true
+	case strings.Contains(combined, "memcached"):
+		return newDataStore(service, "cache", "memcached", "recreate_if_cache_only", "stopped_volume_copy", "cache"), true
+	case containsAny(combined, "minio", "garage"):
+		return newDataStore(service, "object-storage", databaseEngine(combined, "minio"), "mc_mirror", "volume_sync", "critical_if_uploads_or_files"), true
 	case strings.Contains(combined, "qdrant") || strings.Contains(combined, "weaviate"):
 		return newDataStore(service, "vector-db", databaseEngine(combined, "vector-db"), "snapshot_or_collection_export", "stopped_volume_copy", "critical"), true
+	case strings.Contains(combined, "clickhouse"):
+		return newDataStore(service, "clickhouse", "clickhouse", "native_backup_or_export", "stopped_volume_copy", "critical"), true
+	case strings.Contains(combined, "couchdb"):
+		return newDataStore(service, "couchdb", "couchdb", "native_backup_or_export", "stopped_volume_copy", "critical"), true
+	case strings.Contains(combined, "influxdb"):
+		return newDataStore(service, "influxdb", "influxdb", "native_backup_or_export", "stopped_volume_copy", "critical"), true
+	case strings.Contains(combined, "neo4j"):
+		return newDataStore(service, "graph-db", "neo4j", "native_backup_or_export", "stopped_volume_copy", "critical"), true
+	case strings.Contains(combined, "searxng"):
+		return newDataStore(service, "search", "searxng", "config_and_volume_copy", "stopped_volume_copy", "unknown"), true
 	}
 	return DataStore{}, false
 }
@@ -426,6 +454,76 @@ func unknownDataStore(service manifest.Service) DataStore {
 	return newDataStore(service, "unknown", "", "manual_review", "stopped_volume_copy", "unknown")
 }
 
+func knownApplicationImage(image string) bool {
+	image = normalizedImageName(image)
+	for _, pattern := range []string{
+		"supertokens/supertokens-mysql",
+		"supertokens/supertokens-postgresql",
+		"metabase/metabase",
+		"superset",
+		"nocodb/nocodb",
+		"umami-software/umami",
+		"infisical/infisical",
+		"postgrest/postgrest",
+		"supabase/postgres-meta",
+		"bluewaveuptime/uptime_redis",
+	} {
+		if strings.Contains(image, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeDatabaseResource(service manifest.Service) bool {
+	if len(serviceStatefulVolumes(service)) == 0 {
+		return false
+	}
+	for _, key := range []string{"coolify.database.subType", "coolify.service.subType"} {
+		if strings.Contains(strings.ToLower(service.Labels[key]), "database") {
+			return true
+		}
+	}
+	if strings.EqualFold(service.Labels["coolify.type"], "database") {
+		return true
+	}
+	name := strings.ToLower(serviceName(service))
+	if name == "db" || strings.HasSuffix(name, "-db") || strings.HasSuffix(name, "_db") || strings.Contains(name, "database") {
+		return true
+	}
+	for _, mount := range service.Mounts {
+		if databaseMountPath(mount.Target) {
+			return true
+		}
+	}
+	return false
+}
+
+func databaseMountPath(path string) bool {
+	path = strings.ToLower(strings.TrimSpace(path))
+	for _, marker := range []string{
+		"/var/lib/postgresql",
+		"/var/lib/mysql",
+		"/var/lib/mariadb",
+		"/data/db",
+		"/bitnami/postgresql",
+		"/bitnami/mysql",
+		"/bitnami/mariadb",
+		"/bitnami/mongodb",
+		"/var/lib/clickhouse",
+		"/var/lib/redis",
+		"/data/redis",
+		"/var/lib/neo4j",
+		"/var/lib/influxdb",
+		"/opt/couchdb/data",
+	} {
+		if strings.Contains(path, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func newDataStore(service manifest.Service, kind, engine, strategy, fallback, criticality string) DataStore {
 	return DataStore{
 		Kind:        kind,
@@ -443,6 +541,8 @@ func databaseEngine(combined, fallback string) string {
 	switch {
 	case strings.Contains(combined, "mariadb"):
 		return "mariadb"
+	case strings.Contains(combined, "garage"):
+		return "garage"
 	case strings.Contains(combined, "mysql"):
 		return "mysql"
 	case strings.Contains(combined, "qdrant"):
@@ -595,24 +695,46 @@ func requirementKinds(name string) []string {
 }
 
 func serviceKind(service manifest.Service) string {
-	name := strings.ToLower(serviceName(service))
-	image := strings.ToLower(service.Image)
-	combined := name + " " + image
-	switch {
-	case strings.Contains(combined, "postgres") || strings.Contains(combined, "pgvector"):
-		return "database"
-	case strings.Contains(combined, "mysql") || strings.Contains(combined, "mariadb") || strings.Contains(combined, "mongo"):
-		return "database"
-	case strings.Contains(combined, "redis") || strings.Contains(combined, "dragonfly"):
-		return "redis"
-	case strings.Contains(combined, "minio"):
-		return "object-storage"
-	case strings.Contains(combined, "qdrant") || strings.Contains(combined, "weaviate"):
-		return "vector-db"
-	case strings.Contains(combined, "searxng"):
-		return "search"
+	store, ok := classifiedDataStore(service)
+	if !ok {
+		return ""
 	}
-	return ""
+	switch store.Kind {
+	case "postgres", "mysql", "mongo", "clickhouse", "couchdb", "influxdb", "graph-db":
+		return "database"
+	case "redis":
+		return "redis"
+	case "object-storage", "vector-db", "search":
+		return store.Kind
+	case "cache":
+		return "cache"
+	default:
+		return ""
+	}
+}
+
+func normalizedImageName(image string) string {
+	image = strings.ToLower(strings.TrimSpace(image))
+	if before, _, ok := strings.Cut(image, "@"); ok {
+		image = before
+	}
+	lastSlash := strings.LastIndex(image, "/")
+	lastColon := strings.LastIndex(image, ":")
+	if lastColon > lastSlash {
+		image = image[:lastColon]
+	}
+	image = strings.TrimPrefix(image, "docker.io/")
+	image = strings.TrimPrefix(image, "library/")
+	return image
+}
+
+func containsAny(value string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func DeployReadiness(app manifest.App) DeployStatus {

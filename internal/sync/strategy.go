@@ -67,6 +67,7 @@ type Result struct {
 type AppPlan struct {
 	Name             string             `json:"name"`
 	Directory        string             `json:"directory"`
+	Role             string             `json:"role,omitempty"`
 	Status           preparer.Status    `json:"status"`
 	Readiness        preparer.Readiness `json:"readiness"`
 	PrepareReadiness preparer.Readiness `json:"prepareReadiness"`
@@ -124,6 +125,7 @@ func planApp(app preparer.AppPlan) AppPlan {
 	plan := AppPlan{
 		Name:             app.Name,
 		Directory:        app.Directory,
+		Role:             app.Role,
 		Status:           app.Status,
 		Readiness:        app.Readiness,
 		PrepareReadiness: app.Readiness,

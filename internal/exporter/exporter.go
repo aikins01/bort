@@ -15,8 +15,9 @@ import (
 )
 
 type Options struct {
-	OutputDir string
-	AppName   string
+	OutputDir        string
+	AppName          string
+	IncludeEnvValues bool
 }
 
 const (
@@ -28,14 +29,17 @@ type Summary struct {
 	OutputDir   string       `json:"outputDir"`
 	GeneratedAt time.Time    `json:"generatedAt"`
 	Source      string       `json:"source"`
+	EnvMode     string       `json:"envMode,omitempty"`
 	Apps        []AppSummary `json:"apps"`
 }
 
 type AppSummary struct {
-	Name      string   `json:"name"`
-	Directory string   `json:"directory"`
-	Routes    []string `json:"routes,omitempty"`
-	Warnings  []string `json:"warnings,omitempty"`
+	Name             string   `json:"name"`
+	Directory        string   `json:"directory"`
+	Role             string   `json:"role,omitempty"`
+	PrivateEnvValues bool     `json:"privateEnvValues,omitempty"`
+	Routes           []string `json:"routes,omitempty"`
+	Warnings         []string `json:"warnings,omitempty"`
 }
 
 func Export(m manifest.Manifest, opts Options) (Summary, error) {
@@ -59,6 +63,7 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 		OutputDir:   opts.OutputDir,
 		GeneratedAt: time.Now().UTC(),
 		Source:      m.Source.Platform,
+		EnvMode:     exportEnvMode(opts),
 	}
 
 	usedDirs := map[string]int{}
@@ -70,16 +75,18 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 		}
 
 		topology := analyzer.TopologyForAppInManifest(m, app)
-		warnings, err := exportApp(appDir, app, topology)
+		warnings, err := exportApp(appDir, app, topology, opts)
 		if err != nil {
 			return Summary{}, err
 		}
 
 		summary.Apps = append(summary.Apps, AppSummary{
-			Name:      app.Name,
-			Directory: filepath.ToSlash(dirName),
-			Routes:    routeHosts(app.Routes),
-			Warnings:  warnings,
+			Name:             app.Name,
+			Directory:        filepath.ToSlash(dirName),
+			Role:             migrationRole(app),
+			PrivateEnvValues: opts.IncludeEnvValues,
+			Routes:           routeHosts(app.Routes),
+			Warnings:         warnings,
 		})
 	}
 
@@ -90,19 +97,27 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 	return summary, nil
 }
 
-func exportApp(appDir string, app manifest.App, topology analyzer.Topology) ([]string, error) {
+func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts Options) ([]string, error) {
 	warnings := []string{}
-	compose, composeWarnings, serviceEnvFiles := composeForApp(app)
+	compose, composeWarnings, serviceEnvFiles := composeForApp(app, opts.IncludeEnvValues)
 	warnings = append(warnings, composeWarnings...)
 
 	files := map[string][]byte{
 		"compose.yaml":         []byte(compose),
-		".env.example":         []byte(envExample(app.Environment)),
+		".env.example":         []byte(envExample(app.Environment, false)),
 		"migration-report.md":  []byte(report(app, warnings)),
 		"migration-runbook.md": []byte(runbook(app, topology, warnings)),
 	}
-	for _, envFile := range serviceEnvFiles {
-		files[envFile.Name] = []byte(envExample(envFile.Vars))
+	for _, envFile := range serviceEnvFilesForMode(app.Services, false) {
+		files[envFile.Name] = []byte(envExample(envFile.Vars, false))
+	}
+	if opts.IncludeEnvValues {
+		if len(app.Environment) > 0 {
+			files[".env"] = []byte(envExample(app.Environment, true))
+		}
+		for _, envFile := range serviceEnvFiles {
+			files[envFile.Name] = []byte(envExample(envFile.Vars, true))
+		}
 	}
 
 	for name, contents := range files {
@@ -124,16 +139,23 @@ func exportApp(appDir string, app manifest.App, topology analyzer.Topology) ([]s
 	return warnings, nil
 }
 
+func exportEnvMode(opts Options) string {
+	if opts.IncludeEnvValues {
+		return "include-values"
+	}
+	return "redacted"
+}
+
 type envFile struct {
 	Name string
 	Vars []manifest.EnvVar
 }
 
-func composeForApp(app manifest.App) (string, []string, []envFile) {
+func composeForApp(app manifest.App, includePrivateValues bool) (string, []string, []envFile) {
 	warnings := []string{}
 	if app.Compose != nil {
 		if strings.TrimSpace(app.Compose.Raw) != "" {
-			return ensureTrailingNewline(app.Compose.Raw), nil, nil
+			return ensureTrailingNewline(app.Compose.Raw), nil, serviceEnvFilesForMode(app.Services, includePrivateValues)
 		}
 		if strings.TrimSpace(app.Compose.Resolved) != "" {
 			warnings = append(warnings, "skipped resolved compose because it may contain interpolated secret values")
@@ -147,7 +169,7 @@ func composeForApp(app manifest.App) (string, []string, []envFile) {
 
 	var builder strings.Builder
 	volumes := map[string]struct{}{}
-	serviceEnvFileMap := serviceEnvFiles(app.Services)
+	serviceEnvFileMap := serviceEnvFileMapForMode(app.Services, includePrivateValues)
 	builder.WriteString("services:\n")
 	for index, service := range app.Services {
 		name := planutil.Slug(service.Name)
@@ -163,7 +185,7 @@ func composeForApp(app manifest.App) (string, []string, []envFile) {
 		builder.WriteString("    restart: unless-stopped\n")
 		envFiles := []string{}
 		if len(app.Environment) > 0 {
-			envFiles = append(envFiles, ".env.example")
+			envFiles = append(envFiles, appEnvFileName(includePrivateValues))
 		}
 		if envFile, ok := serviceEnvFileMap[index]; ok {
 			envFiles = append(envFiles, envFile.Name)
@@ -210,7 +232,11 @@ func composeForApp(app manifest.App) (string, []string, []envFile) {
 	return builder.String(), warnings, sortedEnvFiles(serviceEnvFileMap)
 }
 
-func serviceEnvFiles(services []manifest.Service) map[int]envFile {
+func serviceEnvFilesForMode(services []manifest.Service, includePrivateValues bool) []envFile {
+	return sortedEnvFiles(serviceEnvFileMapForMode(services, includePrivateValues))
+}
+
+func serviceEnvFileMapForMode(services []manifest.Service, includePrivateValues bool) map[int]envFile {
 	usedNames := map[string]int{}
 	files := map[int]envFile{}
 	for index, service := range services {
@@ -221,9 +247,24 @@ func serviceEnvFiles(services []manifest.Service) map[int]envFile {
 		if base == "" {
 			base = "service"
 		}
-		files[index] = envFile{Name: ".env." + uniqueDirName(base, usedNames) + ".example", Vars: service.Environment}
+		files[index] = envFile{Name: serviceEnvFileName(uniqueDirName(base, usedNames), includePrivateValues), Vars: service.Environment}
 	}
 	return files
+}
+
+func appEnvFileName(includePrivateValues bool) string {
+	if includePrivateValues {
+		return ".env"
+	}
+	return ".env.example"
+}
+
+func serviceEnvFileName(base string, includePrivateValues bool) string {
+	name := ".env." + base
+	if !includePrivateValues {
+		name += ".example"
+	}
+	return name
 }
 
 func sortedEnvFiles(files map[int]envFile) []envFile {
@@ -240,7 +281,7 @@ func sortedEnvFiles(files map[int]envFile) []envFile {
 	return sorted
 }
 
-func envExample(envs []manifest.EnvVar) string {
+func envExample(envs []manifest.EnvVar, includePrivateValues bool) string {
 	vars := map[string]manifest.EnvVar{}
 	for _, env := range envs {
 		vars[env.Name] = env
@@ -258,7 +299,7 @@ func envExample(envs []manifest.EnvVar) string {
 	for _, name := range names {
 		env := vars[name]
 		value := ""
-		if env.ValueKnown && !env.Sensitive {
+		if env.ValueKnown && (includePrivateValues || !env.Sensitive) {
 			value = env.Value
 		}
 		builder.WriteString(name)
@@ -507,6 +548,13 @@ func routeHosts(routes []manifest.Route) []string {
 	}
 	sort.Strings(hosts)
 	return hosts
+}
+
+func migrationRole(app manifest.App) string {
+	if app.Metadata == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(app.Metadata["migrationRole"]))
 }
 
 func mountCount(app manifest.App) int {

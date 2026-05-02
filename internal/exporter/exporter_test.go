@@ -152,6 +152,50 @@ func TestExportScopesServiceEnvFiles(t *testing.T) {
 	}
 }
 
+func TestExportIncludeEnvValuesWritesPrivateEnvFiles(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps: []manifest.App{
+			{
+				Name:        "api",
+				Environment: []manifest.EnvVar{{Name: "APP_SECRET", Value: "app-secret", ValueKnown: true, Sensitive: true}},
+				Services: []manifest.Service{{
+					Name:  "web",
+					Image: "example/web",
+					Environment: []manifest.EnvVar{
+						{Name: "API_TOKEN", Value: "service-secret", ValueKnown: true, Sensitive: true},
+					},
+				}},
+			},
+		},
+	}
+
+	if _, err := Export(m, Options{OutputDir: dir, IncludeEnvValues: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	appDir := filepath.Join(dir, "api")
+	compose := readFile(t, filepath.Join(appDir, "compose.yaml"))
+	for _, want := range []string{".env", ".env.web"} {
+		if !strings.Contains(compose, want) {
+			t.Fatalf("expected compose to reference private %s, got:\n%s", want, compose)
+		}
+	}
+	for _, file := range []string{".env", ".env.web"} {
+		env := readFile(t, filepath.Join(appDir, file))
+		if !strings.Contains(env, "secret") {
+			t.Fatalf("expected private %s to contain env value, got %q", file, env)
+		}
+	}
+	for _, file := range []string{".env.example", ".env.web.example"} {
+		env := readFile(t, filepath.Join(appDir, file))
+		if strings.Contains(env, "secret") {
+			t.Fatalf("did not expect example %s to expose env value, got %q", file, env)
+		}
+	}
+}
+
 func TestExportGeneratesComposeFromServices(t *testing.T) {
 	dir := t.TempDir()
 	m := manifest.Manifest{

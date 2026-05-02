@@ -21,6 +21,8 @@ Implemented now:
 - `bort cutover` plans route cutover, health checks, observation, and rollback windows without changing routes.
 - `bort rollback` plans route rollback to the source without changing routes.
 - `bort commit` plans final target acceptance and source retirement without committing ownership or deleting source resources.
+- `bort`, `bort continue`, `bort migrate`, `bort status`, and `bort next` provide a local run workflow under `.bort/runs/<name>` with persisted dry-run artifacts, a guided migration cockpit, and concise next-step summaries.
+- The analyzer uses Coolify/Dokploy-informed resource classification so known databases, app volumes, support resources, and platform internals become setup decisions instead of generic manual-review blockers.
 - Source/target/gateway/sync/state packages define the shape for the future live migration engine.
 
 Not implemented yet:
@@ -119,11 +121,32 @@ bin/bort commit --from-cutover cutover.json
 
 Artifact consumption is opt-in. `sync` accepts `--from-prepare`; `cutover` accepts `--from-prepare` and can also accept `--from-sync` when the matching prepare artifact is supplied; `rollback` and `commit` accept `--from-cutover`. The CLI checks artifact API versions, dry-run metadata where present, bundle and target compatibility when those flags are supplied, and `--app` filters before building the next dry-run plan. `commit --from-cutover` uses the cutover artifact rollback window unless `--rollback-window` is supplied explicitly.
 
+For a simpler local-first loop, `bort migrate` creates a named dry-run run under `.bort/runs/<name>` and writes the same JSON artifacts plus `run.json` metadata:
+
+```sh
+bin/bort migrate --bundle bort-bundle --target dokploy --run marketmap
+bin/bort status --run marketmap
+bin/bort continue
+bin/bort next --run marketmap
+```
+
+Running `bin/bort` with no subcommand is the guided path. It resumes the latest local run into a migration cockpit, creates a new dry-run from `bort-bundle` when that default bundle exists, or prompts for source, target, env mode, run name, and manifest path when running interactively with no bundle. `bort continue` and no-arg `bort next` reopen the latest cockpit and next safe action. The explicit subcommands remain available for power users and automation through `bin/bort help`.
+
+The run workflow does not scan servers, create Dokploy resources, copy state, change routes, commit ownership, or clean up source resources. It only recomputes local dry-run plans from the exported bundle, persists `prepare.json`, `sync.json`, `cutover.json`, `rollback.json`, `commit.json`, and grouped `decisions.json`, then prints concise app, route, state-sync, decision, and next-safe-step summaries. `blocked` and `needs_input` gates outrank manual decisions, while traffic cutover and final commit readiness remains a `needs_decision` dry-run gate until live execution exists.
+
 By default, environment variable values are redacted. If you need a full migration manifest for a trusted local workflow, opt in explicitly:
 
 ```sh
 bin/bort scan --include-env-values --output manifest.json
 ```
+
+To preserve known environment values through export, opt in again so sensitive values are written only to private local bundle files:
+
+```sh
+bin/bort export --manifest manifest.json --output-dir bort-bundle --include-env-values
+```
+
+The guided path asks before using include-env mode. If you choose redacted mode, private env templates are created and the cockpit keeps environment work open until the values are filled locally.
 
 Exported bundles are local artifacts with private directory and file permissions. When raw and resolved Coolify compose are both present, `bort export` uses raw compose; resolved compose is skipped unless it was explicitly included in the manifest, because it may contain interpolated secret values. Generated Docker bundles write service-specific env examples such as `.env.web.example` to avoid collisions between services. Each app bundle also includes `topology.json`, a machine-readable summary of networks, dependencies, external requirements, possible linked support resources, data stores, stateful volumes, routes, and risk reasons for later prepare/sync/cutover steps. The companion `migration-runbook.md` turns the same topology into a manual checklist for routes, environment, data stores, state sync, validation, cutover, and rollback readiness.
 
@@ -133,12 +156,17 @@ For the current safe audit loop, run only read-only/local commands:
 bin/bort scan --source coolify --output coolify-manifest.json
 bin/bort plan --manifest coolify-manifest.json --target dokploy
 bin/bort export --manifest coolify-manifest.json --output-dir bort-bundle
+bin/bort
 bin/bort validate --bundle bort-bundle
 bin/bort prepare --bundle bort-bundle --target dokploy
 bin/bort sync --bundle bort-bundle --target dokploy
 bin/bort cutover --bundle bort-bundle --target dokploy
 bin/bort rollback --bundle bort-bundle --target dokploy
 bin/bort commit --bundle bort-bundle --target dokploy
+bin/bort migrate --bundle bort-bundle --target dokploy --run audit
+bin/bort status --run audit
+bin/bort continue
+bin/bort next --run audit
 ```
 
 ## Direction
@@ -155,6 +183,10 @@ bort sync      # plan state copy or replication work
 bort cutover   # plan traffic movement through the migration gateway
 bort rollback  # plan route rollback to the source app
 bort commit    # plan final target ownership acceptance
+bort migrate   # write a local dry-run run under .bort/runs/<name>
+bort status    # summarize a persisted local run
+bort continue  # reopen the latest migration cockpit
+bort next      # show the next safe local action for a run, or the latest cockpit with no args
 ```
 
 ## Name

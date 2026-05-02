@@ -19,10 +19,12 @@ func runExport(_ context.Context, args []string, stdout, stderr io.Writer) error
 	var manifestPath string
 	var outputDir string
 	var appName string
+	var includeEnvValues bool
 
 	fs.StringVar(&manifestPath, "manifest", "", "migration manifest path")
 	fs.StringVar(&outputDir, "output-dir", "bort-bundle", "directory to write the migration bundle into")
 	fs.StringVar(&appName, "app", "", "optional app name to export")
+	fs.BoolVar(&includeEnvValues, "include-env-values", false, "write known environment values into private env files")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -42,7 +44,7 @@ func runExport(_ context.Context, args []string, stdout, stderr io.Writer) error
 		return err
 	}
 
-	summary, err := exporter.Export(m, exporter.Options{OutputDir: outputDir, AppName: appName})
+	summary, err := exporter.Export(m, exporter.Options{OutputDir: outputDir, AppName: appName, IncludeEnvValues: includeEnvValues})
 	if err != nil {
 		return err
 	}

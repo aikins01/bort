@@ -101,13 +101,9 @@ func TestAnalyzeAppClassifiesDataStoresAndRisks(t *testing.T) {
 				},
 				Labels: map[string]string{"com.docker.compose.service": "redis"},
 			},
-			{
-				Name:  "uploads",
-				Image: "example/uploads",
-				Mounts: []manifest.Mount{
-					{Type: "bind", Source: "/srv/uploads", Target: "/uploads"},
-				},
-			},
+			{Name: "uploads", Image: "example/uploads", Mounts: []manifest.Mount{{Type: "bind", Source: "/srv/uploads", Target: "/uploads"}}},
+			{Name: "clickhouse", Image: "clickhouse/clickhouse-server:latest", Mounts: []manifest.Mount{{Type: "volume", Name: "clickhouse-data", Target: "/var/lib/clickhouse"}}},
+			{Name: "metabase", Image: "metabase/metabase:latest", Mounts: []manifest.Mount{{Type: "volume", Name: "metabase-data", Target: "/metabase-data"}}},
 		},
 		Routes: []manifest.Route{{Host: "app.example.com"}},
 	})
@@ -120,17 +116,40 @@ func TestAnalyzeAppClassifiesDataStoresAndRisks(t *testing.T) {
 	if redis.Engine != "dragonfly" || redis.Fallback != "recreate_if_cache_only" || redis.Criticality != "unknown" {
 		t.Fatalf("unexpected redis data store: %#v", redis)
 	}
-	unknown := findDataStore(t, analysis.DataStores, "unknown", "uploads")
-	if unknown.Strategy != "manual_review" {
-		t.Fatalf("unexpected unknown data store: %#v", unknown)
+	clickhouse := findDataStore(t, analysis.DataStores, "clickhouse", "clickhouse")
+	if clickhouse.Strategy != "native_backup_or_export" || clickhouse.Criticality != "critical" {
+		t.Fatalf("unexpected clickhouse data store: %#v", clickhouse)
 	}
-	if len(analysis.StatefulVolumes) != 3 {
-		t.Fatalf("expected three stateful volumes, got %#v", analysis.StatefulVolumes)
+	if len(analysis.DataStores) != 3 {
+		t.Fatalf("expected only recognized data stores, got %#v", analysis.DataStores)
+	}
+	if len(analysis.StatefulVolumes) != 5 {
+		t.Fatalf("expected five stateful volumes, got %#v", analysis.StatefulVolumes)
 	}
 	assertRisk(t, analysis.RiskReasons, "data_store.postgres")
 	assertRisk(t, analysis.RiskReasons, "data_store.redis")
-	assertRisk(t, analysis.RiskReasons, "data_store.manual_review")
+	assertRisk(t, analysis.RiskReasons, "data_store.clickhouse")
 	assertRisk(t, analysis.RiskReasons, "state.bind_mounts")
+}
+
+func TestAnalyzeAppKeepsManualReviewForDatabaseLikeUnknowns(t *testing.T) {
+	analysis := AnalyzeApp(manifest.App{
+		Services: []manifest.Service{
+			{
+				Name:   "custom-db",
+				Image:  "example/private-database:latest",
+				Labels: map[string]string{"coolify.service.subType": "database"},
+				Mounts: []manifest.Mount{{Type: "volume", Name: "custom-db-data", Target: "/data"}},
+			},
+		},
+		Routes: []manifest.Route{{Host: "db-admin.example.com"}},
+	})
+
+	unknown := findDataStore(t, analysis.DataStores, "unknown", "custom-db")
+	if unknown.Strategy != "manual_review" {
+		t.Fatalf("unexpected unknown data store: %#v", unknown)
+	}
+	assertRisk(t, analysis.RiskReasons, "data_store.manual_review")
 }
 
 func TestAnalyzeAppInManifestLinksSupportResources(t *testing.T) {

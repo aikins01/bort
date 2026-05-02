@@ -97,21 +97,16 @@ func TestPlanCarriesPrepareBlockersIntoSyncPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != preparer.StatusRed || len(result.Apps) != 1 {
+	if result.Status != preparer.StatusYellow || len(result.Apps) != 1 {
 		t.Fatalf("unexpected sync result: %#v", result)
 	}
 	app := result.Apps[0]
-	if app.PrepareReadiness != preparer.ReadinessBlocked || app.Readiness != preparer.ReadinessBlocked {
-		t.Fatalf("expected sync to carry prepare blocker, got %#v", app)
+	if app.PrepareReadiness != preparer.ReadinessNeedsInput || app.Readiness != preparer.ReadinessNeedsInput {
+		t.Fatalf("expected sync to carry prepare input needs, got %#v", app)
 	}
-	assertGate(t, app, "data_store.manual_review")
 	linked := findStep(t, app, "linked_resource")
 	if linked.TargetAction != "confirm_support_resource_candidate" || linked.Readiness != preparer.ReadinessNeedsDecision {
 		t.Fatalf("unexpected linked resource step: %#v", linked)
-	}
-	dataStore := findStep(t, app, "data_store")
-	if dataStore.Strategy != StrategyManualReview || dataStore.Readiness != preparer.ReadinessBlocked {
-		t.Fatalf("unexpected blocked data-store step: %#v", dataStore)
 	}
 	volume := findStep(t, app, "volume")
 	if volume.Strategy != StrategyRsync || volume.Readiness != preparer.ReadinessNeedsDecision {

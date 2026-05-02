@@ -95,17 +95,16 @@ func TestPlanCarriesCutoverBlockersIntoCommitPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != preparer.StatusRed || len(result.Apps) != 1 {
+	if result.Status != preparer.StatusYellow || len(result.Apps) != 1 {
 		t.Fatalf("unexpected commit result: %#v", result)
 	}
 	app := result.Apps[0]
-	if app.CutoverReadiness != preparer.ReadinessBlocked || app.Readiness != preparer.ReadinessBlocked {
-		t.Fatalf("expected commit to carry cutover blocker, got %#v", app)
+	if app.CutoverReadiness != preparer.ReadinessNeedsInput || app.Readiness != preparer.ReadinessNeedsInput {
+		t.Fatalf("expected commit to carry cutover input needs, got %#v", app)
 	}
-	assertGate(t, app, "data_store.manual_review")
 	assertGate(t, app, "commit.cutover_not_ready")
 	preflight := findStep(t, app, PhasePreflight)
-	if preflight.Readiness != preparer.ReadinessBlocked {
+	if preflight.Readiness != preparer.ReadinessNeedsInput {
 		t.Fatalf("unexpected preflight step: %#v", preflight)
 	}
 }
