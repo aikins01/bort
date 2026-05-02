@@ -46,6 +46,7 @@ func TestRunPrepareWritesTextPlan(t *testing.T) {
 		"[green] api",
 		"readiness: ready_to_create",
 		"target shell: ready_to_create compose from compose.yaml",
+		"dokploy dry-run: compose app api (ready_to_create), 1 domains, 0 env files, 0 volumes",
 		"info compose: would create dokploy compose app from compose.yaml",
 		"info route: would create dokploy domain api.example.com for service api",
 		"Dry run only: no resources were created or changed.",
@@ -92,6 +93,12 @@ func TestRunPrepareWritesJSONPlan(t *testing.T) {
 	}
 	if len(app.Resources.Domains) != 1 || app.Resources.Domains[0].Host != "api.example.com" {
 		t.Fatalf("unexpected prepare domain resources: %#v", app.Resources.Domains)
+	}
+	if app.TargetResources == nil || app.TargetResources.Platform != "dokploy" || !app.TargetResources.DryRun || app.TargetResources.Dokploy == nil {
+		t.Fatalf("unexpected prepare target resources: %#v", app.TargetResources)
+	}
+	if app.TargetResources.Dokploy.ComposeApp.Name != "api" || app.TargetResources.Dokploy.ComposeApp.Readiness != preparer.ReadinessReadyToCreate || len(app.TargetResources.Dokploy.Domains) != 1 {
+		t.Fatalf("unexpected dokploy target resources: %#v", app.TargetResources.Dokploy)
 	}
 }
 

@@ -56,13 +56,14 @@ type Result struct {
 }
 
 type AppPlan struct {
-	Name      string        `json:"name"`
-	Directory string        `json:"directory"`
-	Status    Status        `json:"status"`
-	Readiness Readiness     `json:"readiness"`
-	Resources ResourceSpecs `json:"resources"`
-	Gates     []Gate        `json:"gates,omitempty"`
-	Actions   []Action      `json:"actions"`
+	Name            string           `json:"name"`
+	Directory       string           `json:"directory"`
+	Status          Status           `json:"status"`
+	Readiness       Readiness        `json:"readiness"`
+	Resources       ResourceSpecs    `json:"resources"`
+	TargetResources *TargetResources `json:"targetResources,omitempty"`
+	Gates           []Gate           `json:"gates,omitempty"`
+	Actions         []Action         `json:"actions"`
 }
 
 type Action struct {
@@ -213,7 +214,17 @@ func planApp(bundleDir, target string, app exporter.AppSummary) (AppPlan, error)
 	addVolumeActions(&plan)
 	plan.Readiness = readinessFromGates(plan.Gates)
 	plan.Status = statusFromReadiness(plan.Readiness)
+	plan.TargetResources = targetResources(target, plan)
 	return plan, nil
+}
+
+func targetResources(target string, plan AppPlan) *TargetResources {
+	switch strings.ToLower(strings.TrimSpace(target)) {
+	case "dokploy":
+		return &TargetResources{Platform: "dokploy", DryRun: true, Dokploy: dokployResources(plan)}
+	default:
+		return nil
+	}
 }
 
 func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Topology) ResourceSpecs {

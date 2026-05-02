@@ -59,6 +59,10 @@ func writePrepareText(w io.Writer, result preparer.Result) {
 		if app.Resources.App.Type != "" {
 			fmt.Fprintf(w, "  target shell: %s %s from %s\n", app.Resources.App.Readiness, app.Resources.App.Type, app.Resources.App.ComposePath)
 		}
+		if app.TargetResources != nil && app.TargetResources.Dokploy != nil {
+			dokploy := app.TargetResources.Dokploy
+			fmt.Fprintf(w, "  dokploy dry-run: compose app %s (%s), %d domains, %d env files, %d volumes\n", dokploy.ComposeApp.Name, dokploy.ComposeApp.Readiness, len(dokploy.Domains), len(dokploy.EnvFiles), len(dokploy.Volumes))
+		}
 		if len(app.Gates) > 0 {
 			fmt.Fprintln(w, "  gates:")
 			for _, gate := range app.Gates {

@@ -16,7 +16,7 @@ Implemented now:
 - `bort plan` reads a manifest and prints a first migration readiness summary.
 - `bort export` writes a local migration bundle with compose, env, routes, storages, topology, and a report per app.
 - `bort validate` checks exported bundles for compose validity, portability risks, missing routes, and secret handling.
-- `bort prepare` reads an exported bundle and prints a dry-run target preparation plan without creating resources.
+- `bort prepare` reads an exported bundle and prints a dry-run target preparation plan, including Dokploy render specs, without creating resources.
 - Source/target/gateway/sync/state packages define the shape for the live migration engine.
 
 Not implemented yet:
@@ -100,7 +100,7 @@ Plan target-side preparation from an exported bundle without mutating the target
 bin/bort prepare --bundle bort-bundle --target dokploy
 ```
 
-`bort prepare --format json` emits a versioned dry-run contract with structured target resource specs, heuristic linked-resource candidates, and readiness gates. The app shell can be ready to create while gates still require env input, resource decisions, or manual data-store review before migration proceeds.
+`bort prepare --format json` emits a versioned dry-run contract with structured target resource specs, Dokploy-specific render specs under `targetResources.dokploy`, heuristic linked-resource candidates, and readiness gates. The app shell can be ready to create while gates still require env input, resource decisions, or manual data-store review before migration proceeds.
 
 By default, environment variable values are redacted. If you need a full migration manifest for a trusted local workflow, opt in explicitly:
 

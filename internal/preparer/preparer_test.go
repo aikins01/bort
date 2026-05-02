@@ -70,6 +70,28 @@ func TestPlanBuildsDryRunActionsFromTopology(t *testing.T) {
 	if len(app.Resources.Volumes) != 1 || app.Resources.Volumes[0].Type != "bind" || app.Resources.Volumes[0].Portability != "review_required" {
 		t.Fatalf("unexpected volume resources: %#v", app.Resources.Volumes)
 	}
+	if app.TargetResources == nil || app.TargetResources.Platform != "dokploy" || !app.TargetResources.DryRun || app.TargetResources.Dokploy == nil {
+		t.Fatalf("unexpected target resources: %#v", app.TargetResources)
+	}
+	dokploy := app.TargetResources.Dokploy
+	if dokploy.ComposeApp.Name != "web" || dokploy.ComposeApp.Readiness != ReadinessReadyToCreate {
+		t.Fatalf("unexpected dokploy compose app: %#v", dokploy.ComposeApp)
+	}
+	if len(dokploy.Domains) != 1 || dokploy.Domains[0].AttachTo != "web" || dokploy.Domains[0].Host != "web.example.com" {
+		t.Fatalf("unexpected dokploy domains: %#v", dokploy.Domains)
+	}
+	if len(dokploy.EnvFiles) != 1 || !dokploy.EnvFiles[0].NeedsValues {
+		t.Fatalf("unexpected dokploy env files: %#v", dokploy.EnvFiles)
+	}
+	if len(dokploy.Volumes) != 1 || dokploy.Volumes[0].Action != "review_bind_mount_portability" {
+		t.Fatalf("unexpected dokploy volumes: %#v", dokploy.Volumes)
+	}
+	if len(dokploy.DataStores) != 1 || dokploy.DataStores[0].Action != "manual_data_store_review" {
+		t.Fatalf("unexpected dokploy data stores: %#v", dokploy.DataStores)
+	}
+	if len(dokploy.LinkedResources) != 1 || !dokploy.LinkedResources[0].RequiresConfirmation || dokploy.LinkedResources[0].Source != "heuristic" {
+		t.Fatalf("unexpected dokploy linked resources: %#v", dokploy.LinkedResources)
+	}
 	for _, code := range []string{"env.values_required", "env.values_redacted", "data_store.manual_review", "linked_resource.confirm_candidate", "volume.bind_mount_review"} {
 		assertGate(t, app, code)
 	}
@@ -112,6 +134,9 @@ func TestPlanMarksSimpleAppReadyToCreate(t *testing.T) {
 	if len(result.Apps[0].Gates) != 0 {
 		t.Fatalf("did not expect gates for simple app: %#v", result.Apps[0].Gates)
 	}
+	if result.Apps[0].TargetResources == nil || result.Apps[0].TargetResources.Dokploy == nil || result.Apps[0].TargetResources.Dokploy.ComposeApp.Readiness != ReadinessReadyToCreate {
+		t.Fatalf("expected ready dokploy target render: %#v", result.Apps[0].TargetResources)
+	}
 }
 
 func TestPlanBlocksIncompleteDeployArtifact(t *testing.T) {
@@ -141,6 +166,9 @@ func TestPlanBlocksIncompleteDeployArtifact(t *testing.T) {
 	}
 	if !slices.Contains(app.Resources.App.MissingInputs, "TODO_REPLACE_IMAGE") {
 		t.Fatalf("expected missing image placeholder in app resource: %#v", app.Resources.App)
+	}
+	if app.TargetResources == nil || app.TargetResources.Dokploy == nil || app.TargetResources.Dokploy.ComposeApp.Readiness != ReadinessBlocked {
+		t.Fatalf("expected blocked dokploy compose app: %#v", app.TargetResources)
 	}
 	assertGate(t, app, "app.compose_incomplete")
 	assertGate(t, app, "deploy.missing_artifact")
