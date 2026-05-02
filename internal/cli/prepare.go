@@ -18,13 +18,18 @@ func runPrepare(_ context.Context, args []string, stdout, stderr io.Writer) erro
 	var target string
 	var appName string
 	var format string
+	var outputPath string
 
 	fs.StringVar(&bundleDir, "bundle", "bort-bundle", "migration bundle directory")
 	fs.StringVar(&target, "target", "dokploy", "target platform")
 	fs.StringVar(&appName, "app", "", "optional app name to prepare")
 	fs.StringVar(&format, "format", "text", "output format: text, json")
+	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
 
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := checkOutputFormat("prepare", format); err != nil {
 		return err
 	}
 
@@ -33,20 +38,22 @@ func runPrepare(_ context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 
-	switch format {
-	case "text":
-		writePrepareText(stdout, result)
-	case "json":
-		encoder := json.NewEncoder(stdout)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(result); err != nil {
-			return err
+	return writeOutput(stdout, outputPath, func(out io.Writer) error {
+		switch format {
+		case "text":
+			writePrepareText(out, result)
+		case "json":
+			encoder := json.NewEncoder(out)
+			encoder.SetIndent("", "  ")
+			if err := encoder.Encode(result); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported prepare format %q", format)
 		}
-	default:
-		return fmt.Errorf("unsupported prepare format %q", format)
-	}
 
-	return nil
+		return nil
+	})
 }
 
 func writePrepareText(w io.Writer, result preparer.Result) {

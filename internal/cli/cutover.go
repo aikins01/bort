@@ -8,6 +8,8 @@ import (
 	"io"
 
 	"github.com/aikins01/bort/internal/gateway"
+	"github.com/aikins01/bort/internal/preparer"
+	syncplan "github.com/aikins01/bort/internal/sync"
 )
 
 func runCutover(_ context.Context, args []string, stdout, stderr io.Writer) error {
@@ -18,6 +20,9 @@ func runCutover(_ context.Context, args []string, stdout, stderr io.Writer) erro
 	var target string
 	var appName string
 	var format string
+	var outputPath string
+	var preparePlanPath string
+	var syncPlanPath string
 	observationWindowSeconds := gateway.DefaultObservationWindowSeconds
 	rollbackWindowSeconds := gateway.DefaultRollbackWindowSeconds
 
@@ -25,38 +30,109 @@ func runCutover(_ context.Context, args []string, stdout, stderr io.Writer) erro
 	fs.StringVar(&target, "target", "dokploy", "target platform")
 	fs.StringVar(&appName, "app", "", "optional app name to cut over")
 	fs.StringVar(&format, "format", "text", "output format: text, json")
+	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
+	fs.StringVar(&preparePlanPath, "from-prepare", "", "read a prior prepare JSON plan artifact")
+	fs.StringVar(&syncPlanPath, "from-sync", "", "read a prior sync JSON plan artifact")
 	fs.IntVar(&observationWindowSeconds, "observation-window", gateway.DefaultObservationWindowSeconds, "observation window in seconds")
 	fs.IntVar(&rollbackWindowSeconds, "rollback-window", gateway.DefaultRollbackWindowSeconds, "rollback window in seconds")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if err := checkOutputFormat("cutover", format); err != nil {
+		return err
+	}
 
-	result, err := gateway.Plan(gateway.Options{
-		BundleDir:                bundleDir,
-		Target:                   target,
-		AppName:                  appName,
-		ObservationWindowSeconds: &observationWindowSeconds,
-		RollbackWindowSeconds:    &rollbackWindowSeconds,
-	})
+	result, err := cutoverResultFromOptions(bundleDir, target, appName, preparePlanPath, syncPlanPath, flagWasSet(fs, "bundle"), flagWasSet(fs, "target"), observationWindowSeconds, rollbackWindowSeconds)
 	if err != nil {
 		return err
 	}
 
-	switch format {
-	case "text":
-		writeCutoverText(stdout, result)
-	case "json":
-		encoder := json.NewEncoder(stdout)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(result); err != nil {
-			return err
+	return writeOutput(stdout, outputPath, func(out io.Writer) error {
+		switch format {
+		case "text":
+			writeCutoverText(out, result)
+		case "json":
+			encoder := json.NewEncoder(out)
+			encoder.SetIndent("", "  ")
+			if err := encoder.Encode(result); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported cutover format %q", format)
 		}
-	default:
-		return fmt.Errorf("unsupported cutover format %q", format)
+
+		return nil
+	})
+}
+
+func cutoverResultFromOptions(bundleDir, target, appName, preparePlanPath, syncPlanPath string, bundleSet, targetSet bool, observationWindowSeconds, rollbackWindowSeconds int) (gateway.Result, error) {
+	if preparePlanPath == "" && syncPlanPath == "" {
+		return gateway.Plan(gateway.Options{
+			BundleDir:                bundleDir,
+			Target:                   target,
+			AppName:                  appName,
+			ObservationWindowSeconds: &observationWindowSeconds,
+			RollbackWindowSeconds:    &rollbackWindowSeconds,
+		})
+	}
+	if syncPlanPath != "" && preparePlanPath == "" {
+		return gateway.Result{}, fmt.Errorf("--from-prepare is required when --from-sync is set")
 	}
 
-	return nil
+	expect := artifactExpectations{AppName: appName}
+	if bundleSet {
+		expect.BundleDir = bundleDir
+	}
+	if targetSet {
+		expect.Target = target
+	}
+
+	var preparePlan preparer.Result
+	var err error
+	if preparePlanPath != "" {
+		preparePlan, err = readPrepareArtifact(preparePlanPath, expect)
+		if err != nil {
+			return gateway.Result{}, err
+		}
+		if !bundleSet {
+			bundleDir = preparePlan.BundleDir
+		}
+		if !targetSet {
+			target = preparePlan.Target
+		}
+	}
+
+	var syncResult syncplan.Result
+	if syncPlanPath != "" {
+		syncExpect := expect
+		if preparePlanPath != "" {
+			syncExpect.BundleDir = preparePlan.BundleDir
+			syncExpect.Target = preparePlan.Target
+		}
+		syncResult, err = readSyncArtifact(syncPlanPath, syncExpect)
+		if err != nil {
+			return gateway.Result{}, err
+		}
+		if !bundleSet {
+			bundleDir = syncResult.BundleDir
+		}
+		if !targetSet {
+			target = syncResult.Target
+		}
+	}
+
+	if preparePlanPath == "" {
+		preparePlan, err = preparer.Plan(preparer.Options{BundleDir: bundleDir, Target: target, AppName: appName})
+		if err != nil {
+			return gateway.Result{}, err
+		}
+	}
+	if syncPlanPath == "" {
+		syncResult = syncplan.PlanFromPrepare(preparePlan)
+	}
+
+	return gateway.PlanFromPrepareAndSync(preparePlan, syncResult, observationWindowSeconds, rollbackWindowSeconds)
 }
 
 func writeCutoverText(w io.Writer, result gateway.Result) {

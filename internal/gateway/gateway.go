@@ -3,6 +3,7 @@ package gateway
 import (
 	"fmt"
 
+	"github.com/aikins01/bort/internal/planfile"
 	"github.com/aikins01/bort/internal/planutil"
 	"github.com/aikins01/bort/internal/preparer"
 	syncplan "github.com/aikins01/bort/internal/sync"
@@ -101,9 +102,35 @@ func Plan(opts Options) (Result, error) {
 	}
 	syncResult := syncplan.PlanFromPrepare(preparePlan)
 
-	result := Result{APIVersion: APIVersion, BundleDir: preparePlan.BundleDir, Target: preparePlan.Target, DryRun: true, Status: preparer.StatusGreen}
-	for i, app := range preparePlan.Apps {
-		syncApp := syncResult.Apps[i]
+	return PlanFromPrepareAndSync(preparePlan, syncResult, observationWindowSeconds, rollbackWindowSeconds)
+}
+
+func PlanFromPrepareAndSync(preparePlan preparer.Result, syncResult syncplan.Result, observationWindowSeconds, rollbackWindowSeconds int) (Result, error) {
+	if err := planfile.CheckAPIVersion("prepare plan", preparePlan.APIVersion, preparer.APIVersion); err != nil {
+		return Result{}, err
+	}
+	if err := planfile.CheckAPIVersion("sync plan", syncResult.APIVersion, syncplan.APIVersion); err != nil {
+		return Result{}, err
+	}
+	if err := planfile.CheckDryRun("sync plan", syncResult.DryRun); err != nil {
+		return Result{}, err
+	}
+	if err := planfile.CheckBundle("sync plan", syncResult.BundleDir, preparePlan.BundleDir); err != nil {
+		return Result{}, err
+	}
+	if err := planfile.CheckTarget("sync plan", syncResult.Target, preparePlan.Target); err != nil {
+		return Result{}, err
+	}
+	if len(syncResult.Apps) == 0 {
+		return Result{}, fmt.Errorf("sync plan has no apps")
+	}
+
+	result := Result{APIVersion: APIVersion, BundleDir: syncResult.BundleDir, Target: syncResult.Target, DryRun: true, Status: preparer.StatusGreen}
+	for _, syncApp := range syncResult.Apps {
+		app, ok := findPrepareApp(preparePlan, syncApp)
+		if !ok {
+			return Result{}, fmt.Errorf("sync plan app %q was not found in prepare plan", syncApp.Name)
+		}
 		appPlan := planApp(app, syncApp, observationWindowSeconds, rollbackWindowSeconds)
 		result.Apps = append(result.Apps, appPlan)
 		result.Status = preparer.WorseStatus(result.Status, appPlan.Status)
@@ -295,4 +322,23 @@ func StepEvidence(app AppPlan) []string {
 
 func routeRef(route Route) string {
 	return "route:" + planutil.Fallback(route.Host, "missing-host")
+}
+
+func findPrepareApp(preparePlan preparer.Result, syncApp syncplan.AppPlan) (preparer.AppPlan, bool) {
+	for _, app := range preparePlan.Apps {
+		if sameApp(app.Name, app.Directory, syncApp.Name, syncApp.Directory) {
+			return app, true
+		}
+	}
+	return preparer.AppPlan{}, false
+}
+
+func sameApp(name, directory, otherName, otherDirectory string) bool {
+	if directory != "" && otherDirectory != "" && directory == otherDirectory {
+		return true
+	}
+	if name != "" && otherName != "" && name == otherName {
+		return true
+	}
+	return planutil.Slug(name) != "" && planutil.Slug(name) == planutil.Slug(otherName)
 }

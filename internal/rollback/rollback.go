@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/aikins01/bort/internal/gateway"
+	"github.com/aikins01/bort/internal/planfile"
 	"github.com/aikins01/bort/internal/planutil"
 	"github.com/aikins01/bort/internal/preparer"
 )
@@ -89,6 +90,20 @@ func Plan(opts Options) (Result, error) {
 	cutoverPlan, err := gateway.Plan(gateway.Options{BundleDir: opts.BundleDir, AppName: opts.AppName, Target: opts.Target})
 	if err != nil {
 		return Result{}, err
+	}
+
+	return PlanFromCutover(cutoverPlan, observationWindowSeconds)
+}
+
+func PlanFromCutover(cutoverPlan gateway.Result, observationWindowSeconds int) (Result, error) {
+	if err := planfile.CheckAPIVersion("cutover plan", cutoverPlan.APIVersion, gateway.APIVersion); err != nil {
+		return Result{}, err
+	}
+	if err := planfile.CheckDryRun("cutover plan", cutoverPlan.DryRun); err != nil {
+		return Result{}, err
+	}
+	if len(cutoverPlan.Apps) == 0 {
+		return Result{}, fmt.Errorf("cutover plan has no apps")
 	}
 
 	result := Result{APIVersion: APIVersion, BundleDir: cutoverPlan.BundleDir, Target: cutoverPlan.Target, DryRun: true, Status: preparer.StatusGreen}

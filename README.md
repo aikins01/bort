@@ -107,6 +107,18 @@ bin/bort prepare --bundle bort-bundle --target dokploy
 
 `bort prepare --format json` emits a versioned dry-run contract with structured target resource specs, Dokploy-specific render specs under `targetResources.dokploy`, heuristic linked-resource candidates, and readiness gates. The app shell can be ready to create while gates still require env input, resource decisions, or manual data-store review before migration proceeds.
 
+Dry-run plan commands can persist their text or JSON output with `--output`. When `--format json` is used, the output is a local plan artifact that later stages can consume instead of recomputing every upstream stage from the bundle:
+
+```sh
+bin/bort prepare --bundle bort-bundle --target dokploy --format json --output prepare.json
+bin/bort sync --from-prepare prepare.json --format json --output sync.json
+bin/bort cutover --from-prepare prepare.json --from-sync sync.json --format json --output cutover.json
+bin/bort rollback --from-cutover cutover.json
+bin/bort commit --from-cutover cutover.json
+```
+
+Artifact consumption is opt-in. `sync` accepts `--from-prepare`; `cutover` accepts `--from-prepare` and can also accept `--from-sync` when the matching prepare artifact is supplied; `rollback` and `commit` accept `--from-cutover`. The CLI checks artifact API versions, dry-run metadata where present, bundle and target compatibility when those flags are supplied, and `--app` filters before building the next dry-run plan. `commit --from-cutover` uses the cutover artifact rollback window unless `--rollback-window` is supplied explicitly.
+
 By default, environment variable values are redacted. If you need a full migration manifest for a trusted local workflow, opt in explicitly:
 
 ```sh

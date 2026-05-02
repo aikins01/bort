@@ -18,42 +18,71 @@ func runRollback(_ context.Context, args []string, stdout, stderr io.Writer) err
 	var target string
 	var appName string
 	var format string
+	var outputPath string
+	var cutoverPlanPath string
 	observationWindowSeconds := rollbackplan.DefaultObservationWindowSeconds
 
 	fs.StringVar(&bundleDir, "bundle", "bort-bundle", "migration bundle directory")
 	fs.StringVar(&target, "target", "dokploy", "target platform")
 	fs.StringVar(&appName, "app", "", "optional app name to roll back")
 	fs.StringVar(&format, "format", "text", "output format: text, json")
+	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
+	fs.StringVar(&cutoverPlanPath, "from-cutover", "", "read a prior cutover JSON plan artifact")
 	fs.IntVar(&observationWindowSeconds, "observation-window", rollbackplan.DefaultObservationWindowSeconds, "observation window in seconds")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	result, err := rollbackplan.Plan(rollbackplan.Options{
-		BundleDir:                bundleDir,
-		Target:                   target,
-		AppName:                  appName,
-		ObservationWindowSeconds: &observationWindowSeconds,
-	})
-	if err != nil {
+	if err := checkOutputFormat("rollback", format); err != nil {
 		return err
 	}
 
-	switch format {
-	case "text":
-		writeRollbackText(stdout, result)
-	case "json":
-		encoder := json.NewEncoder(stdout)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(result); err != nil {
+	var result rollbackplan.Result
+	if cutoverPlanPath != "" {
+		expect := artifactExpectations{AppName: appName}
+		if flagWasSet(fs, "bundle") {
+			expect.BundleDir = bundleDir
+		}
+		if flagWasSet(fs, "target") {
+			expect.Target = target
+		}
+		cutoverPlan, err := readCutoverArtifact(cutoverPlanPath, expect)
+		if err != nil {
 			return err
 		}
-	default:
-		return fmt.Errorf("unsupported rollback format %q", format)
+		result, err = rollbackplan.PlanFromCutover(cutoverPlan, observationWindowSeconds)
+		if err != nil {
+			return err
+		}
+	} else {
+		var err error
+		result, err = rollbackplan.Plan(rollbackplan.Options{
+			BundleDir:                bundleDir,
+			Target:                   target,
+			AppName:                  appName,
+			ObservationWindowSeconds: &observationWindowSeconds,
+		})
+		if err != nil {
+			return err
+		}
 	}
 
-	return nil
+	return writeOutput(stdout, outputPath, func(out io.Writer) error {
+		switch format {
+		case "text":
+			writeRollbackText(out, result)
+		case "json":
+			encoder := json.NewEncoder(out)
+			encoder.SetIndent("", "  ")
+			if err := encoder.Encode(result); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported rollback format %q", format)
+		}
+
+		return nil
+	})
 }
 
 func writeRollbackText(w io.Writer, result rollbackplan.Result) {

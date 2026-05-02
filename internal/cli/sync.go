@@ -18,35 +18,61 @@ func runSync(_ context.Context, args []string, stdout, stderr io.Writer) error {
 	var target string
 	var appName string
 	var format string
+	var outputPath string
+	var preparePlanPath string
 
 	fs.StringVar(&bundleDir, "bundle", "bort-bundle", "migration bundle directory")
 	fs.StringVar(&target, "target", "dokploy", "target platform")
 	fs.StringVar(&appName, "app", "", "optional app name to sync")
 	fs.StringVar(&format, "format", "text", "output format: text, json")
+	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
+	fs.StringVar(&preparePlanPath, "from-prepare", "", "read a prior prepare JSON plan artifact")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	result, err := syncplan.Plan(syncplan.Options{BundleDir: bundleDir, Target: target, AppName: appName})
-	if err != nil {
+	if err := checkOutputFormat("sync", format); err != nil {
 		return err
 	}
 
-	switch format {
-	case "text":
-		writeSyncText(stdout, result)
-	case "json":
-		encoder := json.NewEncoder(stdout)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(result); err != nil {
+	var result syncplan.Result
+	if preparePlanPath != "" {
+		expect := artifactExpectations{AppName: appName}
+		if flagWasSet(fs, "bundle") {
+			expect.BundleDir = bundleDir
+		}
+		if flagWasSet(fs, "target") {
+			expect.Target = target
+		}
+		preparePlan, err := readPrepareArtifact(preparePlanPath, expect)
+		if err != nil {
 			return err
 		}
-	default:
-		return fmt.Errorf("unsupported sync format %q", format)
+		result = syncplan.PlanFromPrepare(preparePlan)
+	} else {
+		var err error
+		result, err = syncplan.Plan(syncplan.Options{BundleDir: bundleDir, Target: target, AppName: appName})
+		if err != nil {
+			return err
+		}
 	}
 
-	return nil
+	return writeOutput(stdout, outputPath, func(out io.Writer) error {
+		switch format {
+		case "text":
+			writeSyncText(out, result)
+		case "json":
+			encoder := json.NewEncoder(out)
+			encoder.SetIndent("", "  ")
+			if err := encoder.Encode(result); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported sync format %q", format)
+		}
+
+		return nil
+	})
 }
 
 func writeSyncText(w io.Writer, result syncplan.Result) {

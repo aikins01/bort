@@ -8,6 +8,7 @@ import (
 	"io"
 
 	commitplan "github.com/aikins01/bort/internal/commit"
+	"github.com/aikins01/bort/internal/gateway"
 )
 
 func runCommit(_ context.Context, args []string, stdout, stderr io.Writer) error {
@@ -18,37 +19,76 @@ func runCommit(_ context.Context, args []string, stdout, stderr io.Writer) error
 	var target string
 	var appName string
 	var format string
+	var outputPath string
+	var cutoverPlanPath string
 	rollbackWindowSeconds := commitplan.DefaultRollbackWindowSeconds
 
 	fs.StringVar(&bundleDir, "bundle", "bort-bundle", "migration bundle directory")
 	fs.StringVar(&target, "target", "dokploy", "target platform")
 	fs.StringVar(&appName, "app", "", "optional app name to commit")
 	fs.StringVar(&format, "format", "text", "output format: text, json")
+	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
+	fs.StringVar(&cutoverPlanPath, "from-cutover", "", "read a prior cutover JSON plan artifact")
 	fs.IntVar(&rollbackWindowSeconds, "rollback-window", commitplan.DefaultRollbackWindowSeconds, "rollback window in seconds")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	result, err := commitplan.Plan(commitplan.Options{BundleDir: bundleDir, Target: target, AppName: appName, RollbackWindowSeconds: &rollbackWindowSeconds})
-	if err != nil {
+	if err := checkOutputFormat("commit", format); err != nil {
 		return err
 	}
 
-	switch format {
-	case "text":
-		writeCommitText(stdout, result)
-	case "json":
-		encoder := json.NewEncoder(stdout)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(result); err != nil {
+	var result commitplan.Result
+	if cutoverPlanPath != "" {
+		expect := artifactExpectations{AppName: appName}
+		if flagWasSet(fs, "bundle") {
+			expect.BundleDir = bundleDir
+		}
+		if flagWasSet(fs, "target") {
+			expect.Target = target
+		}
+		cutoverPlan, err := readCutoverArtifact(cutoverPlanPath, expect)
+		if err != nil {
 			return err
 		}
-	default:
-		return fmt.Errorf("unsupported commit format %q", format)
+		if flagWasSet(fs, "rollback-window") {
+			cutoverPlan = withCutoverRollbackWindow(cutoverPlan, rollbackWindowSeconds)
+		}
+		result, err = commitplan.PlanFromCutover(cutoverPlan)
+		if err != nil {
+			return err
+		}
+	} else {
+		var err error
+		result, err = commitplan.Plan(commitplan.Options{BundleDir: bundleDir, Target: target, AppName: appName, RollbackWindowSeconds: &rollbackWindowSeconds})
+		if err != nil {
+			return err
+		}
 	}
 
-	return nil
+	return writeOutput(stdout, outputPath, func(out io.Writer) error {
+		switch format {
+		case "text":
+			writeCommitText(out, result)
+		case "json":
+			encoder := json.NewEncoder(out)
+			encoder.SetIndent("", "  ")
+			if err := encoder.Encode(result); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported commit format %q", format)
+		}
+
+		return nil
+	})
+}
+
+func withCutoverRollbackWindow(plan gateway.Result, seconds int) gateway.Result {
+	for i := range plan.Apps {
+		plan.Apps[i].RollbackWindowSeconds = seconds
+	}
+	return plan
 }
 
 func writeCommitText(w io.Writer, result commitplan.Result) {
