@@ -142,10 +142,14 @@ func planApp(app preparer.AppPlan, syncApp syncplan.AppPlan, observationWindowSe
 		}
 		routeStep := routeStep(route, usedIDs, healthStep.ID)
 		plan.addStep(routeStep, "route", fmt.Sprintf("plan route cutover for %s to %s", routeRef(route), planutil.Fallback(route.TargetRef, "target")))
-		observeStep := observeStep(route, observationWindowSeconds, usedIDs, routeStep.ID)
-		plan.addStep(observeStep, "observe", fmt.Sprintf("observe %s after route cutover", routeRef(route)))
-		rollbackStep := rollbackStep(route, rollbackWindowSeconds, usedIDs, routeStep.ID)
-		plan.addStep(rollbackStep, "rollback", fmt.Sprintf("keep rollback path for %s through %s", routeRef(route), planutil.Fallback(route.CurrentRef, "source")))
+		if observationWindowSeconds > 0 {
+			observeStep := observeStep(route, observationWindowSeconds, usedIDs, routeStep.ID)
+			plan.addStep(observeStep, "observe", fmt.Sprintf("observe %s after route cutover", routeRef(route)))
+		}
+		if rollbackWindowSeconds > 0 {
+			rollbackStep := rollbackStep(route, rollbackWindowSeconds, usedIDs, routeStep.ID)
+			plan.addStep(rollbackStep, "rollback", fmt.Sprintf("keep rollback path for %s through %s", routeRef(route), planutil.Fallback(route.CurrentRef, "source")))
+		}
 	}
 	if len(plan.Routes) == 0 {
 		plan.add(preparer.SeverityInfo, "route", "no public route cutover resources detected")
@@ -166,7 +170,7 @@ func preflightStep(syncApp syncplan.AppPlan, usedIDs map[string]int) Step {
 		ResourceType: "sync",
 		ResourceRef:  "sync",
 		Action:       "confirm_sync_plan_ready_for_cutover",
-		Readiness:    cutoverReadiness(syncApp.Readiness),
+		Readiness:    preparer.ClampReadinessToDecision(syncApp.Readiness),
 		Evidence:     syncStepEvidence(syncApp),
 	}
 }
@@ -179,7 +183,7 @@ func healthStep(route Route, usedIDs map[string]int, dependency string) Step {
 		ResourceRef:  routeRef(route),
 		TargetRef:    route.TargetRef,
 		Action:       "verify_target_route_health",
-		Readiness:    cutoverReadiness(route.Readiness),
+		Readiness:    route.Readiness,
 		DependsOn:    planutil.OptionalDependency(dependency),
 		Evidence:     routeEvidence(route),
 	}
@@ -193,7 +197,7 @@ func routeStep(route Route, usedIDs map[string]int, dependency string) Step {
 		ResourceRef:  routeRef(route),
 		TargetRef:    route.TargetRef,
 		Action:       "plan_route_cutover",
-		Readiness:    cutoverReadiness(route.Readiness),
+		Readiness:    route.Readiness,
 		DependsOn:    planutil.OptionalDependency(dependency),
 		Evidence:     routeEvidence(route),
 	}
@@ -207,7 +211,7 @@ func observeStep(route Route, seconds int, usedIDs map[string]int, dependency st
 		ResourceRef:  routeRef(route),
 		TargetRef:    route.TargetRef,
 		Action:       fmt.Sprintf("observe_target_route_for_%d_seconds", seconds),
-		Readiness:    cutoverReadiness(route.Readiness),
+		Readiness:    route.Readiness,
 		DependsOn:    planutil.OptionalDependency(dependency),
 		Evidence:     routeEvidence(route),
 	}
@@ -221,7 +225,7 @@ func rollbackStep(route Route, seconds int, usedIDs map[string]int, dependency s
 		ResourceRef:  routeRef(route),
 		TargetRef:    route.CurrentRef,
 		Action:       fmt.Sprintf("keep_source_route_available_for_%d_seconds", seconds),
-		Readiness:    cutoverReadiness(route.Readiness),
+		Readiness:    route.Readiness,
 		DependsOn:    planutil.OptionalDependency(dependency),
 		Evidence:     routeEvidence(route),
 	}
@@ -248,7 +252,7 @@ func routesForApp(app preparer.AppPlan) []Route {
 			Source:      domain.Source,
 			CurrentRef:  "source.route:" + planutil.Fallback(domain.Host, "missing-host"),
 			TargetRef:   targetRef,
-			Readiness:   domain.Readiness,
+			Readiness:   preparer.ClampReadinessToDecision(domain.Readiness),
 		})
 	}
 	return routes
@@ -281,15 +285,14 @@ func syncStepEvidence(app syncplan.AppPlan) []string {
 	return evidence
 }
 
-func routeRef(route Route) string {
-	return "route:" + planutil.Fallback(route.Host, "missing-host")
+func StepEvidence(app AppPlan) []string {
+	evidence := make([]string, 0, len(app.Steps))
+	for _, step := range app.Steps {
+		evidence = append(evidence, string(step.Phase)+":"+step.ResourceRef+":"+string(step.Readiness))
+	}
+	return evidence
 }
 
-func cutoverReadiness(readiness preparer.Readiness) preparer.Readiness {
-	switch readiness {
-	case preparer.ReadinessBlocked, preparer.ReadinessNeedsInput:
-		return readiness
-	default:
-		return preparer.ReadinessNeedsDecision
-	}
+func routeRef(route Route) string {
+	return "route:" + planutil.Fallback(route.Host, "missing-host")
 }

@@ -6,7 +6,7 @@ The project is intentionally starting as a small Go CLI. The core idea is to ext
 
 ## Current Status
 
-This repository is at the foundation stage. It can scan local Docker resources or the Coolify API and produce a portable manifest that later target adapters, sync strategies, and gateway cutovers will use.
+This repository is at the local dry-run planning stage. It can scan local Docker resources, the Coolify API, or source-server Docker state; export a private migration bundle; validate topology; and produce read-only prepare, sync, cutover, rollback, and commit plans.
 
 Implemented now:
 
@@ -17,14 +17,19 @@ Implemented now:
 - `bort export` writes a local migration bundle with compose, env, routes, storages, topology, and a report per app.
 - `bort validate` checks exported bundles for compose validity, portability risks, missing routes, and secret handling.
 - `bort prepare` reads an exported bundle and prints a dry-run target preparation plan, including Dokploy render specs, without creating resources.
-- Source/target/gateway/sync/state packages define the shape for the live migration engine.
+- `bort sync` plans state sync work without copying data.
+- `bort cutover` plans route cutover, health checks, observation, and rollback windows without changing routes.
+- `bort rollback` plans route rollback to the source without changing routes.
+- `bort commit` plans final target acceptance and source retirement without committing ownership or deleting source resources.
+- Source/target/gateway/sync/state packages define the shape for the future live migration engine.
 
 Not implemented yet:
 
 - Dokploy resource creation.
 - Migration gateway installation.
 - Database replication adapters.
-- Volume delta sync and final cutover.
+- Volume delta sync execution.
+- Live route cutover, rollback, final commit, and source cleanup.
 
 ## Usage
 
@@ -118,6 +123,10 @@ bin/bort plan --manifest coolify-manifest.json --target dokploy
 bin/bort export --manifest coolify-manifest.json --output-dir bort-bundle
 bin/bort validate --bundle bort-bundle
 bin/bort prepare --bundle bort-bundle --target dokploy
+bin/bort sync --bundle bort-bundle --target dokploy
+bin/bort cutover --bundle bort-bundle --target dokploy
+bin/bort rollback --bundle bort-bundle --target dokploy
+bin/bort commit --bundle bort-bundle --target dokploy
 ```
 
 ## Direction
@@ -130,10 +139,10 @@ bort plan      # classify apps as green/yellow/red
 bort export    # write an inspectable local migration bundle
 bort validate  # validate exported compose, env, routes, and storage
 bort prepare   # plan target resources privately before creating anything
-bort sync      # copy or replicate state
-bort cutover   # flip traffic through the migration gateway
-bort rollback  # route traffic back to the source app
-bort commit    # hand ownership to the target platform
+bort sync      # plan state copy or replication work
+bort cutover   # plan traffic movement through the migration gateway
+bort rollback  # plan route rollback to the source app
+bort commit    # plan final target ownership acceptance
 ```
 
 ## Name

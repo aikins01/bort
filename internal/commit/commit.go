@@ -1,4 +1,4 @@
-package rollback
+package commit
 
 import (
 	"fmt"
@@ -9,25 +9,25 @@ import (
 )
 
 const (
-	APIVersion = "bort.rollback/v1alpha1"
+	APIVersion = "bort.commit/v1alpha1"
 
-	DefaultObservationWindowSeconds = gateway.DefaultObservationWindowSeconds
+	DefaultRollbackWindowSeconds = gateway.DefaultRollbackWindowSeconds
 )
 
 type Phase string
 
 const (
 	PhasePreflight    Phase = "preflight"
-	PhaseSourceHealth Phase = "source_health_check"
-	PhaseRoute        Phase = "route_rollback"
-	PhaseObserve      Phase = "observe"
+	PhaseVerifyTarget Phase = "verify_target"
+	PhaseAcceptTarget Phase = "accept_target"
+	PhaseRetireSource Phase = "retire_source"
 )
 
 type Options struct {
-	BundleDir                string
-	AppName                  string
-	Target                   string
-	ObservationWindowSeconds *int
+	BundleDir             string
+	AppName               string
+	Target                string
+	RollbackWindowSeconds *int
 }
 
 type Result struct {
@@ -40,16 +40,16 @@ type Result struct {
 }
 
 type AppPlan struct {
-	Name                     string             `json:"name"`
-	Directory                string             `json:"directory"`
-	Status                   preparer.Status    `json:"status"`
-	Readiness                preparer.Readiness `json:"readiness"`
-	CutoverReadiness         preparer.Readiness `json:"cutoverReadiness"`
-	ObservationWindowSeconds int                `json:"observationWindowSeconds"`
-	Routes                   []Route            `json:"routes,omitempty"`
-	Gates                    []preparer.Gate    `json:"gates,omitempty"`
-	Steps                    []Step             `json:"steps,omitempty"`
-	Actions                  []Action           `json:"actions"`
+	Name                  string             `json:"name"`
+	Directory             string             `json:"directory"`
+	Status                preparer.Status    `json:"status"`
+	Readiness             preparer.Readiness `json:"readiness"`
+	CutoverReadiness      preparer.Readiness `json:"cutoverReadiness"`
+	RollbackWindowSeconds int                `json:"rollbackWindowSeconds"`
+	Routes                []Route            `json:"routes,omitempty"`
+	Gates                 []preparer.Gate    `json:"gates,omitempty"`
+	Steps                 []Step             `json:"steps,omitempty"`
+	Actions               []Action           `json:"actions"`
 }
 
 type Route struct {
@@ -81,62 +81,58 @@ type Action struct {
 }
 
 func Plan(opts Options) (Result, error) {
-	observationWindowSeconds := DefaultObservationWindowSeconds
-	if opts.ObservationWindowSeconds != nil {
-		observationWindowSeconds = *opts.ObservationWindowSeconds
-	}
-
-	cutoverPlan, err := gateway.Plan(gateway.Options{BundleDir: opts.BundleDir, AppName: opts.AppName, Target: opts.Target})
+	cutoverPlan, err := gateway.Plan(gateway.Options{BundleDir: opts.BundleDir, AppName: opts.AppName, Target: opts.Target, RollbackWindowSeconds: opts.RollbackWindowSeconds})
 	if err != nil {
 		return Result{}, err
 	}
 
 	result := Result{APIVersion: APIVersion, BundleDir: cutoverPlan.BundleDir, Target: cutoverPlan.Target, DryRun: true, Status: preparer.StatusGreen}
 	for _, app := range cutoverPlan.Apps {
-		appPlan := planApp(app, observationWindowSeconds)
+		appPlan := planApp(app)
 		result.Apps = append(result.Apps, appPlan)
 		result.Status = preparer.WorseStatus(result.Status, appPlan.Status)
 	}
 	return result, nil
 }
 
-func planApp(cutoverApp gateway.AppPlan, observationWindowSeconds int) AppPlan {
+func planApp(cutoverApp gateway.AppPlan) AppPlan {
 	plan := AppPlan{
-		Name:                     cutoverApp.Name,
-		Directory:                cutoverApp.Directory,
-		Status:                   cutoverApp.Status,
-		Readiness:                cutoverApp.Readiness,
-		CutoverReadiness:         cutoverApp.Readiness,
-		ObservationWindowSeconds: observationWindowSeconds,
-		Gates:                    append([]preparer.Gate{}, cutoverApp.Gates...),
+		Name:                  cutoverApp.Name,
+		Directory:             cutoverApp.Directory,
+		Status:                cutoverApp.Status,
+		Readiness:             cutoverApp.Readiness,
+		CutoverReadiness:      cutoverApp.Readiness,
+		RollbackWindowSeconds: cutoverApp.RollbackWindowSeconds,
+		Gates:                 append([]preparer.Gate{}, cutoverApp.Gates...),
 	}
 
 	usedIDs := map[string]int{}
 	preflightStep := preflightStep(cutoverApp, usedIDs)
-	plan.addStep(preflightStep, "preflight", "confirm rollback trigger and current traffic state before route rollback")
+	plan.addStep(preflightStep, "preflight", "confirm cutover outcome before committing target ownership")
 	if cutoverApp.Readiness == preparer.ReadinessBlocked || cutoverApp.Readiness == preparer.ReadinessNeedsInput {
-		plan.addGate(cutoverApp.Readiness, preparer.SeverityFromReadiness(cutoverApp.Readiness), "rollback.cutover_not_ready", "cutover plan must be resolved before rollback route actions can be trusted", "cutover", nil)
+		plan.addGate(cutoverApp.Readiness, preparer.SeverityFromReadiness(cutoverApp.Readiness), "commit.cutover_not_ready", "cutover plan must be resolved before target ownership can be committed", "cutover", nil)
 	} else {
-		plan.addGate(preparer.ReadinessNeedsDecision, preparer.SeverityWarn, "rollback.trigger_required", "confirm rollback trigger and current traffic location before changing routes", "rollback", nil)
+		plan.addGate(preparer.ReadinessNeedsDecision, preparer.SeverityWarn, "commit.target_acceptance_required", "confirm target is serving production traffic and source rollback is no longer required", "commit", nil)
 	}
 
 	for _, cutoverRoute := range cutoverApp.Routes {
 		route := routeFromCutover(cutoverRoute)
 		plan.Routes = append(plan.Routes, route)
-		healthStep := sourceHealthStep(route, usedIDs, preflightStep.ID)
-		plan.addStep(healthStep, "health", fmt.Sprintf("verify source health for %s before route rollback", routeRef(route)))
+		verifyStep := targetVerificationStep(route, usedIDs, preflightStep.ID)
+		plan.addStep(verifyStep, "verify", fmt.Sprintf("verify target route for %s before commit", routeRef(route)))
 		if route.Host != "" {
-			plan.addGate(preparer.ReadinessNeedsDecision, preparer.SeverityWarn, "rollback.source_health_required", fmt.Sprintf("verify source health for %s before route rollback", route.Host), "route:"+route.Host, routeEvidence(route))
+			plan.addGate(preparer.ReadinessNeedsDecision, preparer.SeverityWarn, "commit.target_route_acceptance_required", fmt.Sprintf("verify target route %s is serving accepted traffic before commit", route.Host), "route:"+route.Host, routeEvidence(route))
+			if cutoverApp.RollbackWindowSeconds > 0 {
+				plan.addGate(preparer.ReadinessNeedsDecision, preparer.SeverityWarn, "commit.rollback_window_closed", fmt.Sprintf("confirm rollback window for %s is closed or explicitly waived before retiring source route", route.Host), "route:"+route.Host, routeEvidence(route))
+			}
 		}
-		routeStep := routeStep(route, usedIDs, healthStep.ID)
-		plan.addStep(routeStep, "route", fmt.Sprintf("plan route rollback for %s to %s", routeRef(route), planutil.Fallback(route.CurrentRef, "source")))
-		if observationWindowSeconds > 0 {
-			observeStep := observeStep(route, observationWindowSeconds, usedIDs, routeStep.ID)
-			plan.addStep(observeStep, "observe", fmt.Sprintf("observe %s after route rollback", routeRef(route)))
-		}
+		acceptStep := acceptTargetStep(route, usedIDs, verifyStep.ID)
+		plan.addStep(acceptStep, "accept", fmt.Sprintf("accept target ownership for %s", routeRef(route)))
+		retireStep := retireSourceStep(route, usedIDs, acceptStep.ID)
+		plan.addStep(retireStep, "cleanup", fmt.Sprintf("plan source route retirement for %s", routeRef(route)))
 	}
 	if len(plan.Routes) == 0 {
-		plan.add(preparer.SeverityInfo, "route", "no public route rollback resources detected")
+		plan.add(preparer.SeverityInfo, "route", "no public route commit resources detected")
 	}
 
 	for _, step := range plan.Steps {
@@ -149,52 +145,52 @@ func planApp(cutoverApp gateway.AppPlan, observationWindowSeconds int) AppPlan {
 
 func preflightStep(app gateway.AppPlan, usedIDs map[string]int) Step {
 	return Step{
-		ID:           planutil.NextStepID(usedIDs, "preflight:rollback"),
+		ID:           planutil.NextStepID(usedIDs, "preflight:commit"),
 		Phase:        PhasePreflight,
 		ResourceType: "cutover",
 		ResourceRef:  "cutover",
-		Action:       "confirm_rollback_context",
+		Action:       "confirm_cutover_outcome",
 		Readiness:    preparer.ClampReadinessToDecision(app.Readiness),
 		Evidence:     gateway.StepEvidence(app),
 	}
 }
 
-func sourceHealthStep(route Route, usedIDs map[string]int, dependency string) Step {
+func targetVerificationStep(route Route, usedIDs map[string]int, dependency string) Step {
 	return Step{
-		ID:           planutil.NextStepID(usedIDs, "source-health:"+route.Host),
-		Phase:        PhaseSourceHealth,
+		ID:           planutil.NextStepID(usedIDs, "verify-target:"+route.Host),
+		Phase:        PhaseVerifyTarget,
 		ResourceType: "route",
 		ResourceRef:  routeRef(route),
-		TargetRef:    route.CurrentRef,
-		Action:       "verify_source_route_health",
+		TargetRef:    route.TargetRef,
+		Action:       "verify_target_route_accepted",
 		Readiness:    route.Readiness,
 		DependsOn:    planutil.OptionalDependency(dependency),
 		Evidence:     routeEvidence(route),
 	}
 }
 
-func routeStep(route Route, usedIDs map[string]int, dependency string) Step {
+func acceptTargetStep(route Route, usedIDs map[string]int, dependency string) Step {
 	return Step{
-		ID:           planutil.NextStepID(usedIDs, "rollback:"+route.Host),
-		Phase:        PhaseRoute,
+		ID:           planutil.NextStepID(usedIDs, "accept-target:"+route.Host),
+		Phase:        PhaseAcceptTarget,
 		ResourceType: "route",
 		ResourceRef:  routeRef(route),
-		TargetRef:    route.CurrentRef,
-		Action:       "rollback_route",
+		TargetRef:    route.TargetRef,
+		Action:       "plan_target_route_acceptance",
 		Readiness:    route.Readiness,
 		DependsOn:    planutil.OptionalDependency(dependency),
 		Evidence:     routeEvidence(route),
 	}
 }
 
-func observeStep(route Route, seconds int, usedIDs map[string]int, dependency string) Step {
+func retireSourceStep(route Route, usedIDs map[string]int, dependency string) Step {
 	return Step{
-		ID:           planutil.NextStepID(usedIDs, "observe:"+route.Host),
-		Phase:        PhaseObserve,
+		ID:           planutil.NextStepID(usedIDs, "retire-source:"+route.Host),
+		Phase:        PhaseRetireSource,
 		ResourceType: "route",
 		ResourceRef:  routeRef(route),
 		TargetRef:    route.CurrentRef,
-		Action:       fmt.Sprintf("observe_source_route_for_%d_seconds", seconds),
+		Action:       "plan_source_route_retirement",
 		Readiness:    route.Readiness,
 		DependsOn:    planutil.OptionalDependency(dependency),
 		Evidence:     routeEvidence(route),

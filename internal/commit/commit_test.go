@@ -1,4 +1,4 @@
-package gateway
+package commit
 
 import (
 	"slices"
@@ -9,7 +9,7 @@ import (
 	"github.com/aikins01/bort/internal/preparer"
 )
 
-func TestPlanBuildsDryRunCutoverStepsFromPrepareAndSync(t *testing.T) {
+func TestPlanBuildsDryRunCommitStepsFromCutover(t *testing.T) {
 	dir := t.TempDir()
 	m := manifest.Manifest{
 		Source: manifest.Source{Platform: "docker"},
@@ -31,41 +31,38 @@ func TestPlanBuildsDryRunCutoverStepsFromPrepareAndSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.APIVersion != APIVersion || !result.DryRun || result.Target != "dokploy" {
-		t.Fatalf("unexpected cutover result metadata: %#v", result)
+		t.Fatalf("unexpected commit result metadata: %#v", result)
 	}
 	if result.Status != preparer.StatusYellow || len(result.Apps) != 1 {
-		t.Fatalf("unexpected cutover result: %#v", result)
+		t.Fatalf("unexpected commit result: %#v", result)
 	}
 
 	app := result.Apps[0]
-	if app.PrepareReadiness != preparer.ReadinessReadyToCreate || app.SyncReadiness != preparer.ReadinessReadyToCreate || app.Readiness != preparer.ReadinessNeedsDecision {
-		t.Fatalf("unexpected cutover readiness: %#v", app)
+	if app.CutoverReadiness != preparer.ReadinessNeedsDecision || app.Readiness != preparer.ReadinessNeedsDecision {
+		t.Fatalf("unexpected commit readiness: %#v", app)
 	}
-	if app.ObservationWindowSeconds != DefaultObservationWindowSeconds || app.RollbackWindowSeconds != DefaultRollbackWindowSeconds {
-		t.Fatalf("unexpected cutover windows: %#v", app)
+	if app.RollbackWindowSeconds != DefaultRollbackWindowSeconds {
+		t.Fatalf("unexpected rollback window: %#v", app)
 	}
-	if len(app.Routes) != 1 || app.Routes[0].Host != "api.example.com" || app.Routes[0].TargetRef != "dokploy.domain:api.example.com" {
-		t.Fatalf("unexpected route plan: %#v", app.Routes)
+	if len(app.Routes) != 1 || app.Routes[0].Readiness != preparer.ReadinessNeedsDecision || app.Routes[0].TargetRef != "dokploy.domain:api.example.com" || app.Routes[0].CurrentRef != "source.route:api.example.com" {
+		t.Fatalf("unexpected commit route: %#v", app.Routes)
 	}
-	if app.Routes[0].Readiness != preparer.ReadinessNeedsDecision {
-		t.Fatalf("unexpected route readiness: %#v", app.Routes)
+	assertGate(t, app, "commit.target_acceptance_required")
+	assertGate(t, app, "commit.target_route_acceptance_required")
+	assertGate(t, app, "commit.rollback_window_closed")
+	verify := findStep(t, app, PhaseVerifyTarget)
+	accept := findStep(t, app, PhaseAcceptTarget)
+	retire := findStep(t, app, PhaseRetireSource)
+	if accept.Readiness != preparer.ReadinessNeedsDecision || accept.TargetRef != "dokploy.domain:api.example.com" || !slices.Contains(accept.DependsOn, verify.ID) {
+		t.Fatalf("unexpected accept step: %#v", accept)
 	}
-	assertGate(t, app, "cutover.sync_verification_required")
-	assertGate(t, app, "cutover.health_check_required")
-	health := findStep(t, app, PhaseHealth)
-	route := findStep(t, app, PhaseRoute)
-	observe := findStep(t, app, PhaseObserve)
-	rollback := findStep(t, app, PhaseRollback)
-	if route.Readiness != preparer.ReadinessNeedsDecision || !slices.Contains(route.DependsOn, health.ID) {
-		t.Fatalf("unexpected route step: %#v", route)
+	if retire.TargetRef != "source.route:api.example.com" || !slices.Contains(retire.DependsOn, accept.ID) {
+		t.Fatalf("unexpected retire step: %#v", retire)
 	}
-	if !slices.Contains(observe.DependsOn, route.ID) || !slices.Contains(rollback.DependsOn, route.ID) {
-		t.Fatalf("unexpected observe/rollback dependencies: observe=%#v rollback=%#v", observe, rollback)
-	}
-	assertCutoverAction(t, app, "route", "plan route cutover for route:api.example.com to dokploy.domain:api.example.com")
+	assertCommitAction(t, app, "cleanup", "plan source route retirement for route:api.example.com")
 }
 
-func TestPlanCarriesSyncBlockersIntoCutoverPlan(t *testing.T) {
+func TestPlanCarriesCutoverBlockersIntoCommitPlan(t *testing.T) {
 	dir := t.TempDir()
 	m := manifest.Manifest{
 		Source: manifest.Source{Platform: "docker"},
@@ -99,14 +96,14 @@ func TestPlanCarriesSyncBlockersIntoCutoverPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.Status != preparer.StatusRed || len(result.Apps) != 1 {
-		t.Fatalf("unexpected cutover result: %#v", result)
+		t.Fatalf("unexpected commit result: %#v", result)
 	}
 	app := result.Apps[0]
-	if app.PrepareReadiness != preparer.ReadinessBlocked || app.SyncReadiness != preparer.ReadinessBlocked || app.Readiness != preparer.ReadinessBlocked {
-		t.Fatalf("expected cutover to carry sync blocker, got %#v", app)
+	if app.CutoverReadiness != preparer.ReadinessBlocked || app.Readiness != preparer.ReadinessBlocked {
+		t.Fatalf("expected commit to carry cutover blocker, got %#v", app)
 	}
 	assertGate(t, app, "data_store.manual_review")
-	assertGate(t, app, "cutover.sync_not_ready")
+	assertGate(t, app, "commit.cutover_not_ready")
 	preflight := findStep(t, app, PhasePreflight)
 	if preflight.Readiness != preparer.ReadinessBlocked {
 		t.Fatalf("unexpected preflight step: %#v", preflight)
@@ -136,15 +133,15 @@ func TestPlanPreservesRouteInputReadiness(t *testing.T) {
 	}
 	app := result.Apps[0]
 	if app.Readiness != preparer.ReadinessNeedsInput {
-		t.Fatalf("expected needs_input cutover readiness, got %#v", app)
+		t.Fatalf("expected needs_input commit readiness, got %#v", app)
 	}
 	assertGate(t, app, "domain.host_missing")
-	if route := findStep(t, app, PhaseRoute); route.Readiness != preparer.ReadinessNeedsInput {
-		t.Fatalf("expected route step to preserve needs_input, got %#v", route)
+	if route := findStep(t, app, PhaseAcceptTarget); route.Readiness != preparer.ReadinessNeedsInput {
+		t.Fatalf("expected accept step to preserve needs_input, got %#v", route)
 	}
 }
 
-func TestPlanSkipsZeroDurationWindows(t *testing.T) {
+func TestPlanSkipsRollbackWindowGateForZeroRollbackWindow(t *testing.T) {
 	dir := t.TempDir()
 	m := manifest.Manifest{
 		Source: manifest.Source{Platform: "docker"},
@@ -162,19 +159,16 @@ func TestPlanSkipsZeroDurationWindows(t *testing.T) {
 	}
 
 	zero := 0
-	result, err := Plan(Options{BundleDir: dir, Target: "dokploy", ObservationWindowSeconds: &zero, RollbackWindowSeconds: &zero})
+	result, err := Plan(Options{BundleDir: dir, Target: "dokploy", RollbackWindowSeconds: &zero})
 	if err != nil {
 		t.Fatal(err)
 	}
 	app := result.Apps[0]
-	if app.ObservationWindowSeconds != 0 || app.RollbackWindowSeconds != 0 {
-		t.Fatalf("expected explicit zero windows, got %#v", app)
+	if app.RollbackWindowSeconds != 0 {
+		t.Fatalf("expected explicit zero rollback window, got %#v", app)
 	}
-	for _, step := range app.Steps {
-		if step.Phase == PhaseObserve || step.Phase == PhaseRollback {
-			t.Fatalf("did not expect zero-duration cutover window step: %#v", app.Steps)
-		}
-	}
+	assertGate(t, app, "commit.target_route_acceptance_required")
+	assertNoGate(t, app, "commit.rollback_window_closed")
 }
 
 func findStep(t *testing.T, app AppPlan, phase Phase) Step {
@@ -198,7 +192,16 @@ func assertGate(t *testing.T, app AppPlan, code string) {
 	t.Fatalf("expected gate %q in %#v", code, app.Gates)
 }
 
-func assertCutoverAction(t *testing.T, app AppPlan, kind, message string) {
+func assertNoGate(t *testing.T, app AppPlan, code string) {
+	t.Helper()
+	for _, gate := range app.Gates {
+		if gate.Code == code {
+			t.Fatalf("did not expect gate %q in %#v", code, app.Gates)
+		}
+	}
+}
+
+func assertCommitAction(t *testing.T, app AppPlan, kind, message string) {
 	t.Helper()
 	for _, action := range app.Actions {
 		if action.Kind == kind && action.Message == message {

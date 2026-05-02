@@ -36,6 +36,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runCutover(ctx, args[1:], stdout, stderr)
 	case "rollback":
 		return runRollback(ctx, args[1:], stdout, stderr)
+	case "commit":
+		return runCommit(ctx, args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], strings.TrimSpace(usage()))
 	}
@@ -58,6 +60,7 @@ Usage:
   bort sync [flags]
   bort cutover [flags]
   bort rollback [flags]
+  bort commit [flags]
   bort version
 
 Commands:
@@ -69,6 +72,7 @@ Commands:
   sync      plan state sync work from prepared target resources without mutating them
   cutover   plan route cutover and rollback without mutating them
   rollback  plan route rollback without mutating routes
+  commit    plan final target acceptance without retiring source resources
   version   print the CLI version
 
 Run "bort <command> -h" for command-specific flags.

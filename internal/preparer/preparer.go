@@ -762,6 +762,15 @@ func SeverityFromReadiness(readiness Readiness) Severity {
 	}
 }
 
+func ClampReadinessToDecision(readiness Readiness) Readiness {
+	switch readiness {
+	case ReadinessBlocked, ReadinessNeedsInput:
+		return readiness
+	default:
+		return ReadinessNeedsDecision
+	}
+}
+
 func WorseStatus(a, b Status) Status {
 	if a == StatusRed || b == StatusRed {
 		return StatusRed

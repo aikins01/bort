@@ -42,7 +42,7 @@ func TestRunCutoverWritesTextPlan(t *testing.T) {
 		"readiness: needs_decision",
 		"sync readiness: ready_to_create",
 		"observe: 120s, rollback window: 900s",
-		"ready_to_create source.route:api.example.com -> dokploy.domain:api.example.com service=api port=3000",
+		"needs_decision source.route:api.example.com -> dokploy.domain:api.example.com service=api port=3000",
 		"warn cutover.health_check_required: verify target health for api.example.com before route cutover",
 		"Dry run only: no routes were changed and no rollback actions were executed.",
 	} {
@@ -82,7 +82,7 @@ func TestRunCutoverWritesJSONPlan(t *testing.T) {
 	if result.APIVersion != gateway.APIVersion || !result.DryRun || result.Target != "dokploy" || len(result.Apps) != 1 {
 		t.Fatalf("unexpected cutover json: %#v", result)
 	}
-	if len(result.Apps[0].Routes) != 1 || len(result.Apps[0].Steps) != 5 {
+	if len(result.Apps[0].Routes) != 1 || len(result.Apps[0].Steps) != 3 {
 		t.Fatalf("expected cutover route and steps, got %#v", result.Apps[0])
 	}
 	if result.Apps[0].ObservationWindowSeconds != 0 || result.Apps[0].RollbackWindowSeconds != 0 {
