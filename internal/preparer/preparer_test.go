@@ -206,6 +206,15 @@ func TestPlanSkipsRouteActionForInternalSupportResource(t *testing.T) {
 	}
 }
 
+func TestWorseReadinessPrioritizesMissingInputOverDecision(t *testing.T) {
+	if got := WorseReadiness(ReadinessNeedsInput, ReadinessNeedsDecision); got != ReadinessNeedsInput {
+		t.Fatalf("expected needs_input to outrank needs_decision, got %s", got)
+	}
+	if got := WorseReadiness(ReadinessNeedsDecision, ReadinessNeedsInput); got != ReadinessNeedsInput {
+		t.Fatalf("expected needs_input to outrank needs_decision, got %s", got)
+	}
+}
+
 func assertAction(t *testing.T, app AppPlan, want string) {
 	t.Helper()
 	for _, action := range app.Actions {

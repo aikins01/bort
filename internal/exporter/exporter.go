@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/aikins01/bort/internal/analyzer"
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/planutil"
 )
 
 type Options struct {
@@ -63,7 +63,7 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 
 	usedDirs := map[string]int{}
 	for _, app := range apps {
-		dirName := uniqueDirName(slug(app.Name), usedDirs)
+		dirName := uniqueDirName(planutil.Slug(app.Name), usedDirs)
 		appDir := filepath.Join(opts.OutputDir, dirName)
 		if err := ensurePrivateDir(appDir); err != nil {
 			return Summary{}, err
@@ -150,7 +150,7 @@ func composeForApp(app manifest.App) (string, []string, []envFile) {
 	serviceEnvFileMap := serviceEnvFiles(app.Services)
 	builder.WriteString("services:\n")
 	for index, service := range app.Services {
-		name := slug(service.Name)
+		name := planutil.Slug(service.Name)
 		if name == "" {
 			name = "app"
 		}
@@ -217,7 +217,7 @@ func serviceEnvFiles(services []manifest.Service) map[int]envFile {
 		if len(service.Environment) == 0 {
 			continue
 		}
-		base := slug(service.Name)
+		base := planutil.Slug(service.Name)
 		if base == "" {
 			base = "service"
 		}
@@ -273,15 +273,15 @@ func report(app manifest.App, warnings []string) string {
 	var builder strings.Builder
 	builder.WriteString("# migration report\n\n")
 	builder.WriteString(fmt.Sprintf("app: `%s`\n\n", app.Name))
-	builder.WriteString(fmt.Sprintf("platform: `%s`\n\n", fallback(app.Platform, "unknown")))
-	builder.WriteString(fmt.Sprintf("runtime: `%s`\n\n", fallback(app.Runtime, "unknown")))
+	builder.WriteString(fmt.Sprintf("platform: `%s`\n\n", planutil.Fallback(app.Platform, "unknown")))
+	builder.WriteString(fmt.Sprintf("runtime: `%s`\n\n", planutil.Fallback(app.Runtime, "unknown")))
 	if app.BuildPack != "" {
 		builder.WriteString(fmt.Sprintf("build pack: `%s`\n\n", app.BuildPack))
 	}
 	if app.Git != nil {
 		builder.WriteString("## git\n\n")
-		builder.WriteString(fmt.Sprintf("repository: `%s`\n\n", fallback(app.Git.Repository, "unknown")))
-		builder.WriteString(fmt.Sprintf("branch: `%s`\n\n", fallback(app.Git.Branch, "unknown")))
+		builder.WriteString(fmt.Sprintf("repository: `%s`\n\n", planutil.Fallback(app.Git.Repository, "unknown")))
+		builder.WriteString(fmt.Sprintf("branch: `%s`\n\n", planutil.Fallback(app.Git.Branch, "unknown")))
 	}
 
 	builder.WriteString("## routes\n\n")
@@ -289,7 +289,7 @@ func report(app manifest.App, warnings []string) string {
 		builder.WriteString("no routes detected.\n\n")
 	} else {
 		for _, route := range app.Routes {
-			builder.WriteString(fmt.Sprintf("- `%s` -> `%s`", route.Host, fallback(route.ServiceName, app.Name)))
+			builder.WriteString(fmt.Sprintf("- `%s` -> `%s`", route.Host, planutil.Fallback(route.ServiceName, app.Name)))
 			if route.Port != "" {
 				builder.WriteString(fmt.Sprintf(" port `%s`", route.Port))
 			}
@@ -303,11 +303,11 @@ func report(app manifest.App, warnings []string) string {
 		builder.WriteString("no storage detected in the manifest.\n\n")
 	} else {
 		for _, storage := range app.Storages {
-			builder.WriteString(fmt.Sprintf("- `%s` `%s` -> `%s`\n", fallback(storage.Type, "storage"), fallback(storage.Name, storage.Source), storage.Target))
+			builder.WriteString(fmt.Sprintf("- `%s` `%s` -> `%s`\n", planutil.Fallback(storage.Type, "storage"), planutil.Fallback(storage.Name, storage.Source), storage.Target))
 		}
 		for _, service := range app.Services {
 			for _, mount := range service.Mounts {
-				builder.WriteString(fmt.Sprintf("- `%s` `%s` -> `%s`\n", mount.Type, fallback(mount.Name, mount.Source), mount.Target))
+				builder.WriteString(fmt.Sprintf("- `%s` `%s` -> `%s`\n", mount.Type, planutil.Fallback(mount.Name, mount.Source), mount.Target))
 			}
 		}
 		builder.WriteString("\n")
@@ -332,8 +332,8 @@ func runbook(app manifest.App, topology analyzer.Topology, warnings []string) st
 	var builder strings.Builder
 	builder.WriteString("# migration runbook\n\n")
 	builder.WriteString(fmt.Sprintf("app: `%s`\n\n", app.Name))
-	builder.WriteString(fmt.Sprintf("role: `%s`\n\n", fallback(app.Metadata["migrationRole"], "unknown")))
-	builder.WriteString(fmt.Sprintf("runtime: `%s`\n\n", fallback(app.Runtime, "unknown")))
+	builder.WriteString(fmt.Sprintf("role: `%s`\n\n", planutil.Fallback(app.Metadata["migrationRole"], "unknown")))
+	builder.WriteString(fmt.Sprintf("runtime: `%s`\n\n", planutil.Fallback(app.Runtime, "unknown")))
 
 	builder.WriteString("## preflight\n\n")
 	if len(topology.RiskReasons) == 0 && len(warnings) == 0 {
@@ -409,7 +409,7 @@ func runbook(app manifest.App, topology analyzer.Topology, warnings []string) st
 		builder.WriteString("- no stateful volumes or storage records were inferred.\n\n")
 	} else {
 		for _, volume := range topology.StatefulVolumes {
-			builder.WriteString(fmt.Sprintf("- `%s` `%s`", volume.Type, fallback(volume.Name, volume.Source)))
+			builder.WriteString(fmt.Sprintf("- `%s` `%s`", volume.Type, planutil.Fallback(volume.Name, volume.Source)))
 			if volume.Service != "" {
 				builder.WriteString(fmt.Sprintf(" from `%s`", volume.Service))
 			}
@@ -443,7 +443,7 @@ func selectedApps(apps []manifest.App, name string) []manifest.App {
 
 	selected := []manifest.App{}
 	for _, app := range apps {
-		if app.Name == name || app.ID == name || slug(app.Name) == slug(name) {
+		if app.Name == name || app.ID == name || planutil.Slug(app.Name) == planutil.Slug(name) {
 			selected = append(selected, app)
 		}
 	}
@@ -491,16 +491,6 @@ func uniqueDirName(base string, used map[string]int) string {
 		return base
 	}
 	return fmt.Sprintf("%s-%d", base, used[base])
-}
-
-var slugPattern = regexp.MustCompile(`[^a-z0-9._-]+`)
-
-func slug(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	value = strings.ReplaceAll(value, " ", "-")
-	value = slugPattern.ReplaceAllString(value, "-")
-	value = strings.Trim(value, "-._")
-	return value
 }
 
 func routeHosts(routes []manifest.Route) []string {
@@ -556,11 +546,4 @@ func ensureTrailingNewline(value string) string {
 		return value
 	}
 	return value + "\n"
-}
-
-func fallback(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
 }

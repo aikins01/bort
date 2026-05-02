@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/planutil"
 )
 
 type AppAnalysis struct {
@@ -306,12 +307,12 @@ func resourceLinkReasons(app, other manifest.App, requirement Requirement, appNe
 		return nil
 	}
 	if migrationRole(other) == "support" || other.Runtime == "database" || other.Runtime == "service" {
-		reasons = append(reasons, "resource is classified as "+fallback(migrationRole(other), other.Runtime))
+		reasons = append(reasons, "resource is classified as "+planutil.Fallback(migrationRole(other), other.Runtime))
 	}
 	if len(requirement.Evidence) > 0 {
 		reasons = append(reasons, "env evidence: "+strings.Join(requirement.Evidence, ", "))
 	}
-	return uniqueStrings(reasons)
+	return planutil.UniqueStrings(reasons)
 }
 
 func linkableResourceApp(app manifest.App) bool {
@@ -341,7 +342,7 @@ func sharedPortableNetworks(a, b []string) []string {
 			shared = append(shared, network)
 		}
 	}
-	return uniqueStrings(shared)
+	return planutil.UniqueStrings(shared)
 }
 
 func isCommonNetwork(network string) bool {
@@ -590,7 +591,7 @@ func requirementKinds(name string) []string {
 	if strings.HasPrefix(name, "SMTP_") || strings.HasPrefix(name, "EMAIL_HOST") {
 		kinds = append(kinds, "email")
 	}
-	return uniqueStrings(kinds)
+	return planutil.UniqueStrings(kinds)
 }
 
 func serviceKind(service manifest.Service) string {
@@ -673,7 +674,7 @@ func serviceVolumes(service manifest.Service) []string {
 		}
 		volumes = append(volumes, source+" -> "+mount.Target)
 	}
-	return uniqueStrings(volumes)
+	return planutil.UniqueStrings(volumes)
 }
 
 func appNetworks(app manifest.App) []string {
@@ -685,7 +686,7 @@ func appNetworks(app manifest.App) []string {
 			}
 		}
 	}
-	return uniqueStrings(networks)
+	return planutil.UniqueStrings(networks)
 }
 
 func appRoutes(routes []manifest.Route) []manifest.Route {
@@ -741,26 +742,4 @@ func appProject(app manifest.App) string {
 		return ""
 	}
 	return strings.TrimSpace(app.Metadata["coolify.project"])
-}
-
-func fallback(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	return value
-}
-
-func uniqueStrings(values []string) []string {
-	seen := map[string]struct{}{}
-	for _, value := range values {
-		if value != "" {
-			seen[value] = struct{}{}
-		}
-	}
-	unique := make([]string, 0, len(seen))
-	for value := range seen {
-		unique = append(unique, value)
-	}
-	sort.Strings(unique)
-	return unique
 }

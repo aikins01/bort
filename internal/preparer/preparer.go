@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/aikins01/bort/internal/analyzer"
 	"github.com/aikins01/bort/internal/exporter"
+	"github.com/aikins01/bort/internal/planutil"
 )
 
 type Status string
@@ -174,7 +174,7 @@ func Plan(opts Options) (Result, error) {
 
 	result := Result{APIVersion: APIVersion, BundleDir: opts.BundleDir, Target: opts.Target, Status: StatusGreen}
 	for _, app := range index.Apps {
-		if opts.AppName != "" && app.Name != opts.AppName && app.Directory != opts.AppName && slug(app.Name) != slug(opts.AppName) {
+		if opts.AppName != "" && app.Name != opts.AppName && app.Directory != opts.AppName && planutil.Slug(app.Name) != planutil.Slug(opts.AppName) {
 			continue
 		}
 
@@ -183,7 +183,7 @@ func Plan(opts Options) (Result, error) {
 			return Result{}, err
 		}
 		result.Apps = append(result.Apps, appPlan)
-		result.Status = worseStatus(result.Status, appPlan.Status)
+		result.Status = WorseStatus(result.Status, appPlan.Status)
 	}
 
 	if len(result.Apps) == 0 {
@@ -212,8 +212,8 @@ func planApp(bundleDir, target string, app exporter.AppSummary) (AppPlan, error)
 	addDataStoreActions(&plan)
 	addLinkedResourceActions(&plan)
 	addVolumeActions(&plan)
-	plan.Readiness = readinessFromGates(plan.Gates)
-	plan.Status = statusFromReadiness(plan.Readiness)
+	plan.Readiness = ReadinessFromGates(plan.Gates)
+	plan.Status = StatusFromReadiness(plan.Readiness)
 	plan.TargetResources = targetResources(target, plan)
 	return plan, nil
 }
@@ -263,7 +263,7 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 		}
 		resources.ExternalRequirements = append(resources.ExternalRequirements, ExternalRequirementResource{
 			Kind:      requirement.Kind,
-			Evidence:  uniqueStrings(requirement.Evidence),
+			Evidence:  planutil.UniqueStrings(requirement.Evidence),
 			Linkable:  linkable,
 			Readiness: readiness,
 		})
@@ -294,7 +294,7 @@ func appResource(name, appDir string) AppResource {
 			resource.MissingInputs = append(resource.MissingInputs, placeholder)
 		}
 	}
-	resource.MissingInputs = uniqueStrings(resource.MissingInputs)
+	resource.MissingInputs = planutil.UniqueStrings(resource.MissingInputs)
 	if len(resource.MissingInputs) > 0 {
 		resource.Readiness = ReadinessBlocked
 	}
@@ -341,8 +341,8 @@ func envFileResource(path string) EnvFileResource {
 		}
 	}
 
-	resource.Keys = uniqueStrings(keys)
-	resource.MissingValues = uniqueStrings(missing)
+	resource.Keys = planutil.UniqueStrings(keys)
+	resource.MissingValues = planutil.UniqueStrings(missing)
 	return resource
 }
 
@@ -375,7 +375,7 @@ func dataStoreResource(store analyzer.DataStore) DataStoreResource {
 		Engine:      store.Engine,
 		Service:     store.Service,
 		Image:       store.Image,
-		Volumes:     uniqueStrings(store.Volumes),
+		Volumes:     planutil.UniqueStrings(store.Volumes),
 		Strategy:    store.Strategy,
 		Fallback:    store.Fallback,
 		Criticality: store.Criticality,
@@ -394,9 +394,9 @@ func linkedResourceCandidate(link analyzer.ResourceLink) LinkedResourceCandidate
 		AppID:                link.AppID,
 		Role:                 link.Role,
 		Runtime:              link.Runtime,
-		Confidence:           fallback(link.Confidence, "unknown"),
-		Reasons:              uniqueStrings(link.Reasons),
-		Networks:             uniqueStrings(link.Networks),
+		Confidence:           planutil.Fallback(link.Confidence, "unknown"),
+		Reasons:              planutil.UniqueStrings(link.Reasons),
+		Networks:             planutil.UniqueStrings(link.Networks),
 		DataStores:           stores,
 		Source:               "heuristic",
 		RequiresConfirmation: true,
@@ -419,7 +419,7 @@ func addReadinessGates(plan *AppPlan, topology analyzer.Topology) {
 	}
 	for _, code := range []string{"deploy.source_only", "deploy.resolved_only"} {
 		if risk, ok := topologyRisk(topology, code); ok {
-			plan.Resources.App.Readiness = worseReadiness(plan.Resources.App.Readiness, ReadinessNeedsDecision)
+			plan.Resources.App.Readiness = WorseReadiness(plan.Resources.App.Readiness, ReadinessNeedsDecision)
 			plan.addGate(ReadinessNeedsDecision, SeverityWarn, code, risk.Message, "app", nil)
 		}
 	}
@@ -435,7 +435,7 @@ func addReadinessGates(plan *AppPlan, topology analyzer.Topology) {
 	}
 
 	for _, domain := range plan.Resources.Domains {
-		resourceRef := "domain:" + fallback(domain.Host, "missing-host")
+		resourceRef := "domain:" + planutil.Fallback(domain.Host, "missing-host")
 		if strings.TrimSpace(domain.Host) == "" {
 			plan.addGate(ReadinessNeedsInput, SeverityWarn, "domain.host_missing", "domain route has no host and must be filled before deploy", resourceRef, nil)
 		} else if strings.TrimSpace(domain.ServiceName) == "" {
@@ -449,13 +449,13 @@ func addReadinessGates(plan *AppPlan, topology analyzer.Topology) {
 	}
 
 	for _, store := range plan.Resources.DataStores {
-		resourceRef := "data-store:" + fallback(store.Service, store.Kind)
+		resourceRef := "data-store:" + planutil.Fallback(store.Service, store.Kind)
 		if store.Readiness == ReadinessBlocked {
-			message := fmt.Sprintf("manual data-store review required for service %s before target preparation can be trusted", fallback(store.Service, "unknown"))
+			message := fmt.Sprintf("manual data-store review required for service %s before target preparation can be trusted", planutil.Fallback(store.Service, "unknown"))
 			plan.addGate(ReadinessBlocked, SeverityError, "data_store.manual_review", message, resourceRef, store.Volumes)
 			continue
 		}
-		message := fmt.Sprintf("confirm %s data-store preparation strategy %s for service %s", dataStoreLabel(store), fallback(store.Strategy, "manual_review"), fallback(store.Service, "unknown"))
+		message := fmt.Sprintf("confirm %s data-store preparation strategy %s for service %s", dataStoreLabel(store), planutil.Fallback(store.Strategy, "manual_review"), planutil.Fallback(store.Service, "unknown"))
 		plan.addGate(ReadinessNeedsDecision, SeverityWarn, "data_store.prepare_required", message, resourceRef, store.Volumes)
 	}
 
@@ -489,8 +489,8 @@ func addLinkedResourceGates(plan *AppPlan) {
 			message := fmt.Sprintf("select or create a support resource for external %s requirement", requirement.Kind)
 			plan.addGate(ReadinessNeedsDecision, SeverityWarn, "linked_resource.missing_candidate", message, resourceRef, requirement.Evidence)
 		case len(links) == 1:
-			message := fmt.Sprintf("confirm heuristic %s support resource candidate %s with %s confidence", requirement.Kind, fallback(links[0].App, "unknown"), fallback(links[0].Confidence, "unknown"))
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, "linked_resource.confirm_candidate", message, "linked-resource:"+fallback(links[0].App, "unknown"), links[0].Reasons)
+			message := fmt.Sprintf("confirm heuristic %s support resource candidate %s with %s confidence", requirement.Kind, planutil.Fallback(links[0].App, "unknown"), planutil.Fallback(links[0].Confidence, "unknown"))
+			plan.addGate(ReadinessNeedsDecision, SeverityWarn, "linked_resource.confirm_candidate", message, "linked-resource:"+planutil.Fallback(links[0].App, "unknown"), links[0].Reasons)
 		default:
 			message := fmt.Sprintf("select one heuristic %s support resource candidate: %s", requirement.Kind, strings.Join(linkedResourceCandidateLabels(links), ", "))
 			plan.addGate(ReadinessNeedsDecision, SeverityWarn, "linked_resource.select_candidate", message, resourceRef, requirement.Evidence)
@@ -529,7 +529,7 @@ func addRouteActions(plan *AppPlan, target string) {
 	}
 
 	for _, domain := range plan.Resources.Domains {
-		message := fmt.Sprintf("would create %s domain %s", target, fallback(domain.Host, "<missing host>"))
+		message := fmt.Sprintf("would create %s domain %s", target, planutil.Fallback(domain.Host, "<missing host>"))
 		if domain.ServiceName != "" {
 			message += " for service " + domain.ServiceName
 		}
@@ -543,7 +543,7 @@ func addRouteActions(plan *AppPlan, target string) {
 func addDataStoreActions(plan *AppPlan) {
 	for _, store := range plan.Resources.DataStores {
 		severity := SeverityWarn
-		message := fmt.Sprintf("needs %s data store preparation for service %s with %s", dataStoreLabel(store), fallback(store.Service, "unknown"), fallback(store.Strategy, "manual_review"))
+		message := fmt.Sprintf("needs %s data store preparation for service %s with %s", dataStoreLabel(store), planutil.Fallback(store.Service, "unknown"), planutil.Fallback(store.Strategy, "manual_review"))
 		if store.Fallback != "" {
 			message += "; fallback " + store.Fallback
 		}
@@ -576,7 +576,7 @@ func addLinkedResourceActions(plan *AppPlan) {
 			if links[0].Confidence != "likely" {
 				severity = SeverityWarn
 			}
-			plan.add(severity, "linked-resource", fmt.Sprintf("needs confirmation of %s support resource %s with %s confidence", requirement.Kind, fallback(links[0].App, "unknown"), fallback(links[0].Confidence, "unknown")))
+			plan.add(severity, "linked-resource", fmt.Sprintf("needs confirmation of %s support resource %s with %s confidence", requirement.Kind, planutil.Fallback(links[0].App, "unknown"), planutil.Fallback(links[0].Confidence, "unknown")))
 		default:
 			plan.add(SeverityWarn, "linked-resource", fmt.Sprintf("needs one %s support resource candidate selected: %s", requirement.Kind, strings.Join(linkedResourceCandidateLabels(links), ", ")))
 		}
@@ -657,11 +657,11 @@ func linkedResourceCandidateLabels(links []LinkedResourceCandidate) []string {
 	for _, link := range links {
 		labels = append(labels, supportResourceLabel(link.App, link.Confidence))
 	}
-	return uniqueStrings(labels)
+	return planutil.UniqueStrings(labels)
 }
 
 func supportResourceLabel(app, confidence string) string {
-	label := fallback(app, "unknown")
+	label := planutil.Fallback(app, "unknown")
 	if confidence != "" {
 		label += " (" + confidence + ")"
 	}
@@ -673,7 +673,7 @@ func volumeResourceLabel(volume VolumeResource) string {
 }
 
 func volumeTargetLabel(service, target string) string {
-	label := fallback(service, "app")
+	label := planutil.Fallback(service, "app")
 	if target != "" {
 		label += " -> " + target
 	}
@@ -708,39 +708,39 @@ func (p *AppPlan) addGate(readiness Readiness, severity Severity, code, message,
 		Code:        code,
 		Message:     message,
 		ResourceRef: resourceRef,
-		Evidence:    uniqueStrings(evidence),
+		Evidence:    planutil.UniqueStrings(evidence),
 	})
 }
 
-func readinessFromGates(gates []Gate) Readiness {
+func ReadinessFromGates(gates []Gate) Readiness {
 	readiness := ReadinessReadyToCreate
 	for _, gate := range gates {
-		readiness = worseReadiness(readiness, gate.Readiness)
+		readiness = WorseReadiness(readiness, gate.Readiness)
 	}
 	return readiness
 }
 
-func worseReadiness(a, b Readiness) Readiness {
-	if readinessRank(b) > readinessRank(a) {
+func WorseReadiness(a, b Readiness) Readiness {
+	if ReadinessRank(b) > ReadinessRank(a) {
 		return b
 	}
 	return a
 }
 
-func readinessRank(readiness Readiness) int {
+func ReadinessRank(readiness Readiness) int {
 	switch readiness {
 	case ReadinessBlocked:
 		return 3
-	case ReadinessNeedsDecision:
-		return 2
 	case ReadinessNeedsInput:
+		return 2
+	case ReadinessNeedsDecision:
 		return 1
 	default:
 		return 0
 	}
 }
 
-func statusFromReadiness(readiness Readiness) Status {
+func StatusFromReadiness(readiness Readiness) Status {
 	switch readiness {
 	case ReadinessBlocked:
 		return StatusRed
@@ -751,7 +751,18 @@ func statusFromReadiness(readiness Readiness) Status {
 	}
 }
 
-func worseStatus(a, b Status) Status {
+func SeverityFromReadiness(readiness Readiness) Severity {
+	switch readiness {
+	case ReadinessBlocked:
+		return SeverityError
+	case ReadinessNeedsInput, ReadinessNeedsDecision:
+		return SeverityWarn
+	default:
+		return SeverityInfo
+	}
+}
+
+func WorseStatus(a, b Status) Status {
 	if a == StatusRed || b == StatusRed {
 		return StatusRed
 	}
@@ -759,36 +770,4 @@ func worseStatus(a, b Status) Status {
 		return StatusYellow
 	}
 	return StatusGreen
-}
-
-func uniqueStrings(values []string) []string {
-	seen := map[string]struct{}{}
-	for _, value := range values {
-		if value != "" {
-			seen[value] = struct{}{}
-		}
-	}
-	unique := make([]string, 0, len(seen))
-	for value := range seen {
-		unique = append(unique, value)
-	}
-	sort.Strings(unique)
-	return unique
-}
-
-var slugPattern = regexp.MustCompile(`[^a-z0-9._-]+`)
-
-func slug(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	value = strings.ReplaceAll(value, " ", "-")
-	value = slugPattern.ReplaceAllString(value, "-")
-	value = strings.Trim(value, "-._")
-	return value
-}
-
-func fallback(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	return value
 }

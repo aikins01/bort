@@ -1,5 +1,7 @@
 package preparer
 
+import "github.com/aikins01/bort/internal/planutil"
+
 type TargetResources struct {
 	Platform string            `json:"platform"`
 	DryRun   bool              `json:"dryRun"`
@@ -165,10 +167,10 @@ func dokployResources(plan AppPlan) *DokployResources {
 }
 
 func targetSafeName(name, fallbackName string) string {
-	if value := slug(name); value != "" {
+	if value := planutil.Slug(name); value != "" {
 		return value
 	}
-	if value := slug(fallbackName); value != "" {
+	if value := planutil.Slug(fallbackName); value != "" {
 		return value
 	}
 	return "app"

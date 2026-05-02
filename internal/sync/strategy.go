@@ -2,10 +2,9 @@ package sync
 
 import (
 	"fmt"
-	"regexp"
-	"sort"
 	"strings"
 
+	"github.com/aikins01/bort/internal/planutil"
 	"github.com/aikins01/bort/internal/preparer"
 )
 
@@ -102,7 +101,10 @@ func Plan(opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	return PlanFromPrepare(preparePlan), nil
+}
 
+func PlanFromPrepare(preparePlan preparer.Result) Result {
 	result := Result{
 		APIVersion: APIVersion,
 		BundleDir:  preparePlan.BundleDir,
@@ -113,9 +115,9 @@ func Plan(opts Options) (Result, error) {
 	for _, app := range preparePlan.Apps {
 		appPlan := planApp(app)
 		result.Apps = append(result.Apps, appPlan)
-		result.Status = worseStatus(result.Status, appPlan.Status)
+		result.Status = preparer.WorseStatus(result.Status, appPlan.Status)
 	}
-	return result, nil
+	return result
 }
 
 func planApp(app preparer.AppPlan) AppPlan {
@@ -155,9 +157,9 @@ func planApp(app preparer.AppPlan) AppPlan {
 	}
 
 	for _, step := range plan.Steps {
-		plan.Readiness = worseReadiness(plan.Readiness, step.Readiness)
+		plan.Readiness = preparer.WorseReadiness(plan.Readiness, step.Readiness)
 	}
-	plan.Status = statusFromReadiness(plan.Readiness)
+	plan.Status = preparer.StatusFromReadiness(plan.Readiness)
 	return plan
 }
 
@@ -174,7 +176,7 @@ func composeAppStep(app preparer.AppPlan, usedIDs map[string]int) (Step, bool) {
 	}
 
 	return Step{
-		ID:           nextStepID(usedIDs, "target:compose-app"),
+		ID:           planutil.NextStepID(usedIDs, "target:compose-app"),
 		Phase:        PhaseTargetPrepare,
 		ResourceType: "compose_app",
 		ResourceRef:  "app",
@@ -191,9 +193,9 @@ func linkedResourceSteps(app preparer.AppPlan, usedIDs map[string]int) []Step {
 	targetActions := linkedTargetActions(app)
 	steps := make([]Step, 0, len(app.Resources.LinkedResources))
 	for _, link := range app.Resources.LinkedResources {
-		resourceRef := "linked-resource:" + fallback(link.App, link.Kind)
+		resourceRef := "linked-resource:" + planutil.Fallback(link.App, link.Kind)
 		steps = append(steps, Step{
-			ID:           nextStepID(usedIDs, "dependency:"+link.Kind+":"+link.App),
+			ID:           planutil.NextStepID(usedIDs, "dependency:"+link.Kind+":"+link.App),
 			Phase:        PhaseDependencyDecision,
 			ResourceType: "linked_resource",
 			ResourceRef:  resourceRef,
@@ -203,7 +205,7 @@ func linkedResourceSteps(app preparer.AppPlan, usedIDs map[string]int) []Step {
 			Strategy:     StrategyNone,
 			Pause:        PauseNeedsDecision,
 			Readiness:    link.Readiness,
-			Evidence:     uniqueStrings(append(append([]string{}, link.Reasons...), link.Networks...)),
+			Evidence:     planutil.UniqueStrings(append(append([]string{}, link.Reasons...), link.Networks...)),
 		})
 	}
 	return steps
@@ -213,9 +215,9 @@ func dataStoreSteps(app preparer.AppPlan, usedIDs map[string]int, composeStepID 
 	targetActions := dataStoreTargetActions(app)
 	steps := make([]Step, 0, len(app.Resources.DataStores))
 	for _, store := range app.Resources.DataStores {
-		resourceRef := "data-store:" + fallback(store.Service, store.Kind)
+		resourceRef := "data-store:" + planutil.Fallback(store.Service, store.Kind)
 		steps = append(steps, Step{
-			ID:           nextStepID(usedIDs, "state:data-store:"+store.Service+":"+store.Kind),
+			ID:           planutil.NextStepID(usedIDs, "state:data-store:"+store.Service+":"+store.Kind),
 			Phase:        PhaseStateSync,
 			ResourceType: "data_store",
 			ResourceRef:  resourceRef,
@@ -225,7 +227,7 @@ func dataStoreSteps(app preparer.AppPlan, usedIDs map[string]int, composeStepID 
 			Strategy:     dataStoreStrategy(store),
 			Pause:        dataStorePause(store),
 			Readiness:    store.Readiness,
-			DependsOn:    optionalDependency(composeStepID),
+			DependsOn:    planutil.OptionalDependency(composeStepID),
 			Evidence:     store.Volumes,
 		})
 	}
@@ -238,7 +240,7 @@ func volumeSteps(app preparer.AppPlan, usedIDs map[string]int, composeStepID str
 	for _, volume := range app.Resources.Volumes {
 		resourceRef := "volume:" + volumeResourceLabel(volume)
 		steps = append(steps, Step{
-			ID:           nextStepID(usedIDs, "state:volume:"+volume.Service+":"+volume.Target),
+			ID:           planutil.NextStepID(usedIDs, "state:volume:"+volume.Service+":"+volume.Target),
 			Phase:        PhaseStateSync,
 			ResourceType: "volume",
 			ResourceRef:  resourceRef,
@@ -248,8 +250,8 @@ func volumeSteps(app preparer.AppPlan, usedIDs map[string]int, composeStepID str
 			Strategy:     volumeStrategy(volume),
 			Pause:        volumePause(volume),
 			Readiness:    volume.Readiness,
-			DependsOn:    optionalDependency(composeStepID),
-			Evidence:     uniqueStrings([]string{fallback(volume.Name, volume.Source), volume.Target}),
+			DependsOn:    planutil.OptionalDependency(composeStepID),
+			Evidence:     planutil.UniqueStrings([]string{planutil.Fallback(volume.Name, volume.Source), volume.Target}),
 		})
 	}
 	return steps
@@ -257,7 +259,7 @@ func volumeSteps(app preparer.AppPlan, usedIDs map[string]int, composeStepID str
 
 func verifyStep(usedIDs map[string]int, dependencies []string) Step {
 	return Step{
-		ID:           nextStepID(usedIDs, "verify:state"),
+		ID:           planutil.NextStepID(usedIDs, "verify:state"),
 		Phase:        PhaseVerify,
 		ResourceType: "app",
 		ResourceRef:  "app",
@@ -265,15 +267,15 @@ func verifyStep(usedIDs map[string]int, dependencies []string) Step {
 		Strategy:     StrategyNone,
 		Pause:        PauseNone,
 		Readiness:    preparer.ReadinessNeedsDecision,
-		DependsOn:    uniqueStrings(dependencies),
+		DependsOn:    planutil.UniqueStrings(dependencies),
 	}
 }
 
 func (p *AppPlan) addStep(step Step) {
-	step.DependsOn = uniqueStrings(step.DependsOn)
-	step.Evidence = uniqueStrings(step.Evidence)
+	step.DependsOn = planutil.UniqueStrings(step.DependsOn)
+	step.Evidence = planutil.UniqueStrings(step.Evidence)
 	p.Steps = append(p.Steps, step)
-	p.add(severityFromReadiness(step.Readiness), actionKind(step), actionMessage(step))
+	p.add(preparer.SeverityFromReadiness(step.Readiness), actionKind(step), actionMessage(step))
 }
 
 func (p *AppPlan) add(severity preparer.Severity, kind, message string) {
@@ -296,7 +298,7 @@ func actionKind(step Step) string {
 func actionMessage(step Step) string {
 	switch step.ResourceType {
 	case "compose_app":
-		return fmt.Sprintf("requires prepared target compose app %s before state sync", fallback(step.TargetRef, step.ResourceRef))
+		return fmt.Sprintf("requires prepared target compose app %s before state sync", planutil.Fallback(step.TargetRef, step.ResourceRef))
 	case "linked_resource":
 		return fmt.Sprintf("confirm support resource candidate %s before syncing dependent state", step.ResourceRef)
 	case "data_store":
@@ -410,16 +412,16 @@ func volumeTargetActions(app preparer.AppPlan) map[volumeMapKey]string {
 
 func linkedTargetRef(app preparer.AppPlan, link preparer.LinkedResourceCandidate) string {
 	if dokployTarget(app) != nil {
-		return "dokploy.linked_resource:" + fallback(link.App, link.Kind)
+		return "dokploy.linked_resource:" + planutil.Fallback(link.App, link.Kind)
 	}
-	return fallback(link.App, link.Kind)
+	return planutil.Fallback(link.App, link.Kind)
 }
 
 func dataStoreTargetRef(app preparer.AppPlan, store preparer.DataStoreResource) string {
 	if dokployTarget(app) != nil {
-		return "dokploy.data_store:" + fallback(store.Service, store.Kind)
+		return "dokploy.data_store:" + planutil.Fallback(store.Service, store.Kind)
 	}
-	return fallback(store.Service, store.Kind)
+	return planutil.Fallback(store.Service, store.Kind)
 }
 
 func volumeTargetRef(app preparer.AppPlan, volume preparer.VolumeResource) string {
@@ -468,108 +470,10 @@ func newVolumeKey(volumeType, service, name, source, target string) volumeMapKey
 	return volumeMapKey{volumeType: volumeType, service: service, name: name, source: source, target: target}
 }
 
-func optionalDependency(id string) []string {
-	if id == "" {
-		return nil
-	}
-	return []string{id}
-}
-
-func severityFromReadiness(readiness preparer.Readiness) preparer.Severity {
-	switch readiness {
-	case preparer.ReadinessBlocked:
-		return preparer.SeverityError
-	case preparer.ReadinessNeedsDecision, preparer.ReadinessNeedsInput:
-		return preparer.SeverityWarn
-	default:
-		return preparer.SeverityInfo
-	}
-}
-
-func worseReadiness(a, b preparer.Readiness) preparer.Readiness {
-	if readinessRank(b) > readinessRank(a) {
-		return b
-	}
-	return a
-}
-
-func readinessRank(readiness preparer.Readiness) int {
-	switch readiness {
-	case preparer.ReadinessBlocked:
-		return 3
-	case preparer.ReadinessNeedsDecision:
-		return 2
-	case preparer.ReadinessNeedsInput:
-		return 1
-	default:
-		return 0
-	}
-}
-
-func statusFromReadiness(readiness preparer.Readiness) preparer.Status {
-	switch readiness {
-	case preparer.ReadinessBlocked:
-		return preparer.StatusRed
-	case preparer.ReadinessNeedsInput, preparer.ReadinessNeedsDecision:
-		return preparer.StatusYellow
-	default:
-		return preparer.StatusGreen
-	}
-}
-
-func worseStatus(a, b preparer.Status) preparer.Status {
-	if a == preparer.StatusRed || b == preparer.StatusRed {
-		return preparer.StatusRed
-	}
-	if a == preparer.StatusYellow || b == preparer.StatusYellow {
-		return preparer.StatusYellow
-	}
-	return preparer.StatusGreen
-}
-
 func volumeResourceLabel(volume preparer.VolumeResource) string {
-	label := fallback(volume.Service, "app")
+	label := planutil.Fallback(volume.Service, "app")
 	if volume.Target != "" {
 		label += " -> " + volume.Target
 	}
 	return label
-}
-
-func uniqueStrings(values []string) []string {
-	seen := map[string]struct{}{}
-	for _, value := range values {
-		if value != "" {
-			seen[value] = struct{}{}
-		}
-	}
-	unique := make([]string, 0, len(seen))
-	for value := range seen {
-		unique = append(unique, value)
-	}
-	sort.Strings(unique)
-	return unique
-}
-
-var slugPattern = regexp.MustCompile(`[^a-z0-9._:-]+`)
-
-func nextStepID(used map[string]int, value string) string {
-	base := strings.ToLower(strings.TrimSpace(value))
-	base = strings.ReplaceAll(base, " ", "-")
-	base = slugPattern.ReplaceAllString(base, "-")
-	base = strings.Trim(base, "-._:")
-	if base == "" {
-		base = "step"
-	}
-	used[base]++
-	if used[base] == 1 {
-		return base
-	}
-	return fmt.Sprintf("%s-%d", base, used[base])
-}
-
-func fallback(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	return value
 }

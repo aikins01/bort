@@ -32,6 +32,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runPrepare(ctx, args[1:], stdout, stderr)
 	case "sync":
 		return runSync(ctx, args[1:], stdout, stderr)
+	case "cutover":
+		return runCutover(ctx, args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], strings.TrimSpace(usage()))
 	}
@@ -52,6 +54,7 @@ Usage:
   bort validate [flags]
   bort prepare [flags]
   bort sync [flags]
+  bort cutover [flags]
   bort version
 
 Commands:
@@ -61,6 +64,7 @@ Commands:
   validate  validate an exported migration bundle
   prepare   plan target resources from an exported bundle without mutating them
   sync      plan state sync work from prepared target resources without mutating them
+  cutover   plan route cutover and rollback without mutating them
   version   print the CLI version
 
 Run "bort <command> -h" for command-specific flags.

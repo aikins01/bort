@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/aikins01/bort/internal/analyzer"
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/planutil"
 )
 
 func runPlan(_ context.Context, args []string, stdout, stderr io.Writer) error {
@@ -78,7 +78,7 @@ func writePlanWithOptions(w io.Writer, m manifest.Manifest, opts planOptions) er
 	}
 
 	fmt.Fprintf(w, "Migration plan: %s -> %s\n", m.Source.Platform, opts.Target)
-	fmt.Fprintf(w, "Host: %s\n", fallback(m.Source.Hostname, "unknown"))
+	fmt.Fprintf(w, "Host: %s\n", planutil.Fallback(m.Source.Hostname, "unknown"))
 	fmt.Fprintf(w, "Apps: %d, routes: %d, volumes: %d, networks: %d\n", len(apps), routeCount, volumeCount, networkCount)
 	if opts.AppName != "" || opts.Role != "" {
 		fmt.Fprintf(w, "Filters: %s\n", describePlanFilters(opts))
@@ -89,7 +89,7 @@ func writePlanWithOptions(w io.Writer, m manifest.Manifest, opts planOptions) er
 		analysis := analyzer.AnalyzeAppInManifest(m, app)
 		status := classifyApp(analysis)
 		fmt.Fprintf(w, "[%s] %s\n", status, app.Name)
-		fmt.Fprintf(w, "  platform: %s\n", fallback(app.Platform, "docker"))
+		fmt.Fprintf(w, "  platform: %s\n", planutil.Fallback(app.Platform, "docker"))
 		if app.Runtime != "" {
 			fmt.Fprintf(w, "  runtime: %s\n", app.Runtime)
 		}
@@ -328,7 +328,7 @@ func filteredPlanApps(apps []manifest.App, opts planOptions) []manifest.App {
 }
 
 func matchesPlanApp(app manifest.App, name string) bool {
-	return app.Name == name || app.ID == name || slug(app.Name) == slug(name) || app.Metadata["coolify.uuid"] == name
+	return app.Name == name || app.ID == name || planutil.Slug(app.Name) == planutil.Slug(name) || app.Metadata["coolify.uuid"] == name
 }
 
 func planFilterError(opts planOptions) error {
@@ -350,21 +350,4 @@ func describePlanFilters(opts planOptions) string {
 		filters = append(filters, "role="+opts.Role)
 	}
 	return strings.Join(filters, ", ")
-}
-
-var slugPattern = regexp.MustCompile(`[^a-z0-9._-]+`)
-
-func slug(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	value = strings.ReplaceAll(value, " ", "-")
-	value = slugPattern.ReplaceAllString(value, "-")
-	value = strings.Trim(value, "-._")
-	return value
-}
-
-func fallback(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
 }

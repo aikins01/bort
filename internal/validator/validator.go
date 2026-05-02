@@ -16,6 +16,7 @@ import (
 	"github.com/aikins01/bort/internal/analyzer"
 	"github.com/aikins01/bort/internal/exporter"
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/planutil"
 	"github.com/aikins01/bort/internal/secrets"
 	"gopkg.in/yaml.v3"
 )
@@ -76,7 +77,7 @@ func Validate(ctx context.Context, opts Options) (Result, error) {
 
 	result := Result{BundleDir: opts.BundleDir, Status: StatusGreen}
 	for _, app := range index.Apps {
-		if opts.AppName != "" && app.Name != opts.AppName && app.Directory != opts.AppName && slug(app.Name) != slug(opts.AppName) {
+		if opts.AppName != "" && app.Name != opts.AppName && app.Directory != opts.AppName && planutil.Slug(app.Name) != planutil.Slug(opts.AppName) {
 			continue
 		}
 
@@ -180,7 +181,7 @@ func validateComposeText(result *AppResult, compose string, envKeys map[string]s
 			missingEnv = append(missingEnv, match[1])
 		}
 	}
-	missingEnv = uniqueStrings(missingEnv)
+	missingEnv = planutil.UniqueStrings(missingEnv)
 	if len(missingEnv) > 0 {
 		result.add(SeverityWarn, "env.missing_referenced_values", fmt.Sprintf("compose references env vars absent from exported env example files: %s", strings.Join(missingEnv, ", ")))
 	}
@@ -315,8 +316,8 @@ func analyzeCompose(compose string) (composeAnalysis, error) {
 		}
 	}
 
-	analysis.AbsoluteBindSources = uniqueStrings(absoluteBindSources)
-	analysis.UndeclaredNamedVolumes = uniqueStrings(undeclaredNamedVolumes)
+	analysis.AbsoluteBindSources = planutil.UniqueStrings(absoluteBindSources)
+	analysis.UndeclaredNamedVolumes = planutil.UniqueStrings(undeclaredNamedVolumes)
 	return analysis, nil
 }
 
@@ -438,7 +439,7 @@ func validateTopologyLinkedResources(result *AppResult, topology analyzer.Topolo
 		case len(links) > 1:
 			result.add(SeverityWarn, "topology.linked_resource_ambiguous", fmt.Sprintf("external %s requirement has multiple possible support resource candidates: %s", requirement.Kind, strings.Join(resourceLinkLabels(links), ", ")))
 		case strings.ToLower(strings.TrimSpace(links[0].Confidence)) != "likely":
-			result.add(SeverityWarn, "topology.linked_resource_ambiguous", fmt.Sprintf("external %s requirement is linked to %s with %s confidence", requirement.Kind, fallback(links[0].App, "unknown resource"), fallback(links[0].Confidence, "unknown")))
+			result.add(SeverityWarn, "topology.linked_resource_ambiguous", fmt.Sprintf("external %s requirement is linked to %s with %s confidence", requirement.Kind, planutil.Fallback(links[0].App, "unknown resource"), planutil.Fallback(links[0].Confidence, "unknown")))
 		}
 	}
 }
@@ -447,10 +448,10 @@ func validateTopologyDataStores(result *AppResult, stores []analyzer.DataStore) 
 	manualReview := []string{}
 	for _, store := range stores {
 		if store.Kind == "unknown" || store.Strategy == "manual_review" {
-			manualReview = append(manualReview, fallback(store.Service, store.Label()))
+			manualReview = append(manualReview, planutil.Fallback(store.Service, store.Label()))
 		}
 	}
-	manualReview = uniqueStrings(manualReview)
+	manualReview = planutil.UniqueStrings(manualReview)
 	if len(manualReview) > 0 {
 		result.add(SeverityWarn, "topology.data_store_manual_review", fmt.Sprintf("manual data-store review required for: %s", strings.Join(manualReview, ", ")))
 	}
@@ -463,7 +464,7 @@ func validateTopologyStatefulVolumes(result *AppResult, volumes []analyzer.State
 			bindMounts = append(bindMounts, statefulVolumeLabel(volume))
 		}
 	}
-	bindMounts = uniqueStrings(bindMounts)
+	bindMounts = planutil.UniqueStrings(bindMounts)
 	if len(bindMounts) > 0 {
 		result.add(SeverityWarn, "topology.bind_mounts", fmt.Sprintf("bind mount state is host-specific and needs portability review: %s", strings.Join(bindMounts, ", ")))
 	}
@@ -514,17 +515,17 @@ func describeRequirements(requirements []analyzer.Requirement) string {
 func resourceLinkLabels(links []analyzer.ResourceLink) []string {
 	labels := make([]string, 0, len(links))
 	for _, link := range links {
-		label := fallback(link.App, "unknown resource")
+		label := planutil.Fallback(link.App, "unknown resource")
 		if link.Confidence != "" {
 			label += " (" + link.Confidence + ")"
 		}
 		labels = append(labels, label)
 	}
-	return uniqueStrings(labels)
+	return planutil.UniqueStrings(labels)
 }
 
 func statefulVolumeLabel(volume analyzer.StatefulVolume) string {
-	label := fallback(volume.Service, "app")
+	label := planutil.Fallback(volume.Service, "app")
 	if volume.Target != "" {
 		label += " -> " + volume.Target
 	}
@@ -543,7 +544,7 @@ func missingRouteLabels(want, got []manifest.Route) []string {
 			missing = append(missing, routeLabel(route))
 		}
 	}
-	return uniqueStrings(missing)
+	return planutil.UniqueStrings(missing)
 }
 
 func routeKey(route manifest.Route) string {
@@ -551,7 +552,7 @@ func routeKey(route manifest.Route) string {
 }
 
 func routeLabel(route manifest.Route) string {
-	label := fallback(route.Host, "missing host")
+	label := planutil.Fallback(route.Host, "missing host")
 	if route.ServiceName != "" {
 		label += " -> " + route.ServiceName
 	}
@@ -619,10 +620,10 @@ func validateStorages(result *AppResult, path string) {
 	}
 	for _, storage := range storages {
 		if storage.Target == "" {
-			result.add(SeverityError, "storage.missing_target", fmt.Sprintf("storage %s has no target", fallback(storage.Name, storage.Source)))
+			result.add(SeverityError, "storage.missing_target", fmt.Sprintf("storage %s has no target", planutil.Fallback(storage.Name, storage.Source)))
 		}
 		if storage.Type == "bind" && strings.HasPrefix(storage.Source, "/") {
-			result.add(SeverityWarn, "storage.absolute_bind_mount", fmt.Sprintf("storage %s uses absolute host path %s", fallback(storage.Name, storage.Target), storage.Source))
+			result.add(SeverityWarn, "storage.absolute_bind_mount", fmt.Sprintf("storage %s uses absolute host path %s", planutil.Fallback(storage.Name, storage.Target), storage.Source))
 		}
 	}
 }
@@ -715,38 +716,5 @@ func uniqueMatches(matches [][]string, index int) []string {
 			values = append(values, match[index])
 		}
 	}
-	return uniqueStrings(values)
-}
-
-func uniqueStrings(values []string) []string {
-	seen := map[string]struct{}{}
-	for _, value := range values {
-		if value != "" {
-			seen[value] = struct{}{}
-		}
-	}
-
-	unique := make([]string, 0, len(seen))
-	for value := range seen {
-		unique = append(unique, value)
-	}
-	sort.Strings(unique)
-	return unique
-}
-
-var slugPattern = regexp.MustCompile(`[^a-z0-9._-]+`)
-
-func slug(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	value = strings.ReplaceAll(value, " ", "-")
-	value = slugPattern.ReplaceAllString(value, "-")
-	value = strings.Trim(value, "-._")
-	return value
-}
-
-func fallback(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
+	return planutil.UniqueStrings(values)
 }
