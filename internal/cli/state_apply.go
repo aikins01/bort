@@ -267,7 +267,7 @@ func applyStateOverridesToPrepare(state bortState, prepare *preparer.Result) {
 		if len(entry.Env) > 0 && envResourcesComplete(app.Resources.EnvFiles) {
 			before := len(app.Gates)
 			app.Gates = filterGates(app.Gates, func(g preparer.Gate) bool {
-				return g.Code != "env.values_redacted"
+				return g.Code != preparer.GateEnvValuesRedacted
 			})
 			if len(app.Gates) != before {
 				appChanged = true
@@ -304,7 +304,7 @@ func applyStateOverridesToPrepare(state bortState, prepare *preparer.Result) {
 		}
 		app.Gates = filterGates(app.Gates, func(g preparer.Gate) bool {
 			switch g.Code {
-			case "data_store.prepare_required", "data_store.confirm_strategy", "data_store.manual_review":
+			case preparer.GateDataStorePrepareRequired, preparer.GateDataStoreManualReview:
 				_, hit := resolved[g.ResourceRef]
 				return !hit
 			default:

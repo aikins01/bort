@@ -41,6 +41,36 @@ const (
 	SeverityError Severity = "error"
 )
 
+// Gate code identifiers emitted by the planner. Consumers (CLI views,
+// state merging) should reference these constants instead of literal
+// strings so renames stay compile-checked.
+const (
+	GateAppComposeMissing      = "app.compose_missing"
+	GateAppComposeIncomplete   = "app.compose_incomplete"
+	GateDeployMissingArtifact  = "deploy.missing_artifact"
+	GateEnvValuesRequired      = "env.values_required"
+	GateEnvValuesRedacted      = "env.values_redacted"
+	GateDomainHostMissing      = "domain.host_missing"
+	GateDomainServiceMissing   = "domain.service_missing"
+	GateRoutesNone             = "routes.none"
+	GateDataStoreManualReview  = "data_store.manual_review"
+	GateDataStorePrepareRequired = "data_store.prepare_required"
+	GateVolumeBindMountReview  = "volume.bind_mount_review"
+	GateExternalRequirementResolve     = "external_requirement.resolve"
+	GateLinkedResourceMissingCandidate = "linked_resource.missing_candidate"
+	GateLinkedResourceConfirmCandidate = "linked_resource.confirm_candidate"
+	GateLinkedResourceSelectCandidate  = "linked_resource.select_candidate"
+)
+
+// Code prefixes used by consumers to bucket gates by category.
+const (
+	GateCodePrefixEnv                 = "env."
+	GateCodePrefixDataStore           = "data_store."
+	GateCodePrefixDomain              = "domain."
+	GateCodePrefixLinkedResource      = "linked_resource."
+	GateCodePrefixExternalRequirement = "external_requirement."
+)
+
 type Options struct {
 	BundleDir string
 	AppName   string
@@ -407,16 +437,16 @@ func linkedResourceCandidate(link analyzer.ResourceLink) LinkedResourceCandidate
 
 func addReadinessGates(plan *AppPlan, topology analyzer.Topology) {
 	if plan.Resources.App.ComposeMissing {
-		plan.addGate(ReadinessBlocked, SeverityError, "app.compose_missing", "compose.yaml is missing; target app shell cannot be prepared", "app", nil)
+		plan.addGate(ReadinessBlocked, SeverityError, GateAppComposeMissing, "compose.yaml is missing; target app shell cannot be prepared", "app", nil)
 	}
 	if len(plan.Resources.App.MissingInputs) > 0 {
 		missing := plan.Resources.App.MissingInputs
 		message := fmt.Sprintf("compose.yaml contains placeholders that must be replaced before target preparation: %s", strings.Join(missing, ", "))
-		plan.addGate(ReadinessBlocked, SeverityError, "app.compose_incomplete", message, "app", missing)
+		plan.addGate(ReadinessBlocked, SeverityError, GateAppComposeIncomplete, message, "app", missing)
 	}
-	if risk, ok := topologyRisk(topology, "deploy.missing_artifact"); ok {
+	if risk, ok := topologyRisk(topology, GateDeployMissingArtifact); ok {
 		plan.Resources.App.Readiness = ReadinessBlocked
-		plan.addGate(ReadinessBlocked, SeverityError, "deploy.missing_artifact", risk.Message, "app", nil)
+		plan.addGate(ReadinessBlocked, SeverityError, GateDeployMissingArtifact, risk.Message, "app", nil)
 	}
 	for _, code := range []string{"deploy.source_only", "deploy.resolved_only"} {
 		if risk, ok := topologyRisk(topology, code); ok {
@@ -428,24 +458,24 @@ func addReadinessGates(plan *AppPlan, topology analyzer.Topology) {
 	for _, envFile := range plan.Resources.EnvFiles {
 		if len(envFile.MissingValues) > 0 {
 			message := fmt.Sprintf("fill %d value(s) in %s before deploy", len(envFile.MissingValues), envFile.Path)
-			plan.addGate(ReadinessNeedsInput, SeverityWarn, "env.values_required", message, "env:"+envFile.Path, envFile.MissingValues)
+			plan.addGate(ReadinessNeedsInput, SeverityWarn, GateEnvValuesRequired, message, "env:"+envFile.Path, envFile.MissingValues)
 		}
 	}
-	if risk, ok := topologyRisk(topology, "env.values_redacted"); ok {
-		plan.addGate(ReadinessNeedsInput, SeverityWarn, "env.values_redacted", risk.Message, "env", nil)
+	if risk, ok := topologyRisk(topology, GateEnvValuesRedacted); ok {
+		plan.addGate(ReadinessNeedsInput, SeverityWarn, GateEnvValuesRedacted, risk.Message, "env", nil)
 	}
 
 	for _, domain := range plan.Resources.Domains {
 		resourceRef := "domain:" + planutil.Fallback(domain.Host, "missing-host")
 		if strings.TrimSpace(domain.Host) == "" {
-			plan.addGate(ReadinessNeedsInput, SeverityWarn, "domain.host_missing", "domain route has no host and must be filled before deploy", resourceRef, nil)
+			plan.addGate(ReadinessNeedsInput, SeverityWarn, GateDomainHostMissing, "domain route has no host and must be filled before deploy", resourceRef, nil)
 		} else if strings.TrimSpace(domain.ServiceName) == "" {
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, "domain.service_missing", fmt.Sprintf("domain %s has no service mapping; confirm target service manually", domain.Host), resourceRef, nil)
+			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateDomainServiceMissing, fmt.Sprintf("domain %s has no service mapping; confirm target service manually", domain.Host), resourceRef, nil)
 		}
 	}
 	if len(plan.Resources.Domains) == 0 {
-		if risk, ok := topologyRisk(topology, "routes.none"); ok {
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, "routes.none", risk.Message, "domains", nil)
+		if risk, ok := topologyRisk(topology, GateRoutesNone); ok {
+			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateRoutesNone, risk.Message, "domains", nil)
 		}
 	}
 
@@ -453,11 +483,11 @@ func addReadinessGates(plan *AppPlan, topology analyzer.Topology) {
 		resourceRef := "data-store:" + planutil.Fallback(store.Service, store.Kind)
 		if store.Readiness == ReadinessBlocked {
 			message := fmt.Sprintf("manual data-store review required for service %s before target preparation can be trusted", planutil.Fallback(store.Service, "unknown"))
-			plan.addGate(ReadinessBlocked, SeverityError, "data_store.manual_review", message, resourceRef, store.Volumes)
+			plan.addGate(ReadinessBlocked, SeverityError, GateDataStoreManualReview, message, resourceRef, store.Volumes)
 			continue
 		}
 		message := fmt.Sprintf("confirm %s data-store preparation strategy %s for service %s", dataStoreLabel(store), planutil.Fallback(store.Strategy, "manual_review"), planutil.Fallback(store.Service, "unknown"))
-		plan.addGate(ReadinessNeedsDecision, SeverityWarn, "data_store.prepare_required", message, resourceRef, store.Volumes)
+		plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateDataStorePrepareRequired, message, resourceRef, store.Volumes)
 	}
 
 	addLinkedResourceGates(plan)
@@ -465,7 +495,7 @@ func addReadinessGates(plan *AppPlan, topology analyzer.Topology) {
 	for _, volume := range plan.Resources.Volumes {
 		if volume.Type == "bind" {
 			message := fmt.Sprintf("review bind mount portability for %s", volumeResourceLabel(volume))
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, "volume.bind_mount_review", message, "volume:"+volumeResourceLabel(volume), nil)
+			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateVolumeBindMountReview, message, "volume:"+volumeResourceLabel(volume), nil)
 		}
 	}
 }
@@ -480,7 +510,7 @@ func addLinkedResourceGates(plan *AppPlan) {
 		resourceRef := "external:" + requirement.Kind
 		if !requirement.Linkable {
 			message := fmt.Sprintf("resolve external %s requirement before deploy", requirement.Kind)
-			plan.addGate(ReadinessNeedsInput, SeverityWarn, "external_requirement.resolve", message, resourceRef, requirement.Evidence)
+			plan.addGate(ReadinessNeedsInput, SeverityWarn, GateExternalRequirementResolve, message, resourceRef, requirement.Evidence)
 			continue
 		}
 
@@ -488,13 +518,13 @@ func addLinkedResourceGates(plan *AppPlan) {
 		switch {
 		case len(links) == 0:
 			message := fmt.Sprintf("select or create a support resource for external %s requirement", requirement.Kind)
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, "linked_resource.missing_candidate", message, resourceRef, requirement.Evidence)
+			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateLinkedResourceMissingCandidate, message, resourceRef, requirement.Evidence)
 		case len(links) == 1:
 			message := fmt.Sprintf("confirm heuristic %s support resource candidate %s with %s confidence", requirement.Kind, planutil.Fallback(links[0].App, "unknown"), planutil.Fallback(links[0].Confidence, "unknown"))
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, "linked_resource.confirm_candidate", message, "linked-resource:"+planutil.Fallback(links[0].App, "unknown"), links[0].Reasons)
+			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateLinkedResourceConfirmCandidate, message, "linked-resource:"+planutil.Fallback(links[0].App, "unknown"), links[0].Reasons)
 		default:
 			message := fmt.Sprintf("select one heuristic %s support resource candidate: %s", requirement.Kind, strings.Join(linkedResourceCandidateLabels(links), ", "))
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, "linked_resource.select_candidate", message, resourceRef, requirement.Evidence)
+			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateLinkedResourceSelectCandidate, message, resourceRef, requirement.Evidence)
 		}
 	}
 }
@@ -515,7 +545,7 @@ func addEnvironmentActions(plan *AppPlan) {
 	}
 
 	severity := SeverityInfo
-	if plan.hasGate("env.values_redacted") {
+	if plan.hasGate(GateEnvValuesRedacted) {
 		severity = SeverityWarn
 	}
 	plan.add(severity, "environment", fmt.Sprintf("review and fill exported env examples before deploy: %s", strings.Join(items, ", ")))
@@ -523,7 +553,7 @@ func addEnvironmentActions(plan *AppPlan) {
 
 func addRouteActions(plan *AppPlan, target string) {
 	if len(plan.Resources.Domains) == 0 {
-		if plan.hasGate("routes.none") {
+		if plan.hasGate(GateRoutesNone) {
 			plan.add(SeverityWarn, "route", fmt.Sprintf("confirm this app is internal-only or add %s domains manually", target))
 		}
 		return

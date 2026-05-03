@@ -191,13 +191,13 @@ func issuesForApp(items []runDecisionItem) []appIssue {
 func classifyItem(item runDecisionItem) issueKind {
 	code := item.Code
 	switch {
-	case strings.HasPrefix(code, "env."):
+	case strings.HasPrefix(code, preparer.GateCodePrefixEnv):
 		return issueKindEnv
-	case strings.HasPrefix(code, "data_store."):
+	case strings.HasPrefix(code, preparer.GateCodePrefixDataStore):
 		return issueKindData
-	case strings.HasPrefix(code, "domain.") || code == "routes.none":
+	case strings.HasPrefix(code, preparer.GateCodePrefixDomain) || code == preparer.GateRoutesNone:
 		return issueKindRoute
-	case strings.HasPrefix(code, "linked_resource."), strings.HasPrefix(code, "external_requirement."):
+	case strings.HasPrefix(code, preparer.GateCodePrefixLinkedResource), strings.HasPrefix(code, preparer.GateCodePrefixExternalRequirement):
 		return issueKindLink
 	default:
 		return issueKindReview
