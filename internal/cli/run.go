@@ -37,7 +37,6 @@ type migrationRun struct {
 	ManifestPath             string       `json:"manifest,omitempty"`
 	Target                   string       `json:"target"`
 	AppName                  string       `json:"app,omitempty"`
-	EnvMode                  string       `json:"envMode,omitempty"`
 	DryRun                   bool         `json:"dryRun"`
 	ObservationWindowSeconds int          `json:"observationWindowSeconds"`
 	RollbackWindowSeconds    int          `json:"rollbackWindowSeconds"`
@@ -51,6 +50,7 @@ type runArtifacts struct {
 	Rollback  string `json:"rollback"`
 	Commit    string `json:"commit"`
 	Decisions string `json:"decisions"`
+	Progress  string `json:"progress,omitempty"`
 }
 
 type loadedMigrationRun struct {
@@ -61,6 +61,7 @@ type loadedMigrationRun struct {
 	Rollback  rollbackplan.Result
 	Commit    commitplan.Result
 	Decisions runDecisions
+	Progress  runProgress
 }
 
 type runDecisions struct {
@@ -113,6 +114,7 @@ type migrationRunSummary struct {
 	PauseSteps     int
 	FirstGates     []runGateSummary
 	Decisions      []runDecision
+	Progress       string
 	Next           runNextStep
 }
 
@@ -152,7 +154,6 @@ type migrationRunOptions struct {
 	AppName                  string
 	RunRef                   string
 	Source                   string
-	EnvMode                  string
 	ManifestPath             string
 	ObservationWindowSeconds int
 	RollbackWindowSeconds    int
@@ -216,10 +217,19 @@ func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
 		createdAt = existing.CreatedAt
 	}
 
+	state, err := readBortState(defaultStatePath())
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	if _, err := applyStateEnvToBundle(state, opts.BundleDir); err != nil {
+		return loadedMigrationRun{}, err
+	}
+
 	preparePlan, err := preparer.Plan(preparer.Options{BundleDir: opts.BundleDir, Target: opts.Target, AppName: opts.AppName})
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
+	applyStateOverridesToPrepare(state, &preparePlan)
 	syncResult := syncplan.PlanFromPrepare(preparePlan)
 	cutoverResult, err := gateway.PlanFromPrepareAndSync(preparePlan, syncResult, opts.ObservationWindowSeconds, opts.RollbackWindowSeconds)
 	if err != nil {
@@ -245,7 +255,6 @@ func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
 		ManifestPath:             opts.ManifestPath,
 		Target:                   opts.Target,
 		AppName:                  opts.AppName,
-		EnvMode:                  opts.EnvMode,
 		DryRun:                   true,
 		ObservationWindowSeconds: opts.ObservationWindowSeconds,
 		RollbackWindowSeconds:    opts.RollbackWindowSeconds,
@@ -272,11 +281,42 @@ func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
 	if err := writeJSONArtifact(runArtifactPath(runDir, run.Artifacts.Decisions), loadedRun.Decisions); err != nil {
 		return loadedMigrationRun{}, err
 	}
+	progressPath, err := safeRunArtifactPath(runDir, run.Artifacts.Progress)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	progress, err := readRunProgress(progressPath, run)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	loadedRun.Progress = progress
 	if err := writeJSONArtifact(filepath.Join(runDir, "run.json"), run); err != nil {
 		return loadedMigrationRun{}, err
 	}
 
 	return loadedRun, nil
+}
+
+func refreshMigrationRun(runRef string) (loadedMigrationRun, error) {
+	runDir, err := existingRunDir(runRef)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	existing, err := readRunMetadata(filepath.Join(runDir, "run.json"))
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	existing.Artifacts = existing.Artifacts.withDefaults()
+	return createMigrationRun(migrationRunOptions{
+		BundleDir:                existing.BundleDir,
+		Target:                   existing.Target,
+		AppName:                  existing.AppName,
+		RunRef:                   runDir,
+		Source:                   existing.Source,
+		ManifestPath:             existing.ManifestPath,
+		ObservationWindowSeconds: existing.ObservationWindowSeconds,
+		RollbackWindowSeconds:    existing.RollbackWindowSeconds,
+	})
 }
 
 func runStatus(_ context.Context, args []string, stdout, stderr io.Writer) error {
@@ -288,9 +328,9 @@ func runStatus(_ context.Context, args []string, stdout, stderr io.Writer) error
 	return nil
 }
 
-func runNext(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+func runNext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return runContinue(ctx, args, stdout, stderr)
+		return runContinue(ctx, args, stdin, stdout, stderr)
 	}
 
 	run, err := loadRunFromArgs("next", args, stderr, false)
@@ -301,13 +341,12 @@ func runNext(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	return nil
 }
 
-func runContinue(_ context.Context, args []string, stdout, stderr io.Writer) error {
+func runContinue(_ context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	run, err := loadRunFromArgs("continue", args, stderr, true)
 	if err != nil {
 		return err
 	}
-	writeMigrationCockpitText(stdout, summarizeMigrationRun(run))
-	return nil
+	return enterInteractiveCockpit(stdin, stdout, run)
 }
 
 func loadRunFromArgs(command string, args []string, stderr io.Writer, allowLatest bool) (loadedMigrationRun, error) {
@@ -343,9 +382,7 @@ func loadMigrationRun(runRef string) (loadedMigrationRun, error) {
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
-	if run.RunDir == "" {
-		run.RunDir = filepath.ToSlash(filepath.Clean(runDir))
-	}
+	run.RunDir = filepath.ToSlash(filepath.Clean(runDir))
 	if run.Name == "" {
 		run.Name = runNameFromDir(runDir)
 	}
@@ -356,6 +393,11 @@ func loadMigrationRun(runRef string) (loadedMigrationRun, error) {
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
+	state, err := readBortState(defaultStatePath())
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	applyStateOverridesToPrepare(state, &preparePlan)
 	syncResult, err := readSyncArtifact(runArtifactPath(runDir, run.Artifacts.Sync), expect)
 	if err != nil {
 		return loadedMigrationRun{}, err
@@ -379,6 +421,15 @@ func loadMigrationRun(runRef string) (loadedMigrationRun, error) {
 		decisions = generateRunDecisions(loadedRun, run.UpdatedAt)
 	}
 	loadedRun.Decisions = decisions
+	progressPath, err := safeRunArtifactPath(runDir, run.Artifacts.Progress)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	progress, err := readRunProgress(progressPath, run)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	loadedRun.Progress = progress
 	return loadedRun, nil
 }
 
@@ -443,8 +494,9 @@ func summarizeMigrationRun(run loadedMigrationRun) migrationRunSummary {
 	}
 
 	summary.Decisions = openRunDecisions(run)
+	summary.Progress = progressSummary(run.Progress)
 	summary.FirstGates = firstUnresolvedRunGates(run, 3)
-	summary.Next = nextSafeStep(run)
+	summary.Next = nextSafeStep(run, summary.Decisions)
 	return summary
 }
 
@@ -461,8 +513,10 @@ func firstUnresolvedRunGates(run loadedMigrationRun, limit int) []runGateSummary
 	return nil
 }
 
-func nextSafeStep(run loadedMigrationRun) runNextStep {
-	decisions := openRunDecisions(run)
+func nextSafeStep(run loadedMigrationRun, decisions []runDecision) runNextStep {
+	if decisions == nil {
+		decisions = openRunDecisions(run)
+	}
 	if len(decisions) > 0 {
 		decision := decisions[0]
 		return runNextStep{
@@ -489,10 +543,13 @@ func nextSafeStep(run loadedMigrationRun) runNextStep {
 }
 
 func openRunDecisions(run loadedMigrationRun) []runDecision {
+	var decisions []runDecision
 	if run.Decisions.APIVersion == decisionsAPIVersion {
-		return run.Decisions.Decisions
+		decisions = run.Decisions.Decisions
+	} else {
+		decisions = generateRunDecisions(run, run.Run.UpdatedAt).Decisions
 	}
-	return generateRunDecisions(run, run.Run.UpdatedAt).Decisions
+	return applyProgressToDecisions(decisions, run.Progress)
 }
 
 func generateRunDecisions(run loadedMigrationRun, generatedAt time.Time) runDecisions {
@@ -884,6 +941,9 @@ func writeMigrationRunText(w io.Writer, heading string, summary migrationRunSumm
 	fmt.Fprintf(w, "State sync: %d resource step(s), %d pause/decision step(s)\n", summary.StateSteps, summary.PauseSteps)
 	fmt.Fprintf(w, "Gates: %d blocked, %d need input, %d need decision\n", summary.GateCounts.Blocked, summary.GateCounts.NeedsInput, summary.GateCounts.NeedsDecision)
 	fmt.Fprintf(w, "Decisions: %d open\n", len(summary.Decisions))
+	if summary.Progress != "" {
+		fmt.Fprintln(w, summary.Progress)
+	}
 	fmt.Fprintf(w, "Artifacts: %s, %s, %s, %s, %s, %s\n", summary.Run.Artifacts.Prepare, summary.Run.Artifacts.Sync, summary.Run.Artifacts.Cutover, summary.Run.Artifacts.Rollback, summary.Run.Artifacts.Commit, summary.Run.Artifacts.Decisions)
 	if len(summary.Decisions) > 0 {
 		fmt.Fprintln(w, "Open decisions:")
@@ -905,32 +965,25 @@ func writeMigrationRunText(w io.Writer, heading string, summary migrationRunSumm
 func writeMigrationCockpitText(w io.Writer, summary migrationRunSummary) {
 	fmt.Fprintf(w, "Migration cockpit: %s\n", summary.Run.Name)
 	fmt.Fprintf(w, "Migration: %s -> %s\n", runSourceLabel(summary.Run), summary.Run.Target)
+	scope := fmt.Sprintf("%d app(s)", summary.Apps)
 	if summary.Run.AppName != "" {
-		fmt.Fprintf(w, "Scope: app=%s\n", summary.Run.AppName)
-	} else if summary.PlatformApps > 0 {
-		fmt.Fprintf(w, "Scope: %d app(s), %d platform/internal hidden\n", summary.Apps, summary.PlatformApps)
-	} else {
-		fmt.Fprintf(w, "Scope: %d app(s)\n", summary.Apps)
+		scope = "app=" + summary.Run.AppName
 	}
-	if summary.Run.EnvMode != "" {
-		fmt.Fprintf(w, "Environment: %s\n", envModeLabel(summary.Run.EnvMode))
+	fmt.Fprintf(w, "Status: %s | %s | %d open\n", humanReadinessLabel(summary.Readiness), scope, len(summary.Decisions))
+	if summary.Progress != "" {
+		fmt.Fprintln(w, summary.Progress)
 	}
-	fmt.Fprintf(w, "Status: %s (%s)\n", humanReadinessLabel(summary.Readiness), summary.Status)
-	fmt.Fprintf(w, "Apps: %d green, %d yellow, %d red\n", summary.StatusCounts.Green, summary.StatusCounts.Yellow, summary.StatusCounts.Red)
-	fmt.Fprintf(w, "Routes: %d cutover, %d rollback, %d commit\n", summary.CutoverRoutes, summary.RollbackRoutes, summary.CommitRoutes)
-	fmt.Fprintf(w, "State sync: %d resource step(s), %d pause/decision step(s)\n", summary.StateSteps, summary.PauseSteps)
-	fmt.Fprintf(w, "Open work: %d decision(s), %d blocked, %d need input, %d need decision\n", len(summary.Decisions), summary.GateCounts.Blocked, summary.GateCounts.NeedsInput, summary.GateCounts.NeedsDecision)
 	if len(summary.Decisions) > 0 {
-		fmt.Fprintln(w, "Work queue:")
+		fmt.Fprintln(w, "Open decisions:")
 		limit := min(len(summary.Decisions), 3)
 		for _, decision := range summary.Decisions[:limit] {
-			fmt.Fprintf(w, "  %s: %s (%s, %d item(s))\n", decision.Kind, decision.Action, humanReadinessLabel(decision.Readiness), decision.Count)
+			fmt.Fprintf(w, "  %s (%s, %d item(s))\n", decision.Kind, humanReadinessLabel(decision.Readiness), decision.Count)
+		}
+		if len(summary.Decisions) > limit {
+			fmt.Fprintf(w, "  ... %d more\n", len(summary.Decisions)-limit)
 		}
 	}
 	fmt.Fprintf(w, "Next: %s\n", summary.Next.Action)
-	if summary.Next.Reason != "" {
-		fmt.Fprintf(w, "Why: %s\n", summary.Next.Reason)
-	}
 	fmt.Fprintln(w, "Continue: bort continue")
 	fmt.Fprintln(w, "Safety: dry run only; no target resources, sync operations, route changes, ownership commits, or source cleanup were executed.")
 }
@@ -950,17 +1003,6 @@ func runSourceLabel(run migrationRun) string {
 		return "local bundle"
 	}
 	return "source"
-}
-
-func envModeLabel(mode string) string {
-	switch mode {
-	case "include-values":
-		return "known values kept in private local files"
-	case "redacted":
-		return "redacted; fill private env templates later"
-	default:
-		return mode
-	}
 }
 
 func humanReadinessLabel(readiness preparer.Readiness) string {
@@ -1093,7 +1135,7 @@ func ensurePrivateRunDir(path string) error {
 }
 
 func defaultRunArtifacts() runArtifacts {
-	return runArtifacts{Prepare: "prepare.json", Sync: "sync.json", Cutover: "cutover.json", Rollback: "rollback.json", Commit: "commit.json", Decisions: "decisions.json"}
+	return runArtifacts{Prepare: "prepare.json", Sync: "sync.json", Cutover: "cutover.json", Rollback: "rollback.json", Commit: "commit.json", Decisions: "decisions.json", Progress: "progress.json"}
 }
 
 func (artifacts runArtifacts) withDefaults() runArtifacts {
@@ -1116,14 +1158,30 @@ func (artifacts runArtifacts) withDefaults() runArtifacts {
 	if artifacts.Decisions == "" {
 		artifacts.Decisions = defaults.Decisions
 	}
+	if artifacts.Progress == "" {
+		artifacts.Progress = defaults.Progress
+	}
 	return artifacts
 }
 
 func runArtifactPath(runDir, artifact string) string {
-	if filepath.IsAbs(artifact) {
-		return filepath.Clean(artifact)
+	clean, err := cleanRelativeArtifact(artifact)
+	if err != nil {
+		return filepath.Join(filepath.FromSlash(runDir), filepath.FromSlash(artifact))
 	}
-	return filepath.Join(filepath.FromSlash(runDir), filepath.FromSlash(artifact))
+	return filepath.Join(filepath.FromSlash(runDir), clean)
+}
+
+func safeRunArtifactPath(runDir, artifact string) (string, error) {
+	clean, err := cleanRelativeArtifact(artifact)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(filepath.FromSlash(runDir), clean)
+	if err := containedPath(filepath.FromSlash(runDir), path); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func readRunMetadata(path string) (migrationRun, error) {

@@ -18,15 +18,9 @@ import (
 	"github.com/aikins01/bort/internal/source"
 )
 
-const (
-	guideEnvRedacted = "redacted"
-	guideEnvInclude  = "include-values"
-)
-
 type guidedSetup struct {
 	Source       string
 	Target       string
-	EnvMode      string
 	RunName      string
 	ManifestPath string
 }
@@ -43,12 +37,11 @@ type guidePromptInput interface {
 
 func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
 	if runRef, ok := latestRunRef(); ok {
-		run, err := loadMigrationRun(runRef)
+		run, err := refreshMigrationRun(runRef)
 		if err != nil {
 			return err
 		}
-		writeMigrationCockpitText(stdout, summarizeMigrationRun(run))
-		return nil
+		return enterInteractiveCockpit(stdin, stdout, run)
 	}
 
 	if defaultBundleExists() {
@@ -61,12 +54,12 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 		if err != nil {
 			return err
 		}
-		writeMigrationCockpitText(stdout, summarizeMigrationRun(run))
-		return nil
+		return enterInteractiveCockpit(stdin, stdout, run)
 	}
 
-	if canPromptGuide(stdin) {
-		setup, err := promptGuidedSetup(stdin, stdout, time.Now().UTC())
+	if canPromptGuideWithOutput(stdin, stdout) {
+		reader := bufio.NewReader(stdin)
+		setup, err := promptGuidedSetupWithReader(reader, stdout, time.Now().UTC())
 		if err != nil {
 			return err
 		}
@@ -74,59 +67,32 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 		if err != nil {
 			return err
 		}
-		writeMigrationCockpitText(stdout, summarizeMigrationRun(run))
-		return nil
+		return enterInteractiveCockpitWithReader(stdin, reader, stdout, run)
 	}
 
 	return writeGuideStart(stdout)
 }
 
-func promptGuidedSetup(stdin io.Reader, stdout io.Writer, now time.Time) (guidedSetup, error) {
-	reader := bufio.NewReader(stdin)
+func promptGuidedSetupWithReader(reader *bufio.Reader, stdout io.Writer, now time.Time) (guidedSetup, error) {
 	fmt.Fprintln(stdout, "Migration setup")
-	fmt.Fprintln(stdout, "All actions are local dry-runs until live execution is implemented.")
+	fmt.Fprintln(stdout, "All actions are local dry-runs. bort runs on the same server as the source PaaS.")
 	fmt.Fprintln(stdout)
 
-	sourceName, err := promptChoice(reader, stdout, "Source", []guideChoice{
-		{Value: "coolify-local", Label: "Coolify on this server (local Docker labels, no API writes)"},
-		{Value: "coolify", Label: "Coolify API (requires BORT_COOLIFY_URL and BORT_COOLIFY_TOKEN)"},
+	sourceName, err := promptChoice(reader, stdout, "Where are your apps?", []guideChoice{
+		{Value: "coolify-local", Label: "Coolify on this server (reads local Docker labels)"},
+		{Value: "coolify", Label: "Coolify API (uses BORT_COOLIFY_URL/TOKEN)"},
 		{Value: "docker", Label: "Local Docker"},
-		{Value: "manifest", Label: "Existing manifest"},
+		{Value: "manifest", Label: "Existing manifest file"},
 	}, "coolify-local")
 	if err != nil {
 		return guidedSetup{}, err
 	}
 
-	target, err := promptChoice(reader, stdout, "Target", []guideChoice{{Value: "dokploy", Label: "Dokploy"}}, "dokploy")
-	if err != nil {
-		return guidedSetup{}, err
+	setup := guidedSetup{
+		Source:  sourceName,
+		Target:  "dokploy",
+		RunName: defaultGuideRunName(sourceName, now),
 	}
-
-	envMode, err := promptChoice(reader, stdout, "Environment", []guideChoice{
-		{Value: guideEnvRedacted, Label: "Redact env values and fill private templates later"},
-		{Value: guideEnvInclude, Label: "Include known env values in private local files"},
-	}, guideEnvRedacted)
-	if err != nil {
-		return guidedSetup{}, err
-	}
-	if envMode == guideEnvInclude {
-		fmt.Fprintln(stdout, "This may read environment values and secrets into local 0600 files. Values will not be printed.")
-		confirmed, err := promptLine(reader, stdout, "Type include to continue, or press Enter to use redacted mode")
-		if err != nil {
-			return guidedSetup{}, err
-		}
-		if !strings.EqualFold(strings.TrimSpace(confirmed), "include") {
-			envMode = guideEnvRedacted
-		}
-	}
-
-	defaultName := defaultGuideRunName(sourceName, now)
-	runName, err := promptLineDefault(reader, stdout, "Run name", defaultName)
-	if err != nil {
-		return guidedSetup{}, err
-	}
-
-	setup := guidedSetup{Source: sourceName, Target: target, EnvMode: envMode, RunName: runName}
 	if sourceName == "manifest" {
 		manifestPath, err := promptLineDefault(reader, stdout, "Manifest path", "manifest.json")
 		if err != nil {
@@ -149,7 +115,7 @@ func createGuidedMigrationRun(ctx context.Context, setup guidedSetup) (loadedMig
 	}
 
 	bundleDir := filepath.Join(runDir, "bundle")
-	if _, err := exporter.Export(m, exporter.Options{OutputDir: bundleDir, IncludeEnvValues: setup.EnvMode == guideEnvInclude}); err != nil {
+	if _, err := exporter.Export(m, exporter.Options{OutputDir: bundleDir, IncludeEnvValues: true}); err != nil {
 		return loadedMigrationRun{}, err
 	}
 
@@ -158,7 +124,6 @@ func createGuidedMigrationRun(ctx context.Context, setup guidedSetup) (loadedMig
 		Target:                   setup.Target,
 		RunRef:                   runDir,
 		Source:                   setup.Source,
-		EnvMode:                  setup.EnvMode,
 		ManifestPath:             manifestPath,
 		ObservationWindowSeconds: gateway.DefaultObservationWindowSeconds,
 		RollbackWindowSeconds:    gateway.DefaultRollbackWindowSeconds,
@@ -172,7 +137,7 @@ func guidedManifest(ctx context.Context, setup guidedSetup, runDir string) (mani
 	}
 
 	scanOptions := source.ScanOptions{
-		IncludeEnvValues: setup.EnvMode == guideEnvInclude,
+		IncludeEnvValues: true,
 		Coolify: source.CoolifyOptions{
 			BaseURL: os.Getenv("BORT_COOLIFY_URL"),
 			Token:   os.Getenv("BORT_COOLIFY_TOKEN"),
@@ -280,6 +245,17 @@ func canPromptGuide(stdin io.Reader) bool {
 	return err == nil && info.Mode()&os.ModeCharDevice != 0 && isTerminalFile(file)
 }
 
+func canPromptGuideWithOutput(stdin io.Reader, stdout io.Writer) bool {
+	if _, ok := stdin.(guidePromptInput); ok {
+		return true
+	}
+	if !canPromptGuide(stdin) {
+		return false
+	}
+	file, ok := stdout.(*os.File)
+	return ok && isInteractiveTerminal(file)
+}
+
 func latestRunRef() (string, bool) {
 	entries, err := os.ReadDir(filepath.Join(".bort", "runs"))
 	if err != nil {
@@ -322,16 +298,12 @@ func writeGuideStart(w io.Writer) error {
 
 No local migration run or default bundle was found.
 
-Start with a local bundle:
+To get started:
   bort scan --output manifest.json
   bort export --manifest manifest.json --output-dir bort-bundle
   bort
 
-If you already have a bundle elsewhere:
-  bort migrate --bundle <bundle-dir>
-
-Power-user commands are still available with:
-  bort help
+See bort help for more.
 `)
 	return err
 }

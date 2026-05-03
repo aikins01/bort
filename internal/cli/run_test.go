@@ -106,7 +106,7 @@ func TestRunStatusAndNextReadExistingRun(t *testing.T) {
 
 	var nextOut bytes.Buffer
 	var nextErr bytes.Buffer
-	if err := runNext(context.Background(), []string{"marketmap"}, &nextOut, &nextErr); err != nil {
+	if err := runNext(context.Background(), []string{"marketmap"}, strings.NewReader(""), &nextOut, &nextErr); err != nil {
 		t.Fatalf("next failed: %v\nstderr:\n%s", err, nextErr.String())
 	}
 	for _, want := range []string{"Next safe step: confirm cutover readiness for 1 app(s)", "Artifact: .bort/runs/marketmap/decisions.json", "Decision: cutover", "Dry run only: no live migration action is executed by this command."} {

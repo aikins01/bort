@@ -53,7 +53,7 @@ func TestRunWithoutArgsCreatesRunFromDefaultBundle(t *testing.T) {
 	}
 
 	output := stdout.String()
-	for _, want := range []string{"Migration cockpit:", "Migration: local bundle -> dokploy", "Next: confirm cutover readiness for 1 app(s)", "Continue: bort continue"} {
+	for _, want := range []string{"Migration: local bundle -> dokploy", "api", "Dry run only"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected guide output to contain %q, got:\n%s", want, output)
 		}
@@ -87,7 +87,7 @@ func TestRunWithoutArgsResumesLatestRun(t *testing.T) {
 	}
 
 	output := stdout.String()
-	for _, want := range []string{"Migration cockpit: marketmap", "Migration: local bundle -> dokploy", "Next: confirm cutover readiness for 1 app(s)", "Continue: bort continue"} {
+	for _, want := range []string{"Run: marketmap", "Migration: local bundle -> dokploy", "Dry run only"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected resumed guide output to contain %q, got:\n%s", want, output)
 		}
@@ -117,7 +117,7 @@ func TestRunContinueResumesLatestRun(t *testing.T) {
 	}
 
 	output := stdout.String()
-	for _, want := range []string{"Migration cockpit: marketmap", "Next: confirm cutover readiness for 1 app(s)", "Continue: bort continue"} {
+	for _, want := range []string{"Run: marketmap", "Dry run only"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected continue output to contain %q, got:\n%s", want, output)
 		}
@@ -147,7 +147,8 @@ func TestRunWithoutArgsPromptsForManifestAndPrivateEnvMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	input := testGuideInput{Reader: strings.NewReader("4\n\n2\ninclude\nguided-run\n" + manifestPath + "\n")}
+	// Source 4 (manifest), then manifest path. No env-mode prompt anymore.
+	input := testGuideInput{Reader: strings.NewReader("4\n" + manifestPath + "\n")}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	if err := RunWithInput(context.Background(), nil, input, &stdout, &stderr); err != nil {
@@ -155,7 +156,7 @@ func TestRunWithoutArgsPromptsForManifestAndPrivateEnvMode(t *testing.T) {
 	}
 
 	output := stdout.String()
-	for _, want := range []string{"Migration setup", "Migration cockpit: guided-run", "Migration: Existing manifest -> dokploy", "Environment: known values kept in private local files"} {
+	for _, want := range []string{"Migration setup", "Migration: Existing manifest -> dokploy"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected guided output to contain %q, got:\n%s", want, output)
 		}
@@ -164,11 +165,16 @@ func TestRunWithoutArgsPromptsForManifestAndPrivateEnvMode(t *testing.T) {
 		t.Fatalf("guided output exposed env value:\n%s", output)
 	}
 
-	run := readJSONFile[migrationRun](t, filepath.Join(workDir, ".bort", "runs", "guided-run", "run.json"))
-	if run.Source != "manifest" || run.EnvMode != guideEnvInclude || run.ManifestPath != manifestPath {
+	entries, err := os.ReadDir(filepath.Join(workDir, ".bort", "runs"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected one run directory, entries=%#v err=%v", entries, err)
+	}
+	runName := entries[0].Name()
+	run := readJSONFile[migrationRun](t, filepath.Join(workDir, ".bort", "runs", runName, "run.json"))
+	if run.Source != "manifest" || run.ManifestPath != manifestPath {
 		t.Fatalf("unexpected guided run metadata: %#v", run)
 	}
-	envPath := filepath.Join(workDir, ".bort", "runs", "guided-run", "bundle", "api", ".env.api")
+	envPath := filepath.Join(workDir, ".bort", "runs", runName, "bundle", "api", ".env.api")
 	envFile, err := os.ReadFile(envPath)
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +182,7 @@ func TestRunWithoutArgsPromptsForManifestAndPrivateEnvMode(t *testing.T) {
 	if !strings.Contains(string(envFile), "API_TOKEN=private-token") {
 		t.Fatalf("expected private env file to preserve known value, got %q", string(envFile))
 	}
-	envExamplePath := filepath.Join(workDir, ".bort", "runs", "guided-run", "bundle", "api", ".env.api.example")
+	envExamplePath := filepath.Join(workDir, ".bort", "runs", runName, "bundle", "api", ".env.api.example")
 	envExample, err := os.ReadFile(envExamplePath)
 	if err != nil {
 		t.Fatal(err)
