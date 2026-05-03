@@ -27,6 +27,9 @@ func runEnv(_ context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if err := validateStateApp(app); err != nil {
+		return err
+	}
 
 	statePath := defaultStatePath()
 	state, err := readBortState(statePath)

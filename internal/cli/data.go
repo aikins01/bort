@@ -38,6 +38,9 @@ func runData(_ context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if err := validateStateDataStore(app, store); err != nil {
+		return err
+	}
 
 	statePath := defaultStatePath()
 	state, err := readBortState(statePath)
