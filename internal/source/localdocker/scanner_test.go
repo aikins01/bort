@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/aikins01/bort/internal/source"
 )
 
 func TestRoutesFromLabelsExtractsHostsAndServicePort(t *testing.T) {
@@ -93,6 +96,159 @@ func TestInspectContainersChunksIDs(t *testing.T) {
 	wantCalls := []int{100, 100, 5}
 	if fmt.Sprint(inspectCalls) != fmt.Sprint(wantCalls) {
 		t.Fatalf("expected inspect chunks %v, got %v", wantCalls, inspectCalls)
+	}
+}
+
+func TestHealthcheckFromConfig(t *testing.T) {
+	hc := healthcheckFromConfig(&healthcheckConfig{
+		Test:        []string{"CMD", "curl", "http://localhost"},
+		Interval:    int64(30 * time.Second),
+		Timeout:     int64(5 * time.Second),
+		Retries:     3,
+		StartPeriod: int64(10 * time.Second),
+	})
+	if hc == nil {
+		t.Fatal("expected healthcheck, got nil")
+	}
+	if hc.Interval != "30s" || hc.Timeout != "5s" || hc.StartPeriod != "10s" {
+		t.Fatalf("unexpected durations: %+v", hc)
+	}
+	if hc.Retries != 3 || len(hc.Test) != 3 {
+		t.Fatalf("unexpected test/retries: %+v", hc)
+	}
+
+	if got := healthcheckFromConfig(nil); got != nil {
+		t.Fatalf("expected nil for missing healthcheck, got %+v", got)
+	}
+	if got := healthcheckFromConfig(&healthcheckConfig{Test: []string{}}); got != nil {
+		t.Fatalf("expected nil for empty test, got %+v", got)
+	}
+}
+
+func TestInspectImageDigestsAggregatesUnique(t *testing.T) {
+	containers := []containerInspect{
+		{Image: "sha256:aaa"},
+		{Image: "sha256:aaa"},
+		{Image: "sha256:bbb"},
+		{Image: ""},
+	}
+
+	calls := 0
+	scanner := &Scanner{
+		runCommand: func(_ context.Context, args ...string) ([]byte, error) {
+			if len(args) < 2 || args[0] != "image" || args[1] != "inspect" {
+				return nil, fmt.Errorf("unexpected docker args: %v", args)
+			}
+			calls++
+			ids := args[2:]
+			items := make([]map[string]any, 0, len(ids))
+			for _, id := range ids {
+				items = append(items, map[string]any{
+					"Id":          id,
+					"RepoDigests": []string{"registry.example.com/app@" + id},
+				})
+			}
+			encoded, err := json.Marshal(items)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return encoded, nil
+		},
+	}
+
+	digests, err := scanner.inspectImageDigests(context.Background(), containers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 docker call, got %d", calls)
+	}
+	if digests["sha256:aaa"] != "registry.example.com/app@sha256:aaa" {
+		t.Fatalf("missing digest for aaa: %#v", digests)
+	}
+	if digests["sha256:bbb"] != "registry.example.com/app@sha256:bbb" {
+		t.Fatalf("missing digest for bbb: %#v", digests)
+	}
+	if _, ok := digests[""]; ok {
+		t.Fatal("expected empty image id to be skipped")
+	}
+}
+
+func TestParseDuBytesAndInt64(t *testing.T) {
+	got, err := parseDuBytes([]byte("12345\t/var/lib/docker/volumes/foo/_data\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 12345 {
+		t.Fatalf("expected 12345, got %d", got)
+	}
+	if _, err := parseInt64("not-a-number"); err == nil {
+		t.Fatal("expected error for non-numeric")
+	}
+	if _, err := parseDuBytes([]byte("")); err == nil {
+		t.Fatal("expected error for empty du output")
+	}
+}
+
+func TestScanPopulatesNewServiceFields(t *testing.T) {
+	scanner := &Scanner{
+		Now: func() time.Time { return time.Unix(0, 0).UTC() },
+		runCommand: func(_ context.Context, args ...string) ([]byte, error) {
+			switch {
+			case len(args) == 2 && args[0] == "ps" && args[1] == "-aq":
+				return []byte("c1\n"), nil
+			case len(args) > 0 && args[0] == "inspect":
+				return []byte(`[{
+					"Id":"c1","Name":"/api","Image":"sha256:abc",
+					"Config":{"Image":"app:1","Env":["PORT=80"],"Labels":{},"Healthcheck":{"Test":["CMD","ok"],"Interval":1000000000,"Retries":2}},
+					"State":{"Status":"running"},
+					"Mounts":[{"Type":"volume","Name":"data","Source":"/var/lib/docker/volumes/data/_data","Destination":"/data","RW":true}],
+					"NetworkSettings":{"Ports":{},"Networks":{}}
+				}]`), nil
+			case len(args) >= 2 && args[0] == "image" && args[1] == "inspect":
+				return []byte(`[{"Id":"sha256:abc","RepoDigests":["registry/app@sha256:dead"]}]`), nil
+			case len(args) == 3 && args[0] == "volume" && args[1] == "ls" && args[2] == "-q":
+				return []byte("data\n"), nil
+			case len(args) >= 2 && args[0] == "volume" && args[1] == "inspect":
+				return []byte(`[{"Name":"data","Driver":"local","Mountpoint":"/var/lib/docker/volumes/data/_data","Scope":"local"}]`), nil
+			case len(args) == 3 && args[0] == "network" && args[1] == "ls" && args[2] == "-q":
+				return []byte("n1\n"), nil
+			case len(args) >= 2 && args[0] == "network" && args[1] == "inspect":
+				return []byte(`[{"Id":"n1","Name":"net","Driver":"bridge","Scope":"local"}]`), nil
+			}
+			return nil, fmt.Errorf("unexpected docker args: %v", args)
+		},
+		measureCommand: func(_ context.Context, mountpoint string) (int64, int64, error) {
+			if mountpoint != "/var/lib/docker/volumes/data/_data" {
+				t.Fatalf("unexpected mountpoint %q", mountpoint)
+			}
+			return 4096, 12, nil
+		},
+	}
+
+	m, err := scanner.Scan(context.Background(), source.ScanOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Apps) != 1 || len(m.Apps[0].Services) != 1 {
+		t.Fatalf("unexpected apps: %+v", m.Apps)
+	}
+	svc := m.Apps[0].Services[0]
+	if svc.ImageID != "sha256:abc" {
+		t.Fatalf("expected image id sha256:abc, got %q", svc.ImageID)
+	}
+	if svc.ImageDigest != "registry/app@sha256:dead" {
+		t.Fatalf("expected digest, got %q", svc.ImageDigest)
+	}
+	if svc.Healthcheck == nil || svc.Healthcheck.Interval != "1s" || svc.Healthcheck.Retries != 2 {
+		t.Fatalf("unexpected healthcheck: %+v", svc.Healthcheck)
+	}
+	if len(m.Volumes) != 1 {
+		t.Fatalf("expected 1 volume, got %d", len(m.Volumes))
+	}
+	v := m.Volumes[0]
+	if v.SizeBytes != 4096 || v.FileCount != 12 {
+		t.Fatalf("unexpected volume metrics: %+v", v)
 	}
 }
 

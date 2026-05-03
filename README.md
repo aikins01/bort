@@ -22,7 +22,7 @@ Implemented now:
 - `bort rollback` plans route rollback to the source without changing routes.
 - `bort commit` plans final target acceptance and source retirement without committing ownership or deleting source resources.
 - `bort` (no args) renders a linear, app-first migration status view: per-app resource health, attention items, and copy-pasteable `fix:` commands. `bort env <app> KEY=value` and `bort data <app> <store> --recreate|--migrate|--managed` record those answers in a single `.bort/state.json` so the next `bort` invocation drops the resolved issues automatically.
-- `bort migrate`, `bort status`, `bort continue`, and `bort next` keep the local-run workflow under `.bort/runs/<name>` with persisted dry-run artifacts and concise next-step summaries.
+- `bort migrate`, `bort status`, and `bort next` keep the local-run workflow under `.bort/runs/<name>` with persisted dry-run artifacts and concise next-step summaries.
 - The analyzer uses Coolify/Dokploy-informed resource classification so known databases, app volumes, support resources, and platform internals become setup decisions instead of generic manual-review blockers.
 - Source/target/gateway/sync/state packages define the shape for the future live migration engine.
 
@@ -127,11 +127,10 @@ For a simpler local-first loop, `bort migrate` creates a named dry-run run under
 ```sh
 bin/bort migrate --bundle bort-bundle --target dokploy --run marketmap
 bin/bort status --run marketmap
-bin/bort continue
 bin/bort next --run marketmap
 ```
 
-Running `bin/bort` with no subcommand is the linear path. It resumes the latest local run when one exists, creates a new dry-run from `bort-bundle` when that default bundle exists, or prompts for source, run name, and manifest path when running interactively with no bundle. The output is an app-first status report (one block per app: resource health, what needs attention, and the exact `bort env`/`bort data` snippet that fixes each issue). `bort continue` and no-arg `bort next` reopen the latest run and next safe action. Power-user subcommands are available through `bin/bort help --advanced`.
+Running `bin/bort` with no subcommand is the linear path. It resumes the latest local run when one exists, creates a new dry-run from `bort-bundle` when that default bundle exists, or prompts for source, run name, and manifest path when running interactively with no bundle. The output is an app-first status report (one block per app: resource health, what needs attention, and the exact `bort env`/`bort data` snippet that fixes each issue). Power-user subcommands are available through `bin/bort help --advanced`.
 
 Recorded user answers live in `.bort/state.json` (mode 0600). Two verbs write to it:
 
@@ -166,7 +165,6 @@ bin/bort rollback --bundle bort-bundle --target dokploy
 bin/bort commit --bundle bort-bundle --target dokploy
 bin/bort migrate --bundle bort-bundle --target dokploy --run audit
 bin/bort status --run audit
-bin/bort continue
 bin/bort next --run audit
 ```
 
@@ -194,7 +192,6 @@ bort prepare   # plan target resources privately before creating anything
 bort sync      # plan state copy or replication work
 bort cutover   # plan traffic movement through the migration gateway
 bort status    # summarize a persisted local run
-bort continue  # reopen the latest migration view
 bort next      # show the next safe local action for a run
 ```
 

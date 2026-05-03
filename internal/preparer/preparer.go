@@ -154,6 +154,8 @@ type VolumeResource struct {
 	ReadWrite   bool      `json:"readWrite"`
 	Portability string    `json:"portability,omitempty"`
 	Readiness   Readiness `json:"readiness"`
+	SizeBytes   int64     `json:"sizeBytes,omitempty"`
+	FileCount   int64     `json:"fileCount,omitempty"`
 }
 
 type DataStoreResource struct {
@@ -393,6 +395,8 @@ func volumeResource(volume analyzer.StatefulVolume) VolumeResource {
 		ReadWrite:   volume.RW,
 		Portability: portability,
 		Readiness:   readiness,
+		SizeBytes:   volume.SizeBytes,
+		FileCount:   volume.FileCount,
 	}
 }
 

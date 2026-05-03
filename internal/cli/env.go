@@ -14,10 +14,9 @@ import (
 // Values are stored locally and never printed back. The command does not
 // modify the source apps; subsequent `bort` runs read the recorded values
 // instead of asking again.
-func runEnv(_ context.Context, args []string, stdout, stderr io.Writer) error {
+func runEnv(_ context.Context, args []string, stdout, _ io.Writer) error {
 	if len(args) < 2 {
-		fmt.Fprintln(stderr, "usage: bort env <app> KEY=value [KEY=value ...]")
-		return fmt.Errorf("env requires <app> and at least one KEY=value")
+		return fmt.Errorf("usage: bort env <app> KEY=value [KEY=value ...]")
 	}
 	app := strings.TrimSpace(args[0])
 	if app == "" {
@@ -41,8 +40,21 @@ func runEnv(_ context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	st := newStyler(stdout)
 	keys := sortedAppEnvKeys(values)
-	fmt.Fprintf(stdout, "Recorded %d env value(s) for %s: %s\n", len(values), app, strings.Join(keys, ", "))
-	fmt.Fprintln(stdout, "Stored in .bort/state.json (mode 0600). Values are never printed.")
+	fmt.Fprintf(stdout, "%s Recorded %s for %s: %s\n",
+		st.glyph("✓", sevGood),
+		pluralize(len(values), "env value", "env values"),
+		st.emph(app),
+		strings.Join(keys, ", "),
+	)
+	fmt.Fprintln(stdout, st.muted("Stored in .bort/state.json (mode 0600). Run `bort` to recheck."))
 	return nil
+}
+
+func pluralize(n int, one, many string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, one)
+	}
+	return fmt.Sprintf("%d %s", n, many)
 }

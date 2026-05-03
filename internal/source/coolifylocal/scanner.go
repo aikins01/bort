@@ -2,16 +2,23 @@ package coolifylocal
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/safepath"
 	"github.com/aikins01/bort/internal/source"
+	"github.com/aikins01/bort/internal/source/coolify"
 	"github.com/aikins01/bort/internal/source/localdocker"
 )
 
+const defaultDataDir = "/data/coolify"
+
 type Scanner struct {
-	Docker source.Scanner
+	Docker  source.Scanner
+	DataDir string
 }
 
 func NewScanner() *Scanner {
@@ -29,15 +36,68 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 		return manifest.Manifest{}, err
 	}
 	result.Source.Platform = "coolify-local"
-	enrichApps(&result)
+	dataDir := s.dataDir()
+	enrichApps(&result, dataDir)
+	if opts.Coolify.BaseURL != "" && opts.Coolify.Token != "" {
+		apiScanner, err := coolify.NewScanner(opts.Coolify.BaseURL, opts.Coolify.Token)
+		if err != nil {
+			result.Warnings = append(result.Warnings, manifest.Warning{Code: "coolify.api_unavailable", Message: err.Error()})
+		} else if apiResult, err := apiScanner.Scan(ctx, opts); err == nil {
+			mergeAPIMetadata(&result, apiResult)
+		} else {
+			result.Warnings = append(result.Warnings, manifest.Warning{Code: "coolify.api_unavailable", Message: err.Error()})
+		}
+	}
+	result.ProxyArtifacts = append(result.ProxyArtifacts, loadProxyArtifacts(dataDir)...)
 	return result, nil
 }
 
-func enrichApps(result *manifest.Manifest) {
+func mergeAPIMetadata(local *manifest.Manifest, api manifest.Manifest) {
+	byUUID := map[string]manifest.App{}
+	for _, app := range api.Apps {
+		uuid := uuidFromAppID(app.ID)
+		if uuid != "" {
+			byUUID[uuid] = app
+		}
+	}
+	for i := range local.Apps {
+		app := &local.Apps[i]
+		uuid := app.Metadata["coolify.uuid"]
+		match, ok := byUUID[uuid]
+		if !ok {
+			continue
+		}
+		if app.Git == nil && match.Git != nil {
+			git := *match.Git
+			app.Git = &git
+		}
+		if app.BuildPack == "" {
+			app.BuildPack = match.BuildPack
+		}
+		if app.Compose == nil && match.Compose != nil {
+			compose := *match.Compose
+			app.Compose = &compose
+		} else if app.Compose != nil && match.Compose != nil && app.Compose.Resolved == "" && match.Compose.Resolved != "" {
+			app.Compose.Resolved = match.Compose.Resolved
+		}
+	}
+}
+
+func (s *Scanner) dataDir() string {
+	if strings.TrimSpace(s.DataDir) != "" {
+		return s.DataDir
+	}
+	if value := strings.TrimSpace(os.Getenv("BORT_COOLIFY_DATA_DIR")); value != "" {
+		return value
+	}
+	return defaultDataDir
+}
+
+func enrichApps(result *manifest.Manifest, dataDir string) {
 	renamed := map[string]string{}
 	for i := range result.Apps {
 		oldName := result.Apps[i].Name
-		enrichApp(&result.Apps[i])
+		enrichApp(&result.Apps[i], dataDir)
 		if result.Apps[i].Name != oldName {
 			renamed[oldName] = result.Apps[i].Name
 		}
@@ -55,7 +115,7 @@ func enrichApps(result *manifest.Manifest) {
 	sort.Slice(result.Apps, func(i, j int) bool { return result.Apps[i].Name < result.Apps[j].Name })
 }
 
-func enrichApp(app *manifest.App) {
+func enrichApp(app *manifest.App, dataDir string) {
 	labels := appLabels(app)
 	if len(labels) == 0 {
 		return
@@ -81,6 +141,91 @@ func enrichApp(app *manifest.App) {
 	if name := resourceName(labels); name != "" {
 		app.Name = name
 	}
+
+	uuid := metadata["coolify.uuid"]
+	if raw, path := loadComposeRaw(dataDir, labels["coolify.type"], uuid); raw != "" {
+		if app.Compose == nil {
+			app.Compose = &manifest.ComposeSource{}
+		}
+		if app.Compose.Raw == "" {
+			app.Compose.Raw = raw
+		}
+		putMetadata(app.Metadata, "coolify.composeFile", path)
+	}
+}
+
+func loadComposeRaw(dataDir, coolifyType, uuid string) (string, string) {
+	uuid = strings.TrimSpace(uuid)
+	if !isCoolifyUUID(uuid) {
+		return "", ""
+	}
+	candidates := []string{}
+	switch coolifyType {
+	case "service":
+		candidates = []string{
+			filepath.Join(dataDir, "services", uuid, "docker-compose.yml"),
+			filepath.Join(dataDir, "services", uuid, "docker-compose.yaml"),
+		}
+	default:
+		candidates = []string{
+			filepath.Join(dataDir, "applications", uuid, "docker-compose.yaml"),
+			filepath.Join(dataDir, "applications", uuid, "docker-compose.yml"),
+			filepath.Join(dataDir, "services", uuid, "docker-compose.yml"),
+		}
+	}
+	for _, path := range candidates {
+		data, err := readContained(dataDir, path)
+		if err == nil && len(data) > 0 {
+			return string(data), path
+		}
+	}
+	return "", ""
+}
+
+func loadProxyArtifacts(dataDir string) []manifest.ProxyArtifact {
+	dir := filepath.Join(dataDir, "proxy", "dynamic")
+	if err := safepath.ContainedPath(dataDir, dir); err != nil {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	artifacts := []manifest.ProxyArtifact{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := readContained(dataDir, path)
+		if err != nil {
+			continue
+		}
+		artifacts = append(artifacts, manifest.ProxyArtifact{Source: "traefik-dynamic", Path: path, Content: string(data)})
+	}
+	sort.Slice(artifacts, func(i, j int) bool { return artifacts[i].Path < artifacts[j].Path })
+	return artifacts
+}
+
+func isCoolifyUUID(value string) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func readContained(root, path string) ([]byte, error) {
+	if err := safepath.ContainedPath(root, path); err != nil {
+		return nil, err
+	}
+	return safepath.ReadFileNoFollow(path)
 }
 
 func appLabels(app *manifest.App) map[string]string {
@@ -99,7 +244,33 @@ func appLabels(app *manifest.App) map[string]string {
 }
 
 func resourceName(labels map[string]string) string {
-	return firstNonEmpty(labels["coolify.resourceName"], labels["coolify.serviceName"], labels["com.docker.compose.project"])
+	uuid := labels["com.docker.compose.project"]
+	candidates := []string{
+		labels["coolify.service.subName"],
+		labels["coolify.serviceName"],
+		labels["coolify.resourceName"],
+		labels["coolify.name"],
+		uuid,
+	}
+	for _, candidate := range candidates {
+		stripped := stripUUIDSuffix(candidate, uuid)
+		if stripped != "" && stripped != uuid {
+			return stripped
+		}
+	}
+	return firstNonEmpty(candidates...)
+}
+
+func stripUUIDSuffix(name, uuid string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || uuid == "" {
+		return name
+	}
+	suffix := "-" + uuid
+	for strings.HasSuffix(name, suffix) {
+		name = strings.TrimSuffix(name, suffix)
+	}
+	return name
 }
 
 func migrationRole(labels map[string]string) string {

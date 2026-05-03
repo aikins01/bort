@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/aikins01/bort/internal/preparer"
@@ -66,9 +67,14 @@ func TestIssuesForAppGroupsAndOrders(t *testing.T) {
 }
 
 func TestFixCommandOnlyReturnsCommandsThatPersistState(t *testing.T) {
-	envIssue := appIssue{Kind: issueKindEnv, Items: []runDecisionItem{{ResourceRef: "env-key:FIRST_KEY"}}}
+	envIssue := appIssue{Kind: issueKindEnv, Items: []runDecisionItem{{ResourceRef: "env:.env.example", Evidence: []string{"FIRST_KEY"}}}}
 	if got := envIssue.FixCommand("api"); got != "bort env api FIRST_KEY=value" {
 		t.Fatalf("unexpected env fix command: %q", got)
+	}
+	manyKeys := []string{"A", "B", "C", "D", "E", "F", "G"}
+	manyEnvIssue := appIssue{Kind: issueKindEnv, Items: []runDecisionItem{{ResourceRef: "env:.env.example", Evidence: manyKeys}}}
+	if got := manyEnvIssue.FixCommand("api"); got != "bort env api A=value B=value C=value D=value E=value   # +2 more key(s)" {
+		t.Fatalf("unexpected truncated env fix command: %q", got)
 	}
 	dataIssue := appIssue{Kind: issueKindData, Items: []runDecisionItem{{ResourceRef: "data-store:postgres"}}}
 	if got := dataIssue.FixCommand("api"); got != "bort data api postgres --migrate   # or choose --recreate / --managed" {
@@ -78,5 +84,20 @@ func TestFixCommandOnlyReturnsCommandsThatPersistState(t *testing.T) {
 		if got := issue.FixCommand("api"); got != "" {
 			t.Fatalf("expected no canned fix for %s, got %q", issue.Kind, got)
 		}
+	}
+}
+
+func TestFixCommandShellQuotesUntrustedNames(t *testing.T) {
+	envIssue := appIssue{Kind: issueKindEnv}
+	if got := envIssue.FixCommand("My App"); got != "bort env 'My App' KEY=value" {
+		t.Fatalf("unexpected env fix command for spaces: %q", got)
+	}
+	if got := envIssue.FixCommand("api;rm -rf /"); got != `bort env 'api;rm -rf /' KEY=value` {
+		t.Fatalf("unexpected env fix command for shell metacharacters: %q", got)
+	}
+	keyIssue := appIssue{Kind: issueKindEnv, Items: []runDecisionItem{{Evidence: []string{"NAME WITH SPACE", "OK_KEY"}}}}
+	got := keyIssue.FixCommand("api")
+	if !strings.Contains(got, "OK_KEY=value") || strings.Contains(got, "NAME WITH SPACE") {
+		t.Fatalf("expected unsafe key replaced with KEY=value, got %q", got)
 	}
 }

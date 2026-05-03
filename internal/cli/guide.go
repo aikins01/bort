@@ -16,6 +16,7 @@ import (
 	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/manifest"
 	"github.com/aikins01/bort/internal/source"
+	"github.com/charmbracelet/huh"
 )
 
 type guidedSetup struct {
@@ -41,7 +42,8 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 		if err != nil {
 			return err
 		}
-		return enterInteractiveCockpit(stdin, stdout, run)
+		writeAppFirstCockpit(stdout, run)
+		return nil
 	}
 
 	if defaultBundleExists() {
@@ -54,12 +56,19 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 		if err != nil {
 			return err
 		}
-		return enterInteractiveCockpit(stdin, stdout, run)
+		writeAppFirstCockpit(stdout, run)
+		return nil
 	}
 
 	if canPromptGuideWithOutput(stdin, stdout) {
-		reader := bufio.NewReader(stdin)
-		setup, err := promptGuidedSetupWithReader(reader, stdout, time.Now().UTC())
+		var setup guidedSetup
+		var err error
+		if isRealTTY(stdin, stdout) {
+			setup, err = promptGuidedSetupHuh(time.Now().UTC())
+		} else {
+			reader := bufio.NewReader(stdin)
+			setup, err = promptGuidedSetupWithReader(reader, stdout, time.Now().UTC())
+		}
 		if err != nil {
 			return err
 		}
@@ -67,15 +76,75 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 		if err != nil {
 			return err
 		}
-		return enterInteractiveCockpitWithReader(stdin, reader, stdout, run)
+		writeAppFirstCockpit(stdout, run)
+		return nil
 	}
 
 	return writeGuideStart(stdout)
 }
 
+// isRealTTY reports whether stdin and stdout are both attached to an
+// actual terminal device (not a *guidePromptInput test fake), which is
+// the only situation where the huh-based prompt can render correctly.
+func isRealTTY(stdin io.Reader, stdout io.Writer) bool {
+	inFile, ok := stdin.(*os.File)
+	if !ok {
+		return false
+	}
+	outFile, ok := stdout.(*os.File)
+	if !ok {
+		return false
+	}
+	return isInteractiveTerminal(inFile) && isInteractiveTerminal(outFile)
+}
+
+func promptGuidedSetupHuh(now time.Time) (guidedSetup, error) {
+	source := "coolify-local"
+	manifestPath := "manifest.json"
+
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Where are your apps?").
+				Description("All actions are local dry-runs. bort runs on the same server as the source PaaS.").
+				Options(
+					huh.NewOption("Coolify on this server (reads local Docker labels)", "coolify-local"),
+					huh.NewOption("Coolify API (uses BORT_COOLIFY_URL/TOKEN)", "coolify"),
+					huh.NewOption("Local Docker", "docker"),
+					huh.NewOption("Existing manifest file", "manifest"),
+				).
+				Value(&source),
+		),
+		huh.NewGroup(
+			huh.NewInput().
+				Title("Manifest path").
+				Placeholder("manifest.json").
+				Value(&manifestPath),
+		).WithHideFunc(func() bool { return source != "manifest" }),
+	)
+
+	if err := form.Run(); err != nil {
+		return guidedSetup{}, err
+	}
+
+	setup := guidedSetup{
+		Source:  source,
+		Target:  "dokploy",
+		RunName: defaultGuideRunName(source, now),
+	}
+	if source == "manifest" {
+		setup.ManifestPath = strings.TrimSpace(manifestPath)
+		if setup.ManifestPath == "" {
+			setup.ManifestPath = "manifest.json"
+		}
+	}
+	return setup, nil
+}
+
 func promptGuidedSetupWithReader(reader *bufio.Reader, stdout io.Writer, now time.Time) (guidedSetup, error) {
-	fmt.Fprintln(stdout, "Migration setup")
-	fmt.Fprintln(stdout, "All actions are local dry-runs. bort runs on the same server as the source PaaS.")
+	st := newStyler(stdout)
+	fmt.Fprintln(stdout, st.emph("Migration setup"))
+	fmt.Fprintln(stdout, st.muted("All actions are local dry-runs. bort runs on the same server as the source PaaS."))
 	fmt.Fprintln(stdout)
 
 	sourceName, err := promptChoice(reader, stdout, "Where are your apps?", []guideChoice{
@@ -173,17 +242,21 @@ func readManifestFile(path string) (manifest.Manifest, error) {
 }
 
 func promptChoice(reader *bufio.Reader, stdout io.Writer, label string, choices []guideChoice, defaultValue string) (string, error) {
-	fmt.Fprintf(stdout, "%s:\n", label)
+	st := newStyler(stdout)
+	fmt.Fprintln(stdout, st.emph(label))
+	defaultIdx := -1
 	for index, choice := range choices {
-		marker := ""
+		line := fmt.Sprintf("  %d. %s", index+1, choice.Label)
 		if choice.Value == defaultValue {
-			marker = " [default]"
+			defaultIdx = index + 1
+			line = st.emph(line) + " " + st.muted("(default)")
 		}
-		fmt.Fprintf(stdout, "  %d. %s%s\n", index+1, choice.Label, marker)
+		fmt.Fprintln(stdout, line)
 	}
 
 	for {
-		answer, err := promptLine(reader, stdout, label)
+		hint := fmt.Sprintf("[1-%d, default %d]", len(choices), defaultIdx)
+		answer, err := promptLine(reader, stdout, st.muted(hint))
 		if err != nil {
 			return "", err
 		}
@@ -196,7 +269,7 @@ func promptChoice(reader *bufio.Reader, stdout io.Writer, label string, choices 
 				return choice.Value, nil
 			}
 		}
-		fmt.Fprintf(stdout, "Choose 1-%d.\n", len(choices))
+		fmt.Fprintln(stdout, st.glyph(fmt.Sprintf("Choose 1-%d.", len(choices)), sevWarn))
 	}
 }
 
@@ -294,16 +367,20 @@ func defaultBundleExists() bool {
 }
 
 func writeGuideStart(w io.Writer) error {
-	_, err := fmt.Fprint(w, `bort migrates self-hosted apps between PaaS platforms.
-
-No local migration run or default bundle was found.
-
-To get started:
-  bort scan --output manifest.json
-  bort export --manifest manifest.json --output-dir bort-bundle
-  bort
-
-See bort help for more.
-`)
-	return err
+	st := newStyler(w)
+	fmt.Fprintln(w, st.emph("bort")+" "+st.muted("— migrate self-hosted apps between PaaS platforms"))
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, st.muted("No local migration run or default bundle was found."))
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, st.emph("To get started:"))
+	for _, cmd := range []string{
+		"bort scan --output manifest.json",
+		"bort export --manifest manifest.json --output-dir bort-bundle",
+		"bort",
+	} {
+		fmt.Fprintf(w, "  %s\n", st.emph(cmd))
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, st.muted("See `bort help` for more."))
+	return nil
 }

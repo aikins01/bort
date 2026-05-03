@@ -19,6 +19,7 @@ import (
 	"github.com/aikins01/bort/internal/preparer"
 	rollbackplan "github.com/aikins01/bort/internal/rollback"
 	syncplan "github.com/aikins01/bort/internal/sync"
+	"github.com/aikins01/bort/internal/target/dokploy"
 )
 
 const (
@@ -97,6 +98,7 @@ type runDecisionItem struct {
 	Message     string             `json:"message"`
 	Readiness   preparer.Readiness `json:"readiness"`
 	Artifact    string             `json:"artifact"`
+	Evidence    []string           `json:"evidence,omitempty"`
 }
 
 type migrationRunSummary struct {
@@ -139,6 +141,7 @@ type runGateSummary struct {
 	Message     string
 	Readiness   preparer.Readiness
 	ResourceRef string
+	Evidence    []string
 }
 
 type runNextStep struct {
@@ -159,7 +162,7 @@ type migrationRunOptions struct {
 	RollbackWindowSeconds    int
 }
 
-func runMigrate(_ context.Context, args []string, stdout, stderr io.Writer) error {
+func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -167,6 +170,7 @@ func runMigrate(_ context.Context, args []string, stdout, stderr io.Writer) erro
 	var target string
 	var appName string
 	var runRef string
+	var live bool
 	observationWindowSeconds := gateway.DefaultObservationWindowSeconds
 	rollbackWindowSeconds := gateway.DefaultRollbackWindowSeconds
 
@@ -174,6 +178,7 @@ func runMigrate(_ context.Context, args []string, stdout, stderr io.Writer) erro
 	fs.StringVar(&target, "target", "dokploy", "target platform")
 	fs.StringVar(&appName, "app", "", "optional app name to include in the run")
 	fs.StringVar(&runRef, "run", "", "run name under .bort/runs, or a run directory path")
+	fs.BoolVar(&live, "live", false, "execute against the target platform (default dry-run only)")
 	fs.IntVar(&observationWindowSeconds, "observation-window", gateway.DefaultObservationWindowSeconds, "observation window in seconds")
 	fs.IntVar(&rollbackWindowSeconds, "rollback-window", gateway.DefaultRollbackWindowSeconds, "rollback window in seconds")
 
@@ -195,7 +200,24 @@ func runMigrate(_ context.Context, args []string, stdout, stderr io.Writer) erro
 
 	summary := summarizeMigrationRun(loadedRun)
 	writeMigrationRunText(stdout, "Migration run created", summary)
+
+	if live {
+		return applyLiveMigration(ctx, loadedRun, stderr)
+	}
 	return nil
+}
+
+func applyLiveMigration(ctx context.Context, run loadedMigrationRun, stderr io.Writer) error {
+	if run.Run.Target != "dokploy" {
+		return fmt.Errorf("--live is only supported for target dokploy, got %q", run.Run.Target)
+	}
+	client, err := dokploy.NewClientFromEnv()
+	if err != nil {
+		return err
+	}
+	plan := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
+	fmt.Fprintf(stderr, "live mode: planned %d dokploy step(s)\n", len(plan.Steps))
+	return client.Apply(ctx, plan)
 }
 
 func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
@@ -328,25 +350,13 @@ func runStatus(_ context.Context, args []string, stdout, stderr io.Writer) error
 	return nil
 }
 
-func runNext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	if len(args) == 0 {
-		return runContinue(ctx, args, stdin, stdout, stderr)
-	}
-
-	run, err := loadRunFromArgs("next", args, stderr, false)
+func runNext(_ context.Context, args []string, stdout, stderr io.Writer) error {
+	run, err := loadRunFromArgs("next", args, stderr, true)
 	if err != nil {
 		return err
 	}
 	writeRunNextText(stdout, summarizeMigrationRun(run))
 	return nil
-}
-
-func runContinue(_ context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	run, err := loadRunFromArgs("continue", args, stderr, true)
-	if err != nil {
-		return err
-	}
-	return enterInteractiveCockpit(stdin, stdout, run)
 }
 
 func loadRunFromArgs(command string, args []string, stderr io.Writer, allowLatest bool) (loadedMigrationRun, error) {
@@ -617,6 +627,7 @@ func (b *runDecisionBuilder) addGate(gate runGateSummary) {
 		Message:     gate.Message,
 		Readiness:   gate.Readiness,
 		Artifact:    gate.Artifact,
+		Evidence:    gate.Evidence,
 	})
 }
 
@@ -885,7 +896,7 @@ func commitGates(run loadedMigrationRun, readiness preparer.Readiness) []runGate
 }
 
 func newRunGate(stage, artifact, app string, gate preparer.Gate) runGateSummary {
-	return runGateSummary{Stage: stage, Artifact: artifact, App: app, Code: gate.Code, Message: gate.Message, Readiness: gate.Readiness, ResourceRef: gate.ResourceRef}
+	return runGateSummary{Stage: stage, Artifact: artifact, App: app, Code: gate.Code, Message: gate.Message, Readiness: gate.Readiness, ResourceRef: gate.ResourceRef, Evidence: gate.Evidence}
 }
 
 func nextAction(gate runGateSummary) string {
@@ -962,32 +973,6 @@ func writeMigrationRunText(w io.Writer, heading string, summary migrationRunSumm
 	fmt.Fprintln(w, "Dry run only: no target resources, sync operations, route changes, ownership commits, or source cleanup were executed.")
 }
 
-func writeMigrationCockpitText(w io.Writer, summary migrationRunSummary) {
-	fmt.Fprintf(w, "Migration cockpit: %s\n", summary.Run.Name)
-	fmt.Fprintf(w, "Migration: %s -> %s\n", runSourceLabel(summary.Run), summary.Run.Target)
-	scope := fmt.Sprintf("%d app(s)", summary.Apps)
-	if summary.Run.AppName != "" {
-		scope = "app=" + summary.Run.AppName
-	}
-	fmt.Fprintf(w, "Status: %s | %s | %d open\n", humanReadinessLabel(summary.Readiness), scope, len(summary.Decisions))
-	if summary.Progress != "" {
-		fmt.Fprintln(w, summary.Progress)
-	}
-	if len(summary.Decisions) > 0 {
-		fmt.Fprintln(w, "Open decisions:")
-		limit := min(len(summary.Decisions), 3)
-		for _, decision := range summary.Decisions[:limit] {
-			fmt.Fprintf(w, "  %s (%s, %d item(s))\n", decision.Kind, humanReadinessLabel(decision.Readiness), decision.Count)
-		}
-		if len(summary.Decisions) > limit {
-			fmt.Fprintf(w, "  ... %d more\n", len(summary.Decisions)-limit)
-		}
-	}
-	fmt.Fprintf(w, "Next: %s\n", summary.Next.Action)
-	fmt.Fprintln(w, "Continue: bort continue")
-	fmt.Fprintln(w, "Safety: dry run only; no target resources, sync operations, route changes, ownership commits, or source cleanup were executed.")
-}
-
 func runSourceLabel(run migrationRun) string {
 	switch strings.TrimSpace(run.Source) {
 	case "coolify-local":
@@ -1003,19 +988,6 @@ func runSourceLabel(run migrationRun) string {
 		return "local bundle"
 	}
 	return "source"
-}
-
-func humanReadinessLabel(readiness preparer.Readiness) string {
-	switch readiness {
-	case preparer.ReadinessBlocked:
-		return "blocked"
-	case preparer.ReadinessNeedsInput:
-		return "needs input"
-	case preparer.ReadinessNeedsDecision:
-		return "needs decision"
-	default:
-		return "ready"
-	}
 }
 
 func writeRunNextText(w io.Writer, summary migrationRunSummary) {

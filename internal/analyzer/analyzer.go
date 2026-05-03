@@ -73,13 +73,15 @@ type ResourceLink struct {
 }
 
 type StatefulVolume struct {
-	Origin  string `json:"origin,omitempty"`
-	Service string `json:"service"`
-	Type    string `json:"type"`
-	Name    string `json:"name,omitempty"`
-	Source  string `json:"source,omitempty"`
-	Target  string `json:"target"`
-	RW      bool   `json:"rw"`
+	Origin    string `json:"origin,omitempty"`
+	Service   string `json:"service"`
+	Type      string `json:"type"`
+	Name      string `json:"name,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Target    string `json:"target"`
+	RW        bool   `json:"rw"`
+	SizeBytes int64  `json:"sizeBytes,omitempty"`
+	FileCount int64  `json:"fileCount,omitempty"`
 }
 
 type RiskSeverity string
@@ -114,8 +116,32 @@ func AnalyzeApp(app manifest.App) AppAnalysis {
 func AnalyzeAppInManifest(m manifest.Manifest, app manifest.App) AppAnalysis {
 	analysis := analyzeApp(app)
 	analysis.LinkedResources = linkedResources(m, app, analysis)
+	analysis.StatefulVolumes = enrichVolumeSizes(analysis.StatefulVolumes, m.Volumes)
 	analysis.RiskReasons = riskReasons(app, analysis)
 	return analysis
+}
+
+// joins per-app stateful volumes with measured sizes from the manifest's
+// global volume table so plans can show byte/file counts without a second
+// scan.
+func enrichVolumeSizes(volumes []StatefulVolume, manifestVolumes []manifest.Volume) []StatefulVolume {
+	if len(volumes) == 0 || len(manifestVolumes) == 0 {
+		return volumes
+	}
+	byName := make(map[string]manifest.Volume, len(manifestVolumes))
+	for _, v := range manifestVolumes {
+		byName[v.Name] = v
+	}
+	for i := range volumes {
+		if volumes[i].Name == "" {
+			continue
+		}
+		if v, ok := byName[volumes[i].Name]; ok {
+			volumes[i].SizeBytes = v.SizeBytes
+			volumes[i].FileCount = v.FileCount
+		}
+	}
+	return volumes
 }
 
 func analyzeApp(app manifest.App) AppAnalysis {
@@ -649,8 +675,8 @@ func riskReasons(app manifest.App, analysis AppAnalysis) []RiskReason {
 	if bindMounts > 0 {
 		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: "state.bind_mounts", Message: fmt.Sprintf("%d bind mount(s) are host-specific and need portability review", bindMounts)})
 	}
-	if HasRedactedEnvironment(app) {
-		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: "env.values_redacted", Message: "environment values are redacted and must be supplied before deploy"})
+	if count := redactedEnvCount(app); count > 0 {
+		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: "env.values_redacted", Message: fmt.Sprintf("%d env value(s) not captured by scan; run `bort` (default flow captures values) or fill via `bort env <app> KEY=value`", count)})
 	}
 	for _, warning := range app.Warnings {
 		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: warning.Code, Message: warning.Message})
@@ -826,19 +852,24 @@ func appRoutes(routes []manifest.Route) []manifest.Route {
 }
 
 func HasRedactedEnvironment(app manifest.App) bool {
+	return redactedEnvCount(app) > 0
+}
+
+func redactedEnvCount(app manifest.App) int {
+	count := 0
 	for _, env := range app.Environment {
 		if !env.ValueKnown {
-			return true
+			count++
 		}
 	}
 	for _, service := range app.Services {
 		for _, env := range service.Environment {
 			if !env.ValueKnown {
-				return true
+				count++
 			}
 		}
 	}
-	return false
+	return count
 }
 
 func migrationRole(app manifest.App) string {

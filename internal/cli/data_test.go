@@ -16,7 +16,7 @@ func TestRunDataRecordsStrategyInState(t *testing.T) {
 	if err := RunWithInput(context.Background(), []string{"data", "api", "postgres", "--migrate"}, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("data failed: %v\nstderr:\n%s", err, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), `Recorded data strategy "migrate" for api/postgres`) {
+	if !strings.Contains(stdout.String(), "Recorded data strategy migrate for api/postgres") {
 		t.Fatalf("unexpected output: %s", stdout.String())
 	}
 

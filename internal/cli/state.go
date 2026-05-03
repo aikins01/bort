@@ -96,7 +96,7 @@ func writeBortState(path string, state bortState) error {
 		return err
 	}
 	contents = append(contents, '\n')
-	if err := os.WriteFile(path, contents, 0o600); err != nil {
+	if err := writeFileAtomic(path, contents, 0o600); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0o600)

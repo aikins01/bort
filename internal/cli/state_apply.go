@@ -159,7 +159,7 @@ func materializePrivateEnvFiles(appDir string) (bool, error) {
 		if err != nil {
 			return materialized, err
 		}
-		if err := writeFileNoFollow(privatePath, contents, 0o600); err != nil {
+		if err := writeFileAtomic(privatePath, contents, 0o600); err != nil {
 			return materialized, err
 		}
 		materialized = true
@@ -196,7 +196,7 @@ func rewriteComposeEnvFileExamples(appDir string) error {
 	if updated == string(contents) {
 		return nil
 	}
-	return writeFileNoFollow(composePath, []byte(updated), 0o600)
+	return writeFileAtomic(composePath, []byte(updated), 0o600)
 }
 
 // replaceComposeEnvExample swaps oldName for newName inside compose YAML

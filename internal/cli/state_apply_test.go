@@ -411,7 +411,7 @@ func TestBortNoArgsRefreshesLatestRunAfterEnvCommand(t *testing.T) {
 	if strings.Contains(output, "Fill environment values") {
 		t.Fatalf("expected no-arg bort to refresh the latest run after env state, got:\n%s", output)
 	}
-	if !strings.Contains(output, "All app setup inputs look ready") {
+	if !strings.Contains(output, "All app inputs ready") {
 		t.Fatalf("expected refreshed app setup to be ready, got:\n%s", output)
 	}
 }

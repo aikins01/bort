@@ -1,6 +1,6 @@
 //go:build !windows
 
-package cli
+package safepath
 
 import (
 	"os"

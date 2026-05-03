@@ -53,7 +53,7 @@ func TestRunWithoutArgsCreatesRunFromDefaultBundle(t *testing.T) {
 	}
 
 	output := stdout.String()
-	for _, want := range []string{"Migration: local bundle -> dokploy", "api", "Dry run only"} {
+	for _, want := range []string{"local bundle → dokploy", "api", "DRY RUN"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected guide output to contain %q, got:\n%s", want, output)
 		}
@@ -87,7 +87,7 @@ func TestRunWithoutArgsResumesLatestRun(t *testing.T) {
 	}
 
 	output := stdout.String()
-	for _, want := range []string{"Run: marketmap", "Migration: local bundle -> dokploy", "Dry run only"} {
+	for _, want := range []string{"local bundle → dokploy", "DRY RUN"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected resumed guide output to contain %q, got:\n%s", want, output)
 		}
@@ -95,31 +95,6 @@ func TestRunWithoutArgsResumesLatestRun(t *testing.T) {
 	for _, notWant := range []string{"Creating a local dry-run", "Migration run:", "Artifacts:"} {
 		if strings.Contains(output, notWant) {
 			t.Fatalf("did not expect guide output to contain %q:\n%s", notWant, output)
-		}
-	}
-}
-
-func TestRunContinueResumesLatestRun(t *testing.T) {
-	workDir := t.TempDir()
-	t.Chdir(workDir)
-	writeTestBundle(t, filepath.Join(workDir, "bort-bundle"), manifest.Manifest{
-		Source: manifest.Source{Platform: "docker"},
-		Apps: []manifest.App{
-			{Name: "api", Services: []manifest.Service{{Name: "api", Image: "example/api:latest"}}, Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "api"}}},
-		},
-	})
-	runCommand(t, runMigrate, []string{"--bundle", "bort-bundle", "--run", "marketmap", "--observation-window", "0", "--rollback-window", "0"})
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	if err := Run(context.Background(), []string{"continue"}, &stdout, &stderr); err != nil {
-		t.Fatalf("continue failed: %v\nstderr:\n%s", err, stderr.String())
-	}
-
-	output := stdout.String()
-	for _, want := range []string{"Run: marketmap", "Dry run only"} {
-		if !strings.Contains(output, want) {
-			t.Fatalf("expected continue output to contain %q, got:\n%s", want, output)
 		}
 	}
 }
@@ -156,7 +131,7 @@ func TestRunWithoutArgsPromptsForManifestAndPrivateEnvMode(t *testing.T) {
 	}
 
 	output := stdout.String()
-	for _, want := range []string{"Migration setup", "Migration: Existing manifest -> dokploy"} {
+	for _, want := range []string{"Migration setup", "Existing manifest → dokploy"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected guided output to contain %q, got:\n%s", want, output)
 		}

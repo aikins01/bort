@@ -1,16 +1,12 @@
 //go:build windows
 
-package cli
+package safepath
 
 import (
 	"fmt"
 	"os"
 )
 
-// best-effort fallback for platforms that lack O_NOFOLLOW. Lstat first to
-// reject pre-existing symlinks at the final component; this is non-atomic
-// and TOCTOU-vulnerable but matches the historical bort behavior on
-// platforms where atomic symlink-rejection isn't available.
 func openNoFollowRead(path string) (*os.File, error) {
 	if err := rejectFinalSymlink(path); err != nil {
 		return nil, err

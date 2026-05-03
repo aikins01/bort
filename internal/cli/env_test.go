@@ -19,7 +19,7 @@ func TestRunEnvRecordsValuesInState(t *testing.T) {
 	}
 
 	out := stdout.String()
-	if !strings.Contains(out, "Recorded 2 env value(s) for api") {
+	if !strings.Contains(out, "Recorded 2 env values for api") {
 		t.Fatalf("expected confirmation message, got:\n%s", out)
 	}
 	if strings.Contains(out, "secret") || strings.Contains(out, "postgres") {

@@ -16,8 +16,7 @@ import (
 // back by `bort` so the user's choice persists across runs.
 func runData(_ context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) < 2 {
-		fmt.Fprintln(stderr, "usage: bort data <app> <store> --recreate|--migrate|--managed")
-		return fmt.Errorf("data requires <app> and <store>")
+		return fmt.Errorf("usage: bort data <app> <store> --recreate|--migrate|--managed")
 	}
 	app := strings.TrimSpace(args[0])
 	store := strings.TrimSpace(args[1])
@@ -52,7 +51,13 @@ func runData(_ context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	fmt.Fprintf(stdout, "Recorded data strategy %q for %s/%s in .bort/state.json.\n", strategy, app, store)
+	st := newStyler(stdout)
+	fmt.Fprintf(stdout, "%s Recorded data strategy %s for %s\n",
+		st.glyph("✓", sevGood),
+		st.emph(strategy),
+		st.emph(app+"/"+store),
+	)
+	fmt.Fprintln(stdout, st.muted("Stored in .bort/state.json. Run `bort` to recheck."))
 	return nil
 }
 

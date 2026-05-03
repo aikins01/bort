@@ -55,54 +55,93 @@ type appIssue struct {
 // FixCommand returns a copy-pasteable shell snippet that resolves this
 // issue for the given app. Empty string means there is no canned fix.
 func (i appIssue) FixCommand(app string) string {
+	quotedApp := shellQuote(app)
 	switch i.Kind {
 	case issueKindEnv:
 		keys := envKeysFromItems(i.Items)
 		if len(keys) == 0 {
-			return fmt.Sprintf("bort env %s KEY=value", app)
+			return fmt.Sprintf("bort env %s KEY=value", quotedApp)
 		}
-		parts := make([]string, 0, len(keys))
-		for _, key := range keys {
-			parts = append(parts, key+"=value")
+		const maxKeys = 5
+		shown := keys
+		more := 0
+		if len(keys) > maxKeys {
+			shown = keys[:maxKeys]
+			more = len(keys) - maxKeys
 		}
-		return fmt.Sprintf("bort env %s %s", app, strings.Join(parts, " "))
+		parts := make([]string, 0, len(shown))
+		for _, key := range shown {
+			if isShellSafeIdent(key) {
+				parts = append(parts, key+"=value")
+			} else {
+				parts = append(parts, "KEY=value")
+			}
+		}
+		cmd := fmt.Sprintf("bort env %s %s", quotedApp, strings.Join(parts, " "))
+		if more > 0 {
+			cmd += fmt.Sprintf("   # +%d more key(s)", more)
+		}
+		return cmd
 	case issueKindData:
 		stores := dataStoresFromItems(i.Items)
 		if len(stores) == 0 {
-			return fmt.Sprintf("bort data %s <store> --migrate   # or choose --recreate / --managed", app)
+			return fmt.Sprintf("bort data %s <store> --migrate   # or choose --recreate / --managed", quotedApp)
 		}
-		return fmt.Sprintf("bort data %s %s --migrate   # or choose --recreate / --managed", app, stores[0])
+		return fmt.Sprintf("bort data %s %s --migrate   # or choose --recreate / --managed", quotedApp, shellQuote(stores[0]))
 	default:
 		return ""
 	}
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.', r == '/', r == '@', r == ':', r == '+', r == '=', r == ',':
+		default:
+			return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+		}
+	}
+	return s
+}
+
+func isShellSafeIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z', r == '_':
+		case r >= 'a' && r <= 'z':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func envKeysFromItems(items []runDecisionItem) []string {
 	seen := map[string]struct{}{}
 	keys := []string{}
 	for _, item := range items {
-		key := envKeyFromItem(item)
-		if key == "" {
-			continue
+		for _, key := range item.Evidence {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			keys = append(keys, key)
 		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	return keys
-}
-
-func envKeyFromItem(item runDecisionItem) string {
-	if strings.HasPrefix(item.ResourceRef, "env-key:") {
-		return strings.TrimPrefix(item.ResourceRef, "env-key:")
-	}
-	if strings.HasPrefix(item.ResourceRef, "env:") {
-		return ""
-	}
-	return ""
 }
 
 func dataStoresFromItems(items []runDecisionItem) []string {
@@ -266,6 +305,25 @@ func healthRank(h appHealth) int {
 	}
 }
 
+// humanBytes formats a byte count as a short, human-friendly string
+// (e.g. 6.2 GB, 1 GB) for the cockpit volume line. Uses 1024-based units.
+func humanBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	value := float64(bytes) / float64(div)
+	if value == float64(int64(value)) {
+		return fmt.Sprintf("%d %cB", int64(value), "KMGTPE"[exp])
+	}
+	return fmt.Sprintf("%.1f %cB", value, "KMGTPE"[exp])
+}
+
 func resourceLinesForApp(app preparer.AppPlan) []resourceLine {
 	lines := []resourceLine{}
 
@@ -325,16 +383,22 @@ func resourceLinesForApp(app preparer.AppPlan) []resourceLine {
 
 	if len(app.Resources.Volumes) > 0 {
 		binds := 0
+		var totalBytes, totalFiles int64
 		for _, v := range app.Resources.Volumes {
 			if v.Type == "bind" {
 				binds++
 			}
+			totalBytes += v.SizeBytes
+			totalFiles += v.FileCount
 		}
 		status := "✓"
 		detail := fmt.Sprintf("%d volume(s)", len(app.Resources.Volumes))
+		if totalBytes > 0 {
+			detail = fmt.Sprintf("%d volume(s), %s across %d file(s)", len(app.Resources.Volumes), humanBytes(totalBytes), totalFiles)
+		}
 		if binds > 0 {
 			status = "?"
-			detail = fmt.Sprintf("%d volume(s), %d bind mount(s) to verify", len(app.Resources.Volumes), binds)
+			detail = fmt.Sprintf("%s, %d bind mount(s) to verify", detail, binds)
 		}
 		lines = append(lines, resourceLine{Label: "Volumes", Status: status, Detail: detail})
 	}

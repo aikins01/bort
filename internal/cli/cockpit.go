@@ -1,11 +1,9 @@
 package cli
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,36 +11,33 @@ import (
 	"github.com/aikins01/bort/internal/preparer"
 )
 
-func enterInteractiveCockpit(stdin io.Reader, stdout io.Writer, run loadedMigrationRun) error {
-	writeAppFirstCockpit(stdout, run)
-	_ = stdin
-	return nil
-}
-
-func enterInteractiveCockpitWithReader(stdin io.Reader, reader *bufio.Reader, stdout io.Writer, run loadedMigrationRun) error {
-	writeAppFirstCockpit(stdout, run)
-	_ = stdin
-	_ = reader
-	return nil
-}
-
-// writeAppFirstCockpit renders a linear, terraform-style status view of the
-// run: one block per app, listing resource health, the issues that need your
-// attention, and the exact bort command that fixes each issue.
 func writeAppFirstCockpit(w io.Writer, run loadedMigrationRun) {
 	apps := appsFromRun(run)
 	summary := summarizeMigrationRun(run)
 	overall := overallAppHealth(apps)
+	st := newStyler(w)
 
-	fmt.Fprintf(w, "Migration: %s -> %s\n", runSourceLabel(summary.Run), summary.Run.Target)
-	fmt.Fprintf(w, "Run: %s\n", summary.Run.Name)
-	ready := 0
+	ready, blocked := 0, 0
 	for _, app := range apps {
-		if app.Health == appHealthReady {
+		switch app.Health {
+		case appHealthReady:
 			ready++
+		case appHealthBlocked:
+			blocked++
 		}
 	}
-	fmt.Fprintf(w, "Status: %s · %d of %d apps ready\n", overall, ready, len(apps))
+
+	header := fmt.Sprintf("%s %s %s · %d of %d ready",
+		runSourceLabel(summary.Run),
+		st.muted("→"),
+		st.emph(summary.Run.Target),
+		ready, len(apps),
+	)
+	if blocked > 0 {
+		header += " · " + st.glyph(fmt.Sprintf("%d blocked", blocked), sevBad)
+	}
+	header += " " + st.pill("DRY RUN", sevWarn)
+	fmt.Fprintln(w, header)
 	fmt.Fprintln(w)
 
 	if len(apps) == 0 {
@@ -50,31 +45,96 @@ func writeAppFirstCockpit(w io.Writer, run loadedMigrationRun) {
 		return
 	}
 
-	for _, app := range apps {
-		fmt.Fprintf(w, "%s  %s [%s]\n", healthGlyph(app.Health), app.Name, app.Health)
+	for i, app := range apps {
+		if i > 0 {
+			fmt.Fprintln(w, st.muted(strings.Repeat("─", 60)))
+		}
+		nameLine := fmt.Sprintf("%s  %s",
+			st.glyph(healthGlyph(app.Health), severityForHealth(app.Health)),
+			st.emph(app.Name),
+		)
+		if st.color {
+			nameLine += " " + st.pill(string(app.Health), severityForHealth(app.Health))
+		}
+		fmt.Fprintln(w, nameLine)
 		for _, line := range app.Resources {
-			fmt.Fprintf(w, "    %s  %-9s %s\n", line.Status, line.Label, line.Detail)
+			fmt.Fprintf(w, "    %s  %-9s %s\n",
+				st.glyph(line.Status, severityForGlyph(line.Status)),
+				line.Label,
+				st.muted(line.Detail),
+			)
 		}
 		if len(app.Issues) > 0 {
-			fmt.Fprintln(w, "    What needs your attention:")
+			fmt.Fprintln(w, "    "+st.muted("Issues:"))
 			for _, issue := range app.Issues {
-				fmt.Fprintf(w, "      %s %s\n", severityGlyph(issue.Severity), issue.Title)
+				fmt.Fprintf(w, "      %s %s\n",
+					st.glyph(severityGlyph(issue.Severity), severityForReadiness(issue.Severity)),
+					issue.Title,
+				)
 				if issue.Detail != "" {
-					fmt.Fprintf(w, "          %s\n", issue.Detail)
+					fmt.Fprintf(w, "          %s\n", st.muted(issue.Detail))
 				}
 				if fix := issue.FixCommand(app.Name); fix != "" {
-					fmt.Fprintf(w, "          fix: %s\n", fix)
+					fmt.Fprintf(w, "          %s\n", st.fix(fix))
 				}
 			}
 		}
-		fmt.Fprintln(w)
 	}
 
-	fmt.Fprintln(w, "Dry run only: nothing has been sent to the target.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, st.muted(strings.Repeat("─", 60)))
+	parts := []string{fmt.Sprintf("%d apps", len(apps))}
+	if ready > 0 {
+		parts = append(parts, st.glyph(fmt.Sprintf("%d ready", ready), sevGood))
+	}
+	if needsWork := len(apps) - ready - blocked; needsWork > 0 {
+		parts = append(parts, st.glyph(fmt.Sprintf("%d needs work", needsWork), sevWarn))
+	}
+	if blocked > 0 {
+		parts = append(parts, st.glyph(fmt.Sprintf("%d blocked", blocked), sevBad))
+	}
+	fmt.Fprintf(w, "%s %s\n", st.emph("Plan:"), strings.Join(parts, " · "))
 	if overall != appHealthReady {
-		fmt.Fprintln(w, "Resolve the items above, then `bort` again to recheck. Run any shown `fix:` commands to record local answers.")
+		fmt.Fprintln(w, st.muted("Run the shown `fix:` commands, then re-run `bort` to recheck."))
 	} else {
-		fmt.Fprintln(w, "All app setup inputs look ready. Use `bort migrate` to refresh the local dry-run migration plan; live execution is not implemented.")
+		fmt.Fprintln(w, st.muted("All app inputs ready. Use `bort migrate` to refresh dry-run artifacts (live execution not yet implemented)."))
+	}
+}
+
+func severityForHealth(h appHealth) severity {
+	switch h {
+	case appHealthReady:
+		return sevGood
+	case appHealthBlocked:
+		return sevBad
+	default:
+		return sevWarn
+	}
+}
+
+func severityForGlyph(g string) severity {
+	switch g {
+	case "✓":
+		return sevGood
+	case "!":
+		return sevWarn
+	case "✕":
+		return sevBad
+	default:
+		return sevDim
+	}
+}
+
+func severityForReadiness(r preparer.Readiness) severity {
+	switch r {
+	case preparer.ReadinessBlocked:
+		return sevBad
+	case preparer.ReadinessNeedsInput:
+		return sevWarn
+	case preparer.ReadinessNeedsDecision:
+		return sevDim
+	default:
+		return sevGood
 	}
 }
 
@@ -112,35 +172,6 @@ func severityGlyph(r preparer.Readiness) string {
 	}
 }
 
-type envHint struct {
-	Path         string
-	TemplatePath string
-	MissingKeys  []string
-}
-
-func fillEnvFile(stdout io.Writer, input *os.File, hint envHint) error {
-	if hint.Path == hint.TemplatePath && strings.HasSuffix(hint.Path, ".example") {
-		return fmt.Errorf("refusing to write env values into template file %s", hint.Path)
-	}
-	values := map[string]string{}
-	for _, key := range hint.MissingKeys {
-		fmt.Fprintf(stdout, "Enter value for %s in %s (leave blank to keep missing): ", key, hint.Path)
-		value, err := readSecretLine(input)
-		if err != nil && !(err == io.EOF && value != "") {
-			return err
-		}
-		fmt.Fprintln(stdout)
-		if value == "" {
-			continue
-		}
-		values[key] = value
-	}
-	if len(values) == 0 {
-		return nil
-	}
-	return writeEnvFileValues(filepath.FromSlash(hint.Path), filepath.FromSlash(hint.TemplatePath), values)
-}
-
 func writeEnvFileValues(path, templatePath string, values map[string]string) error {
 	contents, err := readFileNoFollow(path)
 	if err != nil {
@@ -175,7 +206,7 @@ func writeEnvFileValues(path, templatePath string, values map[string]string) err
 	for _, key := range keys {
 		lines = append(lines, key+"="+formatEnvValue(values[key]))
 	}
-	if err := writeFileNoFollow(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+	if err := writeFileAtomic(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
 		return err
 	}
 	if path != templatePath && templatePath != "" {
@@ -197,7 +228,7 @@ func ensureEnvTemplateKeys(path string, values map[string]string) error {
 			for _, key := range keys {
 				lines = append(lines, key+"=")
 			}
-			return writeFileNoFollow(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
+			return writeFileAtomic(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
 		}
 		return err
 	}
@@ -223,7 +254,7 @@ func ensureEnvTemplateKeys(path string, values map[string]string) error {
 	for _, key := range keys {
 		lines = append(lines, key+"=")
 	}
-	return writeFileNoFollow(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
+	return writeFileAtomic(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
 }
 
 func formatEnvValue(value string) string {

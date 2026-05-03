@@ -19,9 +19,10 @@ import (
 )
 
 type Scanner struct {
-	DockerPath string
-	Now        func() time.Time
-	runCommand func(context.Context, ...string) ([]byte, error)
+	DockerPath     string
+	Now            func() time.Time
+	runCommand     func(context.Context, ...string) ([]byte, error)
+	measureCommand func(context.Context, string) (int64, int64, error)
 }
 
 const dockerInspectChunkSize = 100
@@ -41,8 +42,10 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 		s.Now = time.Now
 	}
 
-	if _, err := exec.LookPath(s.DockerPath); err != nil {
-		return manifest.Manifest{}, fmt.Errorf("docker CLI not found: %w", err)
+	if s.runCommand == nil {
+		if _, err := exec.LookPath(s.DockerPath); err != nil {
+			return manifest.Manifest{}, fmt.Errorf("docker CLI not found: %w", err)
+		}
 	}
 
 	hostname, _ := os.Hostname()
@@ -51,6 +54,11 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 	containers, err := s.inspectContainers(ctx)
 	if err != nil {
 		return manifest.Manifest{}, err
+	}
+
+	imageDigests, err := s.inspectImageDigests(ctx, containers)
+	if err != nil {
+		result.Warnings = append(result.Warnings, manifest.Warning{Code: "docker.image_inspect_failed", Message: err.Error()})
 	}
 
 	volumeUsers := map[string]map[string]struct{}{}
@@ -70,6 +78,9 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 		}
 
 		service := container.toService(opts.IncludeEnvValues)
+		if digest := imageDigests[container.Image]; digest != "" {
+			service.ImageDigest = digest
+		}
 		app.Services = append(app.Services, service)
 		app.Routes = mergeRoutes(app.Routes, routesFromLabels(service.Name, container.Labels()))
 
@@ -100,6 +111,12 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 				volumes[i].UsedBy = append(volumes[i].UsedBy, appName)
 			}
 			sort.Strings(volumes[i].UsedBy)
+			if len(volumes[i].UsedBy) > 0 && volumes[i].Mountpoint != "" {
+				if size, files, err := s.measureVolume(ctx, volumes[i].Mountpoint); err == nil {
+					volumes[i].SizeBytes = size
+					volumes[i].FileCount = files
+				}
+			}
 		}
 		result.Volumes = volumes
 	}
@@ -224,6 +241,100 @@ func (s *Scanner) inspectNetworks(ctx context.Context) ([]manifest.Network, erro
 	return networks, nil
 }
 
+// inspectImageDigests resolves repo digests (sha256 from RepoDigests)
+// for every unique image id referenced by the running containers, so
+// the manifest captures what should be pulled on the target — not just
+// the floating tag the source ran.
+func (s *Scanner) inspectImageDigests(ctx context.Context, containers []containerInspect) (map[string]string, error) {
+	uniqueIDs := map[string]struct{}{}
+	for _, c := range containers {
+		if c.Image != "" {
+			uniqueIDs[c.Image] = struct{}{}
+		}
+	}
+	if len(uniqueIDs) == 0 {
+		return nil, nil
+	}
+	ids := make([]string, 0, len(uniqueIDs))
+	for id := range uniqueIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	digests := map[string]string{}
+	for _, chunk := range chunks(ids, dockerInspectChunkSize) {
+		args := append([]string{"image", "inspect"}, chunk...)
+		raw, err := s.run(ctx, args...)
+		if err != nil {
+			return digests, fmt.Errorf("inspect docker images: %w", err)
+		}
+		var inspected []imageInspect
+		if err := json.Unmarshal(raw, &inspected); err != nil {
+			return digests, err
+		}
+		for _, image := range inspected {
+			if len(image.RepoDigests) > 0 {
+				digests[image.ID] = image.RepoDigests[0]
+			}
+		}
+	}
+	return digests, nil
+}
+
+// measureVolume reports apparent size in bytes and file count for the
+// given mountpoint. The fields feed sync window planning. We use du -sb
+// (apparent bytes) and find -printf so we don't depend on docker
+// system df, which only reports for named volumes and skips bind mounts.
+// Best-effort: any failure means the volume's size stays 0.
+func (s *Scanner) measureVolume(ctx context.Context, mountpoint string) (int64, int64, error) {
+	if s.measureCommand != nil {
+		return s.measureCommand(ctx, mountpoint)
+	}
+	sizeOut, err := runHost(ctx, "du", "-sb", "--", mountpoint)
+	if err != nil {
+		return 0, 0, err
+	}
+	size, err := parseDuBytes(sizeOut)
+	if err != nil {
+		return 0, 0, err
+	}
+	countOut, err := runHost(ctx, "find", mountpoint, "-mindepth", "1", "-print0")
+	if err != nil {
+		return size, 0, nil
+	}
+	return size, int64(bytes.Count(countOut, []byte{0})), nil
+}
+
+func runHost(ctx context.Context, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %s", name, strings.Join(args, " "), strings.TrimSpace(stderr.String()))
+	}
+	return out, nil
+}
+
+func parseDuBytes(out []byte) (int64, error) {
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("empty du output")
+	}
+	return parseInt64(fields[0])
+}
+
+func parseInt64(value string) (int64, error) {
+	var n int64
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			return 0, fmt.Errorf("non-numeric: %q", value)
+		}
+		n = n*10 + int64(ch-'0')
+	}
+	return n, nil
+}
+
 func (s *Scanner) run(ctx context.Context, args ...string) ([]byte, error) {
 	if s.runCommand != nil {
 		return s.runCommand(ctx, args...)
@@ -246,6 +357,7 @@ func (s *Scanner) run(ctx context.Context, args ...string) ([]byte, error) {
 type containerInspect struct {
 	ID              string `json:"Id"`
 	Name            string `json:"Name"`
+	Image           string `json:"Image"`
 	Config          configInspect
 	State           stateInspect
 	Mounts          []mountInspect
@@ -253,9 +365,18 @@ type containerInspect struct {
 }
 
 type configInspect struct {
-	Image  string            `json:"Image"`
-	Env    []string          `json:"Env"`
-	Labels map[string]string `json:"Labels"`
+	Image       string             `json:"Image"`
+	Env         []string           `json:"Env"`
+	Labels      map[string]string  `json:"Labels"`
+	Healthcheck *healthcheckConfig `json:"Healthcheck,omitempty"`
+}
+
+type healthcheckConfig struct {
+	Test        []string `json:"Test"`
+	Interval    int64    `json:"Interval"`
+	Timeout     int64    `json:"Timeout"`
+	Retries     int      `json:"Retries"`
+	StartPeriod int64    `json:"StartPeriod"`
 }
 
 type stateInspect struct {
@@ -285,6 +406,11 @@ type networkAttachInspect struct {
 	IPAddress string `json:"IPAddress"`
 }
 
+type imageInspect struct {
+	ID          string   `json:"Id"`
+	RepoDigests []string `json:"RepoDigests"`
+}
+
 type volumeInspect struct {
 	Name       string            `json:"Name"`
 	Driver     string            `json:"Driver"`
@@ -312,13 +438,38 @@ func (c containerInspect) toService(includeEnvValues bool) manifest.Service {
 		ID:          shortID(c.ID),
 		Name:        strings.TrimPrefix(c.Name, "/"),
 		Image:       c.Config.Image,
+		ImageID:     c.Image,
 		Status:      c.State.Status,
+		Healthcheck: healthcheckFromConfig(c.Config.Healthcheck),
 		Environment: envVars(c.Config.Env, includeEnvValues),
 		Mounts:      mounts(c.Mounts),
 		Ports:       ports(c.NetworkSettings.Ports),
 		Networks:    networks(c.NetworkSettings.Networks),
 		Labels:      c.Labels(),
 	}
+}
+
+// docker reports healthcheck durations in nanoseconds; we expose them as
+// human-readable strings so manifests stay readable and stable across
+// docker versions.
+func healthcheckFromConfig(hc *healthcheckConfig) *manifest.Healthcheck {
+	if hc == nil || len(hc.Test) == 0 {
+		return nil
+	}
+	return &manifest.Healthcheck{
+		Test:        hc.Test,
+		Interval:    durationString(hc.Interval),
+		Timeout:     durationString(hc.Timeout),
+		Retries:     hc.Retries,
+		StartPeriod: durationString(hc.StartPeriod),
+	}
+}
+
+func durationString(nanos int64) string {
+	if nanos <= 0 {
+		return ""
+	}
+	return time.Duration(nanos).String()
 }
 
 func classifyContainer(container containerInspect) (key, name, platform string) {

@@ -81,6 +81,11 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		fmt.Fprintf(stderr, "wrote migration manifest to %s\n", outputPath)
 	}
 
+	if !includeEnvValues {
+		st := newStyler(stderr)
+		fmt.Fprintln(stderr, st.muted("note: env values were not captured (default). Re-run with --include-env-values, or use `bort` (no args) which captures by default."))
+	}
+
 	return nil
 }
 

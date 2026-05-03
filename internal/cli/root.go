@@ -23,8 +23,8 @@ func RunWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	case "help", "--help", "-h":
 		advanced := len(args) > 1 && (args[1] == "--advanced" || args[1] == "-a")
 		return printHelp(stdout, advanced)
-	case "version":
-		fmt.Fprintln(stdout, version)
+	case "version", "--version":
+		fmt.Fprintf(stdout, "bort %s\n", version)
 		return nil
 	case "env":
 		return runEnv(ctx, args[1:], stdout, stderr)
@@ -36,7 +36,6 @@ func RunWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		return runRollback(ctx, args[1:], stdout, stderr)
 	case "commit":
 		return runCommit(ctx, args[1:], stdout, stderr)
-	// power-user / advanced verbs (still wired so existing tests and scripts keep working).
 	case "scan":
 		return runScan(ctx, args[1:], stdout, stderr)
 	case "plan":
@@ -53,66 +52,81 @@ func RunWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		return runCutover(ctx, args[1:], stdout, stderr)
 	case "status":
 		return runStatus(ctx, args[1:], stdout, stderr)
-	case "continue":
-		return runContinue(ctx, args[1:], stdin, stdout, stderr)
 	case "next":
-		return runNext(ctx, args[1:], stdin, stdout, stderr)
+		return runNext(ctx, args[1:], stdout, stderr)
 	default:
-		return fmt.Errorf("unknown command %q\n\n%s", args[0], strings.TrimSpace(usage(false)))
+		return fmt.Errorf("unknown command %q (run `bort help` for usage)", args[0])
 	}
 }
 
 func printHelp(w io.Writer, advanced bool) error {
-	_, err := fmt.Fprint(w, usage(advanced))
-	return err
-}
-
-func usage(advanced bool) string {
+	st := newStyler(w)
+	fmt.Fprintln(w, st.emph("bort")+" "+st.muted("— migrate self-hosted apps between PaaS platforms"))
+	fmt.Fprintln(w)
 	if advanced {
-		return advancedUsage()
+		writeAdvancedHelp(w, st)
+	} else {
+		writePrimaryHelp(w, st)
 	}
-	return `bort migrates self-hosted apps between PaaS platforms.
-
-Usage:
-  bort                              scan and show app-first migration status
-  bort env <app> KEY=value ...      record env values for an app in .bort/state.json
-  bort data <app> <store> --recreate|--migrate|--managed
-                                    record a data store strategy in .bort/state.json
-  bort migrate                      create/update local dry-run migration artifacts
-  bort rollback                     plan a rollback to the source
-  bort commit                       plan final target acceptance
-
-Other:
-  bort help [--advanced]            show this help (advanced lists power-user verbs)
-  bort version                      print the version
-`
+	return nil
 }
 
-func advancedUsage() string {
-	return `bort migrates self-hosted apps between PaaS platforms.
+func writePrimaryHelp(w io.Writer, st *styler) {
+	writeHelpSection(w, st, "Usage:", []helpLine{
+		{verb: "bort", desc: "scan and show app-first migration status"},
+		{verb: "bort env <app> KEY=value ...", desc: "record env values for an app in .bort/state.json"},
+		{verb: "bort data <app> <store> --recreate|--migrate|--managed", desc: "record a data store strategy in .bort/state.json"},
+		{verb: "bort migrate", desc: "create/update local dry-run migration artifacts"},
+		{verb: "bort rollback", desc: "plan a rollback to the source"},
+		{verb: "bort commit", desc: "plan final target acceptance"},
+	})
+	writeHelpSection(w, st, "Other:", []helpLine{
+		{verb: "bort help [--advanced]", desc: "show this help (advanced lists power-user verbs)"},
+		{verb: "bort version", desc: "print the version"},
+	})
+}
 
-Primary:
-  bort                start or resume a migration (linear, app-first)
-  bort env            record env values for an app in .bort/state.json
-  bort data           record a data store strategy in .bort/state.json
-  bort migrate        create/update local dry-run migration artifacts
-  bort rollback       plan a rollback to the source
-  bort commit         plan final target acceptance
+func writeAdvancedHelp(w io.Writer, st *styler) {
+	writeHelpSection(w, st, "Primary:", []helpLine{
+		{verb: "bort", desc: "start or resume a migration (linear, app-first)"},
+		{verb: "bort env", desc: "record env values for an app in .bort/state.json"},
+		{verb: "bort data", desc: "record a data store strategy in .bort/state.json"},
+		{verb: "bort migrate", desc: "create/update local dry-run migration artifacts"},
+		{verb: "bort rollback", desc: "plan a rollback to the source"},
+		{verb: "bort commit", desc: "plan final target acceptance"},
+	})
+	writeHelpSection(w, st, "Power-user pipeline (each step is local and dry-run only):", []helpLine{
+		{verb: "bort scan", desc: "discover local resources and write a migration manifest"},
+		{verb: "bort plan", desc: "summarize migration readiness from a manifest"},
+		{verb: "bort export", desc: "write an inspectable local migration bundle"},
+		{verb: "bort validate", desc: "validate an exported migration bundle"},
+		{verb: "bort prepare", desc: "plan target resources from an exported bundle"},
+		{verb: "bort sync", desc: "plan state sync work from prepared target resources"},
+		{verb: "bort cutover", desc: "plan route cutover and rollback"},
+	})
+	writeHelpSection(w, st, "Scripting helpers (rarely needed; the linear status view shows the same info):", []helpLine{
+		{verb: "bort status", desc: "print a run summary as text"},
+		{verb: "bort next", desc: "print the next safe action for a run"},
+	})
+	fmt.Fprintln(w, st.muted(`Run "bort <command> -h" for command-specific flags.`))
+}
 
-Power-user pipeline (each step is local and dry-run only):
-  bort scan      discover local resources and write a migration manifest
-  bort plan      summarize migration readiness from a manifest
-  bort export    write an inspectable local migration bundle
-  bort validate  validate an exported migration bundle
-  bort prepare   plan target resources from an exported bundle
-  bort sync      plan state sync work from prepared target resources
-  bort cutover   plan route cutover and rollback
+type helpLine struct {
+	verb string
+	desc string
+}
 
-Scripting helpers (rarely needed; the linear cockpit shows the same info):
-  bort status    print a run summary as text
-  bort continue  reopen the migration cockpit
-  bort next      print the next safe action for a run
-
-Run "bort <command> -h" for command-specific flags.
-`
+func writeHelpSection(w io.Writer, st *styler, heading string, lines []helpLine) {
+	fmt.Fprintln(w, st.emph(heading))
+	width := 0
+	for _, l := range lines {
+		if len(l.verb) > width {
+			width = len(l.verb)
+		}
+	}
+	for _, l := range lines {
+		padding := strings.Repeat(" ", width-len(l.verb)+2)
+		fmt.Fprintf(w, "  %s%s%s\n", st.emph(l.verb), padding, st.muted(l.desc))
+	}
+	fmt.Fprintln(w)
 }

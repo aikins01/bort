@@ -5,14 +5,21 @@ import "time"
 const APIVersion = "bort.io/v1alpha1"
 
 type Manifest struct {
-	APIVersion  string    `json:"apiVersion"`
-	Kind        string    `json:"kind"`
-	GeneratedAt time.Time `json:"generatedAt"`
-	Source      Source    `json:"source"`
-	Apps        []App     `json:"apps"`
-	Volumes     []Volume  `json:"volumes,omitempty"`
-	Networks    []Network `json:"networks,omitempty"`
-	Warnings    []Warning `json:"warnings,omitempty"`
+	APIVersion     string          `json:"apiVersion"`
+	Kind           string          `json:"kind"`
+	GeneratedAt    time.Time       `json:"generatedAt"`
+	Source         Source          `json:"source"`
+	Apps           []App           `json:"apps"`
+	Volumes        []Volume        `json:"volumes,omitempty"`
+	Networks       []Network       `json:"networks,omitempty"`
+	ProxyArtifacts []ProxyArtifact `json:"proxyArtifacts,omitempty"`
+	Warnings       []Warning       `json:"warnings,omitempty"`
+}
+
+type ProxyArtifact struct {
+	Source  string `json:"source"`
+	Path    string `json:"path"`
+	Content string `json:"content,omitempty"`
 }
 
 type Source struct {
@@ -61,12 +68,23 @@ type Service struct {
 	ID          string            `json:"id"`
 	Name        string            `json:"name"`
 	Image       string            `json:"image,omitempty"`
+	ImageID     string            `json:"imageID,omitempty"`
+	ImageDigest string            `json:"imageDigest,omitempty"`
 	Status      string            `json:"status,omitempty"`
+	Healthcheck *Healthcheck      `json:"healthcheck,omitempty"`
 	Environment []EnvVar          `json:"environment,omitempty"`
 	Mounts      []Mount           `json:"mounts,omitempty"`
 	Ports       []Port            `json:"ports,omitempty"`
 	Networks    []ServiceNetwork  `json:"networks,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
+}
+
+type Healthcheck struct {
+	Test        []string `json:"test,omitempty"`
+	Interval    string   `json:"interval,omitempty"`
+	Timeout     string   `json:"timeout,omitempty"`
+	Retries     int      `json:"retries,omitempty"`
+	StartPeriod string   `json:"startPeriod,omitempty"`
 }
 
 type EnvVar struct {
@@ -119,6 +137,8 @@ type Volume struct {
 	Driver     string            `json:"driver,omitempty"`
 	Mountpoint string            `json:"mountpoint,omitempty"`
 	Scope      string            `json:"scope,omitempty"`
+	SizeBytes  int64             `json:"sizeBytes,omitempty"`
+	FileCount  int64             `json:"fileCount,omitempty"`
 	Labels     map[string]string `json:"labels,omitempty"`
 	Options    map[string]string `json:"options,omitempty"`
 	UsedBy     []string          `json:"usedBy,omitempty"`
