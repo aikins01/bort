@@ -142,20 +142,12 @@ func fillEnvFile(stdout io.Writer, input *os.File, hint envHint) error {
 }
 
 func writeEnvFileValues(path, templatePath string, values map[string]string) error {
-	if err := rejectSymlink(path); err != nil {
-		return err
-	}
-	if templatePath != "" {
-		if err := rejectSymlink(templatePath); err != nil {
-			return err
-		}
-	}
-	contents, err := os.ReadFile(path)
+	contents, err := readFileNoFollow(path)
 	if err != nil {
 		if !os.IsNotExist(err) || templatePath == "" {
 			return err
 		}
-		contents, err = os.ReadFile(templatePath)
+		contents, err = readFileNoFollow(templatePath)
 		if err != nil {
 			return err
 		}
@@ -183,10 +175,7 @@ func writeEnvFileValues(path, templatePath string, values map[string]string) err
 	for _, key := range keys {
 		lines = append(lines, key+"="+formatEnvValue(values[key]))
 	}
-	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
-		return err
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := writeFileNoFollow(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
 		return err
 	}
 	if path != templatePath && templatePath != "" {
@@ -196,10 +185,7 @@ func writeEnvFileValues(path, templatePath string, values map[string]string) err
 }
 
 func ensureEnvTemplateKeys(path string, values map[string]string) error {
-	if err := rejectSymlink(path); err != nil {
-		return err
-	}
-	contents, err := os.ReadFile(path)
+	contents, err := readFileNoFollow(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			keys := make([]string, 0, len(values))
@@ -211,10 +197,7 @@ func ensureEnvTemplateKeys(path string, values map[string]string) error {
 			for _, key := range keys {
 				lines = append(lines, key+"=")
 			}
-			if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
-				return err
-			}
-			return os.Chmod(path, 0o600)
+			return writeFileNoFollow(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
 		}
 		return err
 	}
@@ -240,10 +223,7 @@ func ensureEnvTemplateKeys(path string, values map[string]string) error {
 	for _, key := range keys {
 		lines = append(lines, key+"=")
 	}
-	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
-		return err
-	}
-	return os.Chmod(path, 0o600)
+	return writeFileNoFollow(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
 }
 
 func formatEnvValue(value string) string {

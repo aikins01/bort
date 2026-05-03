@@ -2,8 +2,10 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/aikins01/bort/internal/exporter"
@@ -134,25 +136,16 @@ func materializePrivateEnvFiles(appDir string) (bool, error) {
 		}
 		examplePath := filepath.Join(appDir, name)
 		privatePath := filepath.Join(appDir, strings.TrimSuffix(name, ".example"))
-		if err := rejectSymlink(examplePath); err != nil {
-			return materialized, err
-		}
-		if err := rejectSymlink(privatePath); err != nil {
-			return materialized, err
-		}
-		if _, err := os.Stat(privatePath); err == nil {
+		if _, err := os.Lstat(privatePath); err == nil {
 			continue
-		} else if !os.IsNotExist(err) {
+		} else if !errors.Is(err, os.ErrNotExist) {
 			return materialized, err
 		}
-		contents, err := os.ReadFile(examplePath)
+		contents, err := readFileNoFollow(examplePath)
 		if err != nil {
 			return materialized, err
 		}
-		if err := os.WriteFile(privatePath, contents, 0o600); err != nil {
-			return materialized, err
-		}
-		if err := os.Chmod(privatePath, 0o600); err != nil {
+		if err := writeFileNoFollow(privatePath, contents, 0o600); err != nil {
 			return materialized, err
 		}
 		materialized = true
@@ -167,9 +160,9 @@ func materializePrivateEnvFiles(appDir string) (bool, error) {
 
 func rewriteComposeEnvFileExamples(appDir string) error {
 	composePath := filepath.Join(appDir, "compose.yaml")
-	contents, err := os.ReadFile(composePath)
+	contents, err := readFileNoFollow(composePath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		return err
@@ -184,15 +177,23 @@ func rewriteComposeEnvFileExamples(appDir string) error {
 		if entry.IsDir() || !strings.HasPrefix(name, ".env") || !strings.HasSuffix(name, ".example") {
 			continue
 		}
-		updated = strings.ReplaceAll(updated, name, strings.TrimSuffix(name, ".example"))
+		updated = replaceComposeEnvExample(updated, name, strings.TrimSuffix(name, ".example"))
 	}
 	if updated == string(contents) {
 		return nil
 	}
-	if err := rejectSymlink(composePath); err != nil {
-		return err
-	}
-	return os.WriteFile(composePath, []byte(updated), 0o600)
+	return writeFileNoFollow(composePath, []byte(updated), 0o600)
+}
+
+// replaceComposeEnvExample swaps oldName for newName inside compose YAML
+// only when oldName appears as a standalone path token. The boundary
+// classes match the characters that delimit a path value in YAML
+// (whitespace, separators, list markers, quotes, equals). Substring
+// matches inside longer filenames or comments are left alone.
+func replaceComposeEnvExample(yaml, oldName, newName string) string {
+	pattern := `(^|[\s/:'"\[,=])` + regexp.QuoteMeta(oldName) + `($|[\s/:'"\],])`
+	re := regexp.MustCompile(pattern)
+	return re.ReplaceAllString(yaml, "${1}"+newName+"${2}")
 }
 
 // returns values for keys that are empty in the env file or belong to its template.
@@ -226,9 +227,9 @@ func envValuesToFill(envPath, templatePath string, values map[string]string) (ma
 }
 
 func readEnvAssignments(path string) (map[string]string, bool, error) {
-	contents, err := os.ReadFile(path)
+	contents, err := readFileNoFollow(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return map[string]string{}, false, nil
 		}
 		return nil, false, err
