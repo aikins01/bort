@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -33,7 +34,10 @@ func applyStateEnvToBundle(state bortState, bundleDir string) (int, error) {
 		if len(data.Env) == 0 {
 			continue
 		}
-		appDir := bundleAppDir(bundleDir, app, appDirs)
+		appDir, err := bundleAppDir(bundleDir, app, appDirs)
+		if err != nil {
+			return touched, err
+		}
 		materialized, err := materializePrivateEnvFiles(appDir)
 		if err != nil {
 			return touched, err
@@ -98,11 +102,21 @@ func bundleAppDirs(index exporter.Summary) map[string]string {
 	return dirs
 }
 
-func bundleAppDir(bundleDir, app string, dirs map[string]string) string {
+// bundleAppDir resolves the on-disk directory for app within bundleDir.
+// The directory hint can come from the bundle's index.json which is
+// untrusted user input, so the resolved path is validated to be contained
+// within bundleDir to block path-escape attacks (../, absolute paths,
+// or symlinked parents inside the bundle).
+func bundleAppDir(bundleDir, app string, dirs map[string]string) (string, error) {
+	candidate := app
 	if dir := dirs[app]; dir != "" {
-		return filepath.Join(bundleDir, filepath.FromSlash(dir))
+		candidate = filepath.FromSlash(dir)
 	}
-	return filepath.Join(bundleDir, app)
+	resolved := filepath.Join(bundleDir, candidate)
+	if err := containedPath(bundleDir, resolved); err != nil {
+		return "", fmt.Errorf("app %q resolves to %s which escapes bundle %s: %w", app, resolved, bundleDir, err)
+	}
+	return resolved, nil
 }
 
 func markBundleAppPrivateEnv(index *exporter.Summary, appName string) bool {
@@ -189,11 +203,23 @@ func rewriteComposeEnvFileExamples(appDir string) error {
 // only when oldName appears as a standalone path token. The boundary
 // classes match the characters that delimit a path value in YAML
 // (whitespace, separators, list markers, quotes, equals). Substring
-// matches inside longer filenames or comments are left alone.
+// matches inside longer filenames or comments are left alone. The loop
+// re-runs the substitution until stable so adjacent matches sharing a
+// boundary character (e.g. `[oldName,oldName]`) are both rewritten,
+// since regexp consumes the boundary on each match.
 func replaceComposeEnvExample(yaml, oldName, newName string) string {
+	if oldName == newName {
+		return yaml
+	}
 	pattern := `(^|[\s/:'"\[,=])` + regexp.QuoteMeta(oldName) + `($|[\s/:'"\],])`
 	re := regexp.MustCompile(pattern)
-	return re.ReplaceAllString(yaml, "${1}"+newName+"${2}")
+	for {
+		updated := re.ReplaceAllString(yaml, "${1}"+newName+"${2}")
+		if updated == yaml {
+			return updated
+		}
+		yaml = updated
+	}
 }
 
 // returns values for keys that are empty in the env file or belong to its template.

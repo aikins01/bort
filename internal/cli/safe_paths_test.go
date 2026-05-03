@@ -109,3 +109,12 @@ func TestReplaceComposeEnvExampleRewritesInlineValue(t *testing.T) {
 		t.Fatalf("unexpected rewrite: %q", got)
 	}
 }
+
+func TestReplaceComposeEnvExampleHandlesAdjacentMatches(t *testing.T) {
+	yaml := "    env_file: [.env.api.example,.env.api.example]\n"
+	got := replaceComposeEnvExample(yaml, ".env.api.example", ".env.api")
+	want := "    env_file: [.env.api,.env.api]\n"
+	if got != want {
+		t.Fatalf("expected both adjacent matches rewritten\nwant: %q\n got: %q", want, got)
+	}
+}

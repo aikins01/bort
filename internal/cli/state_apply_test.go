@@ -20,6 +20,26 @@ func writePrivateTestBundle(t *testing.T, bundleDir string, m manifest.Manifest)
 	}
 }
 
+func TestBundleAppDirRejectsEscapingDirectoryHint(t *testing.T) {
+	bundleDir := t.TempDir()
+	dirs := map[string]string{"api": "../../../etc"}
+	if _, err := bundleAppDir(bundleDir, "api", dirs); err == nil {
+		t.Fatalf("expected escaping directory hint to be rejected")
+	}
+}
+
+func TestApplyStateEnvToBundleRejectsMaliciousIndex(t *testing.T) {
+	bundleDir := t.TempDir()
+	indexJSON := []byte(`{"apps":[{"name":"api","directory":"../../../etc"}]}`)
+	if err := os.WriteFile(filepath.Join(bundleDir, "index.json"), indexJSON, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := setAppEnv(emptyBortState(), "api", map[string]string{"FIRST_KEY": "v"})
+	if _, err := applyStateEnvToBundle(state, bundleDir); err == nil {
+		t.Fatalf("expected applyStateEnvToBundle to reject escaping app directory")
+	}
+}
+
 func TestApplyStateEnvToBundleFillsMissingValues(t *testing.T) {
 	bundleDir := t.TempDir()
 	appDir := filepath.Join(bundleDir, "api")
