@@ -2,8 +2,11 @@ package dokploy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -131,6 +134,25 @@ func TestApplyDumpDataStoreSkipsRecreate(t *testing.T) {
 	}
 }
 
+func TestRefreshComposeAppNameFetchesByID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/compose.one" || r.URL.Query().Get("composeId") != "c1" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(Compose{ComposeID: "c1", Name: "api", AppName: "stack-1"})
+	}))
+	defer server.Close()
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+	entry := &appCache{ComposeID: "c1"}
+	if err := client.refreshComposeAppName(context.Background(), entry); err != nil {
+		t.Fatalf("refreshComposeAppName: %v", err)
+	}
+	if entry.ComposeAppName != "stack-1" {
+		t.Fatalf("expected appName=stack-1, got %q", entry.ComposeAppName)
+	}
+}
+
 func TestApplySyncVolumeCopiesNamedVolume(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
 	app.Resources.Volumes = []preparer.VolumeResource{{
@@ -146,6 +168,8 @@ func TestApplySyncVolumeCopiesNamedVolume(t *testing.T) {
 		outputs: map[string][]byte{
 			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("dst-id\n"),
 			"inspect --type container dst-id":                                          []byte(`[{"Id":"dst-id","Name":"/dokploy-web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"Mounts":[{"Type":"volume","Name":"dst-vol","Destination":"/data","RW":true}]}]`),
+			"volume inspect src-vol": []byte(`[{"Name":"src-vol"}]`),
+			"volume inspect dst-vol": []byte(`[{"Name":"dst-vol"}]`),
 		},
 	}
 	client := &Client{Docker: runner}
@@ -197,7 +221,7 @@ func TestApplySyncVolumeSkipsDataStoreBackingVolume(t *testing.T) {
 
 func TestPostgresCredsFromEnvDefaults(t *testing.T) {
 	creds := postgresCredsFromEnv(map[string]string{})
-	if creds.User != "postgres" || creds.Database != "postgres" || creds.Port != "5432" {
+	if creds.User != "postgres" || creds.Database != "postgres" {
 		t.Fatalf("unexpected defaults: %+v", creds)
 	}
 	creds = postgresCredsFromEnv(map[string]string{"POSTGRES_USER": "alice", "POSTGRES_DB": "app", "POSTGRES_PASSWORD": "pw"})

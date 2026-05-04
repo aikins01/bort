@@ -377,6 +377,16 @@ func (c *Client) SearchCompose(ctx context.Context, name, environmentID string) 
 	return nil, nil
 }
 
+func (c *Client) GetCompose(ctx context.Context, composeID string) (*Compose, error) {
+	q := url.Values{}
+	q.Set("composeId", composeID)
+	var compose Compose
+	if err := c.do(ctx, http.MethodGet, "/api/compose.one", q, nil, &compose); err != nil {
+		return nil, err
+	}
+	return &compose, nil
+}
+
 type CreateComposeRequest struct {
 	Name          string `json:"name"`
 	EnvironmentID string `json:"environmentId"`

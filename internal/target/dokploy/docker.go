@@ -143,13 +143,27 @@ func listContainersByLabel(ctx context.Context, runner dockerRunner, label strin
 			ids = append(ids, id)
 		}
 	}
-	containers := make([]dockerContainer, 0, len(ids))
-	for _, id := range ids {
-		container, err := inspectContainer(ctx, runner, id)
-		if err != nil {
-			return nil, err
-		}
-		containers = append(containers, container)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	args := append([]string{"inspect", "--type", "container"}, ids...)
+	raw, err := runner.Output(ctx, args...)
+	if err != nil {
+		return nil, fmt.Errorf("docker inspect ids=%v: %w", ids, err)
+	}
+	var decoded []dockerInspectRaw
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil, fmt.Errorf("decode docker inspect batch: %w", err)
+	}
+	containers := make([]dockerContainer, 0, len(decoded))
+	for _, r := range decoded {
+		containers = append(containers, dockerContainer{
+			ID:     r.ID,
+			Name:   strings.TrimPrefix(r.Name, "/"),
+			Config: r.Config,
+			State:  r.State,
+			Mounts: r.Mounts,
+		})
 	}
 	return containers, nil
 }
@@ -194,13 +208,21 @@ func envMap(env []string) map[string]string {
 const volumeCopyImage = "busybox:1.36"
 
 // copyNamedVolume mirrors the contents of one named docker volume into
-// another by attaching both to a one-shot container.
+// another by attaching both to a one-shot container. both volumes must
+// already exist; otherwise docker would silently auto-create an empty
+// volume and the copy would clobber the target with nothing.
 func copyNamedVolume(ctx context.Context, runner dockerRunner, src, dst string) error {
 	if src == "" || dst == "" {
 		return fmt.Errorf("copyNamedVolume: src=%q dst=%q", src, dst)
 	}
 	if src == dst {
 		return nil
+	}
+	if err := requireDockerVolume(ctx, runner, src); err != nil {
+		return err
+	}
+	if err := requireDockerVolume(ctx, runner, dst); err != nil {
+		return err
 	}
 	args := []string{
 		"run", "--rm", "--network", "none",
@@ -211,4 +233,14 @@ func copyNamedVolume(ctx context.Context, runner dockerRunner, src, dst string) 
 		"rm -rf /to/* /to/.[!.]* /to/..?* 2>/dev/null; cd /from && tar cpf - . | tar xpf - -C /to",
 	}
 	return runner.Run(ctx, nil, nil, args...)
+}
+
+func requireDockerVolume(ctx context.Context, runner dockerRunner, name string) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("docker volume name is empty")
+	}
+	if _, err := runner.Output(ctx, "volume", "inspect", name); err != nil {
+		return fmt.Errorf("docker volume %q not found: %w", name, err)
+	}
+	return nil
 }

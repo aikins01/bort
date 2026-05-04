@@ -70,9 +70,6 @@ func (c *Client) applyDumpDataStore(ctx context.Context, actx *applyContext, ste
 		return fmt.Errorf("inspect source data store %s: %w", step.Ref, err)
 	}
 	creds := postgresCredsFromEnv(envMap(src.Config.Env))
-	if creds.Password == "" {
-		return fmt.Errorf("source data store %s missing PGPASSWORD/POSTGRES_PASSWORD", step.Ref)
-	}
 
 	dumpPath, err := dataStoreDumpPath(actx.plan, step.App, step.Ref)
 	if err != nil {
@@ -87,17 +84,15 @@ func (c *Client) applyDumpDataStore(ctx context.Context, actx *applyContext, ste
 	}
 	defer file.Close()
 
-	args := []string{
-		"exec",
-		"-e", "PGPASSWORD=" + creds.Password,
-		src.ID,
-		"pg_dump",
-		"-h", "127.0.0.1",
-		"-p", creds.Port,
+	args := []string{"exec"}
+	if creds.Password != "" {
+		args = append(args, "-e", "PGPASSWORD="+creds.Password)
+	}
+	args = append(args, src.ID, "pg_dump", "-w",
 		"-U", creds.User,
 		"-d", creds.Database,
 		"-Fc", "--no-owner", "--no-acl",
-	}
+	)
 	return runner.Run(ctx, nil, file, args...)
 }
 
@@ -125,8 +120,9 @@ func (c *Client) applyRestoreDataStore(ctx context.Context, actx *applyContext, 
 		return err
 	}
 	creds := postgresCredsFromEnv(envMap(dst.Config.Env))
-	if creds.Password == "" {
-		return fmt.Errorf("target data store %s missing PGPASSWORD/POSTGRES_PASSWORD", step.Ref)
+
+	if err := waitPostgresReady(ctx, runner, dst.ID, creds); err != nil {
+		return err
 	}
 
 	dumpPath, err := dataStoreDumpPath(actx.plan, step.App, step.Ref)
@@ -139,25 +135,47 @@ func (c *Client) applyRestoreDataStore(ctx context.Context, actx *applyContext, 
 	}
 	defer file.Close()
 
-	args := []string{
-		"exec", "-i",
-		"-e", "PGPASSWORD=" + creds.Password,
-		dst.ID,
-		"pg_restore",
-		"-h", "127.0.0.1",
-		"-p", creds.Port,
+	args := []string{"exec", "-i"}
+	if creds.Password != "" {
+		args = append(args, "-e", "PGPASSWORD="+creds.Password)
+	}
+	args = append(args, dst.ID, "pg_restore", "-w",
 		"-U", creds.User,
 		"-d", creds.Database,
 		"--clean", "--if-exists", "--no-owner", "--no-acl",
-	}
+		"--single-transaction", "--exit-on-error",
+	)
 	return runner.Run(ctx, file, nil, args...)
+}
+
+// waitPostgresReady polls pg_isready inside the target container so the
+// restore step does not race compose.deploy bringing up the database.
+func waitPostgresReady(ctx context.Context, runner dockerRunner, containerID string, creds postgresCreds) error {
+	deadline := time.Now().Add(targetDiscoveryTimeout)
+	for {
+		args := []string{"exec"}
+		if creds.Password != "" {
+			args = append(args, "-e", "PGPASSWORD="+creds.Password)
+		}
+		args = append(args, containerID, "pg_isready", "-q", "-U", creds.User, "-d", creds.Database)
+		if err := runner.Run(ctx, nil, nil, args...); err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("target postgres %s was not ready after %s", containerID, targetDiscoveryTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(targetDiscoveryDelay):
+		}
+	}
 }
 
 type postgresCreds struct {
 	User     string
 	Password string
 	Database string
-	Port     string
 }
 
 func postgresCredsFromEnv(env map[string]string) postgresCreds {
@@ -169,21 +187,27 @@ func postgresCredsFromEnv(env map[string]string) postgresCreds {
 	if db == "" {
 		db = user
 	}
-	port := firstNonEmptyEnv(env, "PGPORT")
-	if port == "" {
-		port = "5432"
-	}
 	return postgresCreds{
 		User:     user,
-		Password: firstNonEmptyEnv(env, "PGPASSWORD", "POSTGRES_PASSWORD"),
+		Password: firstPresentEnv(env, "PGPASSWORD", "POSTGRES_PASSWORD"),
 		Database: db,
-		Port:     port,
 	}
 }
 
 func firstNonEmptyEnv(env map[string]string, keys ...string) string {
 	for _, key := range keys {
 		if value := strings.TrimSpace(env[key]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// firstPresentEnv returns the raw first non-empty value for the given
+// keys without trimming, so passwords are preserved verbatim.
+func firstPresentEnv(env map[string]string, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := env[key]; ok && value != "" {
 			return value
 		}
 	}
@@ -221,7 +245,12 @@ func findPrepareVolume(app preparer.AppPlan, ref string) (preparer.VolumeResourc
 func findPrepareDataStore(app preparer.AppPlan, ref string) (preparer.DataStoreResource, bool) {
 	target := strings.TrimPrefix(ref, "data-store:")
 	for _, store := range app.Resources.DataStores {
-		if store.Service == target || store.Kind == target {
+		if store.Service != "" && store.Service == target {
+			return store, true
+		}
+	}
+	for _, store := range app.Resources.DataStores {
+		if store.Service == "" && store.Kind == target {
 			return store, true
 		}
 	}
@@ -239,12 +268,17 @@ func volumeRefLabel(volume preparer.VolumeResource) string {
 	return label
 }
 
+// isDataStoreBackingVolume returns true when a stateful volume belongs to
+// any classified data-store service. raw volume copy is unsafe regardless
+// of the user's strategy: migrate would clobber the logical restore,
+// recreate must keep the target empty, and managed points elsewhere
+// entirely.
 func isDataStoreBackingVolume(app preparer.AppPlan, volume preparer.VolumeResource) bool {
 	if volume.Service == "" {
 		return false
 	}
 	for _, store := range app.Resources.DataStores {
-		if store.Service == volume.Service && isPostgresStore(store) {
+		if store.Service == volume.Service {
 			return true
 		}
 	}
@@ -331,7 +365,9 @@ const (
 func (c *Client) targetContainerForService(ctx context.Context, runner dockerRunner, actx *applyContext, appName, service string) (dockerContainer, error) {
 	entry := actx.entry(appName)
 	if entry.ComposeAppName == "" {
-		return dockerContainer{}, fmt.Errorf("dokploy compose appName missing for %s; cannot discover target container", appName)
+		if err := c.refreshComposeAppName(ctx, entry); err != nil {
+			return dockerContainer{}, err
+		}
 	}
 	deadline := time.Now().Add(targetDiscoveryTimeout)
 	for {
@@ -353,15 +389,42 @@ func (c *Client) targetContainerForService(ctx context.Context, runner dockerRun
 	}
 }
 
-func pickComposeService(containers []dockerContainer, service string) (dockerContainer, bool) {
-	if service == "" && len(containers) == 1 {
-		return containers[0], true
+// refreshComposeAppName fetches the compose record by id and caches its
+// appName. it lets apply tolerate dokploy responses that omit appName on
+// compose.create/search.
+func (c *Client) refreshComposeAppName(ctx context.Context, entry *appCache) error {
+	if entry.ComposeID == "" {
+		return fmt.Errorf("dokploy compose id missing; cannot refresh appName")
 	}
+	compose, err := c.GetCompose(ctx, entry.ComposeID)
+	if err != nil {
+		return fmt.Errorf("refresh compose appName: %w", err)
+	}
+	if compose.AppName == "" {
+		return fmt.Errorf("dokploy compose %s returned no appName", entry.ComposeID)
+	}
+	entry.ComposeAppName = compose.AppName
+	return nil
+}
+
+func pickComposeService(containers []dockerContainer, service string) (dockerContainer, bool) {
+	if service == "" {
+		return dockerContainer{}, false
+	}
+	var fallback dockerContainer
+	haveFallback := false
 	for _, c := range containers {
-		if c.Config.Labels[composeServiceLabel] == service {
+		if c.Config.Labels[composeServiceLabel] != service {
+			continue
+		}
+		if c.State.Running {
 			return c, true
 		}
+		if !haveFallback {
+			fallback = c
+			haveFallback = true
+		}
 	}
-	return dockerContainer{}, false
+	return fallback, haveFallback
 }
 
