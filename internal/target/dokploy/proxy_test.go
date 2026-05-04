@@ -126,3 +126,102 @@ func TestApplyStartDokployProxyErrorsWhenMissing(t *testing.T) {
 		t.Fatal("expected error when dokploy-traefik is missing")
 	}
 }
+
+func TestPlanForCommitEmitsStopPerAppPlusProxyWhenRoutesExist(t *testing.T) {
+	prepare := preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}, {Name: "web"}}}
+	cutover := gateway.Result{Apps: []gateway.AppPlan{{
+		Name:   "api",
+		Routes: []gateway.Route{{Host: "app.example.com"}},
+	}}}
+	plan := PlanForCommit(prepare, cutover)
+	got := []StepKind{}
+	for _, step := range plan.Steps {
+		got = append(got, step.Kind)
+	}
+	want := []StepKind{StepStopSourceApp, StepStopSourceApp, StepStopCoolifyProxy}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("step %d: expected %s, got %s", i, want[i], got[i])
+		}
+	}
+}
+
+func TestPlanForCommitOmitsProxyStopForNoRouteRuns(t *testing.T) {
+	// app-scoped commits without public routes must not stop the host's
+	// coolify-proxy — that's a global resource still serving unrelated
+	// apps. only stop_source_app steps should be emitted.
+	prepare := preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}}
+	plan := PlanForCommit(prepare, gateway.Result{})
+	for _, step := range plan.Steps {
+		if step.Kind == StepStopCoolifyProxy {
+			t.Fatalf("did not expect StepStopCoolifyProxy for no-route commit, got %v", plan.Steps)
+		}
+	}
+}
+
+func TestApplyStopSourceAppStopsAllSourceContainers(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.SourceServices = []preparer.SourceServiceRef{
+		{ServiceName: "web", ContainerID: "web-id"},
+	}
+	app.Resources.DataStores = []preparer.DataStoreResource{
+		{Service: "db", Kind: "postgres", Strategy: "migrate", SourceContainerID: "db-id"},
+	}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"inspect --type container web-id": []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+			"inspect --type container db-id":  []byte(`[{"Id":"db-id","Name":"/db","State":{"Running":true,"Status":"running"}}]`),
+			"stop web-id":                     []byte("web-id\n"),
+			"stop db-id":                      []byte("db-id\n"),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	if err := client.applyStopSourceApp(context.Background(), actx, Step{Kind: StepStopSourceApp, App: "api"}); err != nil {
+		t.Fatalf("applyStopSourceApp: %v", err)
+	}
+}
+
+func TestApplyStopSourceAppToleratesMissingContainers(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.SourceServices = []preparer.SourceServiceRef{
+		{ServiceName: "web", ContainerID: "web-id"},
+	}
+	// inspect for web-id is unstubbed → fakeDockerRunner errors with
+	// "docker output not stubbed"; that must NOT match the missing-
+	// container substring set, so the apply errors out as expected.
+	runner := &fakeDockerRunner{outputs: map[string][]byte{}}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	err := client.applyStopSourceApp(context.Background(), actx, Step{Kind: StepStopSourceApp, App: "api"})
+	if err == nil {
+		t.Fatal("expected unstubbed inspect error to bubble up")
+	}
+}
+
+func TestApplyStopSourceAppFallsBackToContainerName(t *testing.T) {
+	// the recorded ID is stale (container was recreated since scan), but
+	// the recorded name still resolves; sourceContainer must use the
+	// name fallback instead of treating the missing-id as success.
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.SourceServices = []preparer.SourceServiceRef{
+		{ServiceName: "web", ContainerID: "stale-id", ContainerName: "coolify-web"},
+	}
+	// stale-id is intentionally NOT stubbed — fakeDockerRunner returns
+	// "docker output not stubbed", which sourceContainer treats as an
+	// id-inspect failure and falls back to the recorded name.
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"inspect --type container coolify-web": []byte(`[{"Id":"fresh-id","Name":"/coolify-web","State":{"Running":true,"Status":"running"}}]`),
+			"stop fresh-id":                        []byte("fresh-id\n"),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	if err := client.applyStopSourceApp(context.Background(), actx, Step{Kind: StepStopSourceApp, App: "api"}); err != nil {
+		t.Fatalf("applyStopSourceApp: %v", err)
+	}
+}

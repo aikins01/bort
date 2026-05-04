@@ -66,6 +66,99 @@ func (c *Client) applyResumeSource(ctx context.Context, actx *applyContext, step
 	return nil
 }
 
+// applyStopSourceApp is the commit-time stop: it shuts down every source
+// container belonging to the app, including data stores excluded from the
+// cutover quiesce step (logical-dump postgres, skip-strategy stores). the
+// stop is idempotent — a missing or already-stopped container is a no-op
+// — so commit can run safely even on a partially-cleaned host. containers
+// are not removed: operators in a long rollback window can docker start
+// them back up to roll back outside bort.
+func (c *Client) applyStopSourceApp(ctx context.Context, actx *applyContext, step Step) error {
+	app, ok := findPrepareApp(actx.plan.Prepare, step.App)
+	if !ok {
+		return fmt.Errorf("app %s not found in prepare result", step.App)
+	}
+	refs := sourceCommitTargets(app)
+	if len(refs) == 0 {
+		return nil
+	}
+	runner := c.dockerRunner()
+	for _, ref := range refs {
+		container, err := sourceContainer(ctx, runner, ref.id, ref.name)
+		if err != nil {
+			// recreated source containers can change ID, so we already
+			// fell back to the recorded name above. anything still
+			// missing here is gone for real and counts as stopped.
+			if isContainerMissingErr(err) {
+				continue
+			}
+			return fmt.Errorf("inspect source container %s: %w", ref.label(), err)
+		}
+		if !container.State.Running {
+			continue
+		}
+		if _, err := runner.Output(ctx, "stop", container.ID); err != nil {
+			if isContainerMissingErr(err) {
+				continue
+			}
+			return fmt.Errorf("stop source container %s: %w", container.ID, err)
+		}
+	}
+	return nil
+}
+
+type commitTargetRef struct {
+	id   string
+	name string
+}
+
+func (r commitTargetRef) label() string {
+	if r.id != "" {
+		return r.id
+	}
+	return r.name
+}
+
+// sourceCommitTargets returns every unique source container ref for the
+// app — workers, web services, and data stores all included. unlike
+// sourceQuiesceTargets which leaves logical-dump and skip-strategy stores
+// running so pg_dump can read them, commit cleanup must stop everything
+// because the migration is over. id and name are kept separately so a
+// recreated container (id changed since scan) can still be stopped via
+// its stable name.
+func sourceCommitTargets(app preparer.AppPlan) []commitTargetRef {
+	seenID := map[string]struct{}{}
+	seenName := map[string]struct{}{}
+	refs := []commitTargetRef{}
+	add := func(id, name string) {
+		if id == "" && name == "" {
+			return
+		}
+		if id != "" {
+			if _, dup := seenID[id]; dup {
+				return
+			}
+			seenID[id] = struct{}{}
+		} else {
+			if _, dup := seenName[name]; dup {
+				return
+			}
+			seenName[name] = struct{}{}
+		}
+		refs = append(refs, commitTargetRef{id: id, name: name})
+	}
+	for _, service := range app.Resources.SourceServices {
+		add(service.ContainerID, service.ContainerName)
+	}
+	for _, volume := range app.Resources.Volumes {
+		add(volume.SourceContainerID, volume.SourceContainerName)
+	}
+	for _, store := range app.Resources.DataStores {
+		add(store.SourceContainerID, store.SourceContainerName)
+	}
+	return refs
+}
+
 // sourceQuiesceTargets returns unique source container refs for every
 // service that must stop before bort touches state. stateless workers
 // always stop because they keep writing to the database and to shared

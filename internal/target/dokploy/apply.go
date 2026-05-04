@@ -30,6 +30,7 @@ const (
 	StepInstallGateway   StepKind = "install_gateway"
 	StepStopCoolifyProxy StepKind = "stop_coolify_proxy"
 	StepStartDokployProxy StepKind = "start_dokploy_proxy"
+	StepStopSourceApp    StepKind = "stop_source_app"
 )
 
 // proxy container names assumed by the cutover swap. coolify-proxy is
@@ -150,6 +151,34 @@ func PlanFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 		)
 	}
 	return plan
+}
+
+// PlanForCommit produces only the steps that bort commit --apply needs:
+// stop every source-app stack, and only reassert that coolify-proxy is
+// stopped when the cutover plan actually had routes (otherwise cutover
+// never touched the proxy and an app-scoped commit must not affect
+// unrelated coolify apps still served by it). it intentionally does NOT
+// include any migrate steps so a commit cannot accidentally re-deploy or
+// re-route. containers are stopped, never removed: operators on a long
+// rollback window can docker start them back up to roll back manually.
+func PlanForCommit(prepare preparer.Result, commit gateway.Result) Plan {
+	plan := Plan{Prepare: prepare, Cutover: commit}
+	for _, app := range prepare.Apps {
+		plan.Steps = append(plan.Steps, Step{Kind: StepStopSourceApp, App: app.Name, Ref: app.Name})
+	}
+	if cutoverPlanHasRoutes(commit) {
+		plan.Steps = append(plan.Steps, Step{Kind: StepStopCoolifyProxy, Ref: coolifyProxyContainer})
+	}
+	return plan
+}
+
+func cutoverPlanHasRoutes(commit gateway.Result) bool {
+	for _, app := range commit.Apps {
+		if len(app.Routes) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 type appCache struct {
@@ -276,6 +305,8 @@ func (c *Client) applyStep(ctx context.Context, actx *applyContext, step Step) e
 		return c.applyStopCoolifyProxy(ctx, actx, step)
 	case StepStartDokployProxy:
 		return c.applyStartDokployProxy(ctx, actx, step)
+	case StepStopSourceApp:
+		return c.applyStopSourceApp(ctx, actx, step)
 	default:
 		return fmt.Errorf("unknown step kind %q", step.Kind)
 	}

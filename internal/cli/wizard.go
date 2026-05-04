@@ -60,8 +60,41 @@ func runWizard(ctx context.Context, run loadedMigrationRun, stdin io.Reader, std
 		return err
 	}
 
-	fmt.Fprintln(stdout, "Live apply complete. Verify the target, then run `bort commit` to record the cutover.")
+	fmt.Fprintln(stdout, "Live apply complete. Verify the target before retiring the source.")
+	commit, err := confirmCommitApply(current)
+	if err != nil {
+		return err
+	}
+	if !commit {
+		fmt.Fprintln(stdout, "Source kept running. Re-run `bort commit --apply` when you're ready to retire it.")
+		return nil
+	}
+	if err := applyCommitFromArgs(ctx, current.Run.RunDir, stderr); err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "Source retired. Migration committed.")
 	return nil
+}
+
+// confirmCommitApply gates the wizard's source-retirement step behind an
+// explicit confirm. it runs only after the live apply succeeded so the
+// operator can poke at the target before stopping the source — this is
+// the last reversible moment without a manual docker start.
+func confirmCommitApply(run loadedMigrationRun) (bool, error) {
+	plan := dokploy.PlanForCommit(run.Prepare, run.Cutover)
+	confirm := false
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title("Retire source containers now?").
+			Description(fmt.Sprintf("Will stop %d source container group(s) plus coolify-proxy. Source is left in place — `docker start` recovers it.", len(plan.Steps)-1)).
+			Affirmative("Retire").
+			Negative("Skip").
+			Value(&confirm),
+	))
+	if err := form.Run(); err != nil {
+		return false, err
+	}
+	return confirm, nil
 }
 
 func promptWizardDecision(ctx context.Context, run loadedMigrationRun, decision runDecision, stdout io.Writer) (bool, error) {
