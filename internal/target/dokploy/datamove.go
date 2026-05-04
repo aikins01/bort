@@ -26,24 +26,36 @@ func (c *Client) applySyncVolume(ctx context.Context, actx *applyContext, step S
 	if !ok {
 		return fmt.Errorf("volume %s for app %s not found", step.Ref, step.App)
 	}
-	if volume.Type != "volume" {
-		return fmt.Errorf("%w: bind mount sync requires rsync", ErrNotImplemented)
-	}
 	if isDataStoreBackingVolume(app, volume) {
 		// avoid clobbering data restored via logical dump.
 		return nil
 	}
 
 	runner := c.dockerRunner()
-	srcVolName, err := resolveSourceVolume(ctx, runner, volume)
-	if err != nil {
-		return err
+	switch volume.Type {
+	case "volume":
+		srcVolName, err := resolveSourceVolume(ctx, runner, volume)
+		if err != nil {
+			return err
+		}
+		dstVolName, err := c.resolveTargetVolume(ctx, runner, actx, step.App, volume)
+		if err != nil {
+			return err
+		}
+		return copyNamedVolume(ctx, runner, srcVolName, dstVolName)
+	case "bind":
+		srcPath, err := resolveSourceBindPath(ctx, runner, volume)
+		if err != nil {
+			return err
+		}
+		dstPath, err := c.resolveTargetBindPath(ctx, runner, actx, step.App, volume)
+		if err != nil {
+			return err
+		}
+		return rsyncBindMount(ctx, runner, srcPath, dstPath)
+	default:
+		return fmt.Errorf("%w: volume type %q is not supported", ErrNotImplemented, volume.Type)
 	}
-	dstVolName, err := c.resolveTargetVolume(ctx, runner, actx, step.App, volume)
-	if err != nil {
-		return err
-	}
-	return copyNamedVolume(ctx, runner, srcVolName, dstVolName)
 }
 
 // applyDumpDataStore writes a logical dump of the source data store to a
@@ -352,6 +364,54 @@ func (c *Client) resolveTargetVolume(ctx context.Context, runner dockerRunner, a
 		return "", fmt.Errorf("named volume for target %s not found on dokploy compose container", volume.Target)
 	}
 	return mount.Name, nil
+}
+
+// resolveSourceBindPath returns the source-side host path for a bind
+// mount. when a source container ref exists, it inspects live and
+// rejects stale-but-existing recorded paths so we don't silently copy
+// outdated data into the new stack.
+func resolveSourceBindPath(ctx context.Context, runner dockerRunner, volume preparer.VolumeResource) (string, error) {
+	hasContainerRef := volume.SourceContainerID != "" || volume.SourceContainerName != ""
+	if !hasContainerRef {
+		if volume.Source == "" {
+			return "", fmt.Errorf("source bind path unknown and no source container ref recorded")
+		}
+		return volume.Source, nil
+	}
+	src, err := sourceContainer(ctx, runner, volume.SourceContainerID, volume.SourceContainerName)
+	if err != nil {
+		return "", err
+	}
+	mount, ok := findMountByTarget(src, volume.Target)
+	if !ok || mount.Type != "bind" || mount.Source == "" {
+		return "", fmt.Errorf("bind mount for target %s not found on source container", volume.Target)
+	}
+	if volume.Source != "" && volume.Source != mount.Source {
+		return "", fmt.Errorf("recorded source bind path %q for %s does not match live container mount %q; rescan before retrying",
+			volume.Source, volume.Target, mount.Source)
+	}
+	return mount.Source, nil
+}
+
+// resolveTargetBindPath inspects the dokploy-managed compose container
+// and returns the host path it bound for the given mount target. read-
+// only target binds are rejected because the migrator would otherwise
+// quietly bypass the app's intended read-only contract by mounting the
+// host path read-write itself.
+func (c *Client) resolveTargetBindPath(ctx context.Context, runner dockerRunner, actx *applyContext, appName string, volume preparer.VolumeResource) (string, error) {
+	target, err := c.targetContainerForService(ctx, runner, actx, appName, volume.Service)
+	if err != nil {
+		return "", err
+	}
+	mount, ok := findMountByTarget(target, volume.Target)
+	if !ok || mount.Type != "bind" || mount.Source == "" {
+		return "", fmt.Errorf("bind mount for target %s not found on dokploy compose container", volume.Target)
+	}
+	if !mount.RW {
+		return "", fmt.Errorf("dokploy bind mount %s -> %s is read-only; refusing to sync",
+			mount.Source, volume.Target)
+	}
+	return mount.Source, nil
 }
 
 const (

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -241,6 +242,66 @@ func requireDockerVolume(ctx context.Context, runner dockerRunner, name string) 
 	}
 	if _, err := runner.Output(ctx, "volume", "inspect", name); err != nil {
 		return fmt.Errorf("docker volume %q not found: %w", name, err)
+	}
+	return nil
+}
+
+// rsyncImage carries an alpine rsync binary so we don't depend on the
+// host having rsync installed. pinned to a concrete revision tag so a
+// future upstream rebuild can't change the migration's behavior.
+const rsyncImage = "instrumentisto/rsync-ssh:alpine3.23-r3"
+
+// rsyncBindMount mirrors one host directory into another by attaching
+// both to a one-shot rsync container. it uses --mount instead of -v
+// because --mount fails fast when the source path is missing; -v would
+// silently auto-create an empty directory and --delete would then
+// clobber the target with nothing.
+//
+// archive flags preserve permissions, hardlinks, ACLs, and xattrs.
+// security.selinux is filtered out because labels are host- and path-
+// specific; copying source labels to a dokploy-managed path would lock
+// the target app out. label=disable also stops docker from relabeling
+// the host bind sources on enforcing systems.
+func rsyncBindMount(ctx context.Context, runner dockerRunner, src, dst string) error {
+	if err := validateBindPath("source", src); err != nil {
+		return err
+	}
+	if err := validateBindPath("target", dst); err != nil {
+		return err
+	}
+	if src == dst {
+		return nil
+	}
+	args := []string{
+		"run", "--rm", "--network", "none",
+		"--security-opt", "label=disable",
+		"--mount", "type=bind,src=" + src + ",dst=/from,readonly",
+		"--mount", "type=bind,src=" + dst + ",dst=/to",
+		rsyncImage,
+		"rsync", "-aHAX", "--numeric-ids",
+		"--filter=-x security.selinux",
+		"--delete", "/from/", "/to/",
+	}
+	return runner.Run(ctx, nil, nil, args...)
+}
+
+// validateBindPath rejects paths that would be unsafe to bind into the
+// rsync container. relative paths can resolve against the container's
+// cwd; "/" or empty would let --delete wipe the host root; commas and
+// quotes break docker's csv --mount syntax with no portable escaping.
+func validateBindPath(role, path string) error {
+	if path == "" {
+		return fmt.Errorf("rsyncBindMount: %s path is empty", role)
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("rsyncBindMount: %s path must be absolute (got %q)", role, path)
+	}
+	cleaned := filepath.Clean(path)
+	if cleaned == "/" {
+		return fmt.Errorf("rsyncBindMount: refusing to operate on host root (%s=%q)", role, path)
+	}
+	if strings.ContainsAny(path, ",\"") {
+		return fmt.Errorf("rsyncBindMount: %s path contains unsupported character (got %q)", role, path)
 	}
 	return nil
 }

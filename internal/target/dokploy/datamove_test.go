@@ -195,6 +195,124 @@ func TestApplySyncVolumeCopiesNamedVolume(t *testing.T) {
 	}
 }
 
+func TestApplySyncVolumeRsyncsBindMount(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{
+		Service:             "web",
+		Type:                "bind",
+		Source:              "/coolify/data/web",
+		Target:              "/data",
+		SourceContainerID:   "src-id",
+		SourceContainerName: "coolify-web",
+	}}
+
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"inspect --type container src-id": []byte(`[{"Id":"src-id","Name":"/coolify-web","Mounts":[{"Type":"bind","Source":"/coolify/data/web","Destination":"/data","RW":true}]}]`),
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("dst-id\n"),
+			"inspect --type container dst-id": []byte(`[{"Id":"dst-id","Name":"/dokploy-web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"Mounts":[{"Type":"bind","Source":"/etc/dokploy/data/web","Destination":"/data","RW":true}]}]`),
+		},
+	}
+	client := &Client{Docker: runner}
+
+	actx := &applyContext{cache: map[string]*appCache{}}
+	actx.entry("api").ComposeAppName = "stack-1"
+	actx.plan = Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}
+
+	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"}
+	if err := client.applySyncVolume(context.Background(), actx, step); err != nil {
+		t.Fatalf("applySyncVolume: %v", err)
+	}
+	if len(runner.runs) != 1 {
+		t.Fatalf("expected 1 docker run, got %d", len(runner.runs))
+	}
+	args := runner.runs[0].Args
+	joined := strings.Join(args, " ")
+	for _, fragment := range []string{
+		"--security-opt label=disable",
+		"type=bind,src=/coolify/data/web,dst=/from,readonly",
+		"type=bind,src=/etc/dokploy/data/web,dst=/to",
+		"rsync -aHAX --numeric-ids --filter=-x security.selinux --delete /from/ /to/",
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("expected args to contain %q, got %v", fragment, args)
+		}
+	}
+}
+
+func TestApplySyncVolumeBindMountFailsOnStaleSource(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{
+		Service:             "web",
+		Type:                "bind",
+		Source:              "/coolify/old-path",
+		Target:              "/data",
+		SourceContainerID:   "src-id",
+		SourceContainerName: "coolify-web",
+	}}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"inspect --type container src-id": []byte(`[{"Id":"src-id","Name":"/coolify-web","Mounts":[{"Type":"bind","Source":"/coolify/new-path","Destination":"/data","RW":true}]}]`),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"}
+	err := client.applySyncVolume(context.Background(), actx, step)
+	if err == nil || !strings.Contains(err.Error(), "rescan before retrying") {
+		t.Fatalf("expected stale-source error, got %v", err)
+	}
+}
+
+func TestApplySyncVolumeBindMountRejectsReadOnlyTarget(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{
+		Service:           "web",
+		Type:              "bind",
+		Source:            "/coolify/data/web",
+		Target:            "/data",
+		SourceContainerID: "src-id",
+	}}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"inspect --type container src-id": []byte(`[{"Id":"src-id","Name":"/coolify-web","Mounts":[{"Type":"bind","Source":"/coolify/data/web","Destination":"/data","RW":true}]}]`),
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("dst-id\n"),
+			"inspect --type container dst-id": []byte(`[{"Id":"dst-id","Name":"/dokploy-web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"Mounts":[{"Type":"bind","Source":"/etc/dokploy/data/web","Destination":"/data","RW":false}]}]`),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}}
+	actx.entry("api").ComposeAppName = "stack-1"
+	actx.plan = Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}
+	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"}
+	err := client.applySyncVolume(context.Background(), actx, step)
+	if err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("expected read-only target rejection, got %v", err)
+	}
+}
+
+func TestValidateBindPathRejectsUnsafeInputs(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"empty", "", "is empty"},
+		{"relative", "relative/path", "must be absolute"},
+		{"root", "/", "host root"},
+		{"comma", "/data,with-comma", "unsupported character"},
+		{"quote", "/data\"with-quote", "unsupported character"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateBindPath("source", tc.path)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
 func TestApplySyncVolumeSkipsDataStoreBackingVolume(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
 	app.Resources.DataStores = []preparer.DataStoreResource{{
