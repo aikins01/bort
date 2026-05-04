@@ -82,7 +82,9 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 			service.ImageDigest = digest
 		}
 		app.Services = append(app.Services, service)
-		app.Routes = mergeRoutes(app.Routes, routesFromLabels(service.Name, container.Labels()))
+		labels := container.Labels()
+		app.Routes = mergeRoutes(app.Routes, routesFromLabels(service.Name, labels))
+		app.Routes = mergeRoutes(app.Routes, caddyRoutesFromLabels(service.Name, labels))
 
 		for _, mount := range service.Mounts {
 			if mount.Type != "volume" || mount.Name == "" {
@@ -651,6 +653,73 @@ func hostsFromRule(rule string) []string {
 		}
 	}
 	return hosts
+}
+
+var (
+	caddyKeyPattern         = regexp.MustCompile(`^caddy_(\d+)$`)
+	caddyReverseProxyKey    = regexp.MustCompile(`^caddy_(\d+)\.handle_path\.\d+_reverse_proxy$`)
+	caddyUpstreamsArguments = regexp.MustCompile(`\{\{upstreams\s*(\d+)?\s*\}\}`)
+)
+
+// caddyRoutesFromLabels parses coolify's caddy-mode labels emitted by
+// caddy-docker-proxy. each indexed group looks like:
+//
+//	caddy_0=https://app.example.com
+//	caddy_0.handle_path.0_reverse_proxy={{upstreams 3000}}
+//
+// the host comes from the url value; the optional upstream port is read
+// from the reverse_proxy directive when present.
+func caddyRoutesFromLabels(serviceName string, labels map[string]string) []manifest.Route {
+	hosts := map[string]string{}
+	ports := map[string]string{}
+	for key, value := range labels {
+		if match := caddyKeyPattern.FindStringSubmatch(key); len(match) == 2 {
+			if host := hostFromCaddyURL(value); host != "" {
+				hosts[match[1]] = host
+			}
+			continue
+		}
+		if match := caddyReverseProxyKey.FindStringSubmatch(key); len(match) == 2 {
+			if port := portFromUpstreams(value); port != "" {
+				ports[match[1]] = port
+			}
+		}
+	}
+	routes := make([]manifest.Route, 0, len(hosts))
+	for index, host := range hosts {
+		routes = append(routes, manifest.Route{
+			Host:        host,
+			ServiceName: serviceName,
+			Port:        ports[index],
+			Source:      "caddy_" + index,
+		})
+	}
+	return routes
+}
+
+func hostFromCaddyURL(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if i := strings.Index(value, "://"); i >= 0 {
+		value = value[i+3:]
+	}
+	if i := strings.IndexAny(value, "/:?#"); i >= 0 {
+		value = value[:i]
+	}
+	if net.ParseIP(value) != nil {
+		return ""
+	}
+	return value
+}
+
+func portFromUpstreams(value string) string {
+	match := caddyUpstreamsArguments.FindStringSubmatch(value)
+	if len(match) != 2 {
+		return ""
+	}
+	return match[1]
 }
 
 func mergeRoutes(existing, next []manifest.Route) []manifest.Route {

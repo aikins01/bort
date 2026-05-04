@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aikins01/bort/internal/manifest"
 	"github.com/aikins01/bort/internal/source"
 )
 
@@ -36,6 +37,45 @@ func TestRoutesFromLabelsExtractsHostsAndServicePort(t *testing.T) {
 
 	if !seen["app.example.com"] || !seen["www.example.com"] {
 		t.Fatalf("expected app.example.com and www.example.com, got %#v", seen)
+	}
+}
+
+func TestCaddyRoutesFromLabelsExtractsHostsAndPort(t *testing.T) {
+	labels := map[string]string{
+		"caddy_ingress_network":                       "coolify",
+		"caddy_0":                                     "https://app.example.com",
+		"caddy_0.handle_path.0_reverse_proxy":         "{{upstreams 3000}}",
+		"caddy_1":                                     "https://api.example.com/v1",
+		"caddy_1.handle_path.1_reverse_proxy":         "{{upstreams}}",
+		"traefik.http.routers.web.rule":               "Host(`legacy.example.com`)",
+		"traefik.http.routers.web.service":            "app-svc",
+		"traefik.http.services.app-svc.loadbalancer.server.port": "8080",
+	}
+
+	caddyRoutes := caddyRoutesFromLabels("web-1", labels)
+	if len(caddyRoutes) != 2 {
+		t.Fatalf("expected 2 caddy routes, got %#v", caddyRoutes)
+	}
+	byHost := map[string]manifest.Route{}
+	for _, route := range caddyRoutes {
+		byHost[route.Host] = route
+	}
+	if got, ok := byHost["app.example.com"]; !ok || got.Port != "3000" || got.Source != "caddy_0" {
+		t.Fatalf("expected app.example.com on port 3000 from caddy_0, got %#v", got)
+	}
+	if got, ok := byHost["api.example.com"]; !ok || got.Port != "" || got.Source != "caddy_1" {
+		t.Fatalf("expected api.example.com with empty port from caddy_1, got %#v", got)
+	}
+}
+
+func TestCaddyRoutesFromLabelsIgnoresInvalidValues(t *testing.T) {
+	labels := map[string]string{
+		"caddy_0":               "https://192.168.1.1",
+		"caddy_1":               "",
+		"caddy_ingress_network": "coolify",
+	}
+	if got := caddyRoutesFromLabels("svc", labels); len(got) != 0 {
+		t.Fatalf("expected no routes, got %#v", got)
 	}
 }
 

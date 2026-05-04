@@ -2,6 +2,7 @@ package coolifylocal
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -37,6 +38,7 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 	}
 	result.Source.Platform = "coolify-local"
 	dataDir := s.dataDir()
+	proxyMode := detectProxyMode(dataDir)
 	enrichApps(&result, dataDir)
 	if opts.Coolify.BaseURL != "" && opts.Coolify.Token != "" {
 		apiScanner, err := coolify.NewScanner(opts.Coolify.BaseURL, opts.Coolify.Token)
@@ -49,7 +51,62 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 		}
 	}
 	result.ProxyArtifacts = append(result.ProxyArtifacts, loadProxyArtifacts(dataDir)...)
+	annotateProxyMode(&result, dataDir, proxyMode)
 	return result, nil
+}
+
+type proxyMode string
+
+const (
+	proxyModeTraefik proxyMode = "traefik"
+	proxyModeCaddy   proxyMode = "caddy"
+	proxyModeUnknown proxyMode = ""
+)
+
+// detectProxyMode picks the proxy implementation by checking which
+// dynamic-config directory coolify wrote on the host. coolify v4 stores
+// the proxy choice in its own database (servers.proxy->type), not in
+// /data/coolify/source/.env, so the filesystem layout is the only
+// reliable host-side signal: caddy mode uses proxy/caddy/dynamic, while
+// traefik mode uses proxy/dynamic directly.
+func detectProxyMode(dataDir string) proxyMode {
+	if info, err := os.Stat(filepath.Join(dataDir, "proxy", "caddy", "dynamic")); err == nil && info.IsDir() {
+		return proxyModeCaddy
+	}
+	if info, err := os.Stat(filepath.Join(dataDir, "proxy", "dynamic")); err == nil && info.IsDir() {
+		return proxyModeTraefik
+	}
+	return proxyModeUnknown
+}
+
+// annotateProxyMode records the detected proxy on the source platform
+// metadata and surfaces a warning for any coolify-managed app that ended
+// up with zero routes — operators can then audit whether bort missed a
+// caddy/traefik label or whether the app uses an unsupported proxy.
+func annotateProxyMode(result *manifest.Manifest, dataDir string, mode proxyMode) {
+	if mode != proxyModeUnknown {
+		result.Source.Platform = "coolify-local-" + string(mode)
+	}
+	for i := range result.Apps {
+		app := &result.Apps[i]
+		if app.Metadata["coolify.managed"] != "true" {
+			continue
+		}
+		if mode != proxyModeUnknown {
+			if app.Metadata == nil {
+				app.Metadata = map[string]string{}
+			}
+			putMetadata(app.Metadata, "coolify.proxy", string(mode))
+		}
+		if len(app.Routes) > 0 {
+			continue
+		}
+		message := fmt.Sprintf("no traefik or caddy routes found for app %q; proxy may be unsupported or labels missing", app.Name)
+		if mode == proxyModeUnknown {
+			message = fmt.Sprintf("no traefik or caddy routes found for app %q and proxy mode could not be detected from %s", app.Name, filepath.Join(dataDir, "proxy"))
+		}
+		app.Warnings = append(app.Warnings, manifest.Warning{Code: "proxy.unsupported_or_missing", Message: message})
+	}
 }
 
 func mergeAPIMetadata(local *manifest.Manifest, api manifest.Manifest) {
@@ -183,7 +240,14 @@ func loadComposeRaw(dataDir, coolifyType, uuid string) (string, string) {
 }
 
 func loadProxyArtifacts(dataDir string) []manifest.ProxyArtifact {
-	dir := filepath.Join(dataDir, "proxy", "dynamic")
+	artifacts := []manifest.ProxyArtifact{}
+	artifacts = append(artifacts, readProxyDir(dataDir, filepath.Join(dataDir, "proxy", "dynamic"), "traefik-dynamic")...)
+	artifacts = append(artifacts, readProxyDir(dataDir, filepath.Join(dataDir, "proxy", "caddy", "dynamic"), "caddyfile")...)
+	sort.Slice(artifacts, func(i, j int) bool { return artifacts[i].Path < artifacts[j].Path })
+	return artifacts
+}
+
+func readProxyDir(dataDir, dir, sourceTag string) []manifest.ProxyArtifact {
 	if err := safepath.ContainedPath(dataDir, dir); err != nil {
 		return nil
 	}
@@ -201,9 +265,8 @@ func loadProxyArtifacts(dataDir string) []manifest.ProxyArtifact {
 		if err != nil {
 			continue
 		}
-		artifacts = append(artifacts, manifest.ProxyArtifact{Source: "traefik-dynamic", Path: path, Content: string(data)})
+		artifacts = append(artifacts, manifest.ProxyArtifact{Source: sourceTag, Path: path, Content: string(data)})
 	}
-	sort.Slice(artifacts, func(i, j int) bool { return artifacts[i].Path < artifacts[j].Path })
 	return artifacts
 }
 
