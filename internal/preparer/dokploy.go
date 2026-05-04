@@ -45,25 +45,29 @@ type DokployEnvFile struct {
 }
 
 type DokployVolume struct {
-	Name        string    `json:"name,omitempty"`
-	Service     string    `json:"service,omitempty"`
-	Source      string    `json:"source,omitempty"`
-	Target      string    `json:"target"`
-	Type        string    `json:"type"`
-	Action      string    `json:"action"`
-	Portability string    `json:"portability,omitempty"`
-	Readiness   Readiness `json:"readiness"`
+	Name                string    `json:"name,omitempty"`
+	Service             string    `json:"service,omitempty"`
+	Source              string    `json:"source,omitempty"`
+	Target              string    `json:"target"`
+	Type                string    `json:"type"`
+	Action              string    `json:"action"`
+	Portability         string    `json:"portability,omitempty"`
+	Readiness           Readiness `json:"readiness"`
+	SourceContainerID   string    `json:"sourceContainerId,omitempty"`
+	SourceContainerName string    `json:"sourceContainerName,omitempty"`
 }
 
 type DokployDataStore struct {
-	Kind        string    `json:"kind"`
-	Engine      string    `json:"engine,omitempty"`
-	Service     string    `json:"service"`
-	Strategy    string    `json:"strategy"`
-	Fallback    string    `json:"fallback,omitempty"`
-	Criticality string    `json:"criticality"`
-	Action      string    `json:"action"`
-	Readiness   Readiness `json:"readiness"`
+	Kind                string    `json:"kind"`
+	Engine              string    `json:"engine,omitempty"`
+	Service             string    `json:"service"`
+	Strategy            string    `json:"strategy"`
+	Fallback            string    `json:"fallback,omitempty"`
+	Criticality         string    `json:"criticality"`
+	Action              string    `json:"action"`
+	Readiness           Readiness `json:"readiness"`
+	SourceContainerID   string    `json:"sourceContainerId,omitempty"`
+	SourceContainerName string    `json:"sourceContainerName,omitempty"`
 }
 
 type DokployExternalRequirement struct {
@@ -119,26 +123,30 @@ func dokployResources(plan AppPlan) *DokployResources {
 	}
 	for _, volume := range plan.Resources.Volumes {
 		resources.Volumes = append(resources.Volumes, DokployVolume{
-			Name:        volume.Name,
-			Service:     volume.Service,
-			Source:      volume.Source,
-			Target:      volume.Target,
-			Type:        volume.Type,
-			Action:      dokployVolumeAction(volume),
-			Portability: volume.Portability,
-			Readiness:   volume.Readiness,
+			Name:                volume.Name,
+			Service:             volume.Service,
+			Source:              volume.Source,
+			Target:              volume.Target,
+			Type:                volume.Type,
+			Action:              dokployVolumeAction(volume),
+			Portability:         volume.Portability,
+			Readiness:           volume.Readiness,
+			SourceContainerID:   volume.SourceContainerID,
+			SourceContainerName: volume.SourceContainerName,
 		})
 	}
 	for _, store := range plan.Resources.DataStores {
 		resources.DataStores = append(resources.DataStores, DokployDataStore{
-			Kind:        store.Kind,
-			Engine:      store.Engine,
-			Service:     store.Service,
-			Strategy:    store.Strategy,
-			Fallback:    store.Fallback,
-			Criticality: store.Criticality,
-			Action:      dokployDataStoreAction(store),
-			Readiness:   store.Readiness,
+			Kind:                store.Kind,
+			Engine:              store.Engine,
+			Service:             store.Service,
+			Strategy:            store.Strategy,
+			Fallback:            store.Fallback,
+			Criticality:         store.Criticality,
+			Action:              dokployDataStoreAction(store),
+			Readiness:           store.Readiness,
+			SourceContainerID:   store.SourceContainerID,
+			SourceContainerName: store.SourceContainerName,
 		})
 	}
 	for _, requirement := range plan.Resources.ExternalRequirements {

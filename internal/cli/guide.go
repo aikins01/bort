@@ -72,9 +72,17 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 		if err != nil {
 			return err
 		}
-		run, err := createGuidedMigrationRun(ctx, setup)
+		var run loadedMigrationRun
+		if isRealTTY(stdin, stdout) {
+			run, err = runWizardScan(ctx, setup, stdout)
+		} else {
+			run, err = createGuidedMigrationRun(ctx, setup)
+		}
 		if err != nil {
 			return err
+		}
+		if isRealTTY(stdin, stdout) {
+			return runWizard(ctx, run, stdin, stdout, stderr)
 		}
 		writeAppFirstCockpit(stdout, run)
 		return nil

@@ -24,9 +24,18 @@ const (
 // strategies) so subsequent `bort` runs see the same answers without an
 // interactive cockpit.
 type bortState struct {
-	APIVersion string                  `json:"apiVersion"`
-	UpdatedAt  time.Time               `json:"updatedAt"`
-	Apps       map[string]appStateData `json:"apps,omitempty"`
+	APIVersion string                       `json:"apiVersion"`
+	UpdatedAt  time.Time                    `json:"updatedAt"`
+	Apps       map[string]appStateData      `json:"apps,omitempty"`
+	Targets    map[string]targetCredentials `json:"targets,omitempty"`
+}
+
+type targetCredentials struct {
+	URL            string    `json:"url"`
+	Token          string    `json:"token"`
+	AdminEmail     string    `json:"adminEmail,omitempty"`
+	BootstrappedAt time.Time `json:"bootstrappedAt"`
+	APIKeyName     string    `json:"apiKeyName,omitempty"`
 }
 
 type appStateData struct {
@@ -135,6 +144,15 @@ func setAppDataStrategy(state bortState, app, store, strategy string) bortState 
 	}
 	entry.Data[store] = dataStoreState{Strategy: strategy, UpdatedAt: time.Now().UTC()}
 	state.Apps[app] = entry
+	state.UpdatedAt = time.Now().UTC()
+	return state
+}
+
+func setTargetCredentials(state bortState, target string, creds targetCredentials) bortState {
+	if state.Targets == nil {
+		state.Targets = map[string]targetCredentials{}
+	}
+	state.Targets[target] = creds
 	state.UpdatedAt = time.Now().UTC()
 	return state
 }

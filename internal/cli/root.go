@@ -54,6 +54,8 @@ func RunWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		return runStatus(ctx, args[1:], stdout, stderr)
 	case "next":
 		return runNext(ctx, args[1:], stdout, stderr)
+	case "init-target":
+		return runInitTarget(ctx, args[1:], stdin, stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q (run `bort help` for usage)", args[0])
 	}
@@ -79,6 +81,7 @@ func writePrimaryHelp(w io.Writer, st *styler) {
 		{verb: "bort migrate", desc: "create/update local dry-run migration artifacts"},
 		{verb: "bort rollback", desc: "plan a rollback to the source"},
 		{verb: "bort commit", desc: "plan final target acceptance"},
+		{verb: "bort init-target dokploy", desc: "bootstrap a dokploy admin + api key from coolify credentials"},
 	})
 	writeHelpSection(w, st, "Other:", []helpLine{
 		{verb: "bort help [--advanced]", desc: "show this help (advanced lists power-user verbs)"},

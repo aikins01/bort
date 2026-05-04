@@ -94,11 +94,37 @@ func writeAppFirstCockpit(w io.Writer, run loadedMigrationRun) {
 		parts = append(parts, st.glyph(fmt.Sprintf("%d blocked", blocked), sevBad))
 	}
 	fmt.Fprintf(w, "%s %s\n", st.emph("Plan:"), strings.Join(parts, " · "))
+	if line := appliedFooter(run.Applied); line != "" {
+		fmt.Fprintln(w, st.muted(line))
+	}
 	if overall != appHealthReady {
 		fmt.Fprintln(w, st.muted("Run the shown `fix:` commands, then re-run `bort` to recheck."))
 	} else {
-		fmt.Fprintln(w, st.muted("All app inputs ready. Use `bort migrate` to refresh dry-run artifacts (live execution not yet implemented)."))
+		fmt.Fprintln(w, st.muted("All app inputs ready. Use `bort migrate --live` to apply, or rerun `bort` to walk the wizard."))
 	}
+}
+
+func appliedFooter(applied runApplied) string {
+	if len(applied.Steps) == 0 {
+		return ""
+	}
+	ok, errs := 0, 0
+	for _, step := range applied.Steps {
+		switch step.Status {
+		case "ok", "skipped":
+			ok++
+		case "error":
+			errs++
+		}
+	}
+	parts := []string{fmt.Sprintf("Applied: %d step(s) recorded", len(applied.Steps))}
+	if ok > 0 {
+		parts = append(parts, fmt.Sprintf("%d ok", ok))
+	}
+	if errs > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed", errs))
+	}
+	return strings.Join(parts, " · ")
 }
 
 func severityForHealth(h appHealth) severity {

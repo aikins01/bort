@@ -2,6 +2,7 @@
 /bin/
 /dist/
 /tmp/
+/.bort/
 *.log
 *.sqlite
 *.sqlite3

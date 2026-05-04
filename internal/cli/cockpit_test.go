@@ -97,3 +97,21 @@ func TestReadRunProgressIgnoresStaleOrMismatchedProgress(t *testing.T) {
 		t.Fatalf("expected wrong-run-dir progress to be ignored, got %#v", progress.Decisions)
 	}
 }
+
+func TestAppliedFooterEmptyWhenNoSteps(t *testing.T) {
+	if got := appliedFooter(runApplied{}); got != "" {
+		t.Fatalf("expected empty footer, got %q", got)
+	}
+}
+
+func TestAppliedFooterCountsOkAndError(t *testing.T) {
+	applied := runApplied{Steps: []appliedStep{
+		{Index: 0, Status: "ok"},
+		{Index: 1, Status: "error"},
+		{Index: 2, Status: "skipped"},
+	}}
+	got := appliedFooter(applied)
+	if got != "Applied: 3 step(s) recorded · 2 ok · 1 failed" {
+		t.Fatalf("unexpected footer: %q", got)
+	}
+}

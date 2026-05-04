@@ -42,14 +42,16 @@ type Requirement struct {
 }
 
 type DataStore struct {
-	Kind        string   `json:"kind"`
-	Engine      string   `json:"engine,omitempty"`
-	Service     string   `json:"service"`
-	Image       string   `json:"image,omitempty"`
-	Volumes     []string `json:"volumes,omitempty"`
-	Strategy    string   `json:"strategy"`
-	Fallback    string   `json:"fallback,omitempty"`
-	Criticality string   `json:"criticality"`
+	Kind                string   `json:"kind"`
+	Engine              string   `json:"engine,omitempty"`
+	Service             string   `json:"service"`
+	Image               string   `json:"image,omitempty"`
+	Volumes             []string `json:"volumes,omitempty"`
+	Strategy            string   `json:"strategy"`
+	Fallback            string   `json:"fallback,omitempty"`
+	Criticality         string   `json:"criticality"`
+	SourceContainerID   string   `json:"sourceContainerId,omitempty"`
+	SourceContainerName string   `json:"sourceContainerName,omitempty"`
 }
 
 func (s DataStore) Label() string {
@@ -73,15 +75,17 @@ type ResourceLink struct {
 }
 
 type StatefulVolume struct {
-	Origin    string `json:"origin,omitempty"`
-	Service   string `json:"service"`
-	Type      string `json:"type"`
-	Name      string `json:"name,omitempty"`
-	Source    string `json:"source,omitempty"`
-	Target    string `json:"target"`
-	RW        bool   `json:"rw"`
-	SizeBytes int64  `json:"sizeBytes,omitempty"`
-	FileCount int64  `json:"fileCount,omitempty"`
+	Origin              string `json:"origin,omitempty"`
+	Service             string `json:"service"`
+	Type                string `json:"type"`
+	Name                string `json:"name,omitempty"`
+	Source              string `json:"source,omitempty"`
+	Target              string `json:"target"`
+	RW                  bool   `json:"rw"`
+	SizeBytes           int64  `json:"sizeBytes,omitempty"`
+	FileCount           int64  `json:"fileCount,omitempty"`
+	SourceContainerID   string `json:"sourceContainerId,omitempty"`
+	SourceContainerName string `json:"sourceContainerName,omitempty"`
 }
 
 type RiskSeverity string
@@ -552,14 +556,16 @@ func databaseMountPath(path string) bool {
 
 func newDataStore(service manifest.Service, kind, engine, strategy, fallback, criticality string) DataStore {
 	return DataStore{
-		Kind:        kind,
-		Engine:      engine,
-		Service:     serviceName(service),
-		Image:       service.Image,
-		Volumes:     serviceVolumes(service),
-		Strategy:    strategy,
-		Fallback:    fallback,
-		Criticality: criticality,
+		Kind:                kind,
+		Engine:              engine,
+		Service:             serviceName(service),
+		Image:               service.Image,
+		Volumes:             serviceVolumes(service),
+		Strategy:            strategy,
+		Fallback:            fallback,
+		Criticality:         criticality,
+		SourceContainerID:   service.ID,
+		SourceContainerName: service.Name,
 	}
 }
 
@@ -615,13 +621,15 @@ func serviceStatefulVolumes(service manifest.Service) []StatefulVolume {
 			continue
 		}
 		volumes = append(volumes, StatefulVolume{
-			Origin:  "mount",
-			Service: serviceName(service),
-			Type:    mount.Type,
-			Name:    mount.Name,
-			Source:  mount.Source,
-			Target:  mount.Target,
-			RW:      mount.RW,
+			Origin:              "mount",
+			Service:             serviceName(service),
+			Type:                mount.Type,
+			Name:                mount.Name,
+			Source:              mount.Source,
+			Target:              mount.Target,
+			RW:                  mount.RW,
+			SourceContainerID:   service.ID,
+			SourceContainerName: service.Name,
 		})
 	}
 	return volumes

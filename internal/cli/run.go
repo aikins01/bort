@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -52,6 +53,7 @@ type runArtifacts struct {
 	Commit    string `json:"commit"`
 	Decisions string `json:"decisions"`
 	Progress  string `json:"progress,omitempty"`
+	Applied   string `json:"applied,omitempty"`
 }
 
 type loadedMigrationRun struct {
@@ -63,6 +65,7 @@ type loadedMigrationRun struct {
 	Commit    commitplan.Result
 	Decisions runDecisions
 	Progress  runProgress
+	Applied   runApplied
 }
 
 type runDecisions struct {
@@ -202,22 +205,83 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	writeMigrationRunText(stdout, "Migration run created", summary)
 
 	if live {
-		return applyLiveMigration(ctx, loadedRun, stderr)
+		return applyLiveMigration(ctx, loadedRun, stderr, nil)
 	}
 	return nil
 }
 
-func applyLiveMigration(ctx context.Context, run loadedMigrationRun, stderr io.Writer) error {
+func applyLiveMigration(ctx context.Context, run loadedMigrationRun, stderr io.Writer, onProgress func(dokploy.StepProgress)) error {
 	if run.Run.Target != "dokploy" {
 		return fmt.Errorf("--live is only supported for target dokploy, got %q", run.Run.Target)
 	}
-	client, err := dokploy.NewClientFromEnv()
+	client, err := resolveDokployClient(ctx, run.Run.Target, os.Stdin, stderr)
+	if err != nil {
+		return err
+	}
+	if err := client.Ping(ctx); err != nil {
+		return fmt.Errorf("dokploy ping failed: %w", err)
+	}
+	appliedPath, err := safeRunArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied)
+	if err != nil {
+		return err
+	}
+	ledger, err := newAppliedLedger(appliedPath, run.Run)
 	if err != nil {
 		return err
 	}
 	plan := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
-	fmt.Fprintf(stderr, "live mode: planned %d dokploy step(s)\n", len(plan.Steps))
+	plan.RunName = run.Run.Name
+	plan.RunDir = run.Run.RunDir
+	fn := func(p dokploy.StepProgress) {
+		if p.Status == dokploy.StepStatusOK || p.Status == dokploy.StepStatusError || p.Status == dokploy.StepStatusSkipped {
+			if recordErr := ledger.Record(p); recordErr != nil {
+				fmt.Fprintf(stderr, "warning: failed to record applied step %s: %v\n", p.Step.Kind, recordErr)
+			}
+		}
+		if onProgress != nil {
+			onProgress(p)
+		}
+	}
+	plan.OnProgress = &fn
+	fmt.Fprintf(stderr, "live mode: %s reachable; planned %d dokploy step(s)\n", client.BaseURL, len(plan.Steps))
 	return client.Apply(ctx, plan)
+}
+
+func resolveDokployClient(ctx context.Context, target string, stdin io.Reader, stderr io.Writer) (*dokploy.Client, error) {
+	if client, err := dokploy.NewClientFromEnv(); err == nil {
+		return client, nil
+	}
+	state, err := readBortState(defaultStatePath())
+	if err != nil {
+		return nil, err
+	}
+	creds, ok := state.Targets[target]
+	if ok && creds.URL != "" && creds.Token != "" {
+		return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
+	}
+	if target == "dokploy" && stdinIsTerminal(stdin) {
+		fmt.Fprintln(stderr, "no dokploy credentials found; running `bort init-target dokploy` interactively")
+		if err := runInitTarget(ctx, nil, stdin, stderr, stderr); err != nil {
+			return nil, err
+		}
+		state, err = readBortState(defaultStatePath())
+		if err != nil {
+			return nil, err
+		}
+		creds = state.Targets[target]
+		if creds.URL != "" && creds.Token != "" {
+			return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
+		}
+	}
+	return nil, fmt.Errorf("no dokploy credentials available: set %s and %s, or run `bort init-target dokploy` first", dokploy.EnvBaseURL, dokploy.EnvToken)
+}
+
+func stdinIsTerminal(stdin io.Reader) bool {
+	file, ok := stdin.(*os.File)
+	if !ok {
+		return false
+	}
+	return isInteractiveTerminal(file)
 }
 
 func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
@@ -312,6 +376,15 @@ func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
 		return loadedMigrationRun{}, err
 	}
 	loadedRun.Progress = progress
+	appliedPath, err := safeRunArtifactPath(runDir, run.Artifacts.Applied)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	applied, err := readRunApplied(appliedPath, run)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	loadedRun.Applied = applied
 	if err := writeJSONArtifact(filepath.Join(runDir, "run.json"), run); err != nil {
 		return loadedMigrationRun{}, err
 	}
@@ -440,6 +513,15 @@ func loadMigrationRun(runRef string) (loadedMigrationRun, error) {
 		return loadedMigrationRun{}, err
 	}
 	loadedRun.Progress = progress
+	appliedPath, err := safeRunArtifactPath(runDir, run.Artifacts.Applied)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	applied, err := readRunApplied(appliedPath, run)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	loadedRun.Applied = applied
 	return loadedRun, nil
 }
 
@@ -545,11 +627,26 @@ func nextSafeStep(run loadedMigrationRun, decisions []runDecision) runNextStep {
 		gate := gates[0]
 		return runNextStep{Action: nextAction(gate), Reason: gateReason(gate), Artifact: gate.Artifact}
 	}
+	if run.Run.Target == "dokploy" && !hasDokployCredentials(run.Run.Target) {
+		return runNextStep{
+			Action: "run `bort init-target dokploy` to bootstrap the target api key",
+			Reason: "all gates are clear but no dokploy credentials are stored in .bort/state.json",
+		}
+	}
 	return runNextStep{
-		Action:   "review the generated run artifacts before adding any live execution step",
-		Reason:   "no unresolved dry-run gates were found, but live migration execution is not implemented",
+		Action:   "run `bort migrate --live` to apply the planned steps against the target",
+		Reason:   "all gates are clear and target credentials are stored",
 		Artifact: runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Commit),
 	}
+}
+
+func hasDokployCredentials(target string) bool {
+	state, err := readBortState(defaultStatePath())
+	if err != nil {
+		return false
+	}
+	creds, ok := state.Targets[target]
+	return ok && creds.URL != "" && creds.Token != ""
 }
 
 func openRunDecisions(run loadedMigrationRun) []runDecision {
@@ -1107,7 +1204,16 @@ func ensurePrivateRunDir(path string) error {
 }
 
 func defaultRunArtifacts() runArtifacts {
-	return runArtifacts{Prepare: "prepare.json", Sync: "sync.json", Cutover: "cutover.json", Rollback: "rollback.json", Commit: "commit.json", Decisions: "decisions.json", Progress: "progress.json"}
+	return runArtifacts{
+		Prepare:   "prepare.json",
+		Sync:      "sync.json",
+		Cutover:   "cutover.json",
+		Rollback:  "rollback.json",
+		Commit:    "commit.json",
+		Decisions: "decisions.json",
+		Progress:  "progress.json",
+		Applied:   "applied.json",
+	}
 }
 
 func (artifacts runArtifacts) withDefaults() runArtifacts {
@@ -1132,6 +1238,9 @@ func (artifacts runArtifacts) withDefaults() runArtifacts {
 	}
 	if artifacts.Progress == "" {
 		artifacts.Progress = defaults.Progress
+	}
+	if artifacts.Applied == "" {
+		artifacts.Applied = defaults.Applied
 	}
 	return artifacts
 }

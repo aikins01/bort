@@ -146,28 +146,32 @@ type EnvFileResource struct {
 }
 
 type VolumeResource struct {
-	Service     string    `json:"service,omitempty"`
-	Type        string    `json:"type"`
-	Name        string    `json:"name,omitempty"`
-	Source      string    `json:"source,omitempty"`
-	Target      string    `json:"target"`
-	ReadWrite   bool      `json:"readWrite"`
-	Portability string    `json:"portability,omitempty"`
-	Readiness   Readiness `json:"readiness"`
-	SizeBytes   int64     `json:"sizeBytes,omitempty"`
-	FileCount   int64     `json:"fileCount,omitempty"`
+	Service             string    `json:"service,omitempty"`
+	Type                string    `json:"type"`
+	Name                string    `json:"name,omitempty"`
+	Source              string    `json:"source,omitempty"`
+	Target              string    `json:"target"`
+	ReadWrite           bool      `json:"readWrite"`
+	Portability         string    `json:"portability,omitempty"`
+	Readiness           Readiness `json:"readiness"`
+	SizeBytes           int64     `json:"sizeBytes,omitempty"`
+	FileCount           int64     `json:"fileCount,omitempty"`
+	SourceContainerID   string    `json:"sourceContainerId,omitempty"`
+	SourceContainerName string    `json:"sourceContainerName,omitempty"`
 }
 
 type DataStoreResource struct {
-	Kind        string    `json:"kind"`
-	Engine      string    `json:"engine,omitempty"`
-	Service     string    `json:"service"`
-	Image       string    `json:"image,omitempty"`
-	Volumes     []string  `json:"volumes,omitempty"`
-	Strategy    string    `json:"strategy"`
-	Fallback    string    `json:"fallback,omitempty"`
-	Criticality string    `json:"criticality"`
-	Readiness   Readiness `json:"readiness"`
+	Kind                string    `json:"kind"`
+	Engine              string    `json:"engine,omitempty"`
+	Service             string    `json:"service"`
+	Image               string    `json:"image,omitempty"`
+	Volumes             []string  `json:"volumes,omitempty"`
+	Strategy            string    `json:"strategy"`
+	Fallback            string    `json:"fallback,omitempty"`
+	Criticality         string    `json:"criticality"`
+	Readiness           Readiness `json:"readiness"`
+	SourceContainerID   string    `json:"sourceContainerId,omitempty"`
+	SourceContainerName string    `json:"sourceContainerName,omitempty"`
 }
 
 type ExternalRequirementResource struct {
@@ -387,16 +391,18 @@ func volumeResource(volume analyzer.StatefulVolume) VolumeResource {
 		portability = "review_required"
 	}
 	return VolumeResource{
-		Service:     volume.Service,
-		Type:        volume.Type,
-		Name:        volume.Name,
-		Source:      volume.Source,
-		Target:      volume.Target,
-		ReadWrite:   volume.RW,
-		Portability: portability,
-		Readiness:   readiness,
-		SizeBytes:   volume.SizeBytes,
-		FileCount:   volume.FileCount,
+		Service:             volume.Service,
+		Type:                volume.Type,
+		Name:                volume.Name,
+		Source:              volume.Source,
+		Target:              volume.Target,
+		ReadWrite:           volume.RW,
+		Portability:         portability,
+		Readiness:           readiness,
+		SizeBytes:           volume.SizeBytes,
+		FileCount:           volume.FileCount,
+		SourceContainerID:   volume.SourceContainerID,
+		SourceContainerName: volume.SourceContainerName,
 	}
 }
 
@@ -406,15 +412,17 @@ func dataStoreResource(store analyzer.DataStore) DataStoreResource {
 		readiness = ReadinessBlocked
 	}
 	return DataStoreResource{
-		Kind:        store.Kind,
-		Engine:      store.Engine,
-		Service:     store.Service,
-		Image:       store.Image,
-		Volumes:     planutil.UniqueStrings(store.Volumes),
-		Strategy:    store.Strategy,
-		Fallback:    store.Fallback,
-		Criticality: store.Criticality,
-		Readiness:   readiness,
+		Kind:                store.Kind,
+		Engine:              store.Engine,
+		Service:             store.Service,
+		Image:               store.Image,
+		Volumes:             planutil.UniqueStrings(store.Volumes),
+		Strategy:            store.Strategy,
+		Fallback:            store.Fallback,
+		Criticality:         store.Criticality,
+		Readiness:           readiness,
+		SourceContainerID:   store.SourceContainerID,
+		SourceContainerName: store.SourceContainerName,
 	}
 }
 
