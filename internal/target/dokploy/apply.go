@@ -28,6 +28,17 @@ const (
 	StepDumpDataStore    StepKind = "dump_data_store"
 	StepRestoreDataStore StepKind = "restore_data_store"
 	StepInstallGateway   StepKind = "install_gateway"
+	StepStopCoolifyProxy StepKind = "stop_coolify_proxy"
+	StepStartDokployProxy StepKind = "start_dokploy_proxy"
+)
+
+// proxy container names assumed by the cutover swap. coolify-proxy is
+// the canonical name regardless of whether coolify runs in traefik or
+// caddy mode (the proxy compose file always names it coolify-proxy).
+// dokploy-traefik is created by dokploy's official install.sh.
+const (
+	coolifyProxyContainer = "coolify-proxy"
+	dokployProxyContainer = "dokploy-traefik"
 )
 
 type Step struct {
@@ -123,10 +134,20 @@ func PlanFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 		plan.Steps = append(plan.Steps, dataStoreSteps...)
 		plan.Steps = append(plan.Steps, volumeSteps...)
 	}
+	hasRoutes := false
 	for _, app := range cutover.Apps {
 		for _, route := range app.Routes {
 			plan.Steps = append(plan.Steps, Step{Kind: StepInstallGateway, App: app.Name, Ref: route.Host})
+			hasRoutes = true
 		}
+	}
+	// only swap proxies when something actually depends on :80/:443 —
+	// keeps no-route migrations from disturbing a healthy coolify host.
+	if hasRoutes {
+		plan.Steps = append(plan.Steps,
+			Step{Kind: StepStopCoolifyProxy, Ref: coolifyProxyContainer},
+			Step{Kind: StepStartDokployProxy, Ref: dokployProxyContainer},
+		)
 	}
 	return plan
 }
@@ -158,6 +179,7 @@ func (a *applyContext) entry(app string) *appCache {
 func (c *Client) Apply(ctx context.Context, plan Plan) error {
 	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
 	pausedApps := map[string]struct{}{}
+	coolifyProxyStopped := false
 	total := len(plan.Steps)
 	for index, step := range plan.Steps {
 		emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusStarted})
@@ -168,10 +190,13 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 		if step.Kind == StepPauseSource {
 			pausedApps[step.App] = struct{}{}
 		}
+		if step.Kind == StepStopCoolifyProxy {
+			coolifyProxyStopped = true
+		}
 		err := c.applyStep(ctx, actx, step)
 		if err != nil {
 			emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusError, Err: err})
-			c.bestEffortResume(ctx, actx, plan, total, pausedApps)
+			c.bestEffortResume(ctx, actx, plan, total, pausedApps, coolifyProxyStopped)
 			return fmt.Errorf("dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
 		}
 		emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusOK})
@@ -184,8 +209,8 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 // original failure; operators can still re-run apply or rollback. it
 // uses a fresh context so a Ctrl-C that cancelled apply can still
 // clean up — without that, source containers would stay stopped.
-func (c *Client) bestEffortResume(_ context.Context, actx *applyContext, plan Plan, total int, pausedApps map[string]struct{}) {
-	if len(pausedApps) == 0 {
+func (c *Client) bestEffortResume(_ context.Context, actx *applyContext, plan Plan, total int, pausedApps map[string]struct{}, coolifyProxyStopped bool) {
+	if len(pausedApps) == 0 && !coolifyProxyStopped {
 		return
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -198,6 +223,21 @@ func (c *Client) bestEffortResume(_ context.Context, actx *applyContext, plan Pl
 			continue
 		}
 		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusOK})
+	}
+	// proxy resume runs last so coolify-proxy comes back online only
+	// after source apps are restartable. it gets its own fresh 30s
+	// context so a slow source-resume loop can't starve the proxy
+	// restart of its budget.
+	if coolifyProxyStopped {
+		proxyCtx, cancelProxy := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancelProxy()
+		resumeProxyStep := Step{Kind: StepStopCoolifyProxy, Ref: coolifyProxyContainer}
+		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeProxyStep, Status: StepStatusStarted})
+		if err := startProxyContainer(proxyCtx, c.dockerRunner(), coolifyProxyContainer); err != nil {
+			emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeProxyStep, Status: StepStatusError, Err: err})
+			return
+		}
+		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeProxyStep, Status: StepStatusOK})
 	}
 }
 
@@ -232,6 +272,10 @@ func (c *Client) applyStep(ctx context.Context, actx *applyContext, step Step) e
 		return c.applyDumpDataStore(ctx, actx, step)
 	case StepRestoreDataStore:
 		return c.applyRestoreDataStore(ctx, actx, step)
+	case StepStopCoolifyProxy:
+		return c.applyStopCoolifyProxy(ctx, actx, step)
+	case StepStartDokployProxy:
+		return c.applyStartDokployProxy(ctx, actx, step)
 	default:
 		return fmt.Errorf("unknown step kind %q", step.Kind)
 	}
