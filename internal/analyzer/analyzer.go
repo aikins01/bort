@@ -27,7 +27,19 @@ type Topology struct {
 	LinkedResources      []ResourceLink   `json:"linkedResources"`
 	StatefulVolumes      []StatefulVolume `json:"statefulVolumes"`
 	Routes               []manifest.Route `json:"routes"`
+	SourceServices       []SourceService  `json:"sourceServices,omitempty"`
 	RiskReasons          []RiskReason     `json:"riskReasons"`
+}
+
+// SourceService describes a single source-side container belonging to an
+// app, regardless of whether it owns persistent state. apply uses it to
+// quiesce app workers/web containers around volume sync without having to
+// re-read the manifest.
+type SourceService struct {
+	ServiceName   string `json:"serviceName"`
+	ContainerID   string `json:"containerId,omitempty"`
+	ContainerName string `json:"containerName,omitempty"`
+	Image         string `json:"image,omitempty"`
 }
 
 type Dependency struct {
@@ -178,8 +190,25 @@ func topologyForApp(app manifest.App, analysis AppAnalysis) Topology {
 		LinkedResources:      analysis.LinkedResources,
 		StatefulVolumes:      analysis.StatefulVolumes,
 		Routes:               appRoutes(app.Routes),
+		SourceServices:       sourceServices(app),
 		RiskReasons:          analysis.RiskReasons,
 	}
+}
+
+func sourceServices(app manifest.App) []SourceService {
+	services := make([]SourceService, 0, len(app.Services))
+	for _, service := range app.Services {
+		if service.ID == "" && service.Name == "" {
+			continue
+		}
+		services = append(services, SourceService{
+			ServiceName:   serviceName(service),
+			ContainerID:   service.ID,
+			ContainerName: service.Name,
+			Image:         service.Image,
+		})
+	}
+	return services
 }
 
 func internalDependencies(app manifest.App) []Dependency {

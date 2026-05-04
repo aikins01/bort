@@ -21,6 +21,8 @@ const (
 	StepPushImage        StepKind = "push_image"
 	StepUploadEnv        StepKind = "upload_env"
 	StepCreateVolume     StepKind = "create_volume"
+	StepPauseSource      StepKind = "pause_source"
+	StepResumeSource     StepKind = "resume_source"
 	StepSyncVolume       StepKind = "sync_volume"
 	StepDumpDataStore    StepKind = "dump_data_store"
 	StepRestoreDataStore StepKind = "restore_data_store"
@@ -82,14 +84,34 @@ func PlanFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 		}
 	}
 	for _, app := range sync.Apps {
+		var dataStoreSteps, volumeSteps []Step
+		prepApp, hasPrepApp := findPrepareApp(prepare, app.Name)
 		for _, step := range app.Steps {
 			switch step.ResourceType {
 			case "volume":
-				plan.Steps = append(plan.Steps, Step{Kind: StepSyncVolume, App: app.Name, Ref: step.ResourceRef})
+				// datastore-backing volumes migrate via logical dump/restore.
+				// emitting a sync_volume step for them would no-op at apply
+				// time but still force a needless pause of source services.
+				if hasPrepApp {
+					if volume, ok := findPrepareVolume(prepApp, step.ResourceRef); ok && isDataStoreBackingVolume(prepApp, volume) {
+						continue
+					}
+				}
+				volumeSteps = append(volumeSteps, Step{Kind: StepSyncVolume, App: app.Name, Ref: step.ResourceRef})
 			case "data_store":
-				plan.Steps = append(plan.Steps, Step{Kind: StepDumpDataStore, App: app.Name, Ref: step.ResourceRef})
-				plan.Steps = append(plan.Steps, Step{Kind: StepRestoreDataStore, App: app.Name, Ref: step.ResourceRef})
+				dataStoreSteps = append(dataStoreSteps,
+					Step{Kind: StepDumpDataStore, App: app.Name, Ref: step.ResourceRef},
+					Step{Kind: StepRestoreDataStore, App: app.Name, Ref: step.ResourceRef},
+				)
 			}
+		}
+		// data store dumps run with source live so logical pg_dump works.
+		// pause is only required before volume/bind copies that need a
+		// quiesced filesystem.
+		plan.Steps = append(plan.Steps, dataStoreSteps...)
+		if len(volumeSteps) > 0 {
+			plan.Steps = append(plan.Steps, Step{Kind: StepPauseSource, App: app.Name, Ref: app.Name})
+			plan.Steps = append(plan.Steps, volumeSteps...)
 		}
 	}
 	for _, app := range cutover.Apps {
@@ -126,17 +148,37 @@ func (a *applyContext) entry(app string) *appCache {
 
 func (c *Client) Apply(ctx context.Context, plan Plan) error {
 	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	pausedApps := map[string]struct{}{}
 	total := len(plan.Steps)
 	for index, step := range plan.Steps {
 		emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusStarted})
 		err := c.applyStep(ctx, actx, step)
 		if err != nil {
 			emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusError, Err: err})
+			c.bestEffortResume(ctx, actx, plan, total, pausedApps)
 			return fmt.Errorf("dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
+		}
+		if step.Kind == StepPauseSource {
+			pausedApps[step.App] = struct{}{}
 		}
 		emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusOK})
 	}
 	return nil
+}
+
+// bestEffortResume restarts source containers for every app that the
+// failed run had paused. errors are swallowed so they don't mask the
+// original failure; operators can still re-run apply or rollback.
+func (c *Client) bestEffortResume(ctx context.Context, actx *applyContext, plan Plan, total int, pausedApps map[string]struct{}) {
+	for app := range pausedApps {
+		resumeStep := Step{Kind: StepResumeSource, App: app, Ref: app}
+		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusStarted})
+		if err := c.applyResumeSource(ctx, actx, resumeStep); err != nil {
+			emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusError, Err: err})
+			continue
+		}
+		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusOK})
+	}
 }
 
 func emitProgress(fn *func(StepProgress), progress StepProgress) {
@@ -160,6 +202,10 @@ func (c *Client) applyStep(ctx context.Context, actx *applyContext, step Step) e
 		return nil
 	case StepInstallGateway:
 		return c.applyInstallGateway(ctx, actx, step)
+	case StepPauseSource:
+		return c.applyPauseSource(ctx, actx, step)
+	case StepResumeSource:
+		return c.applyResumeSource(ctx, actx, step)
 	case StepSyncVolume:
 		return c.applySyncVolume(ctx, actx, step)
 	case StepDumpDataStore:

@@ -120,6 +120,15 @@ type ResourceSpecs struct {
 	DataStores           []DataStoreResource           `json:"dataStores,omitempty"`
 	ExternalRequirements []ExternalRequirementResource `json:"externalRequirements,omitempty"`
 	LinkedResources      []LinkedResourceCandidate     `json:"linkedResources,omitempty"`
+	SourceServices       []SourceServiceRef            `json:"sourceServices,omitempty"`
+}
+
+// SourceServiceRef carries the source-side container coordinates that
+// apply needs to quiesce app workers/web services around a data move.
+type SourceServiceRef struct {
+	ServiceName   string `json:"serviceName"`
+	ContainerID   string `json:"containerId,omitempty"`
+	ContainerName string `json:"containerName,omitempty"`
 }
 
 type AppResource struct {
@@ -307,6 +316,16 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 	}
 	for _, link := range topology.LinkedResources {
 		resources.LinkedResources = append(resources.LinkedResources, linkedResourceCandidate(link))
+	}
+	for _, service := range topology.SourceServices {
+		if service.ContainerID == "" && service.ContainerName == "" {
+			continue
+		}
+		resources.SourceServices = append(resources.SourceServices, SourceServiceRef{
+			ServiceName:   service.ServiceName,
+			ContainerID:   service.ContainerID,
+			ContainerName: service.ContainerName,
+		})
 	}
 
 	return resources
