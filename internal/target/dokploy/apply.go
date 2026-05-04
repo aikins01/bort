@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/preparer"
@@ -89,30 +90,38 @@ func PlanFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 		for _, step := range app.Steps {
 			switch step.ResourceType {
 			case "volume":
-				// datastore-backing volumes migrate via logical dump/restore.
-				// emitting a sync_volume step for them would no-op at apply
-				// time but still force a needless pause of source services.
+				// volumes owned by logical-dump or skip-strategy stores must
+				// not get a raw sync step: logical owns migration, skip
+				// must leave the target empty. only "volume" migration
+				// kind allows raw copy of a data store volume.
 				if hasPrepApp {
-					if volume, ok := findPrepareVolume(prepApp, step.ResourceRef); ok && isDataStoreBackingVolume(prepApp, volume) {
+					if volume, ok := findPrepareVolume(prepApp, step.ResourceRef); ok && volumeOwnedByLogicalOrSkippedStore(prepApp, volume) {
 						continue
 					}
 				}
 				volumeSteps = append(volumeSteps, Step{Kind: StepSyncVolume, App: app.Name, Ref: step.ResourceRef})
 			case "data_store":
+				if hasPrepApp {
+					if store, ok := findPrepareDataStore(prepApp, step.ResourceRef); ok && dataStoreMigrationKind(store) != dataStoreMigrationLogical {
+						continue
+					}
+				}
 				dataStoreSteps = append(dataStoreSteps,
 					Step{Kind: StepDumpDataStore, App: app.Name, Ref: step.ResourceRef},
 					Step{Kind: StepRestoreDataStore, App: app.Name, Ref: step.ResourceRef},
 				)
 			}
 		}
-		// data store dumps run with source live so logical pg_dump works.
-		// pause is only required before volume/bind copies that need a
-		// quiesced filesystem.
-		plan.Steps = append(plan.Steps, dataStoreSteps...)
-		if len(volumeSteps) > 0 {
+		// pause runs before any state work so app writers stop before
+		// pg_dump captures its snapshot and before raw volume copies
+		// see the on-disk format. logical-dump stores stay live (they
+		// are excluded from quiesce targets); only the app's writers
+		// and volume-strategy stores actually stop here.
+		if len(dataStoreSteps) > 0 || len(volumeSteps) > 0 {
 			plan.Steps = append(plan.Steps, Step{Kind: StepPauseSource, App: app.Name, Ref: app.Name})
-			plan.Steps = append(plan.Steps, volumeSteps...)
 		}
+		plan.Steps = append(plan.Steps, dataStoreSteps...)
+		plan.Steps = append(plan.Steps, volumeSteps...)
 	}
 	for _, app := range cutover.Apps {
 		for _, route := range app.Routes {
@@ -152,14 +161,18 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 	total := len(plan.Steps)
 	for index, step := range plan.Steps {
 		emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusStarted})
+		// mark eagerly: a partial pause that stops some containers and
+		// then errors must still be cleaned up by bestEffortResume.
+		// resume is stateless and only starts what is currently stopped,
+		// so marking before the step is safe.
+		if step.Kind == StepPauseSource {
+			pausedApps[step.App] = struct{}{}
+		}
 		err := c.applyStep(ctx, actx, step)
 		if err != nil {
 			emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusError, Err: err})
 			c.bestEffortResume(ctx, actx, plan, total, pausedApps)
 			return fmt.Errorf("dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
-		}
-		if step.Kind == StepPauseSource {
-			pausedApps[step.App] = struct{}{}
 		}
 		emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusOK})
 	}
@@ -168,12 +181,19 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 
 // bestEffortResume restarts source containers for every app that the
 // failed run had paused. errors are swallowed so they don't mask the
-// original failure; operators can still re-run apply or rollback.
-func (c *Client) bestEffortResume(ctx context.Context, actx *applyContext, plan Plan, total int, pausedApps map[string]struct{}) {
+// original failure; operators can still re-run apply or rollback. it
+// uses a fresh context so a Ctrl-C that cancelled apply can still
+// clean up — without that, source containers would stay stopped.
+func (c *Client) bestEffortResume(_ context.Context, actx *applyContext, plan Plan, total int, pausedApps map[string]struct{}) {
+	if len(pausedApps) == 0 {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	for app := range pausedApps {
 		resumeStep := Step{Kind: StepResumeSource, App: app, Ref: app}
 		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusStarted})
-		if err := c.applyResumeSource(ctx, actx, resumeStep); err != nil {
+		if err := c.applyResumeSource(cleanupCtx, actx, resumeStep); err != nil {
 			emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusError, Err: err})
 			continue
 		}

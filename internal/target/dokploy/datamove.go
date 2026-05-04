@@ -14,9 +14,11 @@ import (
 
 const composeServiceLabel = "com.docker.compose.service"
 
-// applySyncVolume mirrors a source named docker volume into the target
-// named docker volume that dokploy created via compose.deploy. only
-// named volumes are supported; bind mounts return ErrNotImplemented.
+// applySyncVolume mirrors a source-side volume into the matching dokploy
+// target volume. named volumes copy via tar/busybox; bind mounts copy
+// via rsync. raw copy clobbers the target volume's contents, so the
+// dokploy-managed target container is stopped for the duration so it
+// doesn't see files disappear and reappear underneath it.
 func (c *Client) applySyncVolume(ctx context.Context, actx *applyContext, step Step) error {
 	app, ok := findPrepareApp(actx.plan.Prepare, step.App)
 	if !ok {
@@ -26,36 +28,81 @@ func (c *Client) applySyncVolume(ctx context.Context, actx *applyContext, step S
 	if !ok {
 		return fmt.Errorf("volume %s for app %s not found", step.Ref, step.App)
 	}
-	if isDataStoreBackingVolume(app, volume) {
-		// avoid clobbering data restored via logical dump.
+	if volumeOwnedByLogicalOrSkippedStore(app, volume) {
+		// logical-dump stores own their migration; skip-strategy stores
+		// must keep the target empty. raw copy in either case is wrong.
 		return nil
 	}
 
 	runner := c.dockerRunner()
+	target, err := c.targetContainerForService(ctx, runner, actx, step.App, volume.Service)
+	if err != nil {
+		return err
+	}
+	copy, err := c.planVolumeCopy(ctx, runner, volume, target)
+	if err != nil {
+		return err
+	}
+	return withTargetStopped(ctx, runner, target, copy)
+}
+
+// planVolumeCopy resolves source/target locations and returns the copy
+// closure to invoke once the target container is stopped.
+func (c *Client) planVolumeCopy(ctx context.Context, runner dockerRunner, volume preparer.VolumeResource, target dockerContainer) (func() error, error) {
 	switch volume.Type {
 	case "volume":
+		mount, ok := findMountByTarget(target, volume.Target)
+		if !ok || mount.Type != "volume" || mount.Name == "" {
+			return nil, fmt.Errorf("named volume for target %s not found on dokploy compose container", volume.Target)
+		}
 		srcVolName, err := resolveSourceVolume(ctx, runner, volume)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		dstVolName, err := c.resolveTargetVolume(ctx, runner, actx, step.App, volume)
-		if err != nil {
-			return err
-		}
-		return copyNamedVolume(ctx, runner, srcVolName, dstVolName)
+		dstVolName := mount.Name
+		return func() error { return copyNamedVolume(ctx, runner, srcVolName, dstVolName) }, nil
 	case "bind":
+		mount, ok := findMountByTarget(target, volume.Target)
+		if !ok || mount.Type != "bind" || mount.Source == "" {
+			return nil, fmt.Errorf("bind mount for target %s not found on dokploy compose container", volume.Target)
+		}
+		if !mount.RW {
+			return nil, fmt.Errorf("dokploy bind mount %s -> %s is read-only; refusing to sync", mount.Source, volume.Target)
+		}
 		srcPath, err := resolveSourceBindPath(ctx, runner, volume)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		dstPath, err := c.resolveTargetBindPath(ctx, runner, actx, step.App, volume)
-		if err != nil {
-			return err
-		}
-		return rsyncBindMount(ctx, runner, srcPath, dstPath)
+		dstPath := mount.Source
+		return func() error { return rsyncBindMount(ctx, runner, srcPath, dstPath) }, nil
 	default:
-		return fmt.Errorf("%w: volume type %q is not supported", ErrNotImplemented, volume.Type)
+		return nil, fmt.Errorf("%w: volume type %q is not supported", ErrNotImplemented, volume.Type)
 	}
+}
+
+// withTargetStopped runs op while the dokploy target container is
+// stopped so raw volume rewrites don't race with a live service that
+// would otherwise see files disappear and reappear mid-flight (Redis,
+// SQLite, etc.). already-stopped containers are not touched. start
+// always runs in a fresh context so a cancellation during op still
+// returns the container to its prior state.
+func withTargetStopped(ctx context.Context, runner dockerRunner, target dockerContainer, op func() error) error {
+	if !target.State.Running {
+		return op()
+	}
+	if _, err := runner.Output(ctx, "stop", target.ID); err != nil {
+		return fmt.Errorf("stop target container %s: %w", target.ID, err)
+	}
+	opErr := op()
+	startCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := runner.Output(startCtx, "start", target.ID); err != nil {
+		if opErr != nil {
+			return fmt.Errorf("%w (target %s also failed to restart: %v)", opErr, target.ID, err)
+		}
+		return fmt.Errorf("start target container %s: %w", target.ID, err)
+	}
+	return opErr
 }
 
 // applyDumpDataStore writes a logical dump of the source data store to a
@@ -69,11 +116,11 @@ func (c *Client) applyDumpDataStore(ctx context.Context, actx *applyContext, ste
 	if !ok {
 		return fmt.Errorf("data store %s for app %s not found", step.Ref, step.App)
 	}
-	if !shouldMigrateDataStore(store) {
+	if dataStoreMigrationKind(store) != dataStoreMigrationLogical {
+		// non-logical stores migrate via stopped-volume copy, so the
+		// dump step is a noop. plan generation already filters these
+		// out; this branch is defense-in-depth.
 		return nil
-	}
-	if !isPostgresStore(store) {
-		return fmt.Errorf("%w: dump for data store kind %q is not supported yet", ErrNotImplemented, store.Kind)
 	}
 
 	runner := c.dockerRunner()
@@ -119,11 +166,11 @@ func (c *Client) applyRestoreDataStore(ctx context.Context, actx *applyContext, 
 	if !ok {
 		return fmt.Errorf("data store %s for app %s not found", step.Ref, step.App)
 	}
-	if !shouldMigrateDataStore(store) {
+	if dataStoreMigrationKind(store) != dataStoreMigrationLogical {
+		// non-logical stores migrate via stopped-volume copy, so the
+		// restore step is a noop. plan generation already filters these
+		// out; this branch is defense-in-depth.
 		return nil
-	}
-	if !isPostgresStore(store) {
-		return fmt.Errorf("%w: restore for data store kind %q is not supported yet", ErrNotImplemented, store.Kind)
 	}
 
 	runner := c.dockerRunner()
@@ -238,6 +285,27 @@ func shouldMigrateDataStore(store preparer.DataStoreResource) bool {
 	return true
 }
 
+// migration kind classifies how a data store will be migrated.
+//
+//	logical: a tool-specific dump (e.g. pg_dump) reads a live source.
+//	volume:  no logical dump; raw volume copy with the source paused.
+//	skip:    user opted out (recreate/managed) and bort copies nothing.
+const (
+	dataStoreMigrationLogical = "logical"
+	dataStoreMigrationVolume  = "volume"
+	dataStoreMigrationSkip    = "skip"
+)
+
+func dataStoreMigrationKind(store preparer.DataStoreResource) string {
+	if !shouldMigrateDataStore(store) {
+		return dataStoreMigrationSkip
+	}
+	if isPostgresStore(store) {
+		return dataStoreMigrationLogical
+	}
+	return dataStoreMigrationVolume
+}
+
 func isPostgresStore(store preparer.DataStoreResource) bool {
 	kind := strings.ToLower(store.Kind)
 	engine := strings.ToLower(store.Engine)
@@ -280,21 +348,30 @@ func volumeRefLabel(volume preparer.VolumeResource) string {
 	return label
 }
 
-// isDataStoreBackingVolume returns true when a stateful volume belongs to
-// any classified data-store service. raw volume copy is unsafe regardless
-// of the user's strategy: migrate would clobber the logical restore,
-// recreate must keep the target empty, and managed points elsewhere
-// entirely.
-func isDataStoreBackingVolume(app preparer.AppPlan, volume preparer.VolumeResource) bool {
+// dataStoreForVolume returns the data store whose service owns the given
+// volume, when the volume's service maps to a classified data store.
+func dataStoreForVolume(app preparer.AppPlan, volume preparer.VolumeResource) (preparer.DataStoreResource, bool) {
 	if volume.Service == "" {
-		return false
+		return preparer.DataStoreResource{}, false
 	}
 	for _, store := range app.Resources.DataStores {
 		if store.Service == volume.Service {
-			return true
+			return store, true
 		}
 	}
-	return false
+	return preparer.DataStoreResource{}, false
+}
+
+// volumeOwnedByLogicalOrSkippedStore answers whether a raw volume copy
+// for this volume must be suppressed. logical-dump stores own their
+// migration via dump/restore; skip-strategy stores must keep the target
+// empty. only "volume" migration kind keeps raw copy enabled.
+func volumeOwnedByLogicalOrSkippedStore(app preparer.AppPlan, volume preparer.VolumeResource) bool {
+	store, ok := dataStoreForVolume(app, volume)
+	if !ok {
+		return false
+	}
+	return dataStoreMigrationKind(store) != dataStoreMigrationVolume
 }
 
 func dataStoreDumpPath(plan Plan, appName, ref string) (string, error) {
@@ -354,18 +431,6 @@ func resolveSourceVolume(ctx context.Context, runner dockerRunner, volume prepar
 	return mount.Name, nil
 }
 
-func (c *Client) resolveTargetVolume(ctx context.Context, runner dockerRunner, actx *applyContext, appName string, volume preparer.VolumeResource) (string, error) {
-	target, err := c.targetContainerForService(ctx, runner, actx, appName, volume.Service)
-	if err != nil {
-		return "", err
-	}
-	mount, ok := findMountByTarget(target, volume.Target)
-	if !ok || mount.Type != "volume" || mount.Name == "" {
-		return "", fmt.Errorf("named volume for target %s not found on dokploy compose container", volume.Target)
-	}
-	return mount.Name, nil
-}
-
 // resolveSourceBindPath returns the source-side host path for a bind
 // mount. when a source container ref exists, it inspects live and
 // rejects stale-but-existing recorded paths so we don't silently copy
@@ -389,27 +454,6 @@ func resolveSourceBindPath(ctx context.Context, runner dockerRunner, volume prep
 	if volume.Source != "" && volume.Source != mount.Source {
 		return "", fmt.Errorf("recorded source bind path %q for %s does not match live container mount %q; rescan before retrying",
 			volume.Source, volume.Target, mount.Source)
-	}
-	return mount.Source, nil
-}
-
-// resolveTargetBindPath inspects the dokploy-managed compose container
-// and returns the host path it bound for the given mount target. read-
-// only target binds are rejected because the migrator would otherwise
-// quietly bypass the app's intended read-only contract by mounting the
-// host path read-write itself.
-func (c *Client) resolveTargetBindPath(ctx context.Context, runner dockerRunner, actx *applyContext, appName string, volume preparer.VolumeResource) (string, error) {
-	target, err := c.targetContainerForService(ctx, runner, actx, appName, volume.Service)
-	if err != nil {
-		return "", err
-	}
-	mount, ok := findMountByTarget(target, volume.Target)
-	if !ok || mount.Type != "bind" || mount.Source == "" {
-		return "", fmt.Errorf("bind mount for target %s not found on dokploy compose container", volume.Target)
-	}
-	if !mount.RW {
-		return "", fmt.Errorf("dokploy bind mount %s -> %s is read-only; refusing to sync",
-			mount.Source, volume.Target)
 	}
 	return mount.Source, nil
 }

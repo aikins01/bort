@@ -31,17 +31,19 @@ func TestNewClientFromEnvRequiresURLAndToken(t *testing.T) {
 	}
 }
 
-func TestApplyReturnsNotImplementedForUnsupportedDataStoreKind(t *testing.T) {
+func TestApplyDumpDataStoreNoopsForVolumeStrategyKinds(t *testing.T) {
+	// mysql has no logical-dump implementation yet, so it migrates via
+	// stopped-volume copy. the dump step in the plan must be a noop, not
+	// ErrNotImplemented, because the volume sync path covers migration.
 	client := &Client{BaseURL: "https://dokploy.example", Token: "secret", HTTPClient: http.DefaultClient}
 	app := preparer.AppPlan{Name: "api"}
-	app.Resources.DataStores = []preparer.DataStoreResource{{Kind: "mysql", Service: "db"}}
+	app.Resources.DataStores = []preparer.DataStoreResource{{Kind: "mysql", Service: "db", Strategy: "migrate"}}
 	plan := Plan{
 		Steps:   []Step{{Kind: StepDumpDataStore, App: "api", Ref: "data-store:db"}},
 		Prepare: preparer.Result{Apps: []preparer.AppPlan{app}},
 	}
-	err := client.Apply(context.Background(), plan)
-	if !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("expected ErrNotImplemented, got %v", err)
+	if err := client.Apply(context.Background(), plan); err != nil {
+		t.Fatalf("expected noop dump for non-logical store, got %v", err)
 	}
 }
 

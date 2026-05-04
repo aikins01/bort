@@ -67,15 +67,20 @@ func (c *Client) applyResumeSource(ctx context.Context, actx *applyContext, step
 }
 
 // sourceQuiesceTargets returns unique source container refs for every
-// non-data-store service of the app. stateless workers must stop too:
-// they keep writing to the database and to shared volumes, and either
-// would corrupt the migration if left running. data-store containers
-// stay up so the logical dump steps can read from them.
+// service that must stop before bort touches state. stateless workers
+// always stop because they keep writing to the database and to shared
+// volumes. logical-dump stores stay running so pg_dump can read from
+// them; volume-strategy stores must be paused so the on-disk format is
+// consistent. skip-strategy stores are also excluded because we don't
+// touch their data and have no business stopping them.
 func sourceQuiesceTargets(app preparer.AppPlan) []string {
-	dataStoreServices := map[string]struct{}{}
+	excludedServices := map[string]struct{}{}
 	for _, store := range app.Resources.DataStores {
-		if store.Service != "" {
-			dataStoreServices[store.Service] = struct{}{}
+		if store.Service == "" {
+			continue
+		}
+		if dataStoreMigrationKind(store) != dataStoreMigrationVolume {
+			excludedServices[store.Service] = struct{}{}
 		}
 	}
 	seen := map[string]struct{}{}
@@ -84,7 +89,7 @@ func sourceQuiesceTargets(app preparer.AppPlan) []string {
 		if ref == "" {
 			return
 		}
-		if _, isStore := dataStoreServices[service]; isStore {
+		if _, excluded := excludedServices[service]; excluded {
 			return
 		}
 		if _, dup := seen[ref]; dup {

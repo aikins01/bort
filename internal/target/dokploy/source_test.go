@@ -9,9 +9,9 @@ import (
 	syncplan "github.com/aikins01/bort/internal/sync"
 )
 
-func TestSourceQuiesceTargetsSkipsDataStoreServices(t *testing.T) {
+func TestSourceQuiesceTargetsSkipsLogicalDumpStores(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
-	app.Resources.DataStores = []preparer.DataStoreResource{{Service: "db"}}
+	app.Resources.DataStores = []preparer.DataStoreResource{{Service: "db", Kind: "postgres", Strategy: "migrate"}}
 	app.Resources.Volumes = []preparer.VolumeResource{
 		{Service: "db", Type: "volume", SourceContainerID: "db-id"},
 		{Service: "web", Type: "volume", SourceContainerID: "web-id"},
@@ -24,9 +24,24 @@ func TestSourceQuiesceTargetsSkipsDataStoreServices(t *testing.T) {
 	}
 }
 
+func TestSourceQuiesceTargetsIncludesVolumeStrategyDataStores(t *testing.T) {
+	// redis has no logical-dump path, so it migrates via stopped-volume
+	// copy and must be paused along with the rest of the app.
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.DataStores = []preparer.DataStoreResource{{Service: "redis", Kind: "redis", Strategy: "migrate"}}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "redis", Type: "volume", SourceContainerID: "redis-id"},
+		{Service: "web", Type: "volume", SourceContainerID: "web-id"},
+	}
+	ids := sourceQuiesceTargets(app)
+	if len(ids) != 2 || ids[0] != "redis-id" || ids[1] != "web-id" {
+		t.Fatalf("expected [redis-id web-id], got %v", ids)
+	}
+}
+
 func TestSourceQuiesceTargetsIncludesStatelessWorkers(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
-	app.Resources.DataStores = []preparer.DataStoreResource{{Service: "db"}}
+	app.Resources.DataStores = []preparer.DataStoreResource{{Service: "db", Kind: "postgres", Strategy: "migrate"}}
 	app.Resources.SourceServices = []preparer.SourceServiceRef{
 		{ServiceName: "db", ContainerID: "db-id"},
 		{ServiceName: "web", ContainerID: "web-id"},
@@ -42,8 +57,13 @@ func TestSourceQuiesceTargetsIncludesStatelessWorkers(t *testing.T) {
 	}
 }
 
-func TestPlanFromArtifactsInjectsPauseSourceBeforeVolumeSync(t *testing.T) {
-	prepare := preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}}
+func TestPlanFromArtifactsPausesBeforeDumpAndVolumeSync(t *testing.T) {
+	// pause must run before dump/restore so app writers stop before
+	// pg_dump captures its snapshot, and before volume copy so the
+	// on-disk format is consistent.
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.DataStores = []preparer.DataStoreResource{{Service: "db", Kind: "postgres", Strategy: "migrate"}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{app}}
 	syncResult := syncplan.Result{Apps: []syncplan.AppPlan{{
 		Name: "api",
 		Steps: []syncplan.Step{
@@ -59,7 +79,7 @@ func TestPlanFromArtifactsInjectsPauseSourceBeforeVolumeSync(t *testing.T) {
 			kinds = append(kinds, step.Kind)
 		}
 	}
-	want := []StepKind{StepDumpDataStore, StepRestoreDataStore, StepPauseSource, StepSyncVolume}
+	want := []StepKind{StepPauseSource, StepDumpDataStore, StepRestoreDataStore, StepSyncVolume}
 	if len(kinds) != len(want) {
 		t.Fatalf("expected %v, got %v", want, kinds)
 	}
@@ -70,26 +90,58 @@ func TestPlanFromArtifactsInjectsPauseSourceBeforeVolumeSync(t *testing.T) {
 	}
 }
 
-func TestPlanFromArtifactsOmitsPauseSourceWhenNoVolumes(t *testing.T) {
+func TestPlanFromArtifactsOmitsPauseSourceWhenNoState(t *testing.T) {
+	// no data stores and no volumes => nothing to pause for.
 	prepare := preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}}
-	syncResult := syncplan.Result{Apps: []syncplan.AppPlan{{
-		Name: "api",
-		Steps: []syncplan.Step{
-			{ResourceType: "data_store", ResourceRef: "data-store:db"},
-		},
-	}}}
+	syncResult := syncplan.Result{Apps: []syncplan.AppPlan{{Name: "api"}}}
 	plan := PlanFromArtifacts(prepare, syncResult, gatewayResultEmpty())
 	for _, step := range plan.Steps {
 		if step.Kind == StepPauseSource {
-			t.Fatalf("did not expect StepPauseSource without volume sync, got plan=%v", plan.Steps)
+			t.Fatalf("did not expect StepPauseSource without state work, got plan=%v", plan.Steps)
 		}
 	}
 }
 
-// when the only volume sync targets a datastore-backing volume, raw copy
-// is skipped and pause must not run; otherwise we'd needlessly stop the
-// app's web/worker services for a no-op.
-func TestPlanFromArtifactsOmitsPauseSourceForDataStoreBackingVolumes(t *testing.T) {
+// volume-strategy data stores migrate by raw volume copy, so the plan
+// must keep their volume sync step and run pause beforehand. it also
+// must skip the logical dump/restore steps because there is none.
+func TestPlanFromArtifactsCopiesVolumeStrategyDataStoreVolumes(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.DataStores = []preparer.DataStoreResource{{Service: "redis", Kind: "redis", Strategy: "migrate"}}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "redis", Type: "volume", Target: "/data"},
+	}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{app}}
+	syncResult := syncplan.Result{Apps: []syncplan.AppPlan{{
+		Name: "api",
+		Steps: []syncplan.Step{
+			{ResourceType: "data_store", ResourceRef: "data-store:redis"},
+			{ResourceType: "volume", ResourceRef: "volume:redis -> /data"},
+		},
+	}}}
+	plan := PlanFromArtifacts(prepare, syncResult, gatewayResultEmpty())
+	kinds := []StepKind{}
+	for _, step := range plan.Steps {
+		switch step.Kind {
+		case StepDumpDataStore, StepRestoreDataStore, StepPauseSource, StepSyncVolume:
+			kinds = append(kinds, step.Kind)
+		}
+	}
+	want := []StepKind{StepPauseSource, StepSyncVolume}
+	if len(kinds) != len(want) {
+		t.Fatalf("expected %v, got %v", want, kinds)
+	}
+	for i := range want {
+		if kinds[i] != want[i] {
+			t.Fatalf("step %d: expected %s, got %s (full=%v)", i, want[i], kinds[i], kinds)
+		}
+	}
+}
+
+// for a logical-dump store backed by its own volume, the raw volume
+// copy must be suppressed (logical owns migration), but pause must
+// still run so app writers stop before pg_dump.
+func TestPlanFromArtifactsSkipsRawCopyForLogicalStoreVolume(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
 	app.Resources.DataStores = []preparer.DataStoreResource{{Service: "db", Kind: "postgres", Strategy: "migrate"}}
 	app.Resources.Volumes = []preparer.VolumeResource{
@@ -105,8 +157,8 @@ func TestPlanFromArtifactsOmitsPauseSourceForDataStoreBackingVolumes(t *testing.
 	}}}
 	plan := PlanFromArtifacts(prepare, syncResult, gatewayResultEmpty())
 	for _, step := range plan.Steps {
-		if step.Kind == StepPauseSource || step.Kind == StepSyncVolume {
-			t.Fatalf("did not expect %s for datastore-backing volume, got plan=%v", step.Kind, plan.Steps)
+		if step.Kind == StepSyncVolume {
+			t.Fatalf("did not expect StepSyncVolume for logical-store volume, got plan=%v", plan.Steps)
 		}
 	}
 }

@@ -240,6 +240,37 @@ func TestApplySyncVolumeRsyncsBindMount(t *testing.T) {
 	}
 }
 
+func TestApplySyncVolumeStopsRunningTargetForCopy(t *testing.T) {
+	// volume rewrite while the target is running corrupts services
+	// like Redis/SQLite. running targets must be stopped for the copy
+	// and started again after.
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{
+		Service: "redis",
+		Type:    "volume",
+		Name:    "src-vol",
+		Target:  "/data",
+	}}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("dst-id\n"),
+			"inspect --type container dst-id": []byte(`[{"Id":"dst-id","Name":"/dokploy-redis","Config":{"Labels":{"com.docker.compose.service":"redis","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"dst-vol","Destination":"/data","RW":true}]}]`),
+			"volume inspect src-vol": []byte(`[{"Name":"src-vol"}]`),
+			"volume inspect dst-vol": []byte(`[{"Name":"dst-vol"}]`),
+			"stop dst-id":            []byte("dst-id\n"),
+			"start dst-id":           []byte("dst-id\n"),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}}
+	actx.entry("api").ComposeAppName = "stack-1"
+	actx.plan = Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}
+	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:redis -> /data"}
+	if err := client.applySyncVolume(context.Background(), actx, step); err != nil {
+		t.Fatalf("applySyncVolume: %v", err)
+	}
+}
+
 func TestApplySyncVolumeBindMountFailsOnStaleSource(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
 	app.Resources.Volumes = []preparer.VolumeResource{{
@@ -252,11 +283,15 @@ func TestApplySyncVolumeBindMountFailsOnStaleSource(t *testing.T) {
 	}}
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("dst-id\n"),
+			"inspect --type container dst-id": []byte(`[{"Id":"dst-id","Name":"/dokploy-web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"Mounts":[{"Type":"bind","Source":"/etc/dokploy/data/web","Destination":"/data","RW":true}]}]`),
 			"inspect --type container src-id": []byte(`[{"Id":"src-id","Name":"/coolify-web","Mounts":[{"Type":"bind","Source":"/coolify/new-path","Destination":"/data","RW":true}]}]`),
 		},
 	}
 	client := &Client{Docker: runner}
-	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	actx := &applyContext{cache: map[string]*appCache{}}
+	actx.entry("api").ComposeAppName = "stack-1"
+	actx.plan = Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}
 	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"}
 	err := client.applySyncVolume(context.Background(), actx, step)
 	if err == nil || !strings.Contains(err.Error(), "rescan before retrying") {
