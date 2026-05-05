@@ -76,6 +76,8 @@ func writeAppFirstCockpit(w io.Writer, run loadedMigrationRun) {
 				}
 				if fix := issue.FixCommand(app.Name); fix != "" {
 					fmt.Fprintf(w, "          %s\n", st.fix(fix))
+				} else if next := issue.NextStep(); next != "" {
+					fmt.Fprintf(w, "          %s\n", st.muted("next: "+next))
 				}
 			}
 		}
@@ -98,9 +100,32 @@ func writeAppFirstCockpit(w io.Writer, run loadedMigrationRun) {
 		fmt.Fprintln(w, st.muted(line))
 	}
 	if overall != appHealthReady {
-		fmt.Fprintln(w, st.muted("Run the shown `fix:` commands, then re-run `bort` to recheck."))
+		fmt.Fprintln(w, st.muted(issueActionFooter(apps)))
 	} else {
-		fmt.Fprintln(w, st.muted("All app inputs ready. Use `bort migrate --live` to apply, or rerun `bort` to walk the wizard."))
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("All app inputs ready. Run `%s` to apply, or run `bort` interactively to continue.", liveApplyCommand(run))))
+	}
+}
+
+func issueActionFooter(apps []appView) string {
+	hasFix, hasNext := false, false
+	for _, app := range apps {
+		for _, issue := range app.Issues {
+			if issue.FixCommand(app.Name) != "" {
+				hasFix = true
+			} else if issue.NextStep() != "" {
+				hasNext = true
+			}
+		}
+	}
+	switch {
+	case hasFix && hasNext:
+		return "Run the shown `fix:` commands and use the `next:` notes as a checklist, then re-run `bort` to recheck."
+	case hasFix:
+		return "Run the shown `fix:` commands, then re-run `bort` to recheck."
+	case hasNext:
+		return "Use the `next:` notes as a checklist. Re-run `bort` after changing Coolify/Dokploy settings or the bundle."
+	default:
+		return "Resolve the issues above, then re-run `bort` to recheck."
 	}
 }
 

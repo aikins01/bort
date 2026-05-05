@@ -170,8 +170,8 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 // freshly-planned (or partially-applied) run would stop production
 // source containers before the target was actually serving traffic.
 // each step in the computed live plan must have a matching ledger entry
-// at the same index with status=ok and identical kind/app/ref — anything
-// else means the live apply is stale or incomplete.
+// at the same index with a completed status and identical kind/app/ref —
+// anything else means the live apply is stale or incomplete.
 func requireLiveApplySucceeded(run loadedMigrationRun) error {
 	live := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
 	if len(live.Steps) == 0 {
@@ -189,8 +189,8 @@ func requireLiveApplySucceeded(run loadedMigrationRun) error {
 		if got.Kind != string(step.Kind) || got.App != step.App || got.Ref != step.Ref {
 			return fmt.Errorf("run %q live apply ledger is stale at step %d (expected %s %s/%s, got %s %s/%s); rerun the live apply before commit", run.Run.Name, index, step.Kind, step.App, step.Ref, got.Kind, got.App, got.Ref)
 		}
-		if got.Status != string(dokploy.StepStatusOK) {
-			return fmt.Errorf("run %q live apply step %d (%s %s/%s) finished with status %q, not ok; resolve before commit", run.Run.Name, index, step.Kind, step.App, step.Ref, got.Status)
+		if !appliedStepCompleted(got) {
+			return fmt.Errorf("run %q live apply step %d (%s %s/%s) finished with status %q, not complete; resolve before commit", run.Run.Name, index, step.Kind, step.App, step.Ref, got.Status)
 		}
 	}
 	return nil

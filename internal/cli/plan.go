@@ -102,6 +102,9 @@ func writePlanWithOptions(w io.Writer, m manifest.Manifest, opts planOptions) er
 		if app.BuildPack != "" {
 			fmt.Fprintf(w, "  build pack: %s\n", app.BuildPack)
 		}
+		if app.Git != nil {
+			fmt.Fprintf(w, "  source control: %s\n", describeSourceControl(app))
+		}
 		fmt.Fprintf(w, "  services: %d\n", len(app.Services))
 		if len(app.Routes) > 0 {
 			fmt.Fprintf(w, "  routes: %s\n", strings.Join(routeHosts(app.Routes), ", "))
@@ -122,7 +125,7 @@ func writePlanWithOptions(w io.Writer, m manifest.Manifest, opts planOptions) er
 			fmt.Fprintf(w, "  external requirements: %s\n", describeRequirements(analysis.ExternalRequirements))
 		}
 		if len(analysis.LinkedResources) > 0 {
-			fmt.Fprintf(w, "  possible linked resources: %s\n", describeLinkedResources(analysis.LinkedResources))
+			fmt.Fprintf(w, "  possible database/storage apps: %s\n", describeLinkedResources(analysis.LinkedResources))
 		}
 		fmt.Fprintf(w, "  state: %s\n", describeState(app, analysis))
 		if len(analysis.RiskReasons) > 0 {
@@ -205,7 +208,11 @@ func describeRequirements(requirements []analyzer.Requirement) string {
 func describeLinkedResources(links []analyzer.ResourceLink) string {
 	items := make([]string, 0, len(links))
 	for _, link := range links {
-		item := link.Kind + "=" + link.App + " confidence=" + link.Confidence
+		item := link.Kind + "=" + link.App
+		confidence := strings.TrimSpace(link.Confidence)
+		if confidence != "" && confidence != "likely" && confidence != "detected" {
+			item += " (possible match)"
+		}
 		if len(link.DataStores) > 0 {
 			item += " stores[" + summarizeList(dataStoreLabels(link.DataStores), 2) + "]"
 		}
@@ -262,6 +269,30 @@ func describeDeploy(app manifest.App) string {
 	}
 }
 
+func describeSourceControl(app manifest.App) string {
+	if app.Git == nil {
+		return "none"
+	}
+	parts := []string{planutil.Fallback(app.Git.Repository, "repository metadata detected")}
+	if app.Git.Branch != "" {
+		parts = append(parts, "branch="+app.Git.Branch)
+	}
+	if app.Git.Provider != "" {
+		parts = append(parts, "provider="+app.Git.Provider)
+	}
+	switch {
+	case app.Git.SourceID != "" && strings.Contains(strings.ToLower(app.Git.SourceType), "github"):
+		parts = append(parts, "auth=Coolify GitHub App (connect in Dokploy if future Git deploys are needed)")
+	case app.Git.SourceID != "":
+		parts = append(parts, "auth=Coolify source connection (connect in Dokploy if future Git deploys are needed)")
+	case app.Git.PrivateKeyID != "":
+		parts = append(parts, "auth=Coolify deploy key (add a Dokploy key/source if future Git deploys are needed)")
+	default:
+		parts = append(parts, "auth=not copied")
+	}
+	return strings.Join(parts, "; ")
+}
+
 func describeState(app manifest.App, analysis analyzer.AppAnalysis) string {
 	var volumeMounts int
 	var bindMounts int
@@ -286,7 +317,7 @@ func describeState(app manifest.App, analysis analyzer.AppAnalysis) string {
 		parts = append(parts, fmt.Sprintf("%d named volume mount(s)", volumeMounts))
 	}
 	if bindMounts > 0 {
-		parts = append(parts, fmt.Sprintf("%d bind mount(s)", bindMounts))
+		parts = append(parts, fmt.Sprintf("%d VPS file/folder mount(s)", bindMounts))
 	}
 	if analyzer.HasRedactedEnvironment(app) {
 		parts = append(parts, "environment values redacted")

@@ -9,7 +9,10 @@ import (
 
 	commitplan "github.com/aikins01/bort/internal/commit"
 	"github.com/aikins01/bort/internal/exporter"
+	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/preparer"
+	"github.com/aikins01/bort/internal/target/dokploy"
 )
 
 func TestRunCommitWritesTextPlan(t *testing.T) {
@@ -92,5 +95,36 @@ func TestRunCommitWritesJSONPlan(t *testing.T) {
 		if gate.Code == "commit.rollback_window_closed" {
 			t.Fatalf("did not expect rollback window gate for explicit zero window: %#v", result.Apps[0].Gates)
 		}
+	}
+}
+
+func TestRequireLiveApplySucceededAcceptsSkippedPlatformSteps(t *testing.T) {
+	run := loadedMigrationRun{
+		Run: migrationRun{Name: "run-1"},
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{
+			{Name: "proxy", Role: "platform"},
+			{Name: "api"},
+		}},
+		Cutover: gateway.Result{Apps: []gateway.AppPlan{{
+			Name:   "api",
+			Routes: []gateway.Route{{Host: "api.example.com"}},
+		}}},
+	}
+	steps := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps
+	for index, step := range steps {
+		status := string(dokploy.StepStatusOK)
+		if step.App == "proxy" {
+			status = string(dokploy.StepStatusSkipped)
+		}
+		run.Applied.Steps = append(run.Applied.Steps, appliedStep{
+			Index:  index,
+			Kind:   string(step.Kind),
+			App:    step.App,
+			Ref:    step.Ref,
+			Status: status,
+		})
+	}
+	if err := requireLiveApplySucceeded(run); err != nil {
+		t.Fatalf("expected skipped platform steps to count as completed: %v", err)
 	}
 }

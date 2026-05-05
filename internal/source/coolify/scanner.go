@@ -222,7 +222,7 @@ func appFromResource(runtime string, resource map[string]any, includeResolvedCom
 		Status:    getString(resource, "status"),
 		Git:       gitSource(resource),
 		Compose:   composeSource(resource, includeResolvedCompose),
-		Metadata:  metadata(resource, "uuid", "id", "server_uuid", "project_uuid", "environment_name", "environment_uuid", "service_type", "type"),
+		Metadata:  metadata(resource, "uuid", "id", "server_uuid", "project_uuid", "environment_name", "environment_uuid", "service_type", "type", "source_id", "source_type", "private_key_id", "repository_project_id"),
 		Services: []manifest.Service{
 			{
 				ID:     uuid,
@@ -245,11 +245,34 @@ func gitSource(resource map[string]any) *manifest.GitSource {
 		BaseDirectory:      getString(resource, "base_directory", "baseDirectory"),
 		DockerfileLocation: getString(resource, "dockerfile_location", "dockerfileLocation"),
 		ComposeLocation:    getString(resource, "docker_compose_location", "dockerComposeLocation"),
+		SourceType:         getString(resource, "source_type", "sourceType"),
+		SourceID:           getString(resource, "source_id", "sourceId"),
+		PrivateKeyID:       getString(resource, "private_key_id", "privateKeyId"),
+		RepositoryID:       getString(resource, "repository_project_id", "repositoryProjectId"),
 	}
 	if *git == (manifest.GitSource{}) {
 		return nil
 	}
+	git.Provider = gitProvider(git.Repository, git.SourceType)
 	return git
+}
+
+func gitProvider(repository, sourceType string) string {
+	combined := strings.ToLower(strings.TrimSpace(repository + " " + sourceType))
+	switch {
+	case strings.Contains(combined, "github"):
+		return "github"
+	case strings.Contains(combined, "gitlab"):
+		return "gitlab"
+	case strings.Contains(combined, "bitbucket"):
+		return "bitbucket"
+	case strings.Contains(combined, "gitea"):
+		return "gitea"
+	case strings.HasPrefix(strings.TrimSpace(repository), "git@") || strings.HasPrefix(strings.TrimSpace(repository), "ssh://"):
+		return "ssh"
+	default:
+		return "git"
+	}
 }
 
 func composeSource(resource map[string]any, includeResolved bool) *manifest.ComposeSource {

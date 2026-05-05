@@ -52,6 +52,11 @@ type GitSource struct {
 	BaseDirectory      string `json:"baseDirectory,omitempty"`
 	DockerfileLocation string `json:"dockerfileLocation,omitempty"`
 	ComposeLocation    string `json:"composeLocation,omitempty"`
+	Provider           string `json:"provider,omitempty"`
+	SourceType         string `json:"sourceType,omitempty"`
+	SourceID           string `json:"sourceId,omitempty"`
+	PrivateKeyID       string `json:"privateKeyId,omitempty"`
+	RepositoryID       string `json:"repositoryId,omitempty"`
 }
 
 type ComposeSource struct {

@@ -22,16 +22,20 @@ func TestScanApplicationsFromCoolifyAPI(t *testing.T) {
 			writeJSON(t, w, []map[string]any{{"uuid": "app-1", "name": "ghost"}})
 		case "/api/v1/applications/app-1":
 			writeJSON(t, w, map[string]any{
-				"uuid":                    "app-1",
-				"name":                    "ghost",
-				"build_pack":              "dockercompose",
-				"fqdn":                    "https://blog.example.com,https://www.blog.example.com",
-				"git_repository":          "https://github.com/example/ghost-stack",
-				"git_branch":              "main",
-				"docker_compose":          "services:\n  ghost:\n    image: ghost:5\n    environment:\n      DATABASE_PASSWORD: secret\n",
-				"docker_compose_raw":      "services:\n  ghost:\n    image: ghost:5\n",
-				"docker_compose_domains":  `{"ghost":{"domain":"https://blog.example.com:2368"}}`,
-				"docker_compose_location": "/docker-compose.yml",
+				"uuid":                         "app-1",
+				"name":                         "ghost",
+				"build_pack":                   "dockercompose",
+				"fqdn":                         "https://blog.example.com,https://www.blog.example.com",
+				"git_repository":               "https://github.com/example/ghost-stack",
+				"git_branch":                   "main",
+				"source_id":                    42,
+				"source_type":                  "App\\Models\\GithubApp",
+				"repository_project_id":        987,
+				"manual_webhook_secret_github": "secret-not-exported",
+				"docker_compose":               "services:\n  ghost:\n    image: ghost:5\n    environment:\n      DATABASE_PASSWORD: secret\n",
+				"docker_compose_raw":           "services:\n  ghost:\n    image: ghost:5\n",
+				"docker_compose_domains":       `{"ghost":{"domain":"https://blog.example.com:2368"}}`,
+				"docker_compose_location":      "/docker-compose.yml",
 			})
 		case "/api/v1/applications/app-1/envs":
 			writeJSON(t, w, []map[string]any{{"key": "DATABASE_PASSWORD", "real_value": "secret", "is_shown_once": true}})
@@ -65,6 +69,12 @@ func TestScanApplicationsFromCoolifyAPI(t *testing.T) {
 	}
 	if app.Git == nil || app.Git.Repository != "https://github.com/example/ghost-stack" {
 		t.Fatalf("expected git source, got %#v", app.Git)
+	}
+	if app.Git.Provider != "github" || app.Git.SourceID != "42" || app.Git.SourceType != "App\\Models\\GithubApp" || app.Git.RepositoryID != "987" {
+		t.Fatalf("expected sanitized git source metadata, got %#v", app.Git)
+	}
+	if _, ok := app.Metadata["manual_webhook_secret_github"]; ok {
+		t.Fatalf("did not expect webhook secret in metadata: %#v", app.Metadata)
 	}
 	if app.Compose == nil || app.Compose.Raw == "" {
 		t.Fatalf("expected compose source, got %#v", app.Compose)

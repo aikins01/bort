@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aikins01/bort/internal/target/dokploy"
 	"github.com/charmbracelet/bubbles/progress"
@@ -41,8 +43,11 @@ func runWizard(ctx context.Context, run loadedMigrationRun, stdin io.Reader, std
 
 	writeAppFirstCockpit(stdout, current)
 
-	if current.Run.Target == "dokploy" && !hasDokployCredentials(current.Run.Target) {
-		if err := promptInlineInitTarget(ctx, stdin, stdout, stderr); err != nil {
+	if current.Run.Target == "dokploy" {
+		if _, err := ensureDokployClient(ctx, current.Run.Target, stdin, stdout, stderr); err != nil {
+			if errors.Is(err, errDokploySetupSkipped) {
+				return nil
+			}
 			return err
 		}
 	}
@@ -52,7 +57,7 @@ func runWizard(ctx context.Context, run loadedMigrationRun, stdin io.Reader, std
 		return err
 	}
 	if !confirm {
-		fmt.Fprintln(stdout, "Skipped live apply. Run `bort migrate --live` later when you are ready.")
+		fmt.Fprintf(stdout, "Skipped live apply. Run `%s` later when you are ready.\n", liveApplyCommand(current))
 		return nil
 	}
 
@@ -111,7 +116,7 @@ func promptWizardDecision(ctx context.Context, run loadedMigrationRun, decision 
 	case "routes":
 		return promptRoutesDecision(decision, stdout)
 	}
-	fmt.Fprintf(stdout, "Decision %q needs manual review; open the artifact %s and re-run when resolved.\n", decision.Kind, runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Decisions))
+	fmt.Fprintf(stdout, "%s.\n%s.\nOpen %s for details and re-run when resolved.\n", decisionAction(decision), decisionReason(decision), runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Decisions))
 	return false, nil
 }
 
@@ -126,7 +131,7 @@ func promptEnvDecision(_ context.Context, decision runDecision, state bortState,
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewText().
 			Title(fmt.Sprintf("Environment values for %s", app)).
-			Description(hint+"\nPaste KEY=value lines, one per line. Leave blank to skip.").
+			Description(hint + "\nPaste KEY=value lines, one per line. Leave blank to skip.").
 			Value(&input),
 	))
 	if err := form.Run(); err != nil {
@@ -181,7 +186,7 @@ func promptRoutesDecision(decision runDecision, stdout io.Writer) (bool, error) 
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().
 			Title("Confirm route plan").
-			Description(decisionAction(decision)+"\n"+decisionReason(decision)).
+			Description(decisionAction(decision) + "\n" + decisionReason(decision)).
 			Affirmative("Continue").
 			Negative("Skip for now").
 			Value(&confirm),
@@ -202,7 +207,7 @@ func confirmApply(run loadedMigrationRun) (bool, error) {
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().
 			Title("Apply this migration to dokploy now?").
-			Description(fmt.Sprintf("Will execute %d step(s) against %s. You can also skip and run `bort migrate --live` later.", len(planned.Steps), run.Run.Target)).
+			Description(fmt.Sprintf("Will execute %d step(s) against %s. You can also skip and run `%s` later.", len(planned.Steps), run.Run.Target, liveApplyCommand(run))).
 			Affirmative("Apply").
 			Negative("Skip").
 			Value(&confirm),
@@ -213,23 +218,70 @@ func confirmApply(run loadedMigrationRun) (bool, error) {
 	return confirm, nil
 }
 
+var errDokploySetupSkipped = errors.New("dokploy setup skipped")
+
+func promptInstallAndBootstrapDokploy(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, defaultURL string, reason error) error {
+	install := false
+	if strings.TrimSpace(defaultURL) == "" {
+		defaultURL = "http://127.0.0.1:3030"
+	}
+	description := fmt.Sprintf("Bort will set up Dokploy in same-VPS shadow mode at %s and keep Coolify on :80/:443 until cutover. You may be asked to choose a Coolify admin and enter its password.", defaultURL)
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title("Install Dokploy now?").
+			Description(description).
+			Affirmative("Install").
+			Negative("Cancel").
+			Value(&install),
+	))
+	if err := form.Run(); err != nil {
+		return err
+	}
+	if !install {
+		fmt.Fprintln(stdout, "Skipped Dokploy setup. Run `bort` again when you're ready.")
+		return errDokploySetupSkipped
+	}
+	return promptInlineInitTargetWithOptions(ctx, stdin, stdout, stderr, inlineInitTargetOptions{Install: true, DefaultURL: defaultURL})
+}
+
 func promptInlineInitTarget(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
+	return promptInlineInitTargetWithOptions(ctx, stdin, stdout, stderr, inlineInitTargetOptions{})
+}
+
+type inlineInitTargetOptions struct {
+	Install    bool
+	DefaultURL string
+}
+
+func promptInlineInitTargetWithOptions(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, opts inlineInitTargetOptions) error {
 	var url, email string
+	if state, err := readBortState(defaultStatePath()); err == nil {
+		if creds, ok := state.Targets["dokploy"]; ok {
+			url = creds.URL
+			email = creds.AdminEmail
+		}
+	}
+	if strings.TrimSpace(opts.DefaultURL) != "" {
+		url = opts.DefaultURL
+	}
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("Dokploy base URL").Placeholder("http://127.0.0.1:3030").Value(&url),
-		huh.NewInput().Title("Coolify admin email").Value(&email),
+		huh.NewInput().Title("Coolify admin email").Placeholder("press enter to choose from detected admins").Value(&email),
 	))
 	if err := form.Run(); err != nil {
 		return err
 	}
 	args := []string{}
+	if opts.Install {
+		args = append(args, "--install")
+	}
 	if url != "" {
 		args = append(args, "--dokploy-url", url)
 	}
 	if email != "" {
 		args = append(args, "--coolify-email", email)
 	}
-	fmt.Fprintln(stdout, "Bootstrapping dokploy via init-target...")
+	fmt.Fprintln(stdout, "Setting up Dokploy...")
 	return runInitTarget(ctx, args, stdin, stdout, stderr)
 }
 
@@ -242,7 +294,7 @@ func executeWithProgress(ctx context.Context, run loadedMigrationRun, stdout, st
 
 	bar := progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage())
 	bar.Width = 40
-	model := &progressModel{bar: bar, total: total}
+	model := &progressModel{bar: bar, total: total, done: completedApplyPrefix(planned.Steps, run.Applied)}
 	program := tea.NewProgram(model, tea.WithOutput(stderr))
 
 	var applyErr error
@@ -279,14 +331,29 @@ type progressModel struct {
 	closed  bool
 }
 
-func (m *progressModel) Init() tea.Cmd { return nil }
+func (m *progressModel) Init() tea.Cmd {
+	if m.total <= 0 || m.done <= 0 {
+		return nil
+	}
+	percent := float64(m.done) / float64(m.total)
+	if percent > 1 {
+		percent = 1
+	}
+	return m.bar.SetPercent(percent)
+}
 
 func (m *progressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case progressTick:
 		m.current = msg.progress
-		if msg.progress.Status == dokploy.StepStatusOK || msg.progress.Status == dokploy.StepStatusSkipped {
-			m.done++
+		if m.total > 0 && msg.progress.Index >= 0 && msg.progress.Index < m.total {
+			done := msg.progress.Index
+			if msg.progress.Status == dokploy.StepStatusOK || msg.progress.Status == dokploy.StepStatusSkipped {
+				done++
+			}
+			if done > m.done {
+				m.done = done
+			}
 		}
 		percent := 0.0
 		if m.total > 0 {
@@ -410,7 +477,83 @@ func parseEnvBlock(input string) map[string]string {
 // runWizardScan wraps the guided manifest fetch with a status message
 // so the wizard does not look frozen during a slow Coolify scan.
 func runWizardScan(ctx context.Context, setup guidedSetup, stdout io.Writer) (loadedMigrationRun, error) {
-	fmt.Fprintln(stdout, "Scanning source...")
-	return createGuidedMigrationRun(ctx, setup)
+	if !canAnimateStatus(stdout) {
+		fmt.Fprintln(stdout, "~ Scanning source...")
+		return createGuidedMigrationRun(ctx, setup)
+	}
+	stopStatus := startScanStatus(stdout)
+	run, err := createGuidedMigrationRun(ctx, setup)
+	stopStatus(err)
+	return run, err
 }
 
+const scanStatusFrameCount = 3
+
+func canAnimateStatus(w io.Writer) bool {
+	file, ok := w.(*os.File)
+	return ok && isInteractiveTerminal(file)
+}
+
+func startScanStatus(w io.Writer) func(error) {
+	done := make(chan error, 1)
+	stopped := make(chan struct{})
+	st := newStyler(w)
+	go func() {
+		defer close(stopped)
+		defer fmt.Fprint(w, "\x1b[?25h")
+		fmt.Fprint(w, "\x1b[?25l")
+		frame := 0
+		prevHeight := renderScanStatusFrame(w, st, frame, 0)
+		ticker := time.NewTicker(180 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case err := <-done:
+				renderScanStatusDone(w, st, err, prevHeight)
+				return
+			case <-ticker.C:
+				frame = (frame + 1) % scanStatusFrameCount
+				prevHeight = renderScanStatusFrame(w, st, frame, prevHeight)
+			}
+		}
+	}()
+	return func(err error) {
+		done <- err
+		<-stopped
+	}
+}
+
+func renderScanStatusFrame(w io.Writer, st *styler, frame, prevHeight int) int {
+	if prevHeight > 0 {
+		fmt.Fprintf(w, "\r\x1b[%dA\x1b[%dM", prevHeight, prevHeight)
+	}
+	lines := scanStatusLines(st, frame)
+	for _, line := range lines {
+		fmt.Fprintf(w, "%s\n", line)
+	}
+	return len(lines)
+}
+
+func renderScanStatusDone(w io.Writer, st *styler, err error, prevHeight int) {
+	if prevHeight > 0 {
+		fmt.Fprintf(w, "\r\x1b[%dA\x1b[%dM", prevHeight, prevHeight)
+	}
+	line := st.glyph("✓", sevGood) + " Scanned source."
+	if err != nil {
+		line = st.glyph("!", sevBad) + " Scan failed."
+	}
+	fmt.Fprintf(w, "%s\n", line)
+}
+
+func scanStatusLines(st *styler, frame int) []string {
+	count := frame%scanStatusFrameCount + 1
+	lines := make([]string, count)
+	for i := range lines {
+		if i == count-1 {
+			lines[i] = st.glyph("~", sevDim) + " Scanning source..."
+		} else {
+			lines[i] = st.glyph("~", sevDim)
+		}
+	}
+	return lines
+}

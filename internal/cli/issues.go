@@ -23,11 +23,12 @@ const (
 type issueKind string
 
 const (
-	issueKindEnv    issueKind = "env"
-	issueKindData   issueKind = "data"
-	issueKindRoute  issueKind = "route"
-	issueKindLink   issueKind = "link"
-	issueKindReview issueKind = "review"
+	issueKindEnv       issueKind = "env"
+	issueKindData      issueKind = "data"
+	issueKindRoute     issueKind = "route"
+	issueKindLink      issueKind = "link"
+	issueKindHostFiles issueKind = "host_files"
+	issueKindReview    issueKind = "review"
 )
 
 type appView struct {
@@ -88,6 +89,21 @@ func (i appIssue) FixCommand(app string) string {
 			return fmt.Sprintf("bort data %s <store> --migrate   # or choose --recreate / --managed", quotedApp)
 		}
 		return fmt.Sprintf("bort data %s %s --migrate   # or choose --recreate / --managed", quotedApp, shellQuote(stores[0]))
+	default:
+		return ""
+	}
+}
+
+func (i appIssue) NextStep() string {
+	switch i.Kind {
+	case issueKindRoute:
+		return "confirm the route host and service in Dokploy before live apply"
+	case issueKindLink:
+		return "review the detected database/storage settings only if you expect this app to switch to a different service"
+	case issueKindHostFiles:
+		return "Bort preserves same-VPS file/folder mounts by default; inspect only if the source path should change"
+	case issueKindReview:
+		return "inspect this item before live apply"
 	default:
 		return ""
 	}
@@ -238,6 +254,8 @@ func classifyItem(item runDecisionItem) issueKind {
 		return issueKindRoute
 	case strings.HasPrefix(code, preparer.GateCodePrefixLinkedResource), strings.HasPrefix(code, preparer.GateCodePrefixExternalRequirement):
 		return issueKindLink
+	case code == preparer.GateVolumeBindMountReview:
+		return issueKindHostFiles
 	default:
 		return issueKindReview
 	}
@@ -256,7 +274,9 @@ func buildIssue(kind issueKind, items []runDecisionItem) appIssue {
 	case issueKindRoute:
 		issue.Title = "Confirm routes"
 	case issueKindLink:
-		issue.Title = "Confirm support resources"
+		issue.Title = "Review database/storage settings"
+	case issueKindHostFiles:
+		issue.Title = "VPS files/folders preserved"
 	default:
 		issue.Title = "Review needed"
 	}
@@ -392,18 +412,17 @@ func resourceLinesForApp(app preparer.AppPlan) []resourceLine {
 			totalFiles += v.FileCount
 		}
 		status := "✓"
-		detail := fmt.Sprintf("%d volume(s)", len(app.Resources.Volumes))
+		detail := fmt.Sprintf("%d storage item(s)", len(app.Resources.Volumes))
 		if totalBytes > 0 {
-			detail = fmt.Sprintf("%d volume(s), %s across %d file(s)", len(app.Resources.Volumes), humanBytes(totalBytes), totalFiles)
+			detail = fmt.Sprintf("%d storage item(s), %s across %d file(s)", len(app.Resources.Volumes), humanBytes(totalBytes), totalFiles)
 		}
 		if binds > 0 {
-			status = "?"
-			detail = fmt.Sprintf("%s, %d bind mount(s) to verify", detail, binds)
+			detail = fmt.Sprintf("%s, %d VPS file/folder mount(s) preserved", detail, binds)
 		}
-		lines = append(lines, resourceLine{Label: "Volumes", Status: status, Detail: detail})
+		lines = append(lines, resourceLine{Label: "Storage", Status: status, Detail: detail})
 	}
 
-	if len(app.Resources.LinkedResources)+len(app.Resources.ExternalRequirements) > 0 {
+	if len(app.Resources.LinkedResources) > 0 {
 		unconfirmed := 0
 		for _, l := range app.Resources.LinkedResources {
 			if l.RequiresConfirmation {
@@ -411,12 +430,12 @@ func resourceLinesForApp(app preparer.AppPlan) []resourceLine {
 			}
 		}
 		status := "✓"
-		detail := fmt.Sprintf("%d candidate(s)", len(app.Resources.LinkedResources))
+		detail := fmt.Sprintf("%d possible service(s)", len(app.Resources.LinkedResources))
 		if unconfirmed > 0 {
 			status = "?"
-			detail = fmt.Sprintf("%d candidate(s), %d need confirm", len(app.Resources.LinkedResources), unconfirmed)
+			detail = fmt.Sprintf("%d possible service(s), %d need review", len(app.Resources.LinkedResources), unconfirmed)
 		}
-		lines = append(lines, resourceLine{Label: "Linked", Status: status, Detail: detail})
+		lines = append(lines, resourceLine{Label: "Support", Status: status, Detail: detail})
 	}
 	return lines
 }

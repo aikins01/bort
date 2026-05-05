@@ -81,7 +81,7 @@ func TestExportWritesBundleForComposeApp(t *testing.T) {
 		t.Fatalf("expected topology risk reasons, got %#v", topology)
 	}
 	runbook := readFile(t, filepath.Join(appDir, "migration-runbook.md"))
-	if !strings.Contains(runbook, "# migration runbook") || !strings.Contains(runbook, "## cutover checklist") {
+	if !strings.Contains(runbook, "# migration runbook") || !strings.Contains(runbook, "## source control") || !strings.Contains(runbook, "does not require those credentials") || !strings.Contains(runbook, "## cutover checklist") {
 		t.Fatalf("expected migration runbook, got:\n%s", runbook)
 	}
 }
@@ -152,6 +152,108 @@ func TestExportScopesServiceEnvFiles(t *testing.T) {
 	}
 }
 
+func TestExportStripsCoolifyOnlyEnvFromGeneratedCompose(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local"},
+		Apps: []manifest.App{{
+			Name: "api",
+			Environment: []manifest.EnvVar{
+				{Name: "COOLIFY_FQDN", Value: "api.example.com", ValueKnown: true},
+				{Name: "SOURCE_COMMIT", Value: "abc123", ValueKnown: true},
+				{Name: "APP_ENV", Value: "production", ValueKnown: true},
+			},
+			Services: []manifest.Service{{
+				Name:  "web",
+				Image: "example/web",
+				Environment: []manifest.EnvVar{
+					{Name: "COOLIFY_URL", Value: "https://api.example.com", ValueKnown: true},
+					{Name: "SERVICE_FQDN_WEB", Value: "api.example.com", ValueKnown: true},
+					{Name: "PORT", Value: "3000", ValueKnown: true},
+				},
+			}},
+		}},
+	}
+
+	if _, err := Export(m, Options{OutputDir: dir, IncludeEnvValues: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	appDir := filepath.Join(dir, "api")
+	compose := readFile(t, filepath.Join(appDir, "compose.yaml"))
+	if strings.Contains(compose, "COOLIFY_") || strings.Contains(compose, "SOURCE_COMMIT") {
+		t.Fatalf("expected compose env_file refs to omit coolify-only env, got:\n%s", compose)
+	}
+	for _, file := range []string{".env", ".env.example", ".env.web", ".env.web.example"} {
+		env := readFile(t, filepath.Join(appDir, file))
+		if strings.Contains(env, "COOLIFY_") || strings.Contains(env, "SOURCE_COMMIT") {
+			t.Fatalf("expected %s to omit coolify-only env, got %q", file, env)
+		}
+	}
+	if env := readFile(t, filepath.Join(appDir, ".env")); !strings.Contains(env, "APP_ENV=production\n") {
+		t.Fatalf("expected app env retained, got %q", env)
+	}
+	if env := readFile(t, filepath.Join(appDir, ".env.web")); !strings.Contains(env, "PORT=3000\n") {
+		t.Fatalf("expected service env retained, got %q", env)
+	}
+	if env := readFile(t, filepath.Join(appDir, ".env.web")); !strings.Contains(env, "SERVICE_FQDN_WEB=api.example.com\n") {
+		t.Fatalf("expected Coolify service magic env preserved for review, got %q", env)
+	}
+}
+
+func TestExportSanitizesRawCoolifyCompose(t *testing.T) {
+	dir := t.TempDir()
+	compose := `services:
+  api:
+    image: example/api
+    environment:
+      COOLIFY_FQDN: api.example.com
+      SOURCE_COMMIT: abc123
+      SERVICE_URL_WEB: https://api.example.com
+      APP_ENV: production
+    labels:
+      coolify.managed: "true"
+      traefik.http.routers.api.rule: Host(` + "`" + `api.example.com` + "`" + `)
+      com.example.keep: yes
+  worker:
+    image: example/worker
+    environment:
+      - COOLIFY_URL=https://api.example.com
+      - QUEUE=default
+    labels:
+      - caddy_0=https://worker.example.com
+      - com.example.keep=yes
+`
+	m := manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local"},
+		Apps: []manifest.App{{
+			Name:    "api",
+			Compose: &manifest.ComposeSource{Raw: compose},
+		}},
+	}
+
+	summary, err := Export(m, Options{OutputDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := readFile(t, filepath.Join(dir, "api", "compose.yaml"))
+	for _, blocked := range []string{"COOLIFY_FQDN", "COOLIFY_URL", "SOURCE_COMMIT", "coolify.managed", "traefik.http.routers", "caddy_0"} {
+		if strings.Contains(out, blocked) {
+			t.Fatalf("expected raw compose sanitizer to remove %q, got:\n%s", blocked, out)
+		}
+	}
+	for _, want := range []string{"APP_ENV: production", "SERVICE_URL_WEB: https://api.example.com", "QUEUE=default", "com.example.keep"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected sanitized compose to retain %q, got:\n%s", want, out)
+		}
+	}
+	warnings := strings.Join(summary.Apps[0].Warnings, "\n")
+	if len(summary.Apps) != 1 || !strings.Contains(warnings, "removed source platform") || !strings.Contains(warnings, "SERVICE_URL_WEB") {
+		t.Fatalf("expected sanitizer warning, got %#v", summary.Apps)
+	}
+}
+
 func TestExportIncludeEnvValuesWritesPrivateEnvFiles(t *testing.T) {
 	dir := t.TempDir()
 	m := manifest.Manifest{
@@ -196,6 +298,115 @@ func TestExportIncludeEnvValuesWritesPrivateEnvFiles(t *testing.T) {
 	}
 }
 
+func TestExportIncludeEnvValuesPreservesKnownEmptyValues(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps: []manifest.App{{
+			Name: "api",
+			Services: []manifest.Service{{
+				Name:  "web",
+				Image: "example/web",
+				Environment: []manifest.EnvVar{
+					{Name: "KNOWN_EMPTY", ValueKnown: true},
+					{Name: "UNKNOWN_EMPTY"},
+				},
+			}},
+		}},
+	}
+
+	if _, err := Export(m, Options{OutputDir: dir, IncludeEnvValues: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	env := readFile(t, filepath.Join(dir, "api", ".env.web"))
+	if !strings.Contains(env, "KNOWN_EMPTY=\"\"\n") {
+		t.Fatalf("expected known empty value to be quoted, got %q", env)
+	}
+	if !strings.Contains(env, "UNKNOWN_EMPTY=\n") {
+		t.Fatalf("expected unknown empty value to remain blank, got %q", env)
+	}
+}
+
+func TestExportProjectGroupDoesNotUseBroadCoolifyProject(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local"},
+		Apps: []manifest.App{{
+			Name:     "demo-api",
+			Metadata: map[string]string{"coolify.project": "demo-project", "coolify.environment": "production", "migrationRole": "candidate"},
+			Services: []manifest.Service{{Name: "web", Image: "example/web"}},
+		}},
+	}
+
+	summary, err := Export(m, Options{OutputDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Apps) != 1 || summary.Apps[0].ProjectGroup == nil {
+		t.Fatalf("expected project group in summary, got %#v", summary.Apps)
+	}
+	group := summary.Apps[0].ProjectGroup
+	if group.Name != "demo-api" || group.Environment != "production" || group.Source != "app" {
+		t.Fatalf("unexpected project group: %#v", group)
+	}
+
+	var index Summary
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(dir, "index.json"))), &index); err != nil {
+		t.Fatal(err)
+	}
+	if index.Apps[0].ProjectGroup == nil || index.Apps[0].ProjectGroup.Name == "demo-project" {
+		t.Fatalf("expected project group in index.json, got %#v", index.Apps[0])
+	}
+}
+
+func TestExportGroupsSupportResourceWithDetectedOwner(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local"},
+		Apps: []manifest.App{
+			{
+				Name:     "api",
+				Metadata: map[string]string{"migrationRole": "candidate"},
+				Services: []manifest.Service{{
+					Name:        "web",
+					Image:       "example/api",
+					Environment: []manifest.EnvVar{{Name: "DATABASE_URL", Value: "postgres://user:pass@api-db:5432/app", ValueKnown: true, Sensitive: true}},
+				}},
+			},
+			{
+				ID:       "compose:api-db",
+				Name:     "api database",
+				Runtime:  "database",
+				Metadata: map[string]string{"migrationRole": "support", "coolify.composeProject": "api-db"},
+				Services: []manifest.Service{{
+					Name:   "postgres",
+					Image:  "postgres:16-alpine",
+					Labels: map[string]string{"com.docker.compose.project": "api-db"},
+				}},
+			},
+		},
+	}
+
+	summary, err := Export(m, Options{OutputDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Apps) != 2 {
+		t.Fatalf("expected two apps, got %#v", summary.Apps)
+	}
+	for _, app := range summary.Apps {
+		if app.Name != "api database" {
+			continue
+		}
+		if app.ProjectGroup == nil || app.ProjectGroup.Name != "api" || app.ProjectGroup.Source != "detected-link" {
+			t.Fatalf("expected support resource grouped with api, got %#v", app.ProjectGroup)
+		}
+		return
+	}
+	t.Fatalf("support app missing from summary: %#v", summary.Apps)
+}
+
 func TestExportGeneratesComposeFromServices(t *testing.T) {
 	dir := t.TempDir()
 	m := manifest.Manifest{
@@ -236,7 +447,7 @@ func TestExportRunbookIncludesLinkedResources(t *testing.T) {
 			{
 				Name:     "api",
 				Platform: "coolify",
-				Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "vela"},
+				Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "demo-project"},
 				Services: []manifest.Service{{
 					Name:        "web",
 					Image:       "example/api",
@@ -248,7 +459,7 @@ func TestExportRunbookIncludesLinkedResources(t *testing.T) {
 				ID:       "compose:postgres",
 				Name:     "postgres db",
 				Runtime:  "database",
-				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "vela"},
+				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "demo-project"},
 				Services: []manifest.Service{{
 					Name:     "postgres",
 					Image:    "postgres:16-alpine",

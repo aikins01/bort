@@ -78,7 +78,7 @@ func TestRunWithoutArgsResumesLatestRun(t *testing.T) {
 			{Name: "api", Services: []manifest.Service{{Name: "api", Image: "example/api:latest"}}, Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "api"}}},
 		},
 	})
-	runCommand(t, runMigrate, []string{"--bundle", "bort-bundle", "--run", "marketmap", "--observation-window", "0", "--rollback-window", "0"})
+	runCommand(t, runMigrate, []string{"--bundle", "bort-bundle", "--run", "demo-app", "--observation-window", "0", "--rollback-window", "0"})
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

@@ -3,6 +3,7 @@ package dokploy
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/aikins01/bort/internal/preparer"
 )
@@ -17,20 +18,20 @@ func (c *Client) applyPauseSource(ctx context.Context, actx *applyContext, step 
 	if !ok {
 		return fmt.Errorf("app %s not found in prepare result", step.App)
 	}
-	ids := sourceQuiesceTargets(app)
-	if len(ids) == 0 {
+	refs := sourceQuiesceTargetRefs(app)
+	if len(refs) == 0 {
 		return nil
 	}
 	runner := c.dockerRunner()
-	for _, id := range ids {
-		container, err := inspectContainer(ctx, runner, id)
+	for _, ref := range refs {
+		container, err := sourceContainerForQuiesce(ctx, runner, ref)
 		if err != nil {
-			return fmt.Errorf("inspect source container %s: %w", id, err)
+			return fmt.Errorf("inspect source container %s: %w", ref.label(), err)
 		}
 		if !container.State.Running {
 			continue
 		}
-		if _, err := runner.Output(ctx, "stop", container.ID); err != nil {
+		if err := stopContainer(ctx, runner, container.ID); err != nil {
 			return fmt.Errorf("stop source container %s: %w", container.ID, err)
 		}
 	}
@@ -46,20 +47,20 @@ func (c *Client) applyResumeSource(ctx context.Context, actx *applyContext, step
 	if !ok {
 		return fmt.Errorf("app %s not found in prepare result", step.App)
 	}
-	refs := sourceQuiesceTargets(app)
+	refs := sourceQuiesceTargetRefs(app)
 	if len(refs) == 0 {
 		return nil
 	}
 	runner := c.dockerRunner()
 	for _, ref := range refs {
-		container, err := inspectContainer(ctx, runner, ref)
+		container, err := sourceContainerForQuiesce(ctx, runner, ref)
 		if err != nil {
-			return fmt.Errorf("inspect source container %s: %w", ref, err)
+			return fmt.Errorf("inspect source container %s: %w", ref.label(), err)
 		}
 		if container.State.Running {
 			continue
 		}
-		if _, err := runner.Output(ctx, "start", container.ID); err != nil {
+		if err := startContainer(ctx, runner, container.ID); err != nil {
 			return fmt.Errorf("start source container %s: %w", container.ID, err)
 		}
 	}
@@ -97,7 +98,7 @@ func (c *Client) applyStopSourceApp(ctx context.Context, actx *applyContext, ste
 		if !container.State.Running {
 			continue
 		}
-		if _, err := runner.Output(ctx, "stop", container.ID); err != nil {
+		if err := stopContainer(ctx, runner, container.ID); err != nil {
 			if isContainerMissingErr(err) {
 				continue
 			}
@@ -108,8 +109,9 @@ func (c *Client) applyStopSourceApp(ctx context.Context, actx *applyContext, ste
 }
 
 type commitTargetRef struct {
-	id   string
-	name string
+	id      string
+	name    string
+	service string
 }
 
 func (r commitTargetRef) label() string {
@@ -159,6 +161,80 @@ func sourceCommitTargets(app preparer.AppPlan) []commitTargetRef {
 	return refs
 }
 
+func sourceContainerForQuiesce(ctx context.Context, runner dockerRunner, ref commitTargetRef) (dockerContainer, error) {
+	container, err := sourceContainer(ctx, runner, ref.id, ref.name)
+	if err == nil {
+		return container, nil
+	}
+	project := composeProjectFromCoolifyContainerName(ref.name, ref.service)
+	if project == "" {
+		return dockerContainer{}, err
+	}
+	container, ok, listErr := findComposeServiceContainerByProject(ctx, runner, project, ref.service)
+	if listErr != nil {
+		return dockerContainer{}, err
+	}
+	if ok {
+		return container, nil
+	}
+	return dockerContainer{}, err
+}
+
+func findComposeServiceContainerByProject(ctx context.Context, runner dockerRunner, project, service string) (dockerContainer, bool, error) {
+	if project == "" || service == "" {
+		return dockerContainer{}, false, nil
+	}
+	out, err := runner.Output(ctx, "ps", "-a",
+		"--filter", "label=com.docker.compose.project="+project,
+		"--filter", "label="+composeServiceLabel+"="+service,
+		"--format", "{{.ID}}",
+	)
+	if err != nil {
+		return dockerContainer{}, false, err
+	}
+	var fallback dockerContainer
+	haveFallback := false
+	for _, line := range strings.Split(string(out), "\n") {
+		id := strings.TrimSpace(line)
+		if id == "" {
+			continue
+		}
+		container, err := inspectContainer(ctx, runner, id)
+		if err != nil {
+			if isContainerMissingErr(err) {
+				continue
+			}
+			return dockerContainer{}, false, err
+		}
+		if container.State.Running {
+			return container, true, nil
+		}
+		if !haveFallback {
+			fallback = container
+			haveFallback = true
+		}
+	}
+	return fallback, haveFallback, nil
+}
+
+func composeProjectFromCoolifyContainerName(name, service string) string {
+	name = strings.TrimPrefix(strings.TrimSpace(name), "/")
+	service = strings.TrimSpace(service)
+	if name == "" || service == "" {
+		return ""
+	}
+	prefix := service + "-"
+	if !strings.HasPrefix(name, prefix) {
+		return ""
+	}
+	rest := strings.TrimPrefix(name, prefix)
+	lastDash := strings.LastIndex(rest, "-")
+	if lastDash <= 0 {
+		return ""
+	}
+	return rest[:lastDash]
+}
+
 // sourceQuiesceTargets returns unique source container refs for every
 // service that must stop before bort touches state. stateless workers
 // always stop because they keep writing to the database and to shared
@@ -167,6 +243,15 @@ func sourceCommitTargets(app preparer.AppPlan) []commitTargetRef {
 // consistent. skip-strategy stores are also excluded because we don't
 // touch their data and have no business stopping them.
 func sourceQuiesceTargets(app preparer.AppPlan) []string {
+	refs := sourceQuiesceTargetRefs(app)
+	targets := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		targets = append(targets, ref.label())
+	}
+	return targets
+}
+
+func sourceQuiesceTargetRefs(app preparer.AppPlan) []commitTargetRef {
 	excludedServices := map[string]struct{}{}
 	for _, store := range app.Resources.DataStores {
 		if store.Service == "" {
@@ -177,36 +262,32 @@ func sourceQuiesceTargets(app preparer.AppPlan) []string {
 		}
 	}
 	seen := map[string]struct{}{}
-	refs := []string{}
-	add := func(service, ref string) {
-		if ref == "" {
+	refs := []commitTargetRef{}
+	add := func(service, id, name string) {
+		if id == "" && name == "" {
 			return
 		}
 		if _, excluded := excludedServices[service]; excluded {
 			return
 		}
+		ref := id
+		if ref == "" {
+			ref = name
+		}
 		if _, dup := seen[ref]; dup {
 			return
 		}
 		seen[ref] = struct{}{}
-		refs = append(refs, ref)
+		refs = append(refs, commitTargetRef{id: id, name: name, service: service})
 	}
 	for _, service := range app.Resources.SourceServices {
-		ref := service.ContainerID
-		if ref == "" {
-			ref = service.ContainerName
-		}
-		add(service.ServiceName, ref)
+		add(service.ServiceName, service.ContainerID, service.ContainerName)
 	}
 	// fall back to volume-owner discovery when source services were not
 	// captured (older bundles). use container name when id is missing so
 	// stale-id bundles still pause cleanly.
 	for _, volume := range app.Resources.Volumes {
-		ref := volume.SourceContainerID
-		if ref == "" {
-			ref = volume.SourceContainerName
-		}
-		add(volume.Service, ref)
+		add(volume.Service, volume.SourceContainerID, volume.SourceContainerName)
 	}
 	return refs
 }

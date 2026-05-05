@@ -34,7 +34,7 @@ func TestReadRunProgressIgnoresStaleOrMismatchedProgress(t *testing.T) {
 	}
 	progressPath := filepath.Join(runDir, "progress.json")
 	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
-	run := migrationRun{Name: "marketmap", RunDir: filepath.ToSlash(runDir), UpdatedAt: now, DryRun: true}
+	run := migrationRun{Name: "demo-app", RunDir: filepath.ToSlash(runDir), UpdatedAt: now, DryRun: true}
 	decision := runDecision{
 		Kind: "cutover",
 		Items: []runDecisionItem{{

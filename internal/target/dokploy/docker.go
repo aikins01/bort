@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // dockerRunner is the small surface bort needs to drive the local docker
@@ -71,10 +73,73 @@ func (c *Client) dockerRunner() dockerRunner {
 	return localDockerRunner{Path: c.DockerPath}
 }
 
+const (
+	dockerStopTimeout        = 30 * time.Second
+	dockerStopFallbackGrace  = "2"
+	dockerStopFallbackWindow = 30 * time.Second
+	dockerStartTimeout       = 3 * time.Minute
+)
+
+func stopContainer(ctx context.Context, runner dockerRunner, id string) error {
+	stopCtx, cancel := context.WithTimeout(ctx, dockerStopTimeout)
+	defer cancel()
+	if _, err := runner.Output(stopCtx, "stop", id); err != nil {
+		if !errors.Is(stopCtx.Err(), context.DeadlineExceeded) {
+			return err
+		}
+		shortStopCtx, cancelShortStop := context.WithTimeout(context.Background(), dockerStopFallbackWindow)
+		shortStopErr := func() error {
+			defer cancelShortStop()
+			_, shortStopErr := runner.Output(shortStopCtx, "stop", "-t", dockerStopFallbackGrace, id)
+			return shortStopErr
+		}()
+		if shortStopErr == nil || containerStoppedAfterStopFailure(runner, id) {
+			return nil
+		}
+		killCtx, cancelKill := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancelKill()
+		if _, killErr := runner.Output(killCtx, "kill", id); killErr != nil {
+			if containerStoppedAfterStopFailure(runner, id) {
+				return nil
+			}
+			return fmt.Errorf("docker stop %s timed out and kill failed: %w", id, killErr)
+		}
+	}
+	return nil
+}
+
+func containerStoppedAfterStopFailure(runner dockerRunner, id string) bool {
+	inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	container, err := inspectContainer(inspectCtx, runner, id)
+	return err == nil && !container.State.Running
+}
+
+func startContainer(ctx context.Context, runner dockerRunner, id string) error {
+	startCtx, cancel := context.WithTimeout(ctx, dockerStartTimeout)
+	defer cancel()
+	if _, err := runner.Output(startCtx, "start", id); err != nil {
+		if containerRunningAfterStartFailure(runner, id) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func containerRunningAfterStartFailure(runner dockerRunner, id string) bool {
+	inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	container, err := inspectContainer(inspectCtx, runner, id)
+	return err == nil && container.State.Running
+}
+
 type dockerContainer struct {
 	ID     string
 	Name   string
+	Image  string
 	Config struct {
+		Image  string            `json:"Image"`
 		Env    []string          `json:"Env"`
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
@@ -96,7 +161,9 @@ type dockerMount struct {
 type dockerInspectRaw struct {
 	ID     string `json:"Id"`
 	Name   string `json:"Name"`
+	Image  string `json:"Image"`
 	Config struct {
+		Image  string            `json:"Image"`
 		Env    []string          `json:"Env"`
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
@@ -126,6 +193,7 @@ func inspectContainer(ctx context.Context, runner dockerRunner, ref string) (doc
 	return dockerContainer{
 		ID:     r.ID,
 		Name:   strings.TrimPrefix(r.Name, "/"),
+		Image:  r.Image,
 		Config: r.Config,
 		State:  r.State,
 		Mounts: r.Mounts,
@@ -161,6 +229,7 @@ func listContainersByLabel(ctx context.Context, runner dockerRunner, label strin
 		containers = append(containers, dockerContainer{
 			ID:     r.ID,
 			Name:   strings.TrimPrefix(r.Name, "/"),
+			Image:  r.Image,
 			Config: r.Config,
 			State:  r.State,
 			Mounts: r.Mounts,

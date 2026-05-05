@@ -64,6 +64,9 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 	volumeUsers := map[string]map[string]struct{}{}
 	appsByKey := map[string]*manifest.App{}
 	for _, container := range containers {
+		if isDokployTargetContainer(container) {
+			continue
+		}
 		key, appName, platform := classifyContainer(container)
 		app := appsByKey[key]
 		if app == nil {
@@ -497,6 +500,20 @@ func classifyContainer(container containerInspect) (key, name, platform string) 
 	}
 
 	return "container:" + shortID(container.ID), containerName, platform
+}
+
+func isDokployTargetContainer(container containerInspect) bool {
+	labels := container.Labels()
+	workingDir := labels["com.docker.compose.project.working_dir"]
+	if strings.HasPrefix(workingDir, "/etc/dokploy/compose/") {
+		return true
+	}
+	swarmService := labels["com.docker.swarm.service.name"]
+	if swarmService == "dokploy" || strings.HasPrefix(swarmService, "dokploy-") {
+		return true
+	}
+	name := strings.TrimPrefix(container.Name, "/")
+	return name == "dokploy" || strings.HasPrefix(name, "dokploy.") || strings.HasPrefix(name, "dokploy-")
 }
 
 func detectPlatform(labels map[string]string) string {

@@ -16,7 +16,7 @@ func TestPlanBuildsDryRunActionsFromTopology(t *testing.T) {
 		Apps: []manifest.App{
 			{
 				Name:     "web",
-				Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "vela"},
+				Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "demo-project", "coolify.environment": "production"},
 				Services: []manifest.Service{{
 					Name:        "web",
 					Image:       "example/web:latest",
@@ -28,7 +28,7 @@ func TestPlanBuildsDryRunActionsFromTopology(t *testing.T) {
 			{
 				Name:     "postgres support",
 				Runtime:  "database",
-				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "vela"},
+				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "demo-project", "coolify.environment": "production"},
 				Services: []manifest.Service{{Name: "postgres", Image: "postgres:16-alpine"}},
 			},
 		},
@@ -52,6 +52,9 @@ func TestPlanBuildsDryRunActionsFromTopology(t *testing.T) {
 	if app.Readiness != ReadinessNeedsInput || app.Resources.App.Readiness != ReadinessReadyToCreate {
 		t.Fatalf("unexpected readiness: %#v", app)
 	}
+	if app.ProjectGroup == nil || app.ProjectGroup.Name != "web" || app.ProjectGroup.Environment != "production" {
+		t.Fatalf("unexpected project group: %#v", app.ProjectGroup)
+	}
 	if app.Resources.App.Type != "compose" || app.Resources.App.ComposePath != "compose.yaml" {
 		t.Fatalf("unexpected app resource: %#v", app.Resources.App)
 	}
@@ -64,16 +67,19 @@ func TestPlanBuildsDryRunActionsFromTopology(t *testing.T) {
 	if len(app.Resources.DataStores) != 0 {
 		t.Fatalf("unexpected data-store resources: %#v", app.Resources.DataStores)
 	}
-	if len(app.Resources.LinkedResources) != 1 || app.Resources.LinkedResources[0].Source != "heuristic" || !app.Resources.LinkedResources[0].RequiresConfirmation || app.Resources.LinkedResources[0].Confidence != "possible" {
+	if len(app.Resources.LinkedResources) != 1 || app.Resources.LinkedResources[0].Source != "heuristic" || app.Resources.LinkedResources[0].RequiresConfirmation || app.Resources.LinkedResources[0].Confidence != "possible" {
 		t.Fatalf("unexpected linked resources: %#v", app.Resources.LinkedResources)
 	}
-	if len(app.Resources.Volumes) != 1 || app.Resources.Volumes[0].Type != "bind" || app.Resources.Volumes[0].Portability != "review_required" {
+	if len(app.Resources.Volumes) != 1 || app.Resources.Volumes[0].Type != "bind" || app.Resources.Volumes[0].Portability != "host_path_preserved" || app.Resources.Volumes[0].Readiness != ReadinessReadyToCreate {
 		t.Fatalf("unexpected volume resources: %#v", app.Resources.Volumes)
 	}
 	if app.TargetResources == nil || app.TargetResources.Platform != "dokploy" || !app.TargetResources.DryRun || app.TargetResources.Dokploy == nil {
 		t.Fatalf("unexpected target resources: %#v", app.TargetResources)
 	}
 	dokploy := app.TargetResources.Dokploy
+	if dokploy.Project.Name != "web" || dokploy.Project.Environment != "production" || dokploy.Project.Source != "app" {
+		t.Fatalf("unexpected dokploy project group: %#v", dokploy.Project)
+	}
 	if dokploy.ComposeApp.Name != "web" || dokploy.ComposeApp.Readiness != ReadinessReadyToCreate {
 		t.Fatalf("unexpected dokploy compose app: %#v", dokploy.ComposeApp)
 	}
@@ -83,24 +89,27 @@ func TestPlanBuildsDryRunActionsFromTopology(t *testing.T) {
 	if len(dokploy.EnvFiles) != 1 || !dokploy.EnvFiles[0].NeedsValues {
 		t.Fatalf("unexpected dokploy env files: %#v", dokploy.EnvFiles)
 	}
-	if len(dokploy.Volumes) != 1 || dokploy.Volumes[0].Action != "review_bind_mount_portability" {
+	if len(dokploy.Volumes) != 1 || dokploy.Volumes[0].Action != "preserve_vps_file_mount" {
 		t.Fatalf("unexpected dokploy volumes: %#v", dokploy.Volumes)
 	}
 	if len(dokploy.DataStores) != 0 {
 		t.Fatalf("unexpected dokploy data stores: %#v", dokploy.DataStores)
 	}
-	if len(dokploy.LinkedResources) != 1 || !dokploy.LinkedResources[0].RequiresConfirmation || dokploy.LinkedResources[0].Source != "heuristic" {
+	if len(dokploy.LinkedResources) != 1 || dokploy.LinkedResources[0].RequiresConfirmation || dokploy.LinkedResources[0].Source != "heuristic" || dokploy.LinkedResources[0].Action != "reuse_detected_support_resource" {
 		t.Fatalf("unexpected dokploy linked resources: %#v", dokploy.LinkedResources)
 	}
-	for _, code := range []string{"env.values_required", "env.values_redacted", "linked_resource.confirm_candidate", "volume.bind_mount_review"} {
+	for _, code := range []string{"env.values_required", "env.values_redacted"} {
 		assertGate(t, app, code)
+	}
+	for _, code := range []string{"linked_resource.confirm_candidate", "volume.bind_mount_review"} {
+		assertNoGate(t, app, code)
 	}
 	for _, want := range []string{
 		"compose|would create dokploy compose app from compose.yaml",
 		"environment|review and fill exported env examples before deploy: .env.web.example (1 vars)",
 		"route|would create dokploy domain web.example.com for service web on port 3000",
-		"linked-resource|needs confirmation of database support resource postgres support with possible confidence",
-		"volume|review bind mount portability for web -> /uploads",
+		"linked-resource|detected database uses postgres support (possible match) in Dokploy",
+		"volume|will preserve VPS file/folder /srv/web/uploads -> /uploads",
 	} {
 		assertAction(t, app, want)
 	}
@@ -135,6 +144,50 @@ func TestPlanMarksSimpleAppReadyToCreate(t *testing.T) {
 	}
 	if result.Apps[0].TargetResources == nil || result.Apps[0].TargetResources.Dokploy == nil || result.Apps[0].TargetResources.Dokploy.ComposeApp.Readiness != ReadinessReadyToCreate {
 		t.Fatalf("expected ready dokploy target render: %#v", result.Apps[0].TargetResources)
+	}
+}
+
+func TestPlanSurfacesSourceControlAsNonBlockingAction(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify"},
+		Apps: []manifest.App{{
+			Name:      "api",
+			BuildPack: "dockercompose",
+			Git: &manifest.GitSource{
+				Repository:      "https://github.com/example/api",
+				Branch:          "main",
+				Provider:        "github",
+				SourceType:      "App\\Models\\GithubApp",
+				SourceID:        "42",
+				ComposeLocation: "/docker-compose.yml",
+			},
+			Compose:  &manifest.ComposeSource{Raw: "services:\n  api:\n    image: example/api\n"},
+			Services: []manifest.Service{{Name: "api", Image: "example/api"}},
+			Routes:   []manifest.Route{{Host: "api.example.com", ServiceName: "api"}},
+		}},
+	}
+
+	if _, err := exporter.Export(m, exporter.Options{OutputDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Plan(Options{BundleDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := result.Apps[0]
+	if app.Readiness != ReadinessReadyToCreate || app.Resources.SourceControl == nil || app.Resources.SourceControl.Auth != "coolify_github_app" {
+		t.Fatalf("expected source control to be non-blocking, got %#v", app)
+	}
+	if app.TargetResources == nil || app.TargetResources.Dokploy == nil || app.TargetResources.Dokploy.SourceControl == nil || app.TargetResources.Dokploy.SourceControl.Action != "connect_dokploy_source_after_cutover_if_needed" {
+		t.Fatalf("expected dokploy source-control action, got %#v", app.TargetResources)
+	}
+	assertAction(t, app, "source-control|will not copy Coolify source credentials for https://github.com/example/api; connect a Dokploy source after cutover for future Git deploys")
+	for _, gate := range app.Gates {
+		if strings.HasPrefix(gate.Code, "source_control.") {
+			t.Fatalf("did not expect source-control gate: %#v", app.Gates)
+		}
 	}
 }
 
@@ -233,4 +286,13 @@ func assertGate(t *testing.T, app AppPlan, code string) {
 		}
 	}
 	t.Fatalf("expected gate %q in %#v", code, app.Gates)
+}
+
+func assertNoGate(t *testing.T, app AppPlan, code string) {
+	t.Helper()
+	for _, gate := range app.Gates {
+		if gate.Code == code {
+			t.Fatalf("did not expect gate %q in %#v", code, app.Gates)
+		}
+	}
 }

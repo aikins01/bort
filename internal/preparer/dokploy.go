@@ -9,13 +9,21 @@ type TargetResources struct {
 }
 
 type DokployResources struct {
+	Project              DokployProject               `json:"project"`
 	ComposeApp           DokployComposeApp            `json:"composeApp"`
+	SourceControl        *DokploySourceControl        `json:"sourceControl,omitempty"`
 	Domains              []DokployDomain              `json:"domains,omitempty"`
 	EnvFiles             []DokployEnvFile             `json:"envFiles,omitempty"`
 	Volumes              []DokployVolume              `json:"volumes,omitempty"`
 	DataStores           []DokployDataStore           `json:"dataStores,omitempty"`
 	ExternalRequirements []DokployExternalRequirement `json:"externalRequirements,omitempty"`
 	LinkedResources      []DokployLinkedResource      `json:"linkedResources,omitempty"`
+}
+
+type DokployProject struct {
+	Name        string `json:"name"`
+	Environment string `json:"environment,omitempty"`
+	Source      string `json:"source,omitempty"`
 }
 
 type DokployComposeApp struct {
@@ -27,6 +35,15 @@ type DokployComposeApp struct {
 	Readiness       Readiness `json:"readiness"`
 	ComposeMissing  bool      `json:"composeMissing,omitempty"`
 	MissingInputs   []string  `json:"missingInputs,omitempty"`
+}
+
+type DokploySourceControl struct {
+	Repository string    `json:"repository,omitempty"`
+	Branch     string    `json:"branch,omitempty"`
+	Provider   string    `json:"provider,omitempty"`
+	Auth       string    `json:"auth,omitempty"`
+	Action     string    `json:"action"`
+	Readiness  Readiness `json:"readiness"`
 }
 
 type DokployDomain struct {
@@ -92,6 +109,7 @@ type DokployLinkedResource struct {
 func dokployResources(plan AppPlan) *DokployResources {
 	name := targetSafeName(plan.Name, plan.Directory)
 	resources := &DokployResources{
+		Project: dokployProject(plan),
 		ComposeApp: DokployComposeApp{
 			Name:            name,
 			DisplayName:     plan.Name,
@@ -102,6 +120,16 @@ func dokployResources(plan AppPlan) *DokployResources {
 			ComposeMissing:  plan.Resources.App.ComposeMissing,
 			MissingInputs:   plan.Resources.App.MissingInputs,
 		},
+	}
+	if plan.Resources.SourceControl != nil {
+		resources.SourceControl = &DokploySourceControl{
+			Repository: plan.Resources.SourceControl.Repository,
+			Branch:     plan.Resources.SourceControl.Branch,
+			Provider:   plan.Resources.SourceControl.Provider,
+			Auth:       plan.Resources.SourceControl.Auth,
+			Action:     "connect_dokploy_source_after_cutover_if_needed",
+			Readiness:  plan.Resources.SourceControl.Readiness,
+		}
 	}
 
 	for _, domain := range plan.Resources.Domains {
@@ -166,12 +194,26 @@ func dokployResources(plan AppPlan) *DokployResources {
 			Confidence:           link.Confidence,
 			Source:               link.Source,
 			RequiresConfirmation: link.RequiresConfirmation,
-			Action:               "confirm_support_resource_candidate",
+			Action:               "reuse_detected_support_resource",
 			Readiness:            link.Readiness,
 		})
 	}
 
 	return resources
+}
+
+func dokployProject(plan AppPlan) DokployProject {
+	project := DokployProject{
+		Name:        planutil.Fallback(plan.Name, plan.Directory),
+		Environment: "production",
+	}
+	if plan.ProjectGroup != nil {
+		project.Name = planutil.Fallback(plan.ProjectGroup.Name, project.Name)
+		project.Environment = planutil.Fallback(plan.ProjectGroup.Environment, project.Environment)
+		project.Source = plan.ProjectGroup.Source
+	}
+	project.Name = planutil.Fallback(project.Name, "app")
+	return project
 }
 
 func targetSafeName(name, fallbackName string) string {
@@ -189,7 +231,7 @@ func dokployVolumeAction(volume VolumeResource) string {
 	case "volume":
 		return "create_volume_and_sync_state"
 	case "bind":
-		return "review_bind_mount_portability"
+		return "preserve_vps_file_mount"
 	default:
 		return "review_stateful_volume"
 	}
@@ -199,12 +241,12 @@ func dokployDataStoreAction(store DataStoreResource) string {
 	if store.Readiness == ReadinessBlocked {
 		return "manual_data_store_review"
 	}
-	return "confirm_data_store_strategy"
+	return "sync_data_store_with_planned_strategy"
 }
 
 func dokployExternalRequirementAction(requirement ExternalRequirementResource) string {
 	if requirement.Linkable {
-		return "select_or_confirm_support_resource"
+		return "keep_existing_dependency_settings"
 	}
-	return "resolve_external_requirement"
+	return "keep_external_settings"
 }

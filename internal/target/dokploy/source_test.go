@@ -68,7 +68,7 @@ func TestPlanFromArtifactsPausesBeforeDumpAndVolumeSync(t *testing.T) {
 		Name: "api",
 		Steps: []syncplan.Step{
 			{ResourceType: "data_store", ResourceRef: "data-store:db"},
-			{ResourceType: "volume", ResourceRef: "volume:web -> /data"},
+			{ResourceType: "volume", ResourceRef: "volume:web -> /data", Strategy: syncplan.StrategyDockerVolumeArchive},
 		},
 	}}}
 	plan := PlanFromArtifacts(prepare, syncResult, gatewayResultEmpty())
@@ -102,6 +102,25 @@ func TestPlanFromArtifactsOmitsPauseSourceWhenNoState(t *testing.T) {
 	}
 }
 
+func TestPlanFromArtifactsPreservesBindMountsWithoutStateWork(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{Volumes: []preparer.DokployVolume{{Type: "bind", Source: "/srv/api/uploads", Target: "/uploads"}}}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{app}}
+	syncResult := syncplan.Result{Apps: []syncplan.AppPlan{{
+		Name: "api",
+		Steps: []syncplan.Step{
+			{ResourceType: "volume", ResourceRef: "volume:web -> /uploads", Strategy: syncplan.StrategyNone, TargetAction: "preserve_vps_file_mount"},
+		},
+	}}}
+	plan := PlanFromArtifacts(prepare, syncResult, gatewayResultEmpty())
+	for _, step := range plan.Steps {
+		switch step.Kind {
+		case StepCreateVolume, StepPauseSource, StepSyncVolume:
+			t.Fatalf("did not expect state work for preserved bind mount, got step=%#v plan=%v", step, plan.Steps)
+		}
+	}
+}
+
 // volume-strategy data stores migrate by raw volume copy, so the plan
 // must keep their volume sync step and run pause beforehand. it also
 // must skip the logical dump/restore steps because there is none.
@@ -116,7 +135,7 @@ func TestPlanFromArtifactsCopiesVolumeStrategyDataStoreVolumes(t *testing.T) {
 		Name: "api",
 		Steps: []syncplan.Step{
 			{ResourceType: "data_store", ResourceRef: "data-store:redis"},
-			{ResourceType: "volume", ResourceRef: "volume:redis -> /data"},
+			{ResourceType: "volume", ResourceRef: "volume:redis -> /data", Strategy: syncplan.StrategyDockerVolumeArchive},
 		},
 	}}}
 	plan := PlanFromArtifacts(prepare, syncResult, gatewayResultEmpty())
@@ -152,7 +171,7 @@ func TestPlanFromArtifactsSkipsRawCopyForLogicalStoreVolume(t *testing.T) {
 		Name: "api",
 		Steps: []syncplan.Step{
 			{ResourceType: "data_store", ResourceRef: "data-store:db"},
-			{ResourceType: "volume", ResourceRef: "volume:db -> /var/lib/postgresql/data"},
+			{ResourceType: "volume", ResourceRef: "volume:db -> /var/lib/postgresql/data", Strategy: syncplan.StrategyDockerVolumeArchive},
 		},
 	}}}
 	plan := PlanFromArtifacts(prepare, syncResult, gatewayResultEmpty())
@@ -181,6 +200,45 @@ func TestApplyPauseSourceStopsRunningContainers(t *testing.T) {
 	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
 	if err := client.applyPauseSource(context.Background(), actx, Step{Kind: StepPauseSource, App: "api"}); err != nil {
 		t.Fatalf("applyPauseSource: %v", err)
+	}
+}
+
+func TestApplyPauseSourceFallsBackToContainerNameForStaleID(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.SourceServices = []preparer.SourceServiceRef{{ServiceName: "web", ContainerID: "stale-id", ContainerName: "web-current"}}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"inspect --type container web-current": []byte(`[{"Id":"current-id","Name":"/web-current","State":{"Running":true,"Status":"running"}}]`),
+			"stop current-id":                      []byte("current-id\n"),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	if err := client.applyPauseSource(context.Background(), actx, Step{Kind: StepPauseSource, App: "api"}); err != nil {
+		t.Fatalf("applyPauseSource: %v", err)
+	}
+	if !fakeOutputCalled(runner, "stop", "current-id") {
+		t.Fatalf("expected stale id fallback to stop current container, calls=%v", runner.outputArgs)
+	}
+}
+
+func TestApplyPauseSourceFallsBackToComposeServiceForRecreatedContainer(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.SourceServices = []preparer.SourceServiceRef{{ServiceName: "web", ContainerID: "stale-id", ContainerName: "web-proj-123"}}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"ps -a --filter label=com.docker.compose.project=proj --filter label=com.docker.compose.service=web --format {{.ID}}": []byte("live-id\n"),
+			"inspect --type container live-id": []byte(`[{"Id":"live-id","Name":"/web-proj-456","Config":{"Labels":{"com.docker.compose.service":"web"}},"State":{"Running":true,"Status":"running"}}]`),
+			"stop live-id":                     []byte("live-id\n"),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	if err := client.applyPauseSource(context.Background(), actx, Step{Kind: StepPauseSource, App: "api"}); err != nil {
+		t.Fatalf("applyPauseSource: %v", err)
+	}
+	if !fakeOutputCalled(runner, "stop", "live-id") {
+		t.Fatalf("expected compose service fallback to stop live container, calls=%v", runner.outputArgs)
 	}
 }
 

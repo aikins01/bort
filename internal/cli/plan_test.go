@@ -113,7 +113,7 @@ func TestWritePlanFiltersByAppAndRole(t *testing.T) {
 		Apps: []manifest.App{
 			{
 				ID:       "compose:candidate-1",
-				Name:     "new marketmap dj",
+				Name:     "new demo app",
 				Platform: "coolify",
 				Metadata: map[string]string{"migrationRole": "candidate", "coolify.uuid": "candidate-1"},
 				Services: []manifest.Service{{Name: "web", Image: "example/web"}},
@@ -131,11 +131,11 @@ func TestWritePlanFiltersByAppAndRole(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := writePlanWithOptions(&out, m, planOptions{Target: "dokploy", AppName: "new-marketmap-dj", Role: "candidate"}); err != nil {
+	if err := writePlanWithOptions(&out, m, planOptions{Target: "dokploy", AppName: "new-demo-app", Role: "candidate"}); err != nil {
 		t.Fatal(err)
 	}
 	plan := out.String()
-	for _, want := range []string{"Apps: 1", "Filters: app=new-marketmap-dj, role=candidate", "[green] new marketmap dj"} {
+	for _, want := range []string{"Apps: 1", "Filters: app=new-demo-app, role=candidate", "[green] new demo app"} {
 		if !strings.Contains(plan, want) {
 			t.Fatalf("expected filtered plan to contain %q, got:\n%s", want, plan)
 		}
@@ -149,7 +149,7 @@ func TestWritePlanFiltersByAppAndRole(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan = out.String()
-	if !strings.Contains(plan, "[yellow] postgresql database") || strings.Contains(plan, "new marketmap dj") {
+	if !strings.Contains(plan, "[yellow] postgresql database") || strings.Contains(plan, "new demo app") {
 		t.Fatalf("expected role filter to include only support app, got:\n%s", plan)
 	}
 

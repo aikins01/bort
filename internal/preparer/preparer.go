@@ -45,17 +45,17 @@ const (
 // state merging) should reference these constants instead of literal
 // strings so renames stay compile-checked.
 const (
-	GateAppComposeMissing      = "app.compose_missing"
-	GateAppComposeIncomplete   = "app.compose_incomplete"
-	GateDeployMissingArtifact  = "deploy.missing_artifact"
-	GateEnvValuesRequired      = "env.values_required"
-	GateEnvValuesRedacted      = "env.values_redacted"
-	GateDomainHostMissing      = "domain.host_missing"
-	GateDomainServiceMissing   = "domain.service_missing"
-	GateRoutesNone             = "routes.none"
-	GateDataStoreManualReview  = "data_store.manual_review"
-	GateDataStorePrepareRequired = "data_store.prepare_required"
-	GateVolumeBindMountReview  = "volume.bind_mount_review"
+	GateAppComposeMissing              = "app.compose_missing"
+	GateAppComposeIncomplete           = "app.compose_incomplete"
+	GateDeployMissingArtifact          = "deploy.missing_artifact"
+	GateEnvValuesRequired              = "env.values_required"
+	GateEnvValuesRedacted              = "env.values_redacted"
+	GateDomainHostMissing              = "domain.host_missing"
+	GateDomainServiceMissing           = "domain.service_missing"
+	GateRoutesNone                     = "routes.none"
+	GateDataStoreManualReview          = "data_store.manual_review"
+	GateDataStorePrepareRequired       = "data_store.prepare_required"
+	GateVolumeBindMountReview          = "volume.bind_mount_review"
 	GateExternalRequirementResolve     = "external_requirement.resolve"
 	GateLinkedResourceMissingCandidate = "linked_resource.missing_candidate"
 	GateLinkedResourceConfirmCandidate = "linked_resource.confirm_candidate"
@@ -89,12 +89,19 @@ type AppPlan struct {
 	Name            string           `json:"name"`
 	Directory       string           `json:"directory"`
 	Role            string           `json:"role,omitempty"`
+	ProjectGroup    *ProjectGroup    `json:"projectGroup,omitempty"`
 	Status          Status           `json:"status"`
 	Readiness       Readiness        `json:"readiness"`
 	Resources       ResourceSpecs    `json:"resources"`
 	TargetResources *TargetResources `json:"targetResources,omitempty"`
 	Gates           []Gate           `json:"gates,omitempty"`
 	Actions         []Action         `json:"actions"`
+}
+
+type ProjectGroup struct {
+	Name        string `json:"name"`
+	Environment string `json:"environment,omitempty"`
+	Source      string `json:"source,omitempty"`
 }
 
 type Action struct {
@@ -114,6 +121,7 @@ type Gate struct {
 
 type ResourceSpecs struct {
 	App                  AppResource                   `json:"app"`
+	SourceControl        *SourceControlResource        `json:"sourceControl,omitempty"`
 	Domains              []DomainResource              `json:"domains,omitempty"`
 	EnvFiles             []EnvFileResource             `json:"envFiles,omitempty"`
 	Volumes              []VolumeResource              `json:"volumes,omitempty"`
@@ -138,6 +146,16 @@ type AppResource struct {
 	ComposeMissing bool      `json:"composeMissing,omitempty"`
 	MissingInputs  []string  `json:"missingInputs,omitempty"`
 	Readiness      Readiness `json:"readiness"`
+}
+
+type SourceControlResource struct {
+	Repository string    `json:"repository,omitempty"`
+	Branch     string    `json:"branch,omitempty"`
+	CommitSHA  string    `json:"commitSha,omitempty"`
+	Provider   string    `json:"provider,omitempty"`
+	Auth       string    `json:"auth,omitempty"`
+	Evidence   []string  `json:"evidence,omitempty"`
+	Readiness  Readiness `json:"readiness"`
 }
 
 type DomainResource struct {
@@ -249,11 +267,12 @@ func planApp(bundleDir, target string, app exporter.AppSummary) (AppPlan, error)
 		return AppPlan{}, fmt.Errorf("read topology for %s: %w", app.Name, err)
 	}
 
-	plan := AppPlan{Name: app.Name, Directory: app.Directory, Role: app.Role, Status: StatusGreen, Readiness: ReadinessReadyToCreate}
+	plan := AppPlan{Name: app.Name, Directory: app.Directory, Role: app.Role, ProjectGroup: projectGroup(app.ProjectGroup), Status: StatusGreen, Readiness: ReadinessReadyToCreate}
 	plan.Resources = resourceSpecs(app, appDir, topology)
 	addReadinessGates(&plan, topology)
 	plan.add(SeverityInfo, "compose", fmt.Sprintf("would create %s compose app from compose.yaml", target))
-	addEnvironmentActions(&plan)
+	addSourceControlActions(&plan)
+	addEnvironmentActions(&plan, topology)
 	addRouteActions(&plan, target)
 	addDataStoreActions(&plan)
 	addLinkedResourceActions(&plan)
@@ -273,11 +292,19 @@ func targetResources(target string, plan AppPlan) *TargetResources {
 	}
 }
 
+func projectGroup(group *exporter.ProjectGroup) *ProjectGroup {
+	if group == nil {
+		return nil
+	}
+	return &ProjectGroup{Name: group.Name, Environment: group.Environment, Source: group.Source}
+}
+
 func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Topology) ResourceSpecs {
 	resources := ResourceSpecs{
 		App:      appResource(app.Name, appDir),
 		EnvFiles: envFileResources(appDir, app.PrivateEnvValues),
 	}
+	resources.SourceControl = sourceControlResource(topology.SourceControl)
 
 	for _, route := range topology.Routes {
 		readiness := ReadinessReadyToCreate
@@ -302,16 +329,12 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 		resources.DataStores = append(resources.DataStores, dataStoreResource(store))
 	}
 	for _, requirement := range topology.ExternalRequirements {
-		readiness := ReadinessNeedsDecision
 		linkable := analyzer.IsLinkableRequirement(requirement.Kind)
-		if !linkable {
-			readiness = ReadinessNeedsInput
-		}
 		resources.ExternalRequirements = append(resources.ExternalRequirements, ExternalRequirementResource{
 			Kind:      requirement.Kind,
 			Evidence:  planutil.UniqueStrings(requirement.Evidence),
 			Linkable:  linkable,
-			Readiness: readiness,
+			Readiness: ReadinessReadyToCreate,
 		})
 	}
 	for _, link := range topology.LinkedResources {
@@ -355,6 +378,21 @@ func appResource(name, appDir string) AppResource {
 		resource.Readiness = ReadinessBlocked
 	}
 	return resource
+}
+
+func sourceControlResource(source *analyzer.SourceControl) *SourceControlResource {
+	if source == nil {
+		return nil
+	}
+	return &SourceControlResource{
+		Repository: source.Repository,
+		Branch:     source.Branch,
+		CommitSHA:  source.CommitSHA,
+		Provider:   source.Provider,
+		Auth:       source.Auth,
+		Evidence:   planutil.UniqueStrings(source.Evidence),
+		Readiness:  ReadinessReadyToCreate,
+	}
 }
 
 func envFileResources(appDir string, privateEnvValues bool) []EnvFileResource {
@@ -406,8 +444,7 @@ func volumeResource(volume analyzer.StatefulVolume) VolumeResource {
 	readiness := ReadinessReadyToCreate
 	portability := "portable"
 	if volume.Type == "bind" {
-		readiness = ReadinessNeedsDecision
-		portability = "review_required"
+		portability = "host_path_preserved"
 	}
 	return VolumeResource{
 		Service:             volume.Service,
@@ -426,9 +463,11 @@ func volumeResource(volume analyzer.StatefulVolume) VolumeResource {
 }
 
 func dataStoreResource(store analyzer.DataStore) DataStoreResource {
-	readiness := ReadinessNeedsDecision
+	readiness := ReadinessReadyToCreate
 	if store.Kind == "unknown" || store.Strategy == "manual_review" {
 		readiness = ReadinessBlocked
+	} else if strings.TrimSpace(store.Strategy) == "" {
+		readiness = ReadinessNeedsDecision
 	}
 	return DataStoreResource{
 		Kind:                store.Kind,
@@ -450,19 +489,20 @@ func linkedResourceCandidate(link analyzer.ResourceLink) LinkedResourceCandidate
 	for _, store := range link.DataStores {
 		stores = append(stores, dataStoreResource(store))
 	}
+	confidence := planutil.Fallback(link.Confidence, "unknown")
 	return LinkedResourceCandidate{
 		Kind:                 link.Kind,
 		App:                  link.App,
 		AppID:                link.AppID,
 		Role:                 link.Role,
 		Runtime:              link.Runtime,
-		Confidence:           planutil.Fallback(link.Confidence, "unknown"),
+		Confidence:           confidence,
 		Reasons:              planutil.UniqueStrings(link.Reasons),
 		Networks:             planutil.UniqueStrings(link.Networks),
 		DataStores:           stores,
 		Source:               "heuristic",
-		RequiresConfirmation: true,
-		Readiness:            ReadinessNeedsDecision,
+		RequiresConfirmation: false,
+		Readiness:            ReadinessReadyToCreate,
 	}
 }
 
@@ -517,51 +557,19 @@ func addReadinessGates(plan *AppPlan, topology analyzer.Topology) {
 			plan.addGate(ReadinessBlocked, SeverityError, GateDataStoreManualReview, message, resourceRef, store.Volumes)
 			continue
 		}
-		message := fmt.Sprintf("confirm %s data-store preparation strategy %s for service %s", dataStoreLabel(store), planutil.Fallback(store.Strategy, "manual_review"), planutil.Fallback(store.Service, "unknown"))
-		plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateDataStorePrepareRequired, message, resourceRef, store.Volumes)
-	}
-
-	addLinkedResourceGates(plan)
-
-	for _, volume := range plan.Resources.Volumes {
-		if volume.Type == "bind" {
-			message := fmt.Sprintf("review bind mount portability for %s", volumeResourceLabel(volume))
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateVolumeBindMountReview, message, "volume:"+volumeResourceLabel(volume), nil)
+		if store.Readiness == ReadinessNeedsDecision {
+			message := fmt.Sprintf("confirm %s data-store preparation strategy %s for service %s", dataStoreLabel(store), planutil.Fallback(store.Strategy, "manual_review"), planutil.Fallback(store.Service, "unknown"))
+			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateDataStorePrepareRequired, message, resourceRef, store.Volumes)
 		}
 	}
 }
 
-func addLinkedResourceGates(plan *AppPlan) {
-	linksByKind := map[string][]LinkedResourceCandidate{}
-	for _, link := range plan.Resources.LinkedResources {
-		linksByKind[link.Kind] = append(linksByKind[link.Kind], link)
-	}
-
-	for _, requirement := range plan.Resources.ExternalRequirements {
-		resourceRef := "external:" + requirement.Kind
-		if !requirement.Linkable {
-			message := fmt.Sprintf("resolve external %s requirement before deploy", requirement.Kind)
-			plan.addGate(ReadinessNeedsInput, SeverityWarn, GateExternalRequirementResolve, message, resourceRef, requirement.Evidence)
-			continue
-		}
-
-		links := linksByKind[requirement.Kind]
-		switch {
-		case len(links) == 0:
-			message := fmt.Sprintf("select or create a support resource for external %s requirement", requirement.Kind)
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateLinkedResourceMissingCandidate, message, resourceRef, requirement.Evidence)
-		case len(links) == 1:
-			message := fmt.Sprintf("confirm heuristic %s support resource candidate %s with %s confidence", requirement.Kind, planutil.Fallback(links[0].App, "unknown"), planutil.Fallback(links[0].Confidence, "unknown"))
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateLinkedResourceConfirmCandidate, message, "linked-resource:"+planutil.Fallback(links[0].App, "unknown"), links[0].Reasons)
-		default:
-			message := fmt.Sprintf("select one heuristic %s support resource candidate: %s", requirement.Kind, strings.Join(linkedResourceCandidateLabels(links), ", "))
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateLinkedResourceSelectCandidate, message, resourceRef, requirement.Evidence)
-		}
-	}
-}
-
-func addEnvironmentActions(plan *AppPlan) {
+func addEnvironmentActions(plan *AppPlan, topology analyzer.Topology) {
+	_, hasMagicEnv := topologyRisk(topology, "env.coolify_service_magic")
 	if len(plan.Resources.EnvFiles) == 0 {
+		if hasMagicEnv {
+			plan.add(SeverityInfo, "environment", "review preserved Coolify SERVICE_URL/SERVICE_FQDN/SERVICE_NAME values after Dokploy routes are in place")
+		}
 		return
 	}
 
@@ -572,6 +580,9 @@ func addEnvironmentActions(plan *AppPlan) {
 		}
 	}
 	if len(items) == 0 {
+		if hasMagicEnv {
+			plan.add(SeverityInfo, "environment", "review preserved Coolify SERVICE_URL/SERVICE_FQDN/SERVICE_NAME values after Dokploy routes are in place")
+		}
 		return
 	}
 
@@ -580,6 +591,22 @@ func addEnvironmentActions(plan *AppPlan) {
 		severity = SeverityWarn
 	}
 	plan.add(severity, "environment", fmt.Sprintf("review and fill exported env examples before deploy: %s", strings.Join(items, ", ")))
+	if hasMagicEnv {
+		plan.add(SeverityInfo, "environment", "review preserved Coolify SERVICE_URL/SERVICE_FQDN/SERVICE_NAME values after Dokploy routes are in place")
+	}
+}
+
+func addSourceControlActions(plan *AppPlan) {
+	if plan.Resources.SourceControl == nil {
+		return
+	}
+	control := plan.Resources.SourceControl
+	repo := planutil.Fallback(control.Repository, "the source repository")
+	message := fmt.Sprintf("will not copy Coolify source credentials for %s; connect a Dokploy source after cutover for future Git deploys", repo)
+	if control.Auth == "https" || control.Auth == "git" {
+		message = fmt.Sprintf("will deploy %s from raw compose/image snapshot; connect it in Dokploy later only if future Git deploys are needed", repo)
+	}
+	plan.add(SeverityInfo, "source-control", message)
 }
 
 func addRouteActions(plan *AppPlan, target string) {
@@ -604,8 +631,12 @@ func addRouteActions(plan *AppPlan, target string) {
 
 func addDataStoreActions(plan *AppPlan) {
 	for _, store := range plan.Resources.DataStores {
-		severity := SeverityWarn
-		message := fmt.Sprintf("needs %s data store preparation for service %s with %s", dataStoreLabel(store), planutil.Fallback(store.Service, "unknown"), planutil.Fallback(store.Strategy, "manual_review"))
+		severity := SeverityInfo
+		message := fmt.Sprintf("will prepare %s data store for service %s with %s", dataStoreLabel(store), planutil.Fallback(store.Service, "unknown"), planutil.Fallback(store.Strategy, "manual_review"))
+		if store.Readiness != ReadinessReadyToCreate {
+			severity = SeverityWarn
+			message = fmt.Sprintf("needs %s data store preparation for service %s with %s", dataStoreLabel(store), planutil.Fallback(store.Service, "unknown"), planutil.Fallback(store.Strategy, "manual_review"))
+		}
 		if store.Fallback != "" {
 			message += "; fallback " + store.Fallback
 		}
@@ -625,22 +656,18 @@ func addLinkedResourceActions(plan *AppPlan) {
 	for _, requirement := range plan.Resources.ExternalRequirements {
 		evidence := describeRequirementEvidence(requirement)
 		if !requirement.Linkable {
-			plan.add(SeverityWarn, "external-requirement", fmt.Sprintf("needs external %s requirement resolved%s", requirement.Kind, evidence))
+			plan.add(SeverityInfo, "external-requirement", fmt.Sprintf("uses external %s settings from source%s", requirement.Kind, evidence))
 			continue
 		}
 
 		links := linksByKind[requirement.Kind]
 		switch {
 		case len(links) == 0:
-			plan.add(SeverityWarn, "linked-resource", fmt.Sprintf("needs support resource selection for external %s requirement%s", requirement.Kind, evidence))
+			plan.add(SeverityInfo, "linked-resource", fmt.Sprintf("will keep existing %s settings%s", supportResourceKindLabel(requirement.Kind), evidence))
 		case len(links) == 1:
-			severity := SeverityInfo
-			if links[0].Confidence != "likely" {
-				severity = SeverityWarn
-			}
-			plan.add(severity, "linked-resource", fmt.Sprintf("needs confirmation of %s support resource %s with %s confidence", requirement.Kind, planutil.Fallback(links[0].App, "unknown"), planutil.Fallback(links[0].Confidence, "unknown")))
+			plan.add(SeverityInfo, "linked-resource", fmt.Sprintf("detected %s uses %s in Dokploy", supportResourceKindLabel(requirement.Kind), supportResourceCandidateLabel(links[0])))
 		default:
-			plan.add(SeverityWarn, "linked-resource", fmt.Sprintf("needs one %s support resource candidate selected: %s", requirement.Kind, strings.Join(linkedResourceCandidateLabels(links), ", ")))
+			plan.add(SeverityInfo, "linked-resource", fmt.Sprintf("detected %s can use these Dokploy apps: %s", supportResourceKindLabel(requirement.Kind), summarizeSupportResourceLabels(linkedResourceCandidateLabels(links), 4)))
 		}
 	}
 }
@@ -656,7 +683,7 @@ func addVolumeActions(plan *AppPlan) {
 	for _, volume := range plan.Resources.Volumes {
 		switch volume.Type {
 		case "bind":
-			plan.add(SeverityWarn, "volume", fmt.Sprintf("review bind mount portability for %s", volumeResourceLabel(volume)))
+			plan.add(SeverityInfo, "volume", hostFileMountAction(volume))
 		case "volume":
 			plan.add(SeverityInfo, "volume", fmt.Sprintf("would create target volume and sync state for %s", volumeResourceLabel(volume)))
 		}
@@ -721,21 +748,65 @@ func topologyRisk(topology analyzer.Topology, code string) (analyzer.RiskReason,
 func linkedResourceCandidateLabels(links []LinkedResourceCandidate) []string {
 	labels := make([]string, 0, len(links))
 	for _, link := range links {
-		labels = append(labels, supportResourceLabel(link.App, link.Confidence))
+		labels = append(labels, supportResourceCandidateLabel(link))
 	}
 	return planutil.UniqueStrings(labels)
 }
 
-func supportResourceLabel(app, confidence string) string {
-	label := planutil.Fallback(app, "unknown")
-	if confidence != "" {
-		label += " (" + confidence + ")"
+func supportResourceCandidateLabel(link LinkedResourceCandidate) string {
+	label := planutil.Fallback(link.App, "unknown")
+	confidence := strings.TrimSpace(link.Confidence)
+	if confidence != "" && confidence != "likely" && confidence != "detected" {
+		label += " (possible match)"
 	}
 	return label
 }
 
+func supportResourceKindLabel(kind string) string {
+	switch kind {
+	case "database":
+		return "database"
+	case "redis":
+		return "redis/cache"
+	case "object-storage":
+		return "object storage"
+	case "email":
+		return "email"
+	default:
+		return strings.ReplaceAll(kind, "-", " ")
+	}
+}
+
+func summarizeSupportResourceLabels(labels []string, limit int) string {
+	if limit <= 0 || len(labels) <= limit {
+		return strings.Join(labels, ", ")
+	}
+	shown := append([]string{}, labels[:limit]...)
+	shown = append(shown, fmt.Sprintf("+%d more", len(labels)-limit))
+	return strings.Join(shown, ", ")
+}
+
 func volumeResourceLabel(volume VolumeResource) string {
 	return volumeTargetLabel(volume.Service, volume.Target)
+}
+
+func hostFileMountAction(volume VolumeResource) string {
+	return "will preserve VPS file/folder " + hostFileMountLabel(volume)
+}
+
+func hostFileMountLabel(volume VolumeResource) string {
+	source := strings.TrimSpace(volume.Source)
+	target := strings.TrimSpace(volume.Target)
+	switch {
+	case source != "" && target != "":
+		return source + " -> " + target
+	case source != "":
+		return source
+	case target != "":
+		return "mounted at " + target
+	default:
+		return "mounted into the container"
+	}
 }
 
 func volumeTargetLabel(service, target string) string {

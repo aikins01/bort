@@ -349,10 +349,19 @@ func FindEnvironmentInProject(project *Project, name string) *ProjectEnvironment
 }
 
 type Compose struct {
-	ComposeID     string `json:"composeId"`
-	Name          string `json:"name"`
-	AppName       string `json:"appName,omitempty"`
-	EnvironmentID string `json:"environmentId,omitempty"`
+	ComposeID     string       `json:"composeId"`
+	Name          string       `json:"name"`
+	AppName       string       `json:"appName,omitempty"`
+	EnvironmentID string       `json:"environmentId,omitempty"`
+	ComposeStatus string       `json:"composeStatus,omitempty"`
+	Deployments   []Deployment `json:"deployments,omitempty"`
+}
+
+type Deployment struct {
+	Status       string `json:"status,omitempty"`
+	Title        string `json:"title,omitempty"`
+	LogPath      string `json:"logPath,omitempty"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
 }
 
 type composeSearchResponse struct {
@@ -499,12 +508,19 @@ type CreateDomainRequest struct {
 	InternalPath    string `json:"internalPath"`
 }
 
+type UpdateDomainRequest struct {
+	DomainID        string `json:"domainId"`
+	Host            string `json:"host"`
+	DomainType      string `json:"domainType,omitempty"`
+	ServiceName     string `json:"serviceName,omitempty"`
+	Port            int    `json:"port,omitempty"`
+	HTTPS           bool   `json:"https"`
+	CertificateType string `json:"certificateType,omitempty"`
+	Path            string `json:"path,omitempty"`
+	InternalPath    string `json:"internalPath,omitempty"`
+}
+
 func (c *Client) CreateDomain(ctx context.Context, req CreateDomainRequest) (*Domain, error) {
-	if existing, err := c.FindDomainByHost(ctx, req.ComposeID, req.Host); err != nil {
-		return nil, err
-	} else if existing != nil {
-		return existing, nil
-	}
 	if req.DomainType == "" {
 		req.DomainType = "compose"
 	}
@@ -517,9 +533,95 @@ func (c *Client) CreateDomain(ctx context.Context, req CreateDomainRequest) (*Do
 	if req.InternalPath == "" {
 		req.InternalPath = "/"
 	}
+	if existing, err := c.FindDomainByHost(ctx, req.ComposeID, req.Host); err != nil {
+		return nil, err
+	} else if existing != nil {
+		if domainNeedsUpdate(*existing, req) {
+			return c.UpdateDomain(ctx, UpdateDomainRequest{
+				DomainID:        existing.DomainID,
+				Host:            req.Host,
+				DomainType:      req.DomainType,
+				ServiceName:     req.ServiceName,
+				Port:            req.Port,
+				HTTPS:           req.HTTPS,
+				CertificateType: req.CertificateType,
+				Path:            req.Path,
+				InternalPath:    req.InternalPath,
+			})
+		}
+		return existing, nil
+	}
 	var domain Domain
 	if err := c.do(ctx, http.MethodPost, "/api/domain.create", nil, req, &domain); err != nil {
 		return nil, err
 	}
 	return &domain, nil
+}
+
+func (c *Client) UpdateDomain(ctx context.Context, req UpdateDomainRequest) (*Domain, error) {
+	if strings.TrimSpace(req.DomainID) == "" {
+		return nil, fmt.Errorf("domainId is required to update dokploy domain %s", req.Host)
+	}
+	if strings.TrimSpace(req.Host) == "" {
+		return nil, fmt.Errorf("host is required to update dokploy domain %s", req.DomainID)
+	}
+	var domain Domain
+	if err := c.do(ctx, http.MethodPost, "/api/domain.update", nil, req, &domain); err != nil {
+		return nil, err
+	}
+	if domain.DomainID == "" {
+		domain = Domain{
+			DomainID:        req.DomainID,
+			Host:            req.Host,
+			DomainType:      req.DomainType,
+			ServiceName:     req.ServiceName,
+			Port:            req.Port,
+			HTTPS:           req.HTTPS,
+			CertificateType: req.CertificateType,
+			Path:            req.Path,
+			InternalPath:    req.InternalPath,
+		}
+	}
+	return &domain, nil
+}
+
+func domainNeedsUpdate(existing Domain, req CreateDomainRequest) bool {
+	if req.DomainType != "" && existing.DomainType != "" && !strings.EqualFold(existing.DomainType, req.DomainType) {
+		return true
+	}
+	if req.ServiceName != "" && existing.ServiceName != req.ServiceName {
+		return true
+	}
+	if req.Port > 0 && existing.Port != req.Port {
+		return true
+	}
+	if existing.HTTPS != req.HTTPS {
+		return true
+	}
+	if normalizeCertificateType(existing.CertificateType) != normalizeCertificateType(req.CertificateType) {
+		return true
+	}
+	if req.Path != "" && normalizeDomainPath(existing.Path) != normalizeDomainPath(req.Path) {
+		return true
+	}
+	if req.InternalPath != "" && normalizeDomainPath(existing.InternalPath) != normalizeDomainPath(req.InternalPath) {
+		return true
+	}
+	return false
+}
+
+func normalizeDomainPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "/"
+	}
+	return path
+}
+
+func normalizeCertificateType(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "none"
+	}
+	return value
 }

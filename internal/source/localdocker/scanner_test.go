@@ -42,13 +42,13 @@ func TestRoutesFromLabelsExtractsHostsAndServicePort(t *testing.T) {
 
 func TestCaddyRoutesFromLabelsExtractsHostsAndPort(t *testing.T) {
 	labels := map[string]string{
-		"caddy_ingress_network":                       "coolify",
-		"caddy_0":                                     "https://app.example.com",
-		"caddy_0.handle_path.0_reverse_proxy":         "{{upstreams 3000}}",
-		"caddy_1":                                     "https://api.example.com/v1",
-		"caddy_1.handle_path.1_reverse_proxy":         "{{upstreams}}",
-		"traefik.http.routers.web.rule":               "Host(`legacy.example.com`)",
-		"traefik.http.routers.web.service":            "app-svc",
+		"caddy_ingress_network":               "coolify",
+		"caddy_0":                             "https://app.example.com",
+		"caddy_0.handle_path.0_reverse_proxy": "{{upstreams 3000}}",
+		"caddy_1":                             "https://api.example.com/v1",
+		"caddy_1.handle_path.1_reverse_proxy": "{{upstreams}}",
+		"traefik.http.routers.web.rule":       "Host(`legacy.example.com`)",
+		"traefik.http.routers.web.service":    "app-svc",
 		"traefik.http.services.app-svc.loadbalancer.server.port": "8080",
 	}
 
@@ -289,6 +289,41 @@ func TestScanPopulatesNewServiceFields(t *testing.T) {
 	v := m.Volumes[0]
 	if v.SizeBytes != 4096 || v.FileCount != 12 {
 		t.Fatalf("unexpected volume metrics: %+v", v)
+	}
+}
+
+func TestScanIgnoresDokployTargetComposeStacks(t *testing.T) {
+	scanner := &Scanner{
+		Now: func() time.Time { return time.Unix(0, 0).UTC() },
+		runCommand: func(_ context.Context, args ...string) ([]byte, error) {
+			switch {
+			case len(args) == 2 && args[0] == "ps" && args[1] == "-aq":
+				return []byte("source\ntarget\ndokploy\ndokploy-db\ndokploy-traefik\n"), nil
+			case len(args) > 0 && args[0] == "inspect":
+				return []byte(`[
+					{"Id":"source","Name":"/source-api","Image":"sha256:source","Config":{"Image":"app:1","Labels":{"com.docker.compose.project":"source-api","com.docker.compose.project.working_dir":"/data/coolify/app/source-api"}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
+					{"Id":"target","Name":"/compose-noisy-source-api-1","Image":"sha256:target","Config":{"Image":"app:1","Labels":{"com.docker.compose.project":"compose-noisy","com.docker.compose.project.working_dir":"/etc/dokploy/compose/compose-noisy/code"}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
+					{"Id":"dokploy","Name":"/dokploy.1.task","Image":"sha256:dokploy","Config":{"Image":"dokploy/dokploy:latest","Labels":{"com.docker.swarm.service.name":"dokploy"}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
+					{"Id":"dokploy-db","Name":"/dokploy-postgres.1.task","Image":"sha256:db","Config":{"Image":"postgres:16","Labels":{"com.docker.swarm.service.name":"dokploy-postgres"}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
+					{"Id":"dokploy-traefik","Name":"/dokploy-traefik","Image":"sha256:traefik","Config":{"Image":"traefik:v3.6.7","Labels":{}},"State":{"Status":"created"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}}
+				]`), nil
+			case len(args) >= 2 && args[0] == "image" && args[1] == "inspect":
+				return []byte(`[]`), nil
+			case len(args) == 3 && args[0] == "volume" && args[1] == "ls" && args[2] == "-q":
+				return []byte(""), nil
+			case len(args) == 3 && args[0] == "network" && args[1] == "ls" && args[2] == "-q":
+				return []byte(""), nil
+			}
+			return nil, fmt.Errorf("unexpected docker args: %v", args)
+		},
+	}
+
+	m, err := scanner.Scan(context.Background(), source.ScanOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Apps) != 1 || m.Apps[0].Name != "source-api" {
+		t.Fatalf("expected only source app, got %+v", m.Apps)
 	}
 }
 

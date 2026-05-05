@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -188,15 +190,29 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	bundleFlagSet := flagSet(fs, "bundle")
 
-	loadedRun, err := createMigrationRun(migrationRunOptions{
+	opts := migrationRunOptions{
 		BundleDir:                bundleDir,
 		Target:                   target,
 		AppName:                  appName,
 		RunRef:                   runRef,
 		ObservationWindowSeconds: observationWindowSeconds,
 		RollbackWindowSeconds:    rollbackWindowSeconds,
-	})
+	}
+	if live {
+		if activeRef, ok := activeApplyRunRefForMigrate(opts, bundleFlagSet); ok {
+			loadedRun, err := loadMigrationRun(activeRef)
+			if err != nil {
+				return err
+			}
+			summary := summarizeMigrationRun(loadedRun)
+			writeMigrationRunText(stdout, "Migration run loaded", summary)
+			return applyLiveMigration(ctx, loadedRun, stderr, nil)
+		}
+	}
+
+	loadedRun, err := migrationRunForMigrateCommand(opts, live, bundleFlagSet)
 	if err != nil {
 		return err
 	}
@@ -210,19 +226,83 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	return nil
 }
 
+func migrationRunForMigrateCommand(opts migrationRunOptions, live, bundleFlagSet bool) (loadedMigrationRun, error) {
+	if strings.TrimSpace(opts.RunRef) != "" && !bundleFlagSet && migrationRunMetadataExists(opts.RunRef) {
+		return refreshMigrationRun(opts.RunRef)
+	}
+	if live && strings.TrimSpace(opts.RunRef) == "" && !bundleFlagSet && opts.BundleDir == "bort-bundle" && !defaultBundleExists() {
+		if latestRef, ok := latestRunRef(); ok {
+			return refreshMigrationRun(latestRef)
+		}
+	}
+	return createMigrationRun(opts)
+}
+
+func activeApplyRunRefForMigrate(opts migrationRunOptions, bundleFlagSet bool) (string, bool) {
+	if strings.TrimSpace(opts.RunRef) != "" && migrationRunMetadataExists(opts.RunRef) && applyRunActive(opts.RunRef) {
+		return opts.RunRef, true
+	}
+	if strings.TrimSpace(opts.RunRef) == "" && !bundleFlagSet {
+		if latestRef, ok := latestRunRef(); ok && applyRunActive(latestRef) {
+			return latestRef, true
+		}
+	}
+	return "", false
+}
+
+func applyRunActive(runRef string) bool {
+	runDir, err := existingRunDir(runRef)
+	if err != nil {
+		return false
+	}
+	pid := readApplyLockPID(filepath.Join(runDir, "apply.lock"))
+	return pid > 0 && applyLockPIDRunning(pid)
+}
+
+func migrationRunMetadataExists(runRef string) bool {
+	runDir, err := existingRunDir(runRef)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(runDir, "run.json"))
+	return err == nil
+}
+
+func flagSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
 func applyLiveMigration(ctx context.Context, run loadedMigrationRun, stderr io.Writer, onProgress func(dokploy.StepProgress)) error {
 	if run.Run.Target != "dokploy" {
 		return fmt.Errorf("--live is only supported for target dokploy, got %q", run.Run.Target)
 	}
-	client, err := resolveDokployClient(ctx, run.Run.Target, os.Stdin, stderr)
+	appliedPath, err := safeRunArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied)
 	if err != nil {
 		return err
 	}
-	if err := client.Ping(ctx); err != nil {
-		return fmt.Errorf("dokploy ping failed: %w", err)
-	}
-	appliedPath, err := safeRunArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied)
+	lockPath, err := safeRunArtifactPath(run.Run.RunDir, "apply.lock")
 	if err != nil {
+		return err
+	}
+	lock, err := acquireApplyLock(lockPath)
+	if err != nil {
+		if err == errApplyAlreadyRunning {
+			return attachLiveMigration(ctx, run, appliedPath, lockPath, stderr, onProgress)
+		}
+		return fmt.Errorf("lock live migration run: %w", err)
+	}
+	defer lock.Release()
+	client, err := ensureDokployClient(ctx, run.Run.Target, os.Stdin, stderr, stderr)
+	if err != nil {
+		if err == errDokploySetupSkipped {
+			return nil
+		}
 		return err
 	}
 	ledger, err := newAppliedLedger(appliedPath, run.Run)
@@ -232,6 +312,8 @@ func applyLiveMigration(ctx context.Context, run loadedMigrationRun, stderr io.W
 	plan := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
+	resumeFrom := completedApplyPrefix(plan.Steps, ledger.Snapshot())
+	plan.ResumeFrom = resumeFrom
 	fn := func(p dokploy.StepProgress) {
 		if p.Status == dokploy.StepStatusOK || p.Status == dokploy.StepStatusError || p.Status == dokploy.StepStatusSkipped {
 			if recordErr := ledger.Record(p); recordErr != nil {
@@ -244,11 +326,222 @@ func applyLiveMigration(ctx context.Context, run loadedMigrationRun, stderr io.W
 	}
 	plan.OnProgress = &fn
 	fmt.Fprintf(stderr, "live mode: %s reachable; planned %d dokploy step(s)\n", client.BaseURL, len(plan.Steps))
+	if resumeFrom > 0 && resumeFrom < len(plan.Steps) {
+		fmt.Fprintf(stderr, "live mode: resuming after %d completed step(s)\n", resumeFrom)
+	}
+	if resumeFrom == len(plan.Steps) && len(plan.Steps) > 0 {
+		fmt.Fprintln(stderr, "live mode: all planned dokploy steps are already recorded as complete")
+	}
 	return client.Apply(ctx, plan)
 }
 
-func resolveDokployClient(ctx context.Context, target string, stdin io.Reader, stderr io.Writer) (*dokploy.Client, error) {
+const liveAttachPollInterval = 2 * time.Second
+
+func attachLiveMigration(ctx context.Context, run loadedMigrationRun, appliedPath, lockPath string, stderr io.Writer, onProgress func(dokploy.StepProgress)) error {
+	plan := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
+	pid := readApplyLockPID(lockPath)
+	startedAt := time.Now().UTC()
+	var lastSeen time.Time
+	initialApplied, initialAppliedOK := readRunApplied(appliedPath, run.Run)
+	if initialAppliedOK == nil && completedApplyPrefix(plan.Steps, initialApplied) >= len(plan.Steps) && len(plan.Steps) > 0 {
+		entries := attachProgressEntries(plan.Steps, initialApplied, time.Time{})
+		emitAttachProgress(onProgress, entries)
+		if onProgress == nil {
+			fmt.Fprintf(stderr, "live mode: apply already complete (%d/%d step(s) recorded)\n", len(plan.Steps), len(plan.Steps))
+		}
+		return nil
+	}
+	if pid > 0 {
+		fmt.Fprintf(stderr, "live mode: another apply is already running (pid %d); attaching to progress\n", pid)
+	} else {
+		fmt.Fprintln(stderr, "live mode: another apply is already running; attaching to progress")
+	}
+	if initialAppliedOK == nil {
+		entries := attachProgressEntries(plan.Steps, initialApplied, time.Time{})
+		emitAttachProgress(onProgress, entries)
+		if latest, ok := latestAttachProgressEntry(entries); ok {
+			lastSeen = latest.updatedAt
+			if onProgress == nil {
+				writeAttachTextProgress(stderr, latest.progress, len(plan.Steps), "already recorded")
+			}
+		} else if onProgress == nil {
+			fmt.Fprintf(stderr, "live mode: 0/%d step(s) already recorded\n", len(plan.Steps))
+		}
+	}
+
+	ticker := time.NewTicker(liveAttachPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			applied, err := readRunApplied(appliedPath, run.Run)
+			if err != nil {
+				fmt.Fprintf(stderr, "warning: failed to read applied progress: %v\n", err)
+				continue
+			}
+			entries := attachProgressEntries(plan.Steps, applied, lastSeen)
+			if len(entries) > 0 {
+				emitAttachProgress(onProgress, entries)
+				latest, _ := latestAttachProgressEntry(entries)
+				lastSeen = latest.updatedAt
+				if onProgress == nil {
+					writeAttachTextProgress(stderr, latest.progress, len(plan.Steps), "recorded")
+				}
+			}
+			if completedApplyPrefix(plan.Steps, applied) >= len(plan.Steps) {
+				return nil
+			}
+			if pid <= 0 || applyLockPIDRunning(pid) {
+				continue
+			}
+			return attachExitResult(run, plan.Steps, applied, startedAt)
+		}
+	}
+}
+
+func readApplyLockPID(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid < 0 {
+		return 0
+	}
+	return pid
+}
+
+type attachProgressEntry struct {
+	progress  dokploy.StepProgress
+	updatedAt time.Time
+}
+
+func attachProgressEntries(steps []dokploy.Step, applied runApplied, after time.Time) []attachProgressEntry {
+	entries := []attachProgressEntry{}
+	for _, recorded := range applied.Steps {
+		if recorded.Index < 0 || recorded.Index >= len(steps) || recorded.UpdatedAt.IsZero() || !recorded.UpdatedAt.After(after) {
+			continue
+		}
+		step := steps[recorded.Index]
+		if !appliedStepMatches(recorded, step) || !attachStatusRecorded(recorded.Status) {
+			continue
+		}
+		progress := dokploy.StepProgress{Index: recorded.Index, Total: len(steps), Step: step, Status: dokploy.StepStatus(recorded.Status)}
+		if recorded.Error != "" {
+			progress.Err = errors.New(recorded.Error)
+		}
+		entries = append(entries, attachProgressEntry{progress: progress, updatedAt: recorded.UpdatedAt})
+	}
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].updatedAt.Before(entries[j].updatedAt) })
+	return entries
+}
+
+func attachStatusRecorded(status string) bool {
+	return status == string(dokploy.StepStatusOK) || status == string(dokploy.StepStatusSkipped) || status == string(dokploy.StepStatusError)
+}
+
+func emitAttachProgress(onProgress func(dokploy.StepProgress), entries []attachProgressEntry) {
+	if onProgress == nil {
+		return
+	}
+	for _, entry := range entries {
+		onProgress(entry.progress)
+	}
+}
+
+func latestAttachProgressEntry(entries []attachProgressEntry) (attachProgressEntry, bool) {
+	if len(entries) == 0 {
+		return attachProgressEntry{}, false
+	}
+	return entries[len(entries)-1], true
+}
+
+func writeAttachTextProgress(stderr io.Writer, progress dokploy.StepProgress, total int, label string) {
+	fmt.Fprintf(stderr, "live mode: %d/%d step(s) %s; latest %s %s/%s %s\n", progress.Index+1, total, label, progress.Status, progress.Step.App, progress.Step.Ref, progress.Step.Kind)
+}
+
+func attachExitResult(run loadedMigrationRun, steps []dokploy.Step, applied runApplied, attachedAt time.Time) error {
+	completed := completedApplyPrefix(steps, applied)
+	if completed >= len(steps) {
+		return nil
+	}
+	if failed, ok := latestAttachFailure(steps, applied, attachedAt); ok {
+		return fmt.Errorf("live migration exited after %d/%d recorded step(s); latest failure: %s %s/%s: %s", completed, len(steps), failed.Kind, failed.App, failed.Ref, failed.Error)
+	}
+	return fmt.Errorf("live migration exited after %d/%d recorded step(s); rerun `%s` to continue", completed, len(steps), liveApplyCommand(run))
+}
+
+func latestAttachFailure(steps []dokploy.Step, applied runApplied, attachedAt time.Time) (appliedStep, bool) {
+	var latest appliedStep
+	found := false
+	for _, step := range applied.Steps {
+		if step.Status != string(dokploy.StepStatusError) || step.UpdatedAt.Before(attachedAt.Add(-5*time.Second)) {
+			continue
+		}
+		if step.Index < 0 || step.Index >= len(steps) || !appliedStepMatches(step, steps[step.Index]) {
+			continue
+		}
+		if !found || step.UpdatedAt.After(latest.UpdatedAt) {
+			latest = step
+			found = true
+		}
+	}
+	return latest, found
+}
+
+func ensureDokployClient(ctx context.Context, target string, stdin io.Reader, stdout, stderr io.Writer) (*dokploy.Client, error) {
+	client, err := lookupDokployClient(target)
+	if err == nil {
+		if pingErr := client.Ping(ctx); pingErr == nil {
+			return client, nil
+		} else if target == "dokploy" && stdinIsTerminal(stdin) {
+			if err := promptInstallAndBootstrapDokploy(ctx, stdin, stdout, stderr, client.BaseURL, pingErr); err != nil {
+				return nil, err
+			}
+			return pingConfiguredDokployClient(ctx, target)
+		} else {
+			return nil, fmt.Errorf("dokploy is not reachable at %s: %w. run `bort init-target dokploy --install --dokploy-url %s`", client.BaseURL, pingErr, client.BaseURL)
+		}
+	}
+	if target == "dokploy" && stdinIsTerminal(stdin) {
+		if err := promptInstallAndBootstrapDokploy(ctx, stdin, stdout, stderr, "", err); err != nil {
+			return nil, err
+		}
+		return pingConfiguredDokployClient(ctx, target)
+	}
+	return nil, err
+}
+
+func pingConfiguredDokployClient(ctx context.Context, target string) (*dokploy.Client, error) {
+	client, err := lookupDokployClient(target)
+	if err != nil {
+		return nil, err
+	}
+	if err := client.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("dokploy ping failed after install/bootstrap: %w", err)
+	}
+	return client, nil
+}
+
+func lookupDokployClient(target string) (*dokploy.Client, error) {
 	if client, err := dokploy.NewClientFromEnv(); err == nil {
+		return client, nil
+	}
+	state, err := readBortState(defaultStatePath())
+	if err != nil {
+		return nil, err
+	}
+	creds, ok := state.Targets[target]
+	if ok && creds.URL != "" && creds.Token != "" {
+		return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
+	}
+	return nil, fmt.Errorf("no dokploy credentials available: set %s and %s, or run `bort init-target dokploy --install`", dokploy.EnvBaseURL, dokploy.EnvToken)
+}
+
+func resolveDokployClient(ctx context.Context, target string, stdin io.Reader, stderr io.Writer) (*dokploy.Client, error) {
+	if client, err := lookupDokployClient(target); err == nil {
 		return client, nil
 	}
 	state, err := readBortState(defaultStatePath())
@@ -402,13 +695,17 @@ func refreshMigrationRun(runRef string) (loadedMigrationRun, error) {
 		return loadedMigrationRun{}, err
 	}
 	existing.Artifacts = existing.Artifacts.withDefaults()
+	manifestPath := existing.ManifestPath
+	if manifestPath == "" && strings.TrimSpace(existing.Source) != "" {
+		manifestPath = runArtifactPath(runDir, "manifest.json")
+	}
 	return createMigrationRun(migrationRunOptions{
 		BundleDir:                existing.BundleDir,
 		Target:                   existing.Target,
 		AppName:                  existing.AppName,
 		RunRef:                   runDir,
 		Source:                   existing.Source,
-		ManifestPath:             existing.ManifestPath,
+		ManifestPath:             manifestPath,
 		ObservationWindowSeconds: existing.ObservationWindowSeconds,
 		RollbackWindowSeconds:    existing.RollbackWindowSeconds,
 	})
@@ -634,10 +931,21 @@ func nextSafeStep(run loadedMigrationRun, decisions []runDecision) runNextStep {
 		}
 	}
 	return runNextStep{
-		Action:   "run `bort migrate --live` to apply the planned steps against the target",
+		Action:   fmt.Sprintf("run `%s` to apply the planned steps against the target", liveApplyCommand(run)),
 		Reason:   "all gates are clear and target credentials are stored",
 		Artifact: runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Commit),
 	}
+}
+
+func liveApplyCommand(run loadedMigrationRun) string {
+	runRef := strings.TrimSpace(run.Run.Name)
+	if runRef == "" {
+		runRef = run.Run.RunDir
+	}
+	if runRef == "" {
+		return "bort migrate --live"
+	}
+	return "bort migrate --live --run " + shellQuote(runRef)
 }
 
 func hasDokployCredentials(target string) bool {
@@ -680,25 +988,6 @@ func generateRunDecisions(run loadedMigrationRun, generatedAt time.Time) runDeci
 			builder.addGate(gate)
 		}
 	}
-	for _, app := range run.Sync.Apps {
-		if isPlatformRunApp(app.Role) {
-			continue
-		}
-		for _, step := range app.Steps {
-			if step.ResourceType == "volume" && step.Strategy == syncplan.StrategyDockerVolumeArchive {
-				builder.addItem("volume_copy", runDecisionItem{
-					Stage:       "sync",
-					App:         app.Name,
-					Code:        "volume.copy_default",
-					ResourceRef: step.ResourceRef,
-					Message:     fmt.Sprintf("confirm Docker volume copy for %s", step.ResourceRef),
-					Readiness:   preparer.ReadinessNeedsDecision,
-					Artifact:    runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Sync),
-				})
-			}
-		}
-	}
-
 	decisions.Decisions = builder.decisions()
 	return decisions
 }
@@ -783,7 +1072,7 @@ func decisionKindForGate(gate runGateSummary) string {
 	case strings.HasPrefix(code, "data_store."):
 		return "data_stores"
 	case code == "volume.bind_mount_review":
-		return "bind_mounts"
+		return "host_files"
 	case strings.HasPrefix(code, "domain."), code == "routes.none":
 		return "routes"
 	case strings.HasPrefix(code, "cutover."):
@@ -812,11 +1101,11 @@ func decisionAction(decision runDecision) string {
 	case "external_requirements":
 		return fmt.Sprintf("resolve external requirements for %d app(s)", apps)
 	case "support_resources":
-		return fmt.Sprintf("choose or confirm support resources for %d app(s)", apps)
+		return fmt.Sprintf("review database/storage settings for %d app(s)", apps)
 	case "data_stores":
 		return fmt.Sprintf("confirm data-store strategies for %d service(s)", count)
-	case "bind_mounts":
-		return fmt.Sprintf("map or confirm bind mounts for %d app(s)", apps)
+	case "host_files":
+		return fmt.Sprintf("review VPS files/folders for %d app(s)", apps)
 	case "volume_copy":
 		return fmt.Sprintf("confirm %d volume-copy default(s)", count)
 	case "routes":
@@ -833,6 +1122,12 @@ func decisionAction(decision runDecision) string {
 }
 
 func decisionReason(decision runDecision) string {
+	switch decision.Kind {
+	case "support_resources":
+		return fmt.Sprintf("%d item(s), %d app(s): these apps reference database, cache, or storage settings that may point at another Coolify app", decision.Count, len(decision.Apps))
+	case "host_files":
+		return fmt.Sprintf("%d item(s), %d app(s): these apps mount files or folders from this VPS into their containers", decision.Count, len(decision.Apps))
+	}
 	return fmt.Sprintf("%d item(s), %d app(s): %s", decision.Count, len(decision.Apps), strings.Join(decision.Codes, ", "))
 }
 
@@ -857,7 +1152,7 @@ func decisionOrder(kind string) int {
 		"external_requirements": 4,
 		"support_resources":     5,
 		"data_stores":           6,
-		"bind_mounts":           7,
+		"host_files":            7,
 		"volume_copy":           8,
 		"routes":                9,
 		"cutover":               10,
@@ -1003,6 +1298,12 @@ func nextAction(gate runGateSummary) string {
 	case preparer.ReadinessNeedsInput:
 		return fmt.Sprintf("fill the %s input %s, then rerun the local dry-run", gate.Stage, gate.Code)
 	default:
+		if gate.Code == preparer.GateVolumeBindMountReview {
+			return "review the listed VPS files/folders only if their source paths should change"
+		}
+		if strings.HasPrefix(gate.Code, preparer.GateCodePrefixLinkedResource) || strings.HasPrefix(gate.Code, preparer.GateCodePrefixExternalRequirement) {
+			return "review the detected database/storage settings only if they should change"
+		}
 		switch gate.Stage {
 		case "prepare":
 			return fmt.Sprintf("decide the prepare gate %s before trusting target setup", gate.Code)

@@ -156,7 +156,7 @@ func TestAnalyzeAppInManifestLinksSupportResources(t *testing.T) {
 	app := manifest.App{
 		ID:       "compose:app",
 		Name:     "app",
-		Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "vela"},
+		Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "demo-project"},
 		Services: []manifest.Service{{
 			Name:        "web",
 			Image:       "example/web",
@@ -168,7 +168,7 @@ func TestAnalyzeAppInManifestLinksSupportResources(t *testing.T) {
 		ID:       "compose:postgres",
 		Name:     "postgres support",
 		Runtime:  "database",
-		Metadata: map[string]string{"migrationRole": "support", "coolify.project": "vela"},
+		Metadata: map[string]string{"migrationRole": "support", "coolify.project": "demo-project"},
 		Services: []manifest.Service{{
 			Name:     "postgres",
 			Image:    "pgvector/pgvector:pg16",
@@ -195,6 +195,93 @@ func TestAnalyzeAppInManifestLinksSupportResources(t *testing.T) {
 	}
 }
 
+func TestAnalyzeAppInManifestDetectsSupportResourceFromEnvValue(t *testing.T) {
+	app := manifest.App{
+		ID:       "compose:app",
+		Name:     "app",
+		Metadata: map[string]string{"migrationRole": "candidate"},
+		Services: []manifest.Service{{
+			Name:  "web",
+			Image: "example/web",
+			Environment: []manifest.EnvVar{{
+				Name:       "DATABASE_URL",
+				Value:      "postgresql+asyncpg://user:pass@10.0.0.10:9965/postgres",
+				ValueKnown: true,
+			}},
+		}},
+	}
+	support := manifest.App{
+		ID:       "compose:postgres",
+		Name:     "postgres primary",
+		Runtime:  "database",
+		Metadata: map[string]string{"migrationRole": "support"},
+		Services: []manifest.Service{{
+			Name:  "postgres",
+			Image: "postgres:16-alpine",
+			Ports: []manifest.Port{{ContainerPort: "5432/tcp", HostIP: "0.0.0.0", HostPort: "9965"}},
+		}},
+	}
+
+	analysis := AnalyzeAppInManifest(manifest.Manifest{Apps: []manifest.App{app, support}}, app)
+	if len(analysis.LinkedResources) != 1 {
+		t.Fatalf("expected one linked resource, got %#v", analysis.LinkedResources)
+	}
+	link := analysis.LinkedResources[0]
+	if link.Kind != "database" || link.App != "postgres primary" || link.Confidence != "detected" {
+		t.Fatalf("unexpected link: %#v", link)
+	}
+	assertReason(t, link.Reasons, "env value points at this resource")
+}
+
+func TestTopologyCapturesSourceControlWithoutBlockingDeploy(t *testing.T) {
+	app := manifest.App{
+		Name:      "api",
+		BuildPack: "dockercompose",
+		Git: &manifest.GitSource{
+			Repository:      "https://github.com/example/api",
+			Branch:          "main",
+			Provider:        "github",
+			SourceType:      "App\\Models\\GithubApp",
+			SourceID:        "42",
+			ComposeLocation: "/docker-compose.yml",
+		},
+		Compose:  &manifest.ComposeSource{Raw: "services:\n  api:\n    image: example/api\n"},
+		Services: []manifest.Service{{Name: "api", Image: "example/api"}},
+		Routes:   []manifest.Route{{Host: "api.example.com", ServiceName: "api"}},
+	}
+
+	analysis := AnalyzeApp(app)
+	assertRisk(t, analysis.RiskReasons, "source_control.connect_dokploy")
+	if DeployReadiness(app) != DeployReady {
+		t.Fatalf("expected raw compose/image deploy to remain ready")
+	}
+	topology := TopologyForApp(app)
+	if topology.SourceControl == nil || topology.SourceControl.Auth != "coolify_github_app" || topology.SourceControl.Repository != "https://github.com/example/api" {
+		t.Fatalf("unexpected source control topology: %#v", topology.SourceControl)
+	}
+}
+
+func TestAnalyzeAppFlagsCoolifyServiceMagicEnvForReview(t *testing.T) {
+	app := manifest.App{
+		Name: "api",
+		Services: []manifest.Service{{
+			Name:  "api",
+			Image: "example/api",
+			Environment: []manifest.EnvVar{
+				{Name: "SERVICE_FQDN_WEB", Value: "api.example.com", ValueKnown: true},
+				{Name: "APP_ENV", Value: "production", ValueKnown: true},
+			},
+		}},
+		Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "api"}},
+	}
+
+	analysis := AnalyzeApp(app)
+	assertRisk(t, analysis.RiskReasons, "env.coolify_service_magic")
+	if names := CoolifyServiceMagicEnvNames(app); len(names) != 1 || names[0] != "SERVICE_FQDN_WEB" {
+		t.Fatalf("unexpected magic env names: %#v", names)
+	}
+}
+
 func findDataStore(t *testing.T, stores []DataStore, kind, service string) DataStore {
 	t.Helper()
 	for _, store := range stores {
@@ -214,4 +301,14 @@ func assertRisk(t *testing.T, risks []RiskReason, code string) {
 		}
 	}
 	t.Fatalf("expected risk %s in %#v", code, risks)
+}
+
+func assertReason(t *testing.T, reasons []string, want string) {
+	t.Helper()
+	for _, reason := range reasons {
+		if reason == want {
+			return
+		}
+	}
+	t.Fatalf("expected reason %q in %#v", want, reasons)
 }

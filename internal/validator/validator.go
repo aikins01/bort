@@ -196,7 +196,7 @@ func validateComposeTextWithPatterns(result *AppResult, compose string) {
 	}
 	if matches := absoluteBindPattern.FindAllStringSubmatch(compose, -1); len(matches) > 0 {
 		sources := uniqueMatches(matches, 1)
-		result.add(SeverityWarn, "compose.absolute_bind_mount", fmt.Sprintf("absolute bind mounts are not portable: %s", strings.Join(sources, ", ")))
+		result.add(SeverityInfo, "compose.absolute_bind_mount", fmt.Sprintf("compose preserves VPS files/folders on this server: %s", strings.Join(sources, ", ")))
 	}
 	if namedVolumePattern.MatchString(compose) && !topLevelVolumesPattern.MatchString(compose) {
 		result.add(SeverityWarn, "compose.undeclared_named_volume", "named volume mounts were found but no top-level volumes section was detected")
@@ -211,7 +211,7 @@ func addComposeAnalysisIssues(result *AppResult, analysis composeAnalysis) {
 		result.add(SeverityWarn, "compose.host_port", "host port bindings can conflict on Dokploy; prefer internal ports and Dokploy domains")
 	}
 	if len(analysis.AbsoluteBindSources) > 0 {
-		result.add(SeverityWarn, "compose.absolute_bind_mount", fmt.Sprintf("absolute bind mounts are not portable: %s", strings.Join(analysis.AbsoluteBindSources, ", ")))
+		result.add(SeverityInfo, "compose.absolute_bind_mount", fmt.Sprintf("compose preserves VPS files/folders on this server: %s", strings.Join(analysis.AbsoluteBindSources, ", ")))
 	}
 	if len(analysis.UndeclaredNamedVolumes) > 0 {
 		result.add(SeverityWarn, "compose.undeclared_named_volume", fmt.Sprintf("named volume mounts are missing top-level volume declarations: %s", strings.Join(analysis.UndeclaredNamedVolumes, ", ")))
@@ -419,7 +419,7 @@ func validateTopologyExternalRequirements(result *AppResult, topology analyzer.T
 	if len(topology.ExternalRequirements) == 0 {
 		return
 	}
-	result.add(SeverityWarn, "topology.external_requirements", fmt.Sprintf("external requirements inferred from env names must be resolved before deploy: %s", describeRequirements(topology.ExternalRequirements)))
+	result.add(SeverityInfo, "topology.external_requirements", fmt.Sprintf("existing external settings are preserved from env names: %s", describeRequirements(topology.ExternalRequirements)))
 }
 
 func validateTopologyLinkedResources(result *AppResult, topology analyzer.Topology) {
@@ -435,11 +435,11 @@ func validateTopologyLinkedResources(result *AppResult, topology analyzer.Topolo
 		links := linksByKind[requirement.Kind]
 		switch {
 		case len(links) == 0:
-			result.add(SeverityWarn, "topology.linked_resource_ambiguous", fmt.Sprintf("external %s requirement has no linked support resource candidate", requirement.Kind))
+			continue
 		case len(links) > 1:
-			result.add(SeverityWarn, "topology.linked_resource_ambiguous", fmt.Sprintf("external %s requirement has multiple possible support resource candidates: %s", requirement.Kind, strings.Join(resourceLinkLabels(links), ", ")))
-		case strings.ToLower(strings.TrimSpace(links[0].Confidence)) != "likely":
-			result.add(SeverityWarn, "topology.linked_resource_ambiguous", fmt.Sprintf("external %s requirement is linked to %s with %s confidence", requirement.Kind, planutil.Fallback(links[0].App, "unknown resource"), planutil.Fallback(links[0].Confidence, "unknown")))
+			result.add(SeverityInfo, "topology.linked_resource_candidates", fmt.Sprintf("%s settings have possible same-VPS Coolify matches: %s", requirement.Kind, strings.Join(resourceLinkLabels(links), ", ")))
+		default:
+			result.add(SeverityInfo, "topology.linked_resource_candidates", fmt.Sprintf("%s settings may already use %s", requirement.Kind, planutil.Fallback(links[0].App, "unknown resource")))
 		}
 	}
 }
@@ -466,7 +466,7 @@ func validateTopologyStatefulVolumes(result *AppResult, volumes []analyzer.State
 	}
 	bindMounts = planutil.UniqueStrings(bindMounts)
 	if len(bindMounts) > 0 {
-		result.add(SeverityWarn, "topology.bind_mounts", fmt.Sprintf("bind mount state is host-specific and needs portability review: %s", strings.Join(bindMounts, ", ")))
+		result.add(SeverityInfo, "topology.bind_mounts", fmt.Sprintf("VPS files/folders will be preserved on this server: %s", strings.Join(bindMounts, ", ")))
 	}
 }
 

@@ -18,13 +18,13 @@ const appliedAPIVersion = "bort.applied/v1alpha1"
 // step the live applier walks through so a partial run can be inspected and
 // safely retried.
 type runApplied struct {
-	APIVersion string                 `json:"apiVersion"`
-	RunName    string                 `json:"runName"`
-	BundleDir  string                 `json:"bundleDir,omitempty"`
-	Target     string                 `json:"target,omitempty"`
-	UpdatedAt  time.Time              `json:"updatedAt"`
-	Steps      []appliedStep          `json:"steps,omitempty"`
-	Apps       map[string]appliedApp  `json:"apps,omitempty"`
+	APIVersion string                `json:"apiVersion"`
+	RunName    string                `json:"runName"`
+	BundleDir  string                `json:"bundleDir,omitempty"`
+	Target     string                `json:"target,omitempty"`
+	UpdatedAt  time.Time             `json:"updatedAt"`
+	Steps      []appliedStep         `json:"steps,omitempty"`
+	Apps       map[string]appliedApp `json:"apps,omitempty"`
 }
 
 type appliedStep struct {
@@ -143,4 +143,65 @@ func (l *appliedLedger) Snapshot() runApplied {
 		clone.Apps[k] = v
 	}
 	return clone
+}
+
+func completedApplyPrefix(steps []dokploy.Step, applied runApplied) int {
+	strict := indexedCompletedApplyPrefix(steps, applied)
+	sequenced := sequencedCompletedApplyPrefix(steps, applied)
+	if sequenced > strict {
+		return sequenced
+	}
+	return strict
+}
+
+func indexedCompletedApplyPrefix(steps []dokploy.Step, applied runApplied) int {
+	byIndex := map[int]appliedStep{}
+	for _, step := range applied.Steps {
+		if step.Index < 0 || step.Index >= len(steps) {
+			continue
+		}
+		byIndex[step.Index] = step
+	}
+	for index, step := range steps {
+		recorded, ok := byIndex[index]
+		if !ok || !appliedStepCompleted(recorded) || !appliedStepMatches(recorded, step) {
+			return index
+		}
+	}
+	return len(steps)
+}
+
+func sequencedCompletedApplyPrefix(steps []dokploy.Step, applied runApplied) int {
+	completed := make([]appliedStep, 0, len(applied.Steps))
+	for _, step := range applied.Steps {
+		if step.Index < 0 || !appliedStepCompleted(step) {
+			continue
+		}
+		completed = append(completed, step)
+	}
+	sort.SliceStable(completed, func(i, j int) bool { return completed[i].Index < completed[j].Index })
+	searchFrom := 0
+	for index, step := range steps {
+		matched := false
+		for searchFrom < len(completed) {
+			recorded := completed[searchFrom]
+			searchFrom++
+			if appliedStepMatches(recorded, step) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return index
+		}
+	}
+	return len(steps)
+}
+
+func appliedStepCompleted(step appliedStep) bool {
+	return step.Status == string(dokploy.StepStatusOK) || step.Status == string(dokploy.StepStatusSkipped)
+}
+
+func appliedStepMatches(recorded appliedStep, step dokploy.Step) bool {
+	return recorded.Kind == string(step.Kind) && recorded.App == step.App && recorded.Ref == step.Ref
 }

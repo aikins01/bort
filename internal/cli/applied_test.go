@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/aikins01/bort/internal/target/dokploy"
+	"github.com/charmbracelet/bubbles/progress"
 )
 
 func TestAppliedLedgerRecordsAndPersists(t *testing.T) {
@@ -83,5 +84,75 @@ func TestReadRunAppliedRejectsUnknownAPIVersion(t *testing.T) {
 	}
 	if _, err := readRunApplied(path, migrationRun{Name: "run-3"}); err == nil {
 		t.Fatalf("expected error on unsupported apiVersion")
+	}
+}
+
+func TestCompletedApplyPrefixStopsAtFirstIncompleteOrMismatchedStep(t *testing.T) {
+	steps := []dokploy.Step{
+		{Kind: dokploy.StepCreateProject, App: "api", Ref: "api"},
+		{Kind: dokploy.StepCreateService, App: "api", Ref: "api"},
+		{Kind: dokploy.StepPushImage, App: "api", Ref: "api"},
+		{Kind: dokploy.StepInstallGateway, App: "api", Ref: "api.example.com"},
+	}
+	applied := runApplied{Steps: []appliedStep{
+		{Index: 0, Kind: string(dokploy.StepCreateProject), App: "api", Ref: "api", Status: string(dokploy.StepStatusOK)},
+		{Index: 1, Kind: string(dokploy.StepCreateService), App: "api", Ref: "api", Status: string(dokploy.StepStatusSkipped)},
+		{Index: 2, Kind: string(dokploy.StepPushImage), App: "api", Ref: "api", Status: string(dokploy.StepStatusError)},
+		{Index: 4, Kind: string(dokploy.StepResumeSource), App: "api", Ref: "api", Status: string(dokploy.StepStatusOK)},
+	}}
+	if got := completedApplyPrefix(steps, applied); got != 2 {
+		t.Fatalf("expected prefix 2, got %d", got)
+	}
+
+	applied.Steps[2].Status = string(dokploy.StepStatusOK)
+	applied.Steps = append(applied.Steps, appliedStep{Index: 3, Kind: string(dokploy.StepInstallGateway), App: "api", Ref: "wrong.example.com", Status: string(dokploy.StepStatusOK)})
+	if got := completedApplyPrefix(steps, applied); got != 3 {
+		t.Fatalf("expected prefix 3 for mismatched gateway, got %d", got)
+	}
+}
+
+func TestCompletedApplyPrefixToleratesRemovedRecordedSteps(t *testing.T) {
+	steps := []dokploy.Step{
+		{Kind: dokploy.StepCreateProject, App: "api", Ref: "api"},
+		{Kind: dokploy.StepCreateService, App: "api", Ref: "api"},
+	}
+	applied := runApplied{Steps: []appliedStep{
+		{Index: 0, Kind: string(dokploy.StepCreateProject), App: "api", Ref: "api", Status: string(dokploy.StepStatusOK)},
+		{Index: 1, Kind: string(dokploy.StepCreateProject), App: "removed", Ref: "removed", Status: string(dokploy.StepStatusOK)},
+		{Index: 2, Kind: string(dokploy.StepCreateService), App: "api", Ref: "api", Status: string(dokploy.StepStatusOK)},
+	}}
+	if got := completedApplyPrefix(steps, applied); got != 2 {
+		t.Fatalf("expected removed recorded step to be ignored, got prefix %d", got)
+	}
+}
+
+func TestProgressModelUsesStepIndexWhenResuming(t *testing.T) {
+	model := &progressModel{bar: progress.New(progress.WithoutPercentage()), total: 5, done: 3}
+	model.Update(progressTick{progress: dokploy.StepProgress{
+		Index:  3,
+		Total:  5,
+		Step:   dokploy.Step{Kind: dokploy.StepRestoreDataStore, App: "api", Ref: "data-store:db"},
+		Status: dokploy.StepStatusStarted,
+	}})
+	if model.done != 3 {
+		t.Fatalf("expected started step to preserve resumed count 3, got %d", model.done)
+	}
+	model.Update(progressTick{progress: dokploy.StepProgress{
+		Index:  3,
+		Total:  5,
+		Step:   dokploy.Step{Kind: dokploy.StepRestoreDataStore, App: "api", Ref: "data-store:db"},
+		Status: dokploy.StepStatusOK,
+	}})
+	if model.done != 4 {
+		t.Fatalf("expected completed resumed step to advance to 4, got %d", model.done)
+	}
+	model.Update(progressTick{progress: dokploy.StepProgress{
+		Index:  5,
+		Total:  5,
+		Step:   dokploy.Step{Kind: dokploy.StepResumeSource, App: "api", Ref: "api"},
+		Status: dokploy.StepStatusOK,
+	}})
+	if model.done != 4 {
+		t.Fatalf("expected out-of-plan cleanup step not to advance count, got %d", model.done)
 	}
 }

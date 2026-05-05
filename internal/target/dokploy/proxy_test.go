@@ -23,11 +23,11 @@ func TestPlanFromArtifactsAddsProxySwapAfterRoutes(t *testing.T) {
 	got := []StepKind{}
 	for _, step := range plan.Steps {
 		switch step.Kind {
-		case StepInstallGateway, StepStopCoolifyProxy, StepStartDokployProxy:
+		case StepInstallGateway, StepActivateRoutes, StepStopCoolifyProxy, StepStartDokployProxy:
 			got = append(got, step.Kind)
 		}
 	}
-	want := []StepKind{StepInstallGateway, StepStopCoolifyProxy, StepStartDokployProxy}
+	want := []StepKind{StepInstallGateway, StepActivateRoutes, StepStopCoolifyProxy, StepStartDokployProxy}
 	if len(got) != len(want) {
 		t.Fatalf("expected %v, got %v (full=%v)", want, got, plan.Steps)
 	}
@@ -43,7 +43,7 @@ func TestPlanFromArtifactsOmitsProxySwapWhenNoRoutes(t *testing.T) {
 	syncResult := syncplan.Result{Apps: []syncplan.AppPlan{{Name: "api"}}}
 	plan := PlanFromArtifacts(prepare, syncResult, gateway.Result{})
 	for _, step := range plan.Steps {
-		if step.Kind == StepStopCoolifyProxy || step.Kind == StepStartDokployProxy {
+		if step.Kind == StepActivateRoutes || step.Kind == StepStopCoolifyProxy || step.Kind == StepStartDokployProxy {
 			t.Fatalf("did not expect proxy swap without routes, got %v", plan.Steps)
 		}
 	}
@@ -108,7 +108,7 @@ func TestApplyStartDokployProxyStartsStopped(t *testing.T) {
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
 			"inspect --type container dokploy-traefik": []byte(`[{"Id":"dp-id","Name":"/dokploy-traefik","State":{"Running":false,"Status":"exited"}}]`),
-			"start dp-id":                              []byte("dp-id\n"),
+			"start dp-id": []byte("dp-id\n"),
 		},
 	}
 	client := &Client{Docker: runner}

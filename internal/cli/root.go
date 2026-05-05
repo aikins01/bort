@@ -36,6 +36,8 @@ func RunWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		return runRollback(ctx, args[1:], stdout, stderr)
 	case "commit":
 		return runCommit(ctx, args[1:], stdout, stderr)
+	case "cleanup":
+		return runCleanup(ctx, args[1:], stdout, stderr)
 	case "scan":
 		return runScan(ctx, args[1:], stdout, stderr)
 	case "plan":
@@ -81,6 +83,7 @@ func writePrimaryHelp(w io.Writer, st *styler) {
 		{verb: "bort migrate", desc: "create/update local dry-run migration artifacts"},
 		{verb: "bort rollback", desc: "plan a rollback to the source"},
 		{verb: "bort commit", desc: "plan final target acceptance"},
+		{verb: "bort cleanup", desc: "inventory leftovers and remove safe stale Dokploy metadata"},
 		{verb: "bort init-target dokploy", desc: "bootstrap a dokploy admin + api key from coolify credentials"},
 	})
 	writeHelpSection(w, st, "Other:", []helpLine{
@@ -97,6 +100,7 @@ func writeAdvancedHelp(w io.Writer, st *styler) {
 		{verb: "bort migrate", desc: "create/update local dry-run migration artifacts"},
 		{verb: "bort rollback", desc: "plan a rollback to the source"},
 		{verb: "bort commit", desc: "plan final target acceptance"},
+		{verb: "bort cleanup", desc: "dry-run leftover cleanup; --apply only removes safe Dokploy metadata"},
 	})
 	writeHelpSection(w, st, "Power-user pipeline (each step is local and dry-run only):", []helpLine{
 		{verb: "bort scan", desc: "discover local resources and write a migration manifest"},

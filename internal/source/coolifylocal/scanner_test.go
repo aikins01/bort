@@ -45,9 +45,9 @@ func TestScanEnrichesAppsFromCoolifyLabels(t *testing.T) {
 					"com.docker.compose.project.working_dir":  "/artifacts/example",
 					"coolify.environmentName":                 "production",
 					"coolify.managed":                         "true",
-					"coolify.projectName":                     "vela",
-					"coolify.resourceName":                    "marketmap",
-					"coolify.serviceName":                     "marketmap",
+					"coolify.projectName":                     "demo-project",
+					"coolify.resourceName":                    "demo-app",
+					"coolify.serviceName":                     "demo-app",
 					"coolify.type":                            "application",
 				},
 				Services: []manifest.Service{{Name: "web", Image: "example/web"}},
@@ -61,16 +61,16 @@ func TestScanEnrichesAppsFromCoolifyLabels(t *testing.T) {
 		t.Fatal(err)
 	}
 	app := result.Apps[0]
-	if app.Name != "marketmap" {
+	if app.Name != "demo-app" {
 		t.Fatalf("expected friendly app name, got %q", app.Name)
 	}
 	if app.Runtime != "application" {
 		t.Fatalf("expected application runtime, got %q", app.Runtime)
 	}
-	if app.Metadata["migrationRole"] != "candidate" || app.Metadata["coolify.project"] != "vela" || app.Metadata["coolify.uuid"] != "abc123" {
+	if app.Metadata["migrationRole"] != "candidate" || app.Metadata["coolify.project"] != "demo-project" || app.Metadata["coolify.uuid"] != "abc123" {
 		t.Fatalf("unexpected metadata: %#v", app.Metadata)
 	}
-	if len(result.Volumes) != 1 || len(result.Volumes[0].UsedBy) != 1 || result.Volumes[0].UsedBy[0] != "marketmap" {
+	if len(result.Volumes) != 1 || len(result.Volumes[0].UsedBy) != 1 || result.Volumes[0].UsedBy[0] != "demo-app" {
 		t.Fatalf("expected volume users to be renamed, got %#v", result.Volumes)
 	}
 }
@@ -103,7 +103,7 @@ func TestScanLoadsComposeAndProxyArtifactsFromDataDir(t *testing.T) {
 				Labels: map[string]string{
 					"com.docker.compose.project": "abc123",
 					"coolify.type":               "application",
-					"coolify.resourceName":       "marketmap",
+					"coolify.resourceName":       "demo-app",
 				},
 				Services: []manifest.Service{{Name: "web"}},
 			}},
@@ -123,6 +123,92 @@ func TestScanLoadsComposeAndProxyArtifactsFromDataDir(t *testing.T) {
 	}
 	if len(result.ProxyArtifacts) != 1 || result.ProxyArtifacts[0].Source != "traefik-dynamic" || result.ProxyArtifacts[0].Content != "http: {}\n" {
 		t.Fatalf("expected one traefik-dynamic proxy artifact, got %#v", result.ProxyArtifacts)
+	}
+}
+
+func TestScanHydratesEnvValuesFromCoolifyCompose(t *testing.T) {
+	dataDir := t.TempDir()
+	appDir := filepath.Join(dataDir, "applications", "abc123")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composeBody := strings.Join([]string{
+		"services:",
+		"  web:",
+		"    image: example/web",
+		"    env_file:",
+		"      - .env",
+		"    environment:",
+		"      API_URL: https://api.example.com",
+		"      EMPTY_FROM_COMPOSE: ''",
+		"  worker:",
+		"    image: example/worker",
+		"    environment:",
+		"      - QUEUE=critical",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(appDir, "docker-compose.yaml"), []byte(composeBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, ".env"), []byte("FROM_FILE=file-value\nQUOTED=\"quoted value\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := &Scanner{
+		DataDir: dataDir,
+		Docker: fakeScanner{manifest: manifest.Manifest{
+			APIVersion: manifest.APIVersion,
+			Apps: []manifest.App{{
+				ID:   "compose:abc123",
+				Name: "abc123",
+				Labels: map[string]string{
+					"com.docker.compose.project": "abc123",
+					"coolify.type":               "application",
+					"coolify.resourceName":       "demo-app",
+				},
+				Services: []manifest.Service{
+					{
+						Name: "web-abc123-123",
+						Labels: map[string]string{
+							"com.docker.compose.service": "web",
+						},
+						Environment: []manifest.EnvVar{{Name: "API_URL", ValueKnown: true}},
+					},
+					{
+						Name: "worker-abc123-123",
+						Labels: map[string]string{
+							"com.docker.compose.service": "worker",
+						},
+					},
+				},
+			}},
+		}},
+	}
+
+	result, err := scanner.Scan(context.Background(), source.ScanOptions{IncludeEnvValues: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := result.Apps[0]
+	web := app.Services[0]
+	worker := app.Services[1]
+	if got := envValue(web.Environment, "API_URL"); got != "https://api.example.com" {
+		t.Fatalf("expected API_URL from compose, got %q", got)
+	}
+	if got := envValue(web.Environment, "FROM_FILE"); got != "file-value" {
+		t.Fatalf("expected FROM_FILE from env_file, got %q", got)
+	}
+	if got := envValue(web.Environment, "QUOTED"); got != "quoted value" {
+		t.Fatalf("expected QUOTED from env_file, got %q", got)
+	}
+	if got := envValue(web.Environment, "EMPTY_FROM_COMPOSE"); got != "" || !envKnown(web.Environment, "EMPTY_FROM_COMPOSE") {
+		t.Fatalf("expected known empty compose value, got value=%q known=%v", got, envKnown(web.Environment, "EMPTY_FROM_COMPOSE"))
+	}
+	if got := envValue(worker.Environment, "QUEUE"); got != "critical" {
+		t.Fatalf("expected QUEUE from list environment, got %q", got)
+	}
+	if app.Compose == nil || app.Compose.Raw != composeBody {
+		t.Fatalf("expected compose raw preserved, got %#v", app.Compose)
 	}
 }
 
@@ -340,6 +426,24 @@ func TestLoadProxyArtifactsRejectsDirSymlink(t *testing.T) {
 }
 
 func runtimeIsWindows() bool { return os.PathSeparator == '\\' }
+
+func envValue(envs []manifest.EnvVar, name string) string {
+	for _, env := range envs {
+		if env.Name == name {
+			return env.Value
+		}
+	}
+	return ""
+}
+
+func envKnown(envs []manifest.EnvVar, name string) bool {
+	for _, env := range envs {
+		if env.Name == name {
+			return env.ValueKnown
+		}
+	}
+	return false
+}
 
 type fakeScanner struct {
 	manifest manifest.Manifest

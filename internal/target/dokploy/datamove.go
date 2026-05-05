@@ -1,6 +1,7 @@
 package dokploy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -90,13 +91,11 @@ func withTargetStopped(ctx context.Context, runner dockerRunner, target dockerCo
 	if !target.State.Running {
 		return op()
 	}
-	if _, err := runner.Output(ctx, "stop", target.ID); err != nil {
+	if err := stopContainer(ctx, runner, target.ID); err != nil {
 		return fmt.Errorf("stop target container %s: %w", target.ID, err)
 	}
 	opErr := op()
-	startCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if _, err := runner.Output(startCtx, "start", target.ID); err != nil {
+	if err := startContainer(context.Background(), runner, target.ID); err != nil {
 		if opErr != nil {
 			return fmt.Errorf("%w (target %s also failed to restart: %v)", opErr, target.ID, err)
 		}
@@ -124,7 +123,7 @@ func (c *Client) applyDumpDataStore(ctx context.Context, actx *applyContext, ste
 	}
 
 	runner := c.dockerRunner()
-	src, err := sourceContainer(ctx, runner, store.SourceContainerID, store.SourceContainerName)
+	src, err := sourceContainerForQuiesce(ctx, runner, commitTargetRef{id: store.SourceContainerID, name: store.SourceContainerName, service: store.Service})
 	if err != nil {
 		return fmt.Errorf("inspect source data store %s: %w", step.Ref, err)
 	}
@@ -188,6 +187,12 @@ func (c *Client) applyRestoreDataStore(ctx context.Context, actx *applyContext, 
 	if err != nil {
 		return err
 	}
+	restoreListPath, cleanupRestoreList, err := preparePgRestoreList(ctx, runner, dst.ID, dumpPath, step.App, step.Ref)
+	if err != nil {
+		return err
+	}
+	defer cleanupRestoreList()
+
 	file, err := os.Open(dumpPath)
 	if err != nil {
 		return fmt.Errorf("open dump file %s: %w", dumpPath, err)
@@ -204,7 +209,245 @@ func (c *Client) applyRestoreDataStore(ctx context.Context, actx *applyContext, 
 		"--clean", "--if-exists", "--no-owner", "--no-acl",
 		"--single-transaction", "--exit-on-error",
 	)
+	if restoreListPath != "" {
+		args = append(args, "-L", restoreListPath)
+	}
 	return runner.Run(ctx, file, nil, args...)
+}
+
+func preparePgRestoreList(ctx context.Context, runner dockerRunner, containerID, dumpPath, appName, ref string) (string, func(), error) {
+	noop := func() {}
+	dump, err := os.Open(dumpPath)
+	if err != nil {
+		return "", noop, fmt.Errorf("open dump file %s: %w", dumpPath, err)
+	}
+	defer dump.Close()
+
+	var list bytes.Buffer
+	if err := runner.Run(ctx, dump, &list, "exec", "-i", containerID, "pg_restore", "-l"); err != nil {
+		return "", noop, fmt.Errorf("list postgres dump %s: %w", dumpPath, err)
+	}
+	filtered, changed := filterPgRestoreList(list.String())
+	if !changed {
+		return "", noop, nil
+	}
+
+	listFile, err := os.CreateTemp(filepath.Dir(dumpPath), ".bort-pg-restore-list-")
+	if err != nil {
+		return "", noop, fmt.Errorf("create postgres restore list: %w", err)
+	}
+	hostListPath := listFile.Name()
+	if _, err := listFile.WriteString(filtered); err != nil {
+		listFile.Close()
+		os.Remove(hostListPath)
+		return "", noop, fmt.Errorf("write postgres restore list: %w", err)
+	}
+	if err := listFile.Chmod(0o644); err != nil {
+		listFile.Close()
+		os.Remove(hostListPath)
+		return "", noop, fmt.Errorf("chmod postgres restore list: %w", err)
+	}
+	if err := listFile.Close(); err != nil {
+		os.Remove(hostListPath)
+		return "", noop, fmt.Errorf("close postgres restore list: %w", err)
+	}
+
+	containerListPath := pgRestoreListContainerPath(appName, ref)
+	if _, err := runner.Output(ctx, "cp", hostListPath, containerID+":"+containerListPath); err != nil {
+		os.Remove(hostListPath)
+		return "", noop, fmt.Errorf("stage postgres restore list: %w", err)
+	}
+	cleanup := func() {
+		os.Remove(hostListPath)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = runner.Output(cleanupCtx, "exec", containerID, "rm", "-f", containerListPath)
+	}
+	return containerListPath, cleanup, nil
+}
+
+func pgRestoreListContainerPath(appName, ref string) string {
+	store := strings.TrimPrefix(ref, "data-store:")
+	return "/tmp/bort-restore-list-" + safeDataPathSegment(appName) + "-" + safeDataPathSegment(store) + ".list"
+}
+
+func filterPgRestoreList(list string) (string, bool) {
+	var filtered strings.Builder
+	changed := false
+	supabaseManaged := pgRestoreListHasSupabaseManagedSchemas(list)
+	for _, line := range strings.SplitAfter(list, "\n") {
+		if shouldSkipPgRestoreListLine(line, supabaseManaged) {
+			changed = true
+			continue
+		}
+		filtered.WriteString(line)
+	}
+	return filtered.String(), changed
+}
+
+func shouldSkipPgRestoreListLine(line string, supabaseManaged bool) bool {
+	if isPgRestoreEventTriggerListLine(line) {
+		return true
+	}
+	if !supabaseManaged {
+		return false
+	}
+	fields := pgRestoreListFields(line)
+	if len(fields) == 0 {
+		return false
+	}
+	if isSupabaseManagedExtensionListLine(fields) || isSupabaseRealtimePublicationListLine(fields) {
+		return true
+	}
+	namespace := pgRestoreListNamespace(fields)
+	if !supabaseManagedSchemas[namespace] {
+		return false
+	}
+	if isPgRestoreManagedDataListLine(fields) && !isSupabaseManagedMigrationDataListLine(fields) {
+		return false
+	}
+	return true
+}
+
+func pgRestoreListFields(line string) []string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, ";") {
+		return nil
+	}
+	return strings.Fields(trimmed)
+}
+
+func isPgRestoreEventTriggerListLine(line string) bool {
+	fields := pgRestoreListFields(line)
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == "EVENT" && fields[i+1] == "TRIGGER" {
+			return true
+		}
+	}
+	return false
+}
+
+var supabaseManagedSchemas = map[string]bool{
+	"auth":           true,
+	"extensions":     true,
+	"graphql":        true,
+	"graphql_public": true,
+	"pgbouncer":      true,
+	"pgsodium":       true,
+	"realtime":       true,
+	"storage":        true,
+	"vault":          true,
+}
+
+var supabaseMarkerSchemas = map[string]bool{
+	"auth":           true,
+	"graphql":        true,
+	"graphql_public": true,
+	"pgsodium":       true,
+	"realtime":       true,
+	"storage":        true,
+	"vault":          true,
+}
+
+var supabaseManagedExtensions = map[string]bool{
+	"pg_graphql":         true,
+	"pg_stat_statements": true,
+	"pgcrypto":           true,
+	"pgjwt":              true,
+	"pgsodium":           true,
+	"supabase_vault":     true,
+	"uuid-ossp":          true,
+}
+
+func pgRestoreListHasSupabaseManagedSchemas(list string) bool {
+	for _, line := range strings.Split(list, "\n") {
+		fields := pgRestoreListFields(line)
+		if len(fields) > 5 && fields[3] == "EXTENSION" && fields[4] == "-" && fields[5] == "supabase_vault" {
+			return true
+		}
+		if len(fields) < 6 || fields[3] != "SCHEMA" || fields[4] != "-" {
+			continue
+		}
+		owner := fields[len(fields)-1]
+		if supabaseMarkerSchemas[fields[5]] && strings.Contains(owner, "supabase") {
+			return true
+		}
+	}
+	return false
+}
+
+func pgRestoreListNamespace(fields []string) string {
+	if len(fields) < 4 {
+		return ""
+	}
+	switch fields[3] {
+	case "SCHEMA":
+		if len(fields) > 5 && fields[4] == "-" {
+			return fields[5]
+		}
+	case "TABLE":
+		if len(fields) > 5 && fields[4] == "DATA" {
+			return fields[5]
+		}
+		if len(fields) > 4 {
+			return fields[4]
+		}
+	case "FUNCTION", "VIEW", "DEFAULT", "CONSTRAINT", "INDEX", "TRIGGER", "POLICY":
+		if len(fields) > 4 {
+			return fields[4]
+		}
+	case "SEQUENCE":
+		if len(fields) > 5 && fields[4] == "SET" {
+			return fields[5]
+		}
+		if len(fields) > 6 && fields[4] == "OWNED" && fields[5] == "BY" {
+			return fields[6]
+		}
+		if len(fields) > 4 {
+			return fields[4]
+		}
+	case "COMMENT", "ACL":
+		if len(fields) > 4 && fields[4] != "-" {
+			return fields[4]
+		}
+	case "FK":
+		if len(fields) > 5 && fields[4] == "CONSTRAINT" {
+			return fields[5]
+		}
+	case "ROW":
+		if len(fields) > 5 && fields[4] == "SECURITY" {
+			return fields[5]
+		}
+	}
+	return ""
+}
+
+func isPgRestoreManagedDataListLine(fields []string) bool {
+	return len(fields) > 5 && ((fields[3] == "TABLE" && fields[4] == "DATA") || (fields[3] == "SEQUENCE" && fields[4] == "SET"))
+}
+
+func isSupabaseManagedMigrationDataListLine(fields []string) bool {
+	if !isPgRestoreManagedDataListLine(fields) || len(fields) <= 6 {
+		return false
+	}
+	namespace := fields[5]
+	name := fields[6]
+	return (namespace == "auth" && name == "schema_migrations") || (namespace == "storage" && name == "migrations")
+}
+
+func isSupabaseManagedExtensionListLine(fields []string) bool {
+	name := ""
+	if len(fields) > 5 && fields[3] == "EXTENSION" && fields[4] == "-" {
+		name = fields[5]
+	} else if len(fields) > 6 && fields[3] == "COMMENT" && fields[4] == "-" && fields[5] == "EXTENSION" {
+		name = fields[6]
+	}
+	name = strings.Trim(name, "\"")
+	return supabaseManagedExtensions[name]
+}
+
+func isSupabaseRealtimePublicationListLine(fields []string) bool {
+	return len(fields) > 5 && fields[3] == "PUBLICATION" && fields[4] == "-" && fields[5] == "supabase_realtime"
 }
 
 // waitPostgresReady polls pg_isready inside the target container so the
@@ -482,6 +725,15 @@ func (c *Client) targetContainerForService(ctx context.Context, runner dockerRun
 		if container, ok := pickComposeService(containers, service); ok {
 			return container, nil
 		}
+		if err := c.composeDeploymentError(ctx, entry); err != nil {
+			return dockerContainer{}, err
+		}
+		if len(containers) == 0 && entry.ComposeID != "" && !entry.DiscoveryRedeployAttempted {
+			entry.DiscoveryRedeployAttempted = true
+			if err := c.DeployCompose(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
+				return dockerContainer{}, fmt.Errorf("redeploy dokploy compose project %q for target discovery: %w", entry.ComposeAppName, err)
+			}
+		}
 		if time.Now().After(deadline) {
 			return dockerContainer{}, fmt.Errorf("target service %q not found in dokploy compose project %q after %s", service, entry.ComposeAppName, targetDiscoveryTimeout)
 		}
@@ -491,6 +743,44 @@ func (c *Client) targetContainerForService(ctx context.Context, runner dockerRun
 		case <-time.After(targetDiscoveryDelay):
 		}
 	}
+}
+
+func (c *Client) composeDeploymentError(ctx context.Context, entry *appCache) error {
+	if entry == nil || entry.ComposeID == "" {
+		return nil
+	}
+	compose, err := c.GetCompose(ctx, entry.ComposeID)
+	if err != nil {
+		return nil
+	}
+	if !strings.EqualFold(compose.ComposeStatus, "error") {
+		return nil
+	}
+	return fmt.Errorf("dokploy compose project %q deployment failed%s", entry.ComposeAppName, composeDeploymentDetails(compose))
+}
+
+func composeDeploymentDetails(compose *Compose) string {
+	if compose == nil || len(compose.Deployments) == 0 {
+		return ""
+	}
+	latest := compose.Deployments[0]
+	for _, deployment := range compose.Deployments {
+		if strings.EqualFold(deployment.Status, "error") {
+			latest = deployment
+			break
+		}
+	}
+	parts := []string{}
+	if strings.TrimSpace(latest.ErrorMessage) != "" {
+		parts = append(parts, latest.ErrorMessage)
+	}
+	if strings.TrimSpace(latest.LogPath) != "" {
+		parts = append(parts, "log: "+latest.LogPath)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return ": " + strings.Join(parts, "; ")
 }
 
 // refreshComposeAppName fetches the compose record by id and caches its
@@ -531,4 +821,3 @@ func pickComposeService(containers []dockerContainer, service string) (dockerCon
 	}
 	return fallback, haveFallback
 }
-

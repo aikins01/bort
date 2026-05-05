@@ -35,6 +35,7 @@ type Phase string
 
 const (
 	PhaseTargetPrepare      Phase = "target_prepare"
+	PhaseDependencyReuse    Phase = "dependency_reuse"
 	PhaseDependencyDecision Phase = "dependency_decision"
 	PhaseStateSync          Phase = "state_sync"
 	PhaseVerify             Phase = "verify"
@@ -144,11 +145,15 @@ func planApp(app preparer.AppPlan) AppPlan {
 
 	stateStepIDs := []string{}
 	for _, step := range dataStoreSteps(app, usedIDs, composeStep.ID) {
-		stateStepIDs = append(stateStepIDs, step.ID)
+		if requiresStateVerification(step) {
+			stateStepIDs = append(stateStepIDs, step.ID)
+		}
 		plan.addStep(step)
 	}
 	for _, step := range volumeSteps(app, usedIDs, composeStep.ID) {
-		stateStepIDs = append(stateStepIDs, step.ID)
+		if requiresStateVerification(step) {
+			stateStepIDs = append(stateStepIDs, step.ID)
+		}
 		plan.addStep(step)
 	}
 
@@ -198,14 +203,14 @@ func linkedResourceSteps(app preparer.AppPlan, usedIDs map[string]int) []Step {
 		resourceRef := "linked-resource:" + planutil.Fallback(link.App, link.Kind)
 		steps = append(steps, Step{
 			ID:           planutil.NextStepID(usedIDs, "dependency:"+link.Kind+":"+link.App),
-			Phase:        PhaseDependencyDecision,
+			Phase:        PhaseDependencyReuse,
 			ResourceType: "linked_resource",
 			ResourceRef:  resourceRef,
 			TargetRef:    linkedTargetRef(app, link),
-			Action:       "confirm_support_resource_candidate",
+			Action:       "reuse_detected_support_resource",
 			TargetAction: targetActions[newLinkedResourceKey(link.Kind, link.App, link.AppID)],
 			Strategy:     StrategyNone,
-			Pause:        PauseNeedsDecision,
+			Pause:        PauseNone,
 			Readiness:    link.Readiness,
 			Evidence:     planutil.UniqueStrings(append(append([]string{}, link.Reasons...), link.Networks...)),
 		})
@@ -243,11 +248,11 @@ func volumeSteps(app preparer.AppPlan, usedIDs map[string]int, composeStepID str
 		resourceRef := "volume:" + volumeResourceLabel(volume)
 		steps = append(steps, Step{
 			ID:           planutil.NextStepID(usedIDs, "state:volume:"+volume.Service+":"+volume.Target),
-			Phase:        PhaseStateSync,
+			Phase:        volumePhase(volume),
 			ResourceType: "volume",
 			ResourceRef:  resourceRef,
 			TargetRef:    volumeTargetRef(app, volume),
-			Action:       "plan_volume_sync",
+			Action:       volumeAction(volume),
 			TargetAction: targetActions[newVolumeKey(volume.Type, volume.Service, volume.Name, volume.Source, volume.Target)],
 			Strategy:     volumeStrategy(volume),
 			Pause:        volumePause(volume),
@@ -257,6 +262,10 @@ func volumeSteps(app preparer.AppPlan, usedIDs map[string]int, composeStepID str
 		})
 	}
 	return steps
+}
+
+func requiresStateVerification(step Step) bool {
+	return step.Phase == PhaseStateSync && step.Strategy != StrategyNone
 }
 
 func verifyStep(usedIDs map[string]int, dependencies []string) Step {
@@ -288,7 +297,7 @@ func actionKind(step Step) string {
 	switch step.Phase {
 	case PhaseTargetPrepare:
 		return "target-prepare"
-	case PhaseDependencyDecision:
+	case PhaseDependencyDecision, PhaseDependencyReuse:
 		return "linked-resource"
 	case PhaseVerify:
 		return "verify"
@@ -302,10 +311,13 @@ func actionMessage(step Step) string {
 	case "compose_app":
 		return fmt.Sprintf("requires prepared target compose app %s before state sync", planutil.Fallback(step.TargetRef, step.ResourceRef))
 	case "linked_resource":
-		return fmt.Sprintf("confirm support resource candidate %s before syncing dependent state", step.ResourceRef)
+		return fmt.Sprintf("reuse existing database/storage settings for %s", step.ResourceRef)
 	case "data_store":
 		return fmt.Sprintf("plan %s data-store sync for %s", step.Strategy, step.ResourceRef)
 	case "volume":
+		if step.Action == "preserve_host_path_mount" || step.TargetAction == "preserve_vps_file_mount" {
+			return fmt.Sprintf("preserve VPS file/folder for %s", step.ResourceRef)
+		}
 		return fmt.Sprintf("plan %s volume sync for %s", step.Strategy, step.ResourceRef)
 	case "app":
 		return "verify restored state before cutover"
@@ -354,12 +366,26 @@ func dataStorePause(store preparer.DataStoreResource) PauseRequirement {
 	}
 }
 
+func volumePhase(volume preparer.VolumeResource) Phase {
+	if volume.Type == "bind" {
+		return PhaseTargetPrepare
+	}
+	return PhaseStateSync
+}
+
+func volumeAction(volume preparer.VolumeResource) string {
+	if volume.Type == "bind" {
+		return "preserve_host_path_mount"
+	}
+	return "plan_volume_sync"
+}
+
 func volumeStrategy(volume preparer.VolumeResource) Strategy {
 	switch volume.Type {
 	case "volume":
 		return StrategyDockerVolumeArchive
 	case "bind":
-		return StrategyRsync
+		return StrategyNone
 	default:
 		return StrategyManual
 	}
@@ -370,7 +396,7 @@ func volumePause(volume preparer.VolumeResource) PauseRequirement {
 	case "volume":
 		return PauseStoppedSource
 	case "bind":
-		return PauseNeedsDecision
+		return PauseNone
 	default:
 		return PauseNeedsDecision
 	}

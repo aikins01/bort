@@ -72,7 +72,7 @@ func TestPlanCarriesSyncBlockersIntoCutoverPlan(t *testing.T) {
 		Apps: []manifest.App{
 			{
 				Name:     "web",
-				Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "vela"},
+				Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "demo-project"},
 				Services: []manifest.Service{{
 					Name:        "web",
 					Image:       "example/web:latest",
@@ -84,7 +84,7 @@ func TestPlanCarriesSyncBlockersIntoCutoverPlan(t *testing.T) {
 			{
 				Name:     "postgres support",
 				Runtime:  "database",
-				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "vela"},
+				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "demo-project"},
 				Services: []manifest.Service{{Name: "postgres", Image: "postgres:16-alpine"}},
 			},
 		},

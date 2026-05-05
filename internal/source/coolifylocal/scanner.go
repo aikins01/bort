@@ -6,13 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/aikins01/bort/internal/manifest"
 	"github.com/aikins01/bort/internal/safepath"
+	"github.com/aikins01/bort/internal/secrets"
 	"github.com/aikins01/bort/internal/source"
 	"github.com/aikins01/bort/internal/source/coolify"
 	"github.com/aikins01/bort/internal/source/localdocker"
+	"gopkg.in/yaml.v3"
 )
 
 const defaultDataDir = "/data/coolify"
@@ -39,7 +42,7 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 	result.Source.Platform = "coolify-local"
 	dataDir := s.dataDir()
 	proxyMode := detectProxyMode(dataDir)
-	enrichApps(&result, dataDir)
+	enrichApps(&result, dataDir, opts.IncludeEnvValues)
 	if opts.Coolify.BaseURL != "" && opts.Coolify.Token != "" {
 		apiScanner, err := coolify.NewScanner(opts.Coolify.BaseURL, opts.Coolify.Token)
 		if err != nil {
@@ -150,11 +153,11 @@ func (s *Scanner) dataDir() string {
 	return defaultDataDir
 }
 
-func enrichApps(result *manifest.Manifest, dataDir string) {
+func enrichApps(result *manifest.Manifest, dataDir string, includeEnvValues bool) {
 	renamed := map[string]string{}
 	for i := range result.Apps {
 		oldName := result.Apps[i].Name
-		enrichApp(&result.Apps[i], dataDir)
+		enrichApp(&result.Apps[i], dataDir, includeEnvValues)
 		if result.Apps[i].Name != oldName {
 			renamed[oldName] = result.Apps[i].Name
 		}
@@ -172,7 +175,7 @@ func enrichApps(result *manifest.Manifest, dataDir string) {
 	sort.Slice(result.Apps, func(i, j int) bool { return result.Apps[i].Name < result.Apps[j].Name })
 }
 
-func enrichApp(app *manifest.App, dataDir string) {
+func enrichApp(app *manifest.App, dataDir string, includeEnvValues bool) {
 	labels := appLabels(app)
 	if len(labels) == 0 {
 		return
@@ -208,7 +211,209 @@ func enrichApp(app *manifest.App, dataDir string) {
 			app.Compose.Raw = raw
 		}
 		putMetadata(app.Metadata, "coolify.composeFile", path)
+		if includeEnvValues {
+			hydrateServiceEnvFromCompose(app, dataDir, filepath.Dir(path), raw)
+		}
 	}
+}
+
+type composeEnvDocument struct {
+	Services map[string]composeEnvService `yaml:"services"`
+}
+
+type composeEnvService struct {
+	Environment yaml.Node `yaml:"environment"`
+	EnvFile     yaml.Node `yaml:"env_file"`
+}
+
+func hydrateServiceEnvFromCompose(app *manifest.App, dataDir, composeDir, raw string) {
+	valuesByService := composeEnvValues(dataDir, composeDir, raw)
+	if len(valuesByService) == 0 {
+		return
+	}
+	for i := range app.Services {
+		serviceName := app.Services[i].Labels["com.docker.compose.service"]
+		if serviceName == "" {
+			serviceName = app.Services[i].Name
+		}
+		values := valuesByService[serviceName]
+		if len(values) == 0 {
+			continue
+		}
+		app.Services[i].Environment = mergeEnvValues(app.Services[i].Environment, values)
+	}
+}
+
+func composeEnvValues(dataDir, composeDir, raw string) map[string]map[string]string {
+	var doc composeEnvDocument
+	if err := yaml.Unmarshal([]byte(raw), &doc); err != nil || len(doc.Services) == 0 {
+		return nil
+	}
+	valuesByService := map[string]map[string]string{}
+	for serviceName, service := range doc.Services {
+		values := map[string]string{}
+		for _, envFile := range envFilePaths(service.EnvFile) {
+			for key, value := range loadEnvFileValues(dataDir, composeDir, envFile) {
+				values[key] = value
+			}
+		}
+		for key, value := range envValuesFromNode(service.Environment) {
+			values[key] = value
+		}
+		if len(values) > 0 {
+			valuesByService[serviceName] = values
+		}
+	}
+	return valuesByService
+}
+
+func envValuesFromNode(node yaml.Node) map[string]string {
+	values := map[string]string{}
+	switch node.Kind {
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := strings.TrimSpace(node.Content[i].Value)
+			if key == "" {
+				continue
+			}
+			values[key] = scalarNodeValue(node.Content[i+1])
+		}
+	case yaml.SequenceNode:
+		for _, item := range node.Content {
+			if item.Kind != yaml.ScalarNode {
+				continue
+			}
+			key, value, ok := strings.Cut(item.Value, "=")
+			key = strings.TrimSpace(key)
+			if !ok || key == "" {
+				continue
+			}
+			values[key] = value
+		}
+	}
+	return values
+}
+
+func scalarNodeValue(node *yaml.Node) string {
+	if node == nil || node.Kind == 0 || node.Tag == "!!null" {
+		return ""
+	}
+	if node.Kind == yaml.ScalarNode {
+		return node.Value
+	}
+	return ""
+}
+
+func envFilePaths(node yaml.Node) []string {
+	paths := []string{}
+	switch node.Kind {
+	case yaml.ScalarNode:
+		if path := strings.TrimSpace(node.Value); path != "" {
+			paths = append(paths, path)
+		}
+	case yaml.SequenceNode:
+		for _, item := range node.Content {
+			switch item.Kind {
+			case yaml.ScalarNode:
+				if path := strings.TrimSpace(item.Value); path != "" {
+					paths = append(paths, path)
+				}
+			case yaml.MappingNode:
+				if path := envFilePathFromMapping(item); path != "" {
+					paths = append(paths, path)
+				}
+			}
+		}
+	case yaml.MappingNode:
+		if path := envFilePathFromMapping(&node); path != "" {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
+func envFilePathFromMapping(node *yaml.Node) string {
+	if node == nil {
+		return ""
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == "path" {
+			return strings.TrimSpace(node.Content[i+1].Value)
+		}
+	}
+	return ""
+}
+
+func loadEnvFileValues(dataDir, composeDir, envFile string) map[string]string {
+	envFile = strings.TrimSpace(envFile)
+	if envFile == "" || strings.Contains(envFile, "://") {
+		return nil
+	}
+	path := envFile
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(composeDir, path)
+	}
+	data, err := readContained(dataDir, path)
+	if err != nil {
+		return nil
+	}
+	return parseEnvAssignments(string(data))
+}
+
+func parseEnvAssignments(contents string) map[string]string {
+	values := map[string]string{}
+	for _, raw := range strings.Split(contents, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		key = strings.TrimSpace(key)
+		if !ok || key == "" {
+			continue
+		}
+		values[key] = unquoteEnvValue(strings.TrimSpace(value))
+	}
+	return values
+}
+
+func unquoteEnvValue(value string) string {
+	if len(value) < 2 {
+		return value
+	}
+	if value[0] == '\'' && value[len(value)-1] == '\'' {
+		return value[1 : len(value)-1]
+	}
+	if value[0] == '"' && value[len(value)-1] == '"' {
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			return unquoted
+		}
+	}
+	return value
+}
+
+func mergeEnvValues(envs []manifest.EnvVar, values map[string]string) []manifest.EnvVar {
+	indexes := map[string]int{}
+	for i, env := range envs {
+		indexes[env.Name] = i
+	}
+	for key, value := range values {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		if index, ok := indexes[key]; ok {
+			if !envs[index].ValueKnown || envs[index].Value == "" {
+				envs[index].Value = value
+				envs[index].ValueKnown = true
+			}
+			continue
+		}
+		envs = append(envs, manifest.EnvVar{Name: key, Value: value, ValueKnown: true, Sensitive: secrets.IsSensitiveName(key)})
+		indexes[key] = len(envs) - 1
+	}
+	sort.Slice(envs, func(i, j int) bool { return envs[i].Name < envs[j].Name })
+	return envs
 }
 
 func loadComposeRaw(dataDir, coolifyType, uuid string) (string, string) {
@@ -308,6 +513,14 @@ func appLabels(app *manifest.App) map[string]string {
 
 func resourceName(labels map[string]string) string {
 	uuid := labels["com.docker.compose.project"]
+	if labels["coolify.type"] == "database" {
+		return firstNonEmpty(
+			labels["coolify.resourceName"],
+			labels["coolify.serviceName"],
+			labels["coolify.name"],
+			uuid,
+		)
+	}
 	candidates := []string{
 		labels["coolify.service.subName"],
 		labels["coolify.serviceName"],
@@ -344,7 +557,9 @@ func migrationRole(labels map[string]string) string {
 		return "platform"
 	case project == "source", strings.Contains(workingDir, "/data/coolify/source"):
 		return "platform"
-	case project == "proxy", strings.Contains(workingDir, "/data/coolify/databases/"):
+	case project == "proxy", strings.Contains(workingDir, "/proxy"):
+		return "platform"
+	case strings.Contains(workingDir, "/data/coolify/databases/"):
 		return "support"
 	default:
 		return "candidate"

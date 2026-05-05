@@ -38,9 +38,23 @@ type guidePromptInput interface {
 
 func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
 	if runRef, ok := latestRunRef(); ok {
-		run, err := refreshMigrationRun(runRef)
+		if applyRunActive(runRef) {
+			run, err := loadMigrationRun(runRef)
+			if err != nil {
+				return err
+			}
+			if isRealTTY(stdin, stdout) {
+				return executeWithProgress(ctx, run, stdout, stderr)
+			}
+			writeAppFirstCockpit(stdout, run)
+			return nil
+		}
+		run, err := refreshGuideRun(ctx, runRef, stdin, stdout)
 		if err != nil {
 			return err
+		}
+		if isRealTTY(stdin, stdout) && readyToOfferLiveApply(run) {
+			return runWizard(ctx, run, stdin, stdout, stderr)
 		}
 		writeAppFirstCockpit(stdout, run)
 		return nil
@@ -89,6 +103,76 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 	}
 
 	return writeGuideStart(stdout)
+}
+
+func readyToOfferLiveApply(run loadedMigrationRun) bool {
+	return overallAppHealth(appsFromRun(run)) == appHealthReady
+}
+
+func refreshGuideRun(ctx context.Context, runRef string, stdin io.Reader, stdout io.Writer) (loadedMigrationRun, error) {
+	runDir := filepath.FromSlash(runRef)
+	existing, err := readRunMetadata(filepath.Join(runDir, "run.json"))
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	if shouldAutoRescanRun(existing) && !runHasAppliedSteps(existing) {
+		if isRealTTY(stdin, stdout) {
+			stopStatus := startScanStatus(stdout)
+			err = refreshRunSourceBundle(ctx, existing)
+			stopStatus(err)
+		} else {
+			err = refreshRunSourceBundle(ctx, existing)
+		}
+		if err != nil {
+			return loadedMigrationRun{}, err
+		}
+	}
+	return refreshMigrationRun(runRef)
+}
+
+func shouldAutoRescanRun(run migrationRun) bool {
+	sourceName := strings.TrimSpace(run.Source)
+	if sourceName == "" || sourceName == "manifest" {
+		return false
+	}
+	runDir := filepath.FromSlash(run.RunDir)
+	bundleDir := filepath.FromSlash(run.BundleDir)
+	if runDir == "" || bundleDir == "" {
+		return false
+	}
+	return containedPath(runDir, bundleDir) == nil
+}
+
+func runHasAppliedSteps(run migrationRun) bool {
+	run.Artifacts = run.Artifacts.withDefaults()
+	runDir := filepath.FromSlash(run.RunDir)
+	if runDir == "" {
+		return false
+	}
+	appliedPath, err := safeRunArtifactPath(runDir, run.Artifacts.Applied)
+	if err != nil {
+		return false
+	}
+	applied, err := readRunApplied(appliedPath, run)
+	return err == nil && len(applied.Steps) > 0
+}
+
+func refreshRunSourceBundle(ctx context.Context, run migrationRun) error {
+	runDir := filepath.FromSlash(run.RunDir)
+	bundleDir := filepath.FromSlash(run.BundleDir)
+	setup := guidedSetup{Source: run.Source, Target: run.Target, ManifestPath: run.ManifestPath}
+	m, _, err := guidedManifest(ctx, setup, runDir)
+	if err != nil {
+		return err
+	}
+	if err := containedPath(runDir, bundleDir); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(bundleDir); err != nil {
+		return err
+	}
+	_, err = exporter.Export(m, exporter.Options{OutputDir: bundleDir, AppName: run.AppName, IncludeEnvValues: true})
+	return err
 }
 
 // isRealTTY reports whether stdin and stdout are both attached to an

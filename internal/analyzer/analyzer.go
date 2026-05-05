@@ -2,6 +2,8 @@ package analyzer
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -28,6 +30,7 @@ type Topology struct {
 	StatefulVolumes      []StatefulVolume `json:"statefulVolumes"`
 	Routes               []manifest.Route `json:"routes"`
 	SourceServices       []SourceService  `json:"sourceServices,omitempty"`
+	SourceControl        *SourceControl   `json:"sourceControl,omitempty"`
 	RiskReasons          []RiskReason     `json:"riskReasons"`
 }
 
@@ -40,6 +43,18 @@ type SourceService struct {
 	ContainerID   string `json:"containerId,omitempty"`
 	ContainerName string `json:"containerName,omitempty"`
 	Image         string `json:"image,omitempty"`
+}
+
+type SourceControl struct {
+	Repository   string   `json:"repository,omitempty"`
+	Branch       string   `json:"branch,omitempty"`
+	CommitSHA    string   `json:"commitSha,omitempty"`
+	Provider     string   `json:"provider,omitempty"`
+	Auth         string   `json:"auth,omitempty"`
+	SourceType   string   `json:"sourceType,omitempty"`
+	SourceID     string   `json:"sourceId,omitempty"`
+	PrivateKeyID string   `json:"privateKeyId,omitempty"`
+	Evidence     []string `json:"evidence,omitempty"`
 }
 
 type Dependency struct {
@@ -191,6 +206,7 @@ func topologyForApp(app manifest.App, analysis AppAnalysis) Topology {
 		StatefulVolumes:      analysis.StatefulVolumes,
 		Routes:               appRoutes(app.Routes),
 		SourceServices:       sourceServices(app),
+		SourceControl:        sourceControl(app),
 		RiskReasons:          analysis.RiskReasons,
 	}
 }
@@ -209,6 +225,83 @@ func sourceServices(app manifest.App) []SourceService {
 		})
 	}
 	return services
+}
+
+func sourceControl(app manifest.App) *SourceControl {
+	if app.Git == nil {
+		return nil
+	}
+	control := &SourceControl{
+		Repository:   strings.TrimSpace(app.Git.Repository),
+		Branch:       strings.TrimSpace(app.Git.Branch),
+		CommitSHA:    strings.TrimSpace(app.Git.CommitSHA),
+		Provider:     strings.TrimSpace(app.Git.Provider),
+		SourceType:   strings.TrimSpace(app.Git.SourceType),
+		SourceID:     strings.TrimSpace(app.Git.SourceID),
+		PrivateKeyID: strings.TrimSpace(app.Git.PrivateKeyID),
+	}
+	if control.Provider == "" {
+		control.Provider = providerFromGit(control.Repository, control.SourceType)
+	}
+	control.Auth = sourceControlAuth(control)
+	control.Evidence = sourceControlEvidence(control)
+	if control.Repository == "" && control.Branch == "" && control.CommitSHA == "" && control.SourceType == "" && control.SourceID == "" && control.PrivateKeyID == "" {
+		return nil
+	}
+	return control
+}
+
+func sourceControlAuth(control *SourceControl) string {
+	sourceType := strings.ToLower(control.SourceType)
+	switch {
+	case control.SourceID != "" && strings.Contains(sourceType, "github"):
+		return "coolify_github_app"
+	case control.SourceID != "":
+		return "coolify_source_connection"
+	case control.PrivateKeyID != "":
+		return "coolify_deploy_key"
+	case strings.HasPrefix(control.Repository, "git@") || strings.HasPrefix(control.Repository, "ssh://"):
+		return "ssh"
+	case strings.HasPrefix(control.Repository, "http://") || strings.HasPrefix(control.Repository, "https://"):
+		return "https"
+	default:
+		return "git"
+	}
+}
+
+func sourceControlEvidence(control *SourceControl) []string {
+	items := []string{}
+	if control.Repository != "" {
+		items = append(items, "repository="+control.Repository)
+	}
+	if control.Branch != "" {
+		items = append(items, "branch="+control.Branch)
+	}
+	if control.Provider != "" {
+		items = append(items, "provider="+control.Provider)
+	}
+	if control.Auth != "" {
+		items = append(items, "auth="+control.Auth)
+	}
+	return planutil.UniqueStrings(items)
+}
+
+func providerFromGit(repository, sourceType string) string {
+	combined := strings.ToLower(strings.TrimSpace(repository + " " + sourceType))
+	switch {
+	case strings.Contains(combined, "github"):
+		return "github"
+	case strings.Contains(combined, "gitlab"):
+		return "gitlab"
+	case strings.Contains(combined, "bitbucket"):
+		return "bitbucket"
+	case strings.Contains(combined, "gitea"):
+		return "gitea"
+	case strings.HasPrefix(strings.TrimSpace(repository), "git@") || strings.HasPrefix(strings.TrimSpace(repository), "ssh://"):
+		return "ssh"
+	default:
+		return "git"
+	}
 }
 
 func internalDependencies(app manifest.App) []Dependency {
@@ -356,6 +449,9 @@ func requirementMatchesStore(requirementKind, storeKind string) bool {
 
 func resourceLinkReasons(app, other manifest.App, requirement Requirement, appNetworks, otherNetworks []string) []string {
 	reasons := []string{}
+	if len(matchingEnvReferences(app, other, requirement.Kind)) > 0 {
+		reasons = append(reasons, "env value points at this resource")
+	}
 	if len(sharedPortableNetworks(appNetworks, otherNetworks)) > 0 {
 		reasons = append(reasons, "shared Docker network")
 	}
@@ -381,11 +477,165 @@ func linkableResourceApp(app manifest.App) bool {
 
 func resourceLinkConfidence(reasons []string) string {
 	for _, reason := range reasons {
+		if reason == "env value points at this resource" {
+			return "detected"
+		}
+	}
+	for _, reason := range reasons {
 		if reason == "shared Docker network" {
 			return "likely"
 		}
 	}
 	return "possible"
+}
+
+func matchingEnvReferences(app, other manifest.App, kind string) []string {
+	refs := envReferenceTokens(app, kind)
+	if len(refs) == 0 {
+		return nil
+	}
+	targets := appReferenceTokens(other)
+	matches := []string{}
+	for ref := range refs {
+		if _, ok := targets[ref]; ok {
+			matches = append(matches, ref)
+			continue
+		}
+		for target := range targets {
+			if strongTokenContains(ref, target) || strongTokenContains(target, ref) {
+				matches = append(matches, ref)
+				break
+			}
+		}
+	}
+	return planutil.UniqueStrings(matches)
+}
+
+func envReferenceTokens(app manifest.App, kind string) map[string]struct{} {
+	tokens := map[string]struct{}{}
+	for _, env := range appEnvironment(app) {
+		if !env.ValueKnown || strings.TrimSpace(env.Value) == "" || !envNameMatchesRequirement(env.Name, kind) {
+			continue
+		}
+		for _, token := range valueReferenceTokens(env.Value) {
+			tokens[token] = struct{}{}
+		}
+	}
+	return tokens
+}
+
+func appReferenceTokens(app manifest.App) map[string]struct{} {
+	tokens := map[string]struct{}{}
+	addReferenceToken(tokens, app.Name)
+	addReferenceToken(tokens, strings.TrimPrefix(app.ID, "compose:"))
+	for _, key := range []string{"coolify.uuid", "coolify.resourceName", "coolify.serviceName", "coolify.composeProject"} {
+		addReferenceToken(tokens, app.Metadata[key])
+	}
+	for _, route := range app.Routes {
+		addReferenceToken(tokens, route.Host)
+		if route.Port != "" {
+			addReferenceToken(tokens, route.Host+":"+route.Port)
+		}
+	}
+	for _, service := range app.Services {
+		addReferenceToken(tokens, service.Name)
+		for _, key := range []string{"com.docker.compose.project", "com.docker.compose.service", "coolify.name", "coolify.resourceName", "coolify.serviceName"} {
+			addReferenceToken(tokens, service.Labels[key])
+		}
+		for _, port := range service.Ports {
+			if port.HostPort != "" {
+				addReferenceToken(tokens, port.HostPort)
+				addReferenceToken(tokens, net.JoinHostPort("127.0.0.1", port.HostPort))
+			}
+		}
+		for _, env := range service.Environment {
+			if !env.ValueKnown {
+				continue
+			}
+			switch env.Name {
+			case "COOLIFY_FQDN", "COOLIFY_URL", "MINIO_SERVER_URL", "MINIO_BROWSER_REDIRECT_URL":
+				for _, token := range valueReferenceTokens(env.Value) {
+					tokens[token] = struct{}{}
+				}
+			}
+		}
+	}
+	return tokens
+}
+
+func appEnvironment(app manifest.App) []manifest.EnvVar {
+	envs := append([]manifest.EnvVar{}, app.Environment...)
+	for _, service := range app.Services {
+		envs = append(envs, service.Environment...)
+	}
+	return envs
+}
+
+func envNameMatchesRequirement(name, kind string) bool {
+	for _, candidate := range requirementKinds(strings.ToUpper(strings.TrimSpace(name))) {
+		if candidate == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func valueReferenceTokens(value string) []string {
+	tokens := map[string]struct{}{}
+	for _, part := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t' }) {
+		part = strings.Trim(strings.TrimSpace(part), "'\"")
+		if part == "" || strings.HasPrefix(part, "[REDACTED:") {
+			continue
+		}
+		addReferenceToken(tokens, part)
+		if parsed, err := url.Parse(part); err == nil {
+			addReferenceToken(tokens, parsed.Host)
+			addReferenceToken(tokens, parsed.Hostname())
+			if parsed.Port() != "" {
+				addReferenceToken(tokens, net.JoinHostPort(parsed.Hostname(), parsed.Port()))
+				addReferenceToken(tokens, parsed.Port())
+			}
+		}
+		if host, port, err := net.SplitHostPort(part); err == nil {
+			addReferenceToken(tokens, host)
+			addReferenceToken(tokens, net.JoinHostPort(host, port))
+			addReferenceToken(tokens, port)
+		}
+	}
+	return mapKeys(tokens)
+}
+
+func addReferenceToken(tokens map[string]struct{}, value string) {
+	value = normalizeReferenceToken(value)
+	if value == "" {
+		return
+	}
+	tokens[value] = struct{}{}
+}
+
+func normalizeReferenceToken(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.Trim(value, "'\"`[]()")
+	value = strings.TrimPrefix(value, "http://")
+	value = strings.TrimPrefix(value, "https://")
+	value = strings.TrimSuffix(value, "/")
+	if host, port, err := net.SplitHostPort(value); err == nil && host != "" && port != "" {
+		return net.JoinHostPort(host, port)
+	}
+	return value
+}
+
+func strongTokenContains(value, token string) bool {
+	return len(token) >= 8 && strings.Contains(value, token)
+}
+
+func mapKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func sharedPortableNetworks(a, b []string) []string {
@@ -679,11 +929,16 @@ func riskReasons(app manifest.App, analysis AppAnalysis) []RiskReason {
 		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: "routes.none", Message: "no public routes were detected; verify routing or confirm this resource is internal-only"})
 	}
 
+	if control := sourceControl(app); control != nil {
+		message := fmt.Sprintf("git source %s detected; Bort deploys a raw compose/image snapshot and does not copy Coolify source credentials", planutil.Fallback(control.Repository, control.Provider))
+		reasons = append(reasons, RiskReason{Severity: RiskInfo, Code: "source_control.connect_dokploy", Message: message})
+	}
+
 	for _, requirement := range analysis.ExternalRequirements {
-		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: "external." + requirement.Kind, Message: fmt.Sprintf("external %s requirement inferred from env names: %s", requirement.Kind, strings.Join(requirement.Evidence, ", "))})
+		reasons = append(reasons, RiskReason{Severity: RiskInfo, Code: "external." + requirement.Kind, Message: fmt.Sprintf("%s settings inferred from env names: %s", requirement.Kind, strings.Join(requirement.Evidence, ", "))})
 	}
 	for _, link := range analysis.LinkedResources {
-		reasons = append(reasons, RiskReason{Severity: RiskInfo, Code: "linked_resource." + link.Kind, Message: fmt.Sprintf("%s support candidate %s identified with %s confidence", link.Kind, link.App, link.Confidence)})
+		reasons = append(reasons, RiskReason{Severity: RiskInfo, Code: "linked_resource." + link.Kind, Message: fmt.Sprintf("%s settings may use Coolify app %s", link.Kind, link.App)})
 	}
 
 	for _, store := range analysis.DataStores {
@@ -710,10 +965,13 @@ func riskReasons(app manifest.App, analysis AppAnalysis) []RiskReason {
 		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: "state.named_volumes", Message: fmt.Sprintf("%d named volume mount(s) require target volume creation and data sync", namedVolumeMounts)})
 	}
 	if bindMounts > 0 {
-		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: "state.bind_mounts", Message: fmt.Sprintf("%d bind mount(s) are host-specific and need portability review", bindMounts)})
+		reasons = append(reasons, RiskReason{Severity: RiskInfo, Code: "state.bind_mounts", Message: fmt.Sprintf("%d VPS file/folder mount(s) will be preserved on this VPS", bindMounts)})
 	}
 	if count := redactedEnvCount(app); count > 0 {
 		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: "env.values_redacted", Message: fmt.Sprintf("%d env value(s) not captured by scan; run `bort` (default flow captures values) or fill via `bort env <app> KEY=value`", count)})
+	}
+	if names := coolifyServiceMagicEnvNames(app); len(names) > 0 {
+		reasons = append(reasons, RiskReason{Severity: RiskInfo, Code: "env.coolify_service_magic", Message: fmt.Sprintf("Coolify service magic env vars detected; review preserved values in Dokploy: %s", strings.Join(names, ", "))})
 	}
 	for _, warning := range app.Warnings {
 		reasons = append(reasons, RiskReason{Severity: RiskWarn, Code: warning.Code, Message: warning.Message})
@@ -890,6 +1148,27 @@ func appRoutes(routes []manifest.Route) []manifest.Route {
 
 func HasRedactedEnvironment(app manifest.App) bool {
 	return redactedEnvCount(app) > 0
+}
+
+func CoolifyServiceMagicEnvNames(app manifest.App) []string {
+	return coolifyServiceMagicEnvNames(app)
+}
+
+func coolifyServiceMagicEnvNames(app manifest.App) []string {
+	names := []string{}
+	for _, env := range appEnvironment(app) {
+		name := strings.ToUpper(strings.TrimSpace(env.Name))
+		if isCoolifyServiceMagicEnvName(name) {
+			names = append(names, name)
+		}
+	}
+	return planutil.UniqueStrings(names)
+}
+
+func isCoolifyServiceMagicEnvName(name string) bool {
+	return strings.HasPrefix(name, "SERVICE_FQDN_") ||
+		strings.HasPrefix(name, "SERVICE_URL_") ||
+		strings.HasPrefix(name, "SERVICE_NAME_")
 }
 
 func redactedEnvCount(app manifest.App) int {

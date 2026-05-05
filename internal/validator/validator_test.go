@@ -172,7 +172,7 @@ func TestValidateFlagsTopologyIssues(t *testing.T) {
 		Apps: []manifest.App{
 			{
 				Name:     "web",
-				Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "vela"},
+				Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "demo-project"},
 				Services: []manifest.Service{
 					{
 						Name:        "web",
@@ -186,13 +186,13 @@ func TestValidateFlagsTopologyIssues(t *testing.T) {
 			{
 				Name:     "postgres primary",
 				Runtime:  "database",
-				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "vela"},
+				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "demo-project"},
 				Services: []manifest.Service{{Name: "postgres", Image: "postgres:16-alpine"}},
 			},
 			{
 				Name:     "postgres replica",
 				Runtime:  "database",
-				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "vela"},
+				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "demo-project"},
 				Services: []manifest.Service{{Name: "postgres", Image: "postgres:16-alpine"}},
 			},
 		},
@@ -210,7 +210,7 @@ func TestValidateFlagsTopologyIssues(t *testing.T) {
 		t.Fatalf("expected yellow status, got %#v", result)
 	}
 	assertIssue(t, result.Apps[0], "topology.external_requirements")
-	assertIssue(t, result.Apps[0], "topology.linked_resource_ambiguous")
+	assertIssue(t, result.Apps[0], "topology.linked_resource_candidates")
 	assertIssue(t, result.Apps[0], "topology.bind_mounts")
 	assertIssue(t, result.Apps[0], "topology.env_values_redacted")
 	assertNoIssue(t, result.Apps[0], "routes.none")

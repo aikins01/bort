@@ -344,7 +344,7 @@ func TestBortEnvThenBortClearsEnvIssue(t *testing.T) {
 	})
 
 	// first create a run; the env file will have an empty value.
-	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "marketmap", "--observation-window", "0", "--rollback-window", "0"})
+	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "demo-app", "--observation-window", "0", "--rollback-window", "0"})
 
 	// record the env value via the bort env command.
 	var stdout, stderr bytes.Buffer
@@ -355,9 +355,9 @@ func TestBortEnvThenBortClearsEnvIssue(t *testing.T) {
 	// re-create the run so state env values are merged before preparer scans.
 	stdout.Reset()
 	stderr.Reset()
-	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "marketmap", "--observation-window", "0", "--rollback-window", "0"})
+	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "demo-app", "--observation-window", "0", "--rollback-window", "0"})
 
-	run, err := loadMigrationRun("marketmap")
+	run, err := loadMigrationRun("demo-app")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func TestBortNoArgsRefreshesLatestRunAfterEnvCommand(t *testing.T) {
 			},
 		},
 	})
-	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "marketmap", "--observation-window", "0", "--rollback-window", "0"})
+	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "demo-app", "--observation-window", "0", "--rollback-window", "0"})
 
 	var stdout, stderr bytes.Buffer
 	if err := RunWithInput(context.Background(), []string{"env", "api", "FIRST_KEY=filled-from-state"}, strings.NewReader(""), &stdout, &stderr); err != nil {

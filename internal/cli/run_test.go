@@ -30,11 +30,11 @@ func TestRunMigrateCreatesLocalRunArtifactsAndSummary(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	if err := runMigrate(context.Background(), []string{"--bundle", bundleDir, "--run", "marketmap", "--observation-window", "0", "--rollback-window", "0"}, &stdout, &stderr); err != nil {
+	if err := runMigrate(context.Background(), []string{"--bundle", bundleDir, "--run", "demo-app", "--observation-window", "0", "--rollback-window", "0"}, &stdout, &stderr); err != nil {
 		t.Fatalf("migrate failed: %v\nstderr:\n%s", err, stderr.String())
 	}
 
-	runDir := filepath.Join(workDir, ".bort", "runs", "marketmap")
+	runDir := filepath.Join(workDir, ".bort", "runs", "demo-app")
 	for _, name := range []string{"run.json", "prepare.json", "sync.json", "cutover.json", "rollback.json", "commit.json", "decisions.json"} {
 		if _, err := os.Stat(filepath.Join(runDir, name)); err != nil {
 			t.Fatalf("expected %s to exist: %v", name, err)
@@ -42,7 +42,7 @@ func TestRunMigrateCreatesLocalRunArtifactsAndSummary(t *testing.T) {
 	}
 
 	run := readJSONFile[migrationRun](t, filepath.Join(runDir, "run.json"))
-	if run.APIVersion != runAPIVersion || !run.DryRun || run.Name != "marketmap" || run.BundleDir != bundleDir || run.Target != "dokploy" {
+	if run.APIVersion != runAPIVersion || !run.DryRun || run.Name != "demo-app" || run.BundleDir != bundleDir || run.Target != "dokploy" {
 		t.Fatalf("unexpected run metadata: %#v", run)
 	}
 	prepareResult := readJSONFile[preparer.Result](t, filepath.Join(runDir, "prepare.json"))
@@ -63,7 +63,7 @@ func TestRunMigrateCreatesLocalRunArtifactsAndSummary(t *testing.T) {
 
 	output := stdout.String()
 	for _, want := range []string{
-		"Migration run created: .bort/runs/marketmap",
+		"Migration run created: .bort/runs/demo-app",
 		"Overall: needs_decision (yellow)",
 		"Apps: 1 total, 0 green, 1 yellow, 0 red",
 		"Routes: 1 cutover, 1 rollback, 1 commit",
@@ -72,12 +72,43 @@ func TestRunMigrateCreatesLocalRunArtifactsAndSummary(t *testing.T) {
 		"cutover needs_decision: confirm cutover readiness for 1 app(s) (2 item(s))",
 		"Next safe step: confirm cutover readiness for 1 app(s)",
 		"Next decision: cutover",
-		"Next artifact: .bort/runs/marketmap/decisions.json",
+		"Next artifact: .bort/runs/demo-app/decisions.json",
 		"Dry run only: no target resources, sync operations, route changes, ownership commits, or source cleanup were executed.",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected migrate output to contain %q, got:\n%s", want, output)
 		}
+	}
+}
+
+func TestRunMigrateLiveUsesLatestRunWhenDefaultBundleMissing(t *testing.T) {
+	t.Setenv("BORT_DOKPLOY_URL", "")
+	t.Setenv("BORT_DOKPLOY_TOKEN", "")
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	bundleDir := filepath.Join(workDir, ".bort", "runs", "coolify-local", "bundle")
+	writeTestBundle(t, bundleDir, manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local"},
+		Apps: []manifest.App{
+			{Name: "api", Services: []manifest.Service{{Name: "api", Image: "example/api:latest"}}, Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "api", Port: "3000"}}},
+		},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "coolify-local", "--observation-window", "0", "--rollback-window", "0"})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := runMigrate(context.Background(), []string{"--live"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected live mode to stop at missing dokploy credentials")
+	}
+	if strings.Contains(err.Error(), "bort-bundle") || strings.Contains(stderr.String(), "bort-bundle") {
+		t.Fatalf("expected latest run to be used instead of default bundle, err=%v stderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(err.Error(), "no dokploy credentials") {
+		t.Fatalf("expected missing credentials after loading latest run, got err=%v stderr=%s stdout=%s", err, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Migration run created: .bort/runs/coolify-local") {
+		t.Fatalf("expected live migrate to refresh latest run, got stdout=%s", stdout.String())
 	}
 }
 
@@ -91,14 +122,14 @@ func TestRunStatusAndNextReadExistingRun(t *testing.T) {
 			{Name: "api", Services: []manifest.Service{{Name: "api", Image: "example/api:latest"}}, Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "api"}}},
 		},
 	})
-	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "marketmap", "--observation-window", "0", "--rollback-window", "0"})
+	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "demo-app", "--observation-window", "0", "--rollback-window", "0"})
 
 	var statusOut bytes.Buffer
 	var statusErr bytes.Buffer
-	if err := runStatus(context.Background(), []string{"--run", "marketmap"}, &statusOut, &statusErr); err != nil {
+	if err := runStatus(context.Background(), []string{"--run", "demo-app"}, &statusOut, &statusErr); err != nil {
 		t.Fatalf("status failed: %v\nstderr:\n%s", err, statusErr.String())
 	}
-	for _, want := range []string{"Migration run: .bort/runs/marketmap", "Run: marketmap", "Overall: needs_decision (yellow)", "Next decision: cutover", "Next artifact: .bort/runs/marketmap/decisions.json"} {
+	for _, want := range []string{"Migration run: .bort/runs/demo-app", "Run: demo-app", "Overall: needs_decision (yellow)", "Next decision: cutover", "Next artifact: .bort/runs/demo-app/decisions.json"} {
 		if !strings.Contains(statusOut.String(), want) {
 			t.Fatalf("expected status output to contain %q, got:\n%s", want, statusOut.String())
 		}
@@ -106,10 +137,10 @@ func TestRunStatusAndNextReadExistingRun(t *testing.T) {
 
 	var nextOut bytes.Buffer
 	var nextErr bytes.Buffer
-	if err := runNext(context.Background(), []string{"marketmap"}, &nextOut, &nextErr); err != nil {
+	if err := runNext(context.Background(), []string{"demo-app"}, &nextOut, &nextErr); err != nil {
 		t.Fatalf("next failed: %v\nstderr:\n%s", err, nextErr.String())
 	}
-	for _, want := range []string{"Next safe step: confirm cutover readiness for 1 app(s)", "Artifact: .bort/runs/marketmap/decisions.json", "Decision: cutover", "Dry run only: no live migration action is executed by this command."} {
+	for _, want := range []string{"Next safe step: confirm cutover readiness for 1 app(s)", "Artifact: .bort/runs/demo-app/decisions.json", "Decision: cutover", "Dry run only: no live migration action is executed by this command."} {
 		if !strings.Contains(nextOut.String(), want) {
 			t.Fatalf("expected next output to contain %q, got:\n%s", want, nextOut.String())
 		}

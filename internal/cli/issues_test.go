@@ -18,7 +18,7 @@ func TestClassifyItemMapsCodesToIssueKinds(t *testing.T) {
 		{"routes.none", issueKindRoute},
 		{"linked_resource.confirm", issueKindLink},
 		{"external_requirement.unresolved", issueKindLink},
-		{"volume.bind_mount_review", issueKindReview},
+		{"volume.bind_mount_review", issueKindHostFiles},
 		{"cutover.observation_pending", issueKindReview},
 		{"random.code", issueKindReview},
 	}

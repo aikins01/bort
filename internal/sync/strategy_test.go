@@ -50,7 +50,7 @@ func TestPlanBuildsDryRunStateSyncStepsFromPrepareResources(t *testing.T) {
 		t.Fatalf("unexpected sync readiness: %#v", app)
 	}
 	dataStore := findStep(t, app, "data_store")
-	if dataStore.Strategy != StrategyPostgresDumpOrLogical || dataStore.TargetAction != "confirm_data_store_strategy" || dataStore.Pause != PauseCutoverWindow {
+	if dataStore.Strategy != StrategyPostgresDumpOrLogical || dataStore.TargetAction != "sync_data_store_with_planned_strategy" || dataStore.Pause != PauseCutoverWindow || dataStore.Readiness != preparer.ReadinessReadyToCreate {
 		t.Fatalf("unexpected data-store sync step: %#v", dataStore)
 	}
 	volume := findStep(t, app, "volume")
@@ -71,7 +71,7 @@ func TestPlanCarriesPrepareBlockersIntoSyncPlan(t *testing.T) {
 		Apps: []manifest.App{
 			{
 				Name:     "web",
-				Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "vela"},
+				Metadata: map[string]string{"migrationRole": "candidate", "coolify.project": "demo-project"},
 				Services: []manifest.Service{{
 					Name:        "web",
 					Image:       "example/web:latest",
@@ -83,7 +83,7 @@ func TestPlanCarriesPrepareBlockersIntoSyncPlan(t *testing.T) {
 			{
 				Name:     "postgres support",
 				Runtime:  "database",
-				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "vela"},
+				Metadata: map[string]string{"migrationRole": "support", "coolify.project": "demo-project"},
 				Services: []manifest.Service{{Name: "postgres", Image: "postgres:16-alpine"}},
 			},
 		},
@@ -105,11 +105,11 @@ func TestPlanCarriesPrepareBlockersIntoSyncPlan(t *testing.T) {
 		t.Fatalf("expected sync to carry prepare input needs, got %#v", app)
 	}
 	linked := findStep(t, app, "linked_resource")
-	if linked.TargetAction != "confirm_support_resource_candidate" || linked.Readiness != preparer.ReadinessNeedsDecision {
+	if linked.TargetAction != "reuse_detected_support_resource" || linked.Action != "reuse_detected_support_resource" || linked.Pause != PauseNone || linked.Readiness != preparer.ReadinessReadyToCreate {
 		t.Fatalf("unexpected linked resource step: %#v", linked)
 	}
 	volume := findStep(t, app, "volume")
-	if volume.Strategy != StrategyRsync || volume.Readiness != preparer.ReadinessNeedsDecision {
+	if volume.Strategy != StrategyNone || volume.Action != "preserve_host_path_mount" || volume.TargetAction != "preserve_vps_file_mount" || volume.Pause != PauseNone || volume.Readiness != preparer.ReadinessReadyToCreate {
 		t.Fatalf("unexpected bind volume step: %#v", volume)
 	}
 }

@@ -36,7 +36,7 @@ func stopProxyContainer(ctx context.Context, runner dockerRunner, name string) e
 	if !container.State.Running {
 		return nil
 	}
-	if _, err := runner.Output(ctx, "stop", container.ID); err != nil {
+	if err := stopContainer(ctx, runner, container.ID); err != nil {
 		// stop loses its target between inspect and stop on a busy host;
 		// the goal is "container is not running" and that's already true.
 		if isContainerMissingErr(err) {
@@ -55,7 +55,7 @@ func startProxyContainer(ctx context.Context, runner dockerRunner, name string) 
 	if container.State.Running {
 		return nil
 	}
-	if _, err := runner.Output(ctx, "start", container.ID); err != nil {
+	if err := startContainer(ctx, runner, container.ID); err != nil {
 		return fmt.Errorf("start proxy container %s: %w", name, err)
 	}
 	return nil
