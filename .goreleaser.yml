@@ -1,0 +1,91 @@
+version: 2
+
+project_name: bort
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: bort
+    main: ./cmd/bort
+    binary: bort
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/aikins01/bort/internal/cli.version={{ .Version }}
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: bort
+    ids:
+      - bort
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+nfpms:
+  - id: linux-packages
+    ids:
+      - bort
+    package_name: bort
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: aikins01
+    homepage: https://github.com/aikins01/bort
+    maintainer: aikins01 <aikins01@users.noreply.github.com>
+    description: migration cockpit for self-hosted PaaS platform moves
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+
+brews:
+  - name: bort
+    ids:
+      - bort
+    repository:
+      owner: aikins01
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/aikins01/bort
+    description: migration cockpit for self-hosted PaaS platform moves
+    license: MIT
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    install: |
+      bin.install "bort"
+    test: |
+      system "#{bin}/bort", "version"

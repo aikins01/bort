@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const version = "0.1.0-dev"
+var version = "0.1.0-dev"
 
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	return RunWithInput(ctx, args, os.Stdin, stdout, stderr)
