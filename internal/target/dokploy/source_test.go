@@ -75,11 +75,11 @@ func TestPlanFromArtifactsPausesBeforeDumpAndVolumeSync(t *testing.T) {
 	kinds := []StepKind{}
 	for _, step := range plan.Steps {
 		switch step.Kind {
-		case StepDumpDataStore, StepRestoreDataStore, StepPauseSource, StepSyncVolume:
+		case StepDumpDataStore, StepRestoreDataStore, StepPauseSource, StepSyncVolume, StepResumeSource:
 			kinds = append(kinds, step.Kind)
 		}
 	}
-	want := []StepKind{StepPauseSource, StepDumpDataStore, StepRestoreDataStore, StepSyncVolume}
+	want := []StepKind{StepPauseSource, StepDumpDataStore, StepRestoreDataStore, StepSyncVolume, StepResumeSource}
 	if len(kinds) != len(want) {
 		t.Fatalf("expected %v, got %v", want, kinds)
 	}
@@ -142,11 +142,11 @@ func TestPlanFromArtifactsCopiesVolumeStrategyDataStoreVolumes(t *testing.T) {
 	kinds := []StepKind{}
 	for _, step := range plan.Steps {
 		switch step.Kind {
-		case StepDumpDataStore, StepRestoreDataStore, StepPauseSource, StepSyncVolume:
+		case StepDumpDataStore, StepRestoreDataStore, StepPauseSource, StepSyncVolume, StepResumeSource:
 			kinds = append(kinds, step.Kind)
 		}
 	}
-	want := []StepKind{StepPauseSource, StepSyncVolume}
+	want := []StepKind{StepPauseSource, StepSyncVolume, StepResumeSource}
 	if len(kinds) != len(want) {
 		t.Fatalf("expected %v, got %v", want, kinds)
 	}

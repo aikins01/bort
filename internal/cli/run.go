@@ -207,7 +207,7 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 				return err
 			}
 			summary := summarizeMigrationRun(loadedRun)
-			writeMigrationRunText(stdout, "Migration run loaded", summary)
+			writeLiveMigrationRunText(stdout, "Migration run loaded", summary)
 			return applyLiveMigration(ctx, loadedRun, stderr, nil)
 		}
 	}
@@ -218,11 +218,14 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 
 	summary := summarizeMigrationRun(loadedRun)
-	writeMigrationRunText(stdout, "Migration run created", summary)
-
 	if live {
+		writeLiveMigrationRunText(stdout, "Migration run created", summary)
+		if err := validateLiveApplyReady(loadedRun); err != nil {
+			return err
+		}
 		return applyLiveMigration(ctx, loadedRun, stderr, nil)
 	}
+	writeMigrationRunText(stdout, "Migration run created", summary)
 	return nil
 }
 
@@ -248,6 +251,22 @@ func activeApplyRunRefForMigrate(opts migrationRunOptions, bundleFlagSet bool) (
 		}
 	}
 	return "", false
+}
+
+func validateLiveApplyReady(run loadedMigrationRun) error {
+	if decisions := openRunDecisions(run); len(decisions) > 0 {
+		decision := decisions[0]
+		action := strings.TrimSpace(decision.Action)
+		if action == "" {
+			action = "resolve the open migration decision"
+		}
+		runRef := strings.TrimSpace(run.Run.Name)
+		if runRef == "" {
+			runRef = run.Run.RunDir
+		}
+		return fmt.Errorf("live apply is blocked by %d open decision(s); next safe step: %s (run `bort next --run %s`)", len(decisions), action, shellQuote(runRef))
+	}
+	return nil
 }
 
 func applyRunActive(runRef string) bool {
@@ -298,6 +317,9 @@ func applyLiveMigration(ctx context.Context, run loadedMigrationRun, stderr io.W
 		return fmt.Errorf("lock live migration run: %w", err)
 	}
 	defer lock.Release()
+	if err := validateLiveApplyReady(run); err != nil {
+		return err
+	}
 	client, err := ensureDokployClient(ctx, run.Run.Target, os.Stdin, stderr, stderr)
 	if err != nil {
 		if err == errDokploySetupSkipped {
@@ -393,7 +415,13 @@ func attachLiveMigration(ctx context.Context, run loadedMigrationRun, appliedPat
 			if completedApplyPrefix(plan.Steps, applied) >= len(plan.Steps) {
 				return nil
 			}
-			if pid <= 0 || applyLockPIDRunning(pid) {
+			if pid <= 0 {
+				if _, err := os.Stat(lockPath); errors.Is(err, os.ErrNotExist) {
+					return attachExitResult(run, plan.Steps, applied, startedAt)
+				}
+				continue
+			}
+			if applyLockPIDRunning(pid) {
 				continue
 			}
 			return attachExitResult(run, plan.Steps, applied, startedAt)
@@ -535,6 +563,9 @@ func lookupDokployClient(target string) (*dokploy.Client, error) {
 	}
 	creds, ok := state.Targets[target]
 	if ok && creds.URL != "" && creds.Token != "" {
+		if err := dokploy.ValidateTokenBaseURL(creds.URL); err != nil {
+			return nil, err
+		}
 		return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
 	}
 	return nil, fmt.Errorf("no dokploy credentials available: set %s and %s, or run `bort init-target dokploy --install`", dokploy.EnvBaseURL, dokploy.EnvToken)
@@ -550,6 +581,9 @@ func resolveDokployClient(ctx context.Context, target string, stdin io.Reader, s
 	}
 	creds, ok := state.Targets[target]
 	if ok && creds.URL != "" && creds.Token != "" {
+		if err := dokploy.ValidateTokenBaseURL(creds.URL); err != nil {
+			return nil, err
+		}
 		return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
 	}
 	if target == "dokploy" && stdinIsTerminal(stdin) {
@@ -563,6 +597,9 @@ func resolveDokployClient(ctx context.Context, target string, stdin io.Reader, s
 		}
 		creds = state.Targets[target]
 		if creds.URL != "" && creds.Token != "" {
+			if err := dokploy.ValidateTokenBaseURL(creds.URL); err != nil {
+				return nil, err
+			}
 			return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
 		}
 	}
@@ -1333,6 +1370,14 @@ func gateReason(gate runGateSummary) string {
 }
 
 func writeMigrationRunText(w io.Writer, heading string, summary migrationRunSummary) {
+	writeMigrationRunTextWithFooter(w, heading, summary, "Dry run only: no target resources, sync operations, route changes, ownership commits, or source cleanup were executed.")
+}
+
+func writeLiveMigrationRunText(w io.Writer, heading string, summary migrationRunSummary) {
+	writeMigrationRunTextWithFooter(w, heading, summary, "Live mode requested: no changes have been made yet; apply will start only after gates and credentials are checked.")
+}
+
+func writeMigrationRunTextWithFooter(w io.Writer, heading string, summary migrationRunSummary, footer string) {
 	fmt.Fprintf(w, "%s: %s\n", heading, summary.Run.RunDir)
 	fmt.Fprintf(w, "Run: %s\n", summary.Run.Name)
 	fmt.Fprintf(w, "Bundle: %s -> %s\n", summary.Run.BundleDir, summary.Run.Target)
@@ -1368,7 +1413,7 @@ func writeMigrationRunText(w io.Writer, heading string, summary migrationRunSumm
 	if summary.Next.Artifact != "" {
 		fmt.Fprintf(w, "Next artifact: %s\n", summary.Next.Artifact)
 	}
-	fmt.Fprintln(w, "Dry run only: no target resources, sync operations, route changes, ownership commits, or source cleanup were executed.")
+	fmt.Fprintln(w, footer)
 }
 
 func runSourceLabel(run migrationRun) string {

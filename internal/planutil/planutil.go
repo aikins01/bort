@@ -2,6 +2,7 @@ package planutil
 
 import (
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -61,4 +62,14 @@ func Fallback(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func RedactRepositoryCredentials(repository string) string {
+	repository = strings.TrimSpace(repository)
+	parsed, err := url.Parse(repository)
+	if err != nil || parsed.User == nil {
+		return repository
+	}
+	parsed.User = nil
+	return parsed.String()
 }

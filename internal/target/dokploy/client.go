@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,11 +41,35 @@ func NewClientFromEnv() (*Client, error) {
 	if token == "" {
 		return nil, fmt.Errorf("%s is required for live mode", EnvToken)
 	}
+	if err := ValidateTokenBaseURL(baseURL); err != nil {
+		return nil, err
+	}
 	return &Client{
 		BaseURL:    baseURL,
 		Token:      token,
 		HTTPClient: &http.Client{Timeout: defaultTimeout},
 	}, nil
+}
+
+func ValidateTokenBaseURL(raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("invalid Dokploy URL %q", raw)
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if parsed.Scheme != "http" {
+		return fmt.Errorf("Dokploy URL must use https, or http on loopback")
+	}
+	host := parsed.Hostname()
+	if host == "localhost" {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("refusing to send Dokploy API token to non-loopback http URL %q", raw)
 }
 
 type APIError struct {

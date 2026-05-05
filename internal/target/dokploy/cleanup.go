@@ -18,6 +18,7 @@ type StalePlatformProject struct {
 
 type StalePlatformCleanupOptions struct {
 	ProjectNames []string
+	ProjectIDs   map[string]string
 	BackupDir    string
 	BackupPrefix string
 }
@@ -41,7 +42,7 @@ func (c *Client) CleanupStalePlatformProjects(ctx context.Context, opts StalePla
 	if err != nil {
 		return StalePlatformCleanupResult{}, err
 	}
-	deleted, err := deleteStalePlatformProjects(ctx, runner, pg, names)
+	deleted, err := deleteStalePlatformProjects(ctx, runner, pg, names, opts.ProjectIDs)
 	if err != nil {
 		return StalePlatformCleanupResult{}, fmt.Errorf("delete stale Dokploy platform metadata after backup %s: %w", backupPath, err)
 	}
@@ -99,53 +100,68 @@ func backupDokployDatabase(ctx context.Context, runner dockerRunner, pg, backupD
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
 	if err := runner.Run(ctx, nil, file, "exec", pg, "pg_dump", "-U", "dokploy", "-d", "dokploy"); err != nil {
+		_ = file.Close()
 		return "", fmt.Errorf("backup dokploy database to %s: %w", path, err)
 	}
 	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
 		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("close dokploy database backup %s: %w", path, err)
 	}
 	return path, nil
 }
 
-func deleteStalePlatformProjects(ctx context.Context, runner dockerRunner, pg string, names []string) ([]StalePlatformProject, error) {
+func deleteStalePlatformProjects(ctx context.Context, runner dockerRunner, pg string, names []string, projectIDs map[string]string) ([]StalePlatformProject, error) {
 	var out bytes.Buffer
-	if err := runner.Run(ctx, strings.NewReader(stalePlatformCleanupSQL(names)), &out,
+	if err := runner.Run(ctx, strings.NewReader(stalePlatformCleanupSQL(names, projectIDs)), &out,
 		"exec", "-i", pg, "psql", "-U", "dokploy", "-d", "dokploy", "-v", "ON_ERROR_STOP=1", "-At", "-F", "|"); err != nil {
 		return nil, err
 	}
 	return parseDeletedStalePlatformProjects(out.String()), nil
 }
 
-func stalePlatformCleanupSQL(names []string) string {
+func stalePlatformCleanupSQL(names []string, projectIDs map[string]string) string {
 	values := make([]string, 0, len(names))
 	for _, name := range names {
-		values = append(values, "("+sqlStringLiteral(name)+")")
+		id := "null"
+		if projectID := strings.TrimSpace(projectIDs[name]); projectID != "" {
+			id = sqlStringLiteral(projectID)
+		}
+		values = append(values, "("+sqlStringLiteral(name)+", "+id+")")
 	}
 	return fmt.Sprintf(`begin;
-create temporary table bort_stale_platform_project(project_name text primary key) on commit drop;
-insert into bort_stale_platform_project(project_name) values
+create temporary table bort_stale_platform_project(project_name text primary key, project_id text) on commit drop;
+insert into bort_stale_platform_project(project_name, project_id) values
   %s;
 
 do $$
 declare
   bad text;
 begin
-  select string_agg(p.name || ' domains=' || coalesce(d.domain_count, 0), ', ' order by p.name)
+  select string_agg(p.name || ' compose=' || coalesce(c.compose_count, 0) || ' domains=' || coalesce(d.domain_count, 0), ', ' order by p.name)
     into bad
   from project p
   join bort_stale_platform_project x on x.project_name = p.name
+   and (x.project_id is null or x.project_id = p."projectId")
+  left join lateral (
+    select count(*) as compose_count
+    from environment e
+    join compose cmp on cmp."environmentId" = e."environmentId"
+    where e."projectId" = p."projectId"
+  ) c on true
   left join lateral (
     select count(*) as domain_count
     from environment e
-    join compose c on c."environmentId" = e."environmentId"
-    join domain dom on dom."composeId" = c."composeId"
+    join compose cmp on cmp."environmentId" = e."environmentId"
+    join domain dom on dom."composeId" = cmp."composeId"
     where e."projectId" = p."projectId"
   ) d on true
-  where coalesce(d.domain_count, 0) <> 0;
+  where coalesce(c.compose_count, 0) <> 0 or coalesce(d.domain_count, 0) <> 0;
   if bad is not null then
-    raise exception 'refusing to delete stale platform projects with domains: %%', bad;
+    raise exception 'refusing to delete stale platform projects with attached Dokploy resources: %%', bad;
   end if;
 end $$;
 
@@ -153,6 +169,7 @@ with deleted as (
   delete from project p
   using bort_stale_platform_project x
   where p.name = x.project_name
+    and (x.project_id is null or x.project_id = p."projectId")
   returning p."projectId", p.name
 )
 select 'deleted', name, "projectId" from deleted order by name;

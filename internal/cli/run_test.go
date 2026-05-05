@@ -104,8 +104,8 @@ func TestRunMigrateLiveUsesLatestRunWhenDefaultBundleMissing(t *testing.T) {
 	if strings.Contains(err.Error(), "bort-bundle") || strings.Contains(stderr.String(), "bort-bundle") {
 		t.Fatalf("expected latest run to be used instead of default bundle, err=%v stderr=%s", err, stderr.String())
 	}
-	if !strings.Contains(err.Error(), "no dokploy credentials") {
-		t.Fatalf("expected missing credentials after loading latest run, got err=%v stderr=%s stdout=%s", err, stderr.String(), stdout.String())
+	if !strings.Contains(err.Error(), "live apply is blocked") || !strings.Contains(err.Error(), "bort next --run coolify-local") {
+		t.Fatalf("expected live apply to stop at open gates after loading latest run, got err=%v stderr=%s stdout=%s", err, stderr.String(), stdout.String())
 	}
 	if !strings.Contains(stdout.String(), "Migration run created: .bort/runs/coolify-local") {
 		t.Fatalf("expected live migrate to refresh latest run, got stdout=%s", stdout.String())

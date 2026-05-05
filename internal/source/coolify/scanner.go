@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/planutil"
 	"github.com/aikins01/bort/internal/secrets"
 	"github.com/aikins01/bort/internal/source"
 )
@@ -239,7 +240,7 @@ func appFromResource(runtime string, resource map[string]any, includeResolvedCom
 
 func gitSource(resource map[string]any) *manifest.GitSource {
 	git := &manifest.GitSource{
-		Repository:         getString(resource, "git_repository", "gitRepository", "git_full_url", "gitFullUrl"),
+		Repository:         planutil.RedactRepositoryCredentials(getString(resource, "git_repository", "gitRepository", "git_full_url", "gitFullUrl")),
 		Branch:             getString(resource, "git_branch", "gitBranch"),
 		CommitSHA:          getString(resource, "git_commit_sha", "gitCommitSha"),
 		BaseDirectory:      getString(resource, "base_directory", "baseDirectory"),

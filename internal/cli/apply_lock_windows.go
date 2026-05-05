@@ -4,7 +4,9 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"syscall"
 )
 
 var errApplyAlreadyRunning = errors.New("live apply already running")
@@ -21,6 +23,11 @@ func acquireApplyLock(path string) (*applyLock, error) {
 		}
 		return nil, err
 	}
+	if _, err := fmt.Fprintln(file, os.Getpid()); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return nil, err
+	}
 	return &applyLock{file: file}, nil
 }
 
@@ -34,5 +41,21 @@ func (l *applyLock) Release() {
 }
 
 func applyLockPIDRunning(pid int) bool {
-	return pid > 0
+	if pid <= 0 {
+		return false
+	}
+	const (
+		processQueryLimitedInformation = 0x1000
+		stillActive                    = 259
+	)
+	handle, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
+	if err != nil {
+		return false
+	}
+	defer syscall.CloseHandle(handle)
+	var code uint32
+	if err := syscall.GetExitCodeProcess(handle, &code); err != nil {
+		return false
+	}
+	return code == stillActive
 }

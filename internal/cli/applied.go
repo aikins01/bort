@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -61,10 +62,26 @@ func readRunApplied(path string, run migrationRun) (runApplied, error) {
 	if applied.APIVersion != "" && applied.APIVersion != appliedAPIVersion {
 		return runApplied{}, fmt.Errorf("%s has unsupported apiVersion %q (want %q)", path, applied.APIVersion, appliedAPIVersion)
 	}
+	if err := validateRunAppliedIdentity(path, applied, run); err != nil {
+		return runApplied{}, err
+	}
 	if applied.Apps == nil {
 		applied.Apps = map[string]appliedApp{}
 	}
 	return applied, nil
+}
+
+func validateRunAppliedIdentity(path string, applied runApplied, run migrationRun) error {
+	if applied.RunName != "" && run.Name != "" && applied.RunName != run.Name {
+		return fmt.Errorf("%s belongs to run %q, not %q", path, applied.RunName, run.Name)
+	}
+	if applied.BundleDir != "" && run.BundleDir != "" && filepath.Clean(applied.BundleDir) != filepath.Clean(run.BundleDir) {
+		return fmt.Errorf("%s belongs to bundle %q, not %q", path, applied.BundleDir, run.BundleDir)
+	}
+	if applied.Target != "" && run.Target != "" && applied.Target != run.Target {
+		return fmt.Errorf("%s belongs to target %q, not %q", path, applied.Target, run.Target)
+	}
+	return nil
 }
 
 func newRunApplied(run migrationRun) runApplied {
@@ -146,12 +163,7 @@ func (l *appliedLedger) Snapshot() runApplied {
 }
 
 func completedApplyPrefix(steps []dokploy.Step, applied runApplied) int {
-	strict := indexedCompletedApplyPrefix(steps, applied)
-	sequenced := sequencedCompletedApplyPrefix(steps, applied)
-	if sequenced > strict {
-		return sequenced
-	}
-	return strict
+	return indexedCompletedApplyPrefix(steps, applied)
 }
 
 func indexedCompletedApplyPrefix(steps []dokploy.Step, applied runApplied) int {
@@ -165,33 +177,6 @@ func indexedCompletedApplyPrefix(steps []dokploy.Step, applied runApplied) int {
 	for index, step := range steps {
 		recorded, ok := byIndex[index]
 		if !ok || !appliedStepCompleted(recorded) || !appliedStepMatches(recorded, step) {
-			return index
-		}
-	}
-	return len(steps)
-}
-
-func sequencedCompletedApplyPrefix(steps []dokploy.Step, applied runApplied) int {
-	completed := make([]appliedStep, 0, len(applied.Steps))
-	for _, step := range applied.Steps {
-		if step.Index < 0 || !appliedStepCompleted(step) {
-			continue
-		}
-		completed = append(completed, step)
-	}
-	sort.SliceStable(completed, func(i, j int) bool { return completed[i].Index < completed[j].Index })
-	searchFrom := 0
-	for index, step := range steps {
-		matched := false
-		for searchFrom < len(completed) {
-			recorded := completed[searchFrom]
-			searchFrom++
-			if appliedStepMatches(recorded, step) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
 			return index
 		}
 	}

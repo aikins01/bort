@@ -87,6 +87,17 @@ func TestReadRunAppliedRejectsUnknownAPIVersion(t *testing.T) {
 	}
 }
 
+func TestReadRunAppliedRejectsMismatchedRunIdentity(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "applied.json")
+	if err := writeJSONArtifact(path, runApplied{APIVersion: appliedAPIVersion, RunName: "other", BundleDir: "bundle", Target: "dokploy"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := readRunApplied(path, migrationRun{Name: "current", BundleDir: "bundle", Target: "dokploy"}); err == nil {
+		t.Fatalf("expected mismatched run identity to be rejected")
+	}
+}
+
 func TestCompletedApplyPrefixStopsAtFirstIncompleteOrMismatchedStep(t *testing.T) {
 	steps := []dokploy.Step{
 		{Kind: dokploy.StepCreateProject, App: "api", Ref: "api"},
@@ -111,7 +122,7 @@ func TestCompletedApplyPrefixStopsAtFirstIncompleteOrMismatchedStep(t *testing.T
 	}
 }
 
-func TestCompletedApplyPrefixToleratesRemovedRecordedSteps(t *testing.T) {
+func TestCompletedApplyPrefixRequiresContiguousIndexedSteps(t *testing.T) {
 	steps := []dokploy.Step{
 		{Kind: dokploy.StepCreateProject, App: "api", Ref: "api"},
 		{Kind: dokploy.StepCreateService, App: "api", Ref: "api"},
@@ -121,8 +132,8 @@ func TestCompletedApplyPrefixToleratesRemovedRecordedSteps(t *testing.T) {
 		{Index: 1, Kind: string(dokploy.StepCreateProject), App: "removed", Ref: "removed", Status: string(dokploy.StepStatusOK)},
 		{Index: 2, Kind: string(dokploy.StepCreateService), App: "api", Ref: "api", Status: string(dokploy.StepStatusOK)},
 	}}
-	if got := completedApplyPrefix(steps, applied); got != 2 {
-		t.Fatalf("expected removed recorded step to be ignored, got prefix %d", got)
+	if got := completedApplyPrefix(steps, applied); got != 1 {
+		t.Fatalf("expected prefix to stop at mismatched index 1, got %d", got)
 	}
 }
 

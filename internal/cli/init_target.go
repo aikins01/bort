@@ -8,7 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -120,6 +122,9 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 	if dokployURL == "" {
 		return fmt.Errorf("--dokploy-url is required (or set %s)", dokploy.EnvBaseURL)
 	}
+	if err := validateDokployBootstrapURL(dokployURL); err != nil {
+		return err
+	}
 
 	admins, err := deps.lister.listAdmins(ctx)
 	if err != nil {
@@ -209,6 +214,27 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 	fmt.Fprintf(stdout, "Dokploy setup complete for %s at %s\n", admin.Email, client.BaseURL)
 	fmt.Fprintln(stdout, "Bort can now continue with this migration.")
 	return nil
+}
+
+func validateDokployBootstrapURL(raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("invalid --dokploy-url %q", raw)
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if parsed.Scheme != "http" {
+		return fmt.Errorf("--dokploy-url must use https, or http on loopback for same-VPS bootstrap")
+	}
+	host := parsed.Hostname()
+	if host == "localhost" {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("refusing to send Coolify admin credentials to non-loopback http Dokploy URL %q; use https or http://127.0.0.1:<port>", raw)
 }
 
 func (shellDokployInstaller) InstallDokploy(ctx context.Context, opts dokployInstallOptions, stdout, stderr io.Writer) error {

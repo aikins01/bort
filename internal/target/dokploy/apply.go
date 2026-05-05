@@ -26,6 +26,7 @@ const (
 	StepCreateVolume      StepKind = "create_volume"
 	StepPauseSource       StepKind = "pause_source"
 	StepResumeSource      StepKind = "resume_source"
+	StepResumeTarget      StepKind = "resume_target"
 	StepSyncVolume        StepKind = "sync_volume"
 	StepDumpDataStore     StepKind = "dump_data_store"
 	StepRestoreDataStore  StepKind = "restore_data_store"
@@ -103,6 +104,15 @@ func PlanFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 			}
 		}
 	}
+	routedAppNames := map[string]struct{}{}
+	for _, app := range cutover.Apps {
+		for _, route := range app.Routes {
+			if strings.TrimSpace(route.Host) == "" {
+				continue
+			}
+			routedAppNames[app.Name] = struct{}{}
+		}
+	}
 	for _, app := range sync.Apps {
 		var dataStoreSteps, volumeSteps []Step
 		prepApp, hasPrepApp := findPrepareApp(prepare, app.Name)
@@ -144,6 +154,12 @@ func PlanFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 		}
 		plan.Steps = append(plan.Steps, dataStoreSteps...)
 		plan.Steps = append(plan.Steps, volumeSteps...)
+		if len(dataStoreSteps) > 0 || len(volumeSteps) > 0 {
+			if _, routed := routedAppNames[app.Name]; !routed {
+				plan.Steps = append(plan.Steps, Step{Kind: StepResumeSource, App: app.Name, Ref: app.Name})
+			}
+			plan.Steps = append(plan.Steps, Step{Kind: StepResumeTarget, App: app.Name, Ref: app.Name})
+		}
 	}
 	hasRoutes := false
 	routedApps := []string{}
@@ -220,6 +236,7 @@ type appCache struct {
 	ComposeID                  string
 	ComposeAppName             string
 	DiscoveryRedeployAttempted bool
+	TargetWritersStopped       []dockerContainer
 }
 
 type applyContext struct {
@@ -239,7 +256,31 @@ func (a *applyContext) entry(app string) *appCache {
 	return entry
 }
 
+func validatePlanReadyForLiveApply(plan Plan) error {
+	for _, app := range plan.Prepare.Apps {
+		if isPlatformAppRole(app.Role) {
+			continue
+		}
+		switch app.Readiness {
+		case "", preparer.ReadinessReadyToCreate:
+		default:
+			return fmt.Errorf("live apply blocked by prepare readiness for app %s: %s", app.Name, app.Readiness)
+		}
+		for _, gate := range app.Gates {
+			switch gate.Readiness {
+			case preparer.ReadinessReadyToCreate:
+			default:
+				return fmt.Errorf("live apply blocked by prepare gate %s/%s: %s", app.Name, gate.Code, gate.Message)
+			}
+		}
+	}
+	return nil
+}
+
 func (c *Client) Apply(ctx context.Context, plan Plan) error {
+	if err := validatePlanReadyForLiveApply(plan); err != nil {
+		return err
+	}
 	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
 	pausedApps := map[string]struct{}{}
 	coolifyProxyStopped := false
@@ -300,6 +341,8 @@ func isPlatformAppRole(role string) bool {
 }
 
 func (c *Client) primeResumeState(ctx context.Context, actx *applyContext, completed []Step, next Step, pausedApps map[string]struct{}, coolifyProxyStopped *bool) error {
+	pushedApps := map[string]struct{}{}
+	resumedTargetApps := map[string]struct{}{}
 	for _, step := range completed {
 		if shouldSkipApplyStep(actx.plan, step) {
 			continue
@@ -322,6 +365,7 @@ func (c *Client) primeResumeState(ctx context.Context, actx *applyContext, compl
 				return fmt.Errorf("refresh completed env for resume: %w", err)
 			}
 		case StepPushImage:
+			pushedApps[step.App] = struct{}{}
 			if !replayNextApp {
 				continue
 			}
@@ -332,10 +376,21 @@ func (c *Client) primeResumeState(ctx context.Context, actx *applyContext, compl
 			pausedApps[step.App] = struct{}{}
 		case StepResumeSource:
 			delete(pausedApps, step.App)
+		case StepResumeTarget:
+			resumedTargetApps[step.App] = struct{}{}
+			actx.entry(step.App).TargetWritersStopped = nil
 		case StepStopCoolifyProxy:
 			*coolifyProxyStopped = true
 		case StepStartDokployProxy:
 			*coolifyProxyStopped = false
+		}
+	}
+	for app := range pushedApps {
+		if _, resumed := resumedTargetApps[app]; resumed {
+			continue
+		}
+		if err := c.primeTargetWritersForResume(ctx, c.dockerRunner(), actx, app); err != nil {
+			return fmt.Errorf("refresh target writer pause for resume app %s: %w", app, err)
 		}
 	}
 	return nil
@@ -347,9 +402,10 @@ func (c *Client) primeResumeState(ctx context.Context, actx *applyContext, compl
 // uses a fresh context so a Ctrl-C that cancelled apply can still
 // clean up — without that, source containers would stay stopped.
 func (c *Client) bestEffortResume(_ context.Context, actx *applyContext, plan Plan, total int, pausedApps map[string]struct{}, coolifyProxyStopped bool) {
-	if len(pausedApps) == 0 && !coolifyProxyStopped {
+	if len(pausedApps) == 0 && !coolifyProxyStopped && !actx.hasStoppedTargetWriters() {
 		return
 	}
+	c.bestEffortResumeTargetWriters(actx, plan, total)
 	for app := range pausedApps {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), dockerStartTimeout)
 		resumeStep := Step{Kind: StepResumeSource, App: app, Ref: app}
@@ -376,6 +432,38 @@ func (c *Client) bestEffortResume(_ context.Context, actx *applyContext, plan Pl
 			return
 		}
 		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeProxyStep, Status: StepStatusOK})
+	}
+}
+
+func (a *applyContext) hasStoppedTargetWriters() bool {
+	if a == nil {
+		return false
+	}
+	for _, entry := range a.cache {
+		if len(entry.TargetWritersStopped) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) bestEffortResumeTargetWriters(actx *applyContext, plan Plan, total int) {
+	if actx == nil {
+		return
+	}
+	runner := c.dockerRunner()
+	for app, entry := range actx.cache {
+		if len(entry.TargetWritersStopped) == 0 {
+			continue
+		}
+		resumeStep := Step{Kind: StepResumeTarget, App: app, Ref: app}
+		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusStarted})
+		if err := startStoppedTargetWriters(runner, entry.TargetWritersStopped); err != nil {
+			emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusError, Err: err})
+			continue
+		}
+		entry.TargetWritersStopped = nil
+		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusOK})
 	}
 }
 
@@ -406,6 +494,8 @@ func (c *Client) applyStep(ctx context.Context, actx *applyContext, step Step) e
 		return c.applyPauseSource(ctx, actx, step)
 	case StepResumeSource:
 		return c.applyResumeSource(ctx, actx, step)
+	case StepResumeTarget:
+		return c.applyResumeTarget(ctx, actx, step)
 	case StepSyncVolume:
 		return c.applySyncVolume(ctx, actx, step)
 	case StepDumpDataStore:
@@ -514,7 +604,10 @@ func (c *Client) applyPushImage(ctx context.Context, actx *applyContext, step St
 	if err := ensureComposeImagesAvailable(ctx, c.dockerRunner(), actx.plan, step.App, composeFile); err != nil {
 		return err
 	}
-	return c.DeployCompose(ctx, entry.ComposeID, deployComposeTitle(actx.plan))
+	if err := c.DeployCompose(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
+		return err
+	}
+	return c.pauseTargetWritersForState(ctx, c.dockerRunner(), actx, step.App)
 }
 
 func deployComposeTitle(plan Plan) string {
@@ -1064,19 +1157,14 @@ func inlineComposeEnvFilesWithFallbacks(contents, appDir string, fallbackPaths [
 		}
 		values := map[string]string{}
 		envFileNode := mappingValue(service, "env_file")
-		preservedSharedEnvFile := false
 		if envFileNode != nil {
 			envFilePaths := composeEnvFilePaths(envFileNode)
-			preserveSharedEnvFile := len(fallbackPaths) > 0 && hasDefaultComposeEnvFilePath(envFilePaths)
+			preserveSharedEnvFile := hasDefaultComposeEnvFilePath(envFilePaths) && hasDefaultComposeEnvFilePath(fallbackPaths)
 			inlinePaths := []string{}
 			preservedPaths := []string{}
 			for _, path := range envFilePaths {
 				if preserveSharedEnvFile && isDefaultComposeEnvFilePath(path) {
 					preservedPaths = append(preservedPaths, path)
-					preservedSharedEnvFile = true
-					continue
-				}
-				if preserveSharedEnvFile && composeEnvFilePathInList(path, fallbackPaths) {
 					continue
 				}
 				inlinePaths = append(inlinePaths, path)
@@ -1098,19 +1186,16 @@ func inlineComposeEnvFilesWithFallbacks(contents, appDir string, fallbackPaths [
 		}
 		if envFileNode == nil && sharedEnvFilePath != "" && !isComposeInfrastructureService(serviceName, service) {
 			setMappingScalar(service, "env_file", sharedEnvFilePath)
-			preservedSharedEnvFile = true
 			changed = true
 		}
-		if !preservedSharedEnvFile {
-			for _, path := range fallbacksByService[serviceName] {
-				envValues, err := readComposeEnvFilePathValues(appDir, path)
-				if err != nil {
-					return "", err
-				}
-				for key, value := range envValues {
-					if _, exists := values[key]; !exists {
-						values[key] = value
-					}
+		for _, path := range fallbacksByService[serviceName] {
+			envValues, err := readComposeEnvFilePathValues(appDir, path)
+			if err != nil {
+				return "", err
+			}
+			for key, value := range envValues {
+				if _, exists := values[key]; !exists {
+					values[key] = value
 				}
 			}
 		}
@@ -1301,9 +1386,7 @@ func isSourcePlatformLabel(key string) bool {
 	return strings.HasPrefix(key, "coolify.") ||
 		key == "traefik.enable" ||
 		strings.HasPrefix(key, "traefik.") ||
-		key == "caddy" ||
-		strings.HasPrefix(key, "caddy_") ||
-		strings.HasPrefix(key, "caddy.")
+		strings.HasPrefix(key, "caddy")
 }
 
 func isSourcePlatformEnvName(name string) bool {
@@ -1475,11 +1558,7 @@ func parseComposeEnvFile(contents string) map[string]string {
 		if !ok || key == "" || isSourcePlatformEnvName(key) {
 			continue
 		}
-		value = strings.TrimSpace(value)
-		if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') && value[len(value)-1] == value[0] {
-			value = value[1 : len(value)-1]
-		}
-		values[key] = value
+		values[key] = normalizeEnvUploadValue(value)
 	}
 	return values
 }
@@ -1602,6 +1681,9 @@ func readEnvContent(plan Plan, appName string) (string, error) {
 	}
 	merged := map[string]string{}
 	for _, envFile := range app.TargetResources.Dokploy.EnvFiles {
+		if !isSharedDokployEnvFile(envFile.Path) {
+			continue
+		}
 		full := filepath.Join(appDir, filepath.FromSlash(envFile.Path))
 		if err := safepath.ContainedPath(appDir, full); err != nil {
 			return "", err
@@ -1636,6 +1718,15 @@ func readEnvContent(plan Plan, appName string) (string, error) {
 		b.WriteString("\n")
 	}
 	return b.String(), nil
+}
+
+func isSharedDokployEnvFile(path string) bool {
+	switch normalizeComposeEnvFilePath(path) {
+	case ".env", ".env.example":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeEnvUploadValue(value string) string {

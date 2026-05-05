@@ -83,6 +83,36 @@ func (f *fakeDockerRunner) Run(_ context.Context, stdin io.Reader, stdout io.Wri
 	return f.runErr
 }
 
+type stagedTargetWriterRunner struct {
+	psCalls    int
+	outputArgs [][]string
+}
+
+func (r *stagedTargetWriterRunner) Output(_ context.Context, args ...string) ([]byte, error) {
+	r.outputArgs = append(r.outputArgs, append([]string{}, args...))
+	key := strings.Join(args, " ")
+	switch key {
+	case "ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}":
+		r.psCalls++
+		if r.psCalls == 1 {
+			return []byte("db-id\n"), nil
+		}
+		return []byte("db-id\nweb-id\n"), nil
+	case "inspect --type container db-id":
+		return []byte(`[{"Id":"db-id","Name":"/db","Config":{"Labels":{"com.docker.compose.service":"db","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"}}]`), nil
+	case "inspect --type container db-id web-id":
+		return []byte(`[{"Id":"db-id","Name":"/db","Config":{"Labels":{"com.docker.compose.service":"db","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"}},{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"}}]`), nil
+	case "stop web-id":
+		return []byte("web-id\n"), nil
+	default:
+		return nil, errors.New("docker output not stubbed: " + key)
+	}
+}
+
+func (r *stagedTargetWriterRunner) Run(context.Context, io.Reader, io.Writer, ...string) error {
+	return nil
+}
+
 func TestStopContainerKillsAfterStopTimeout(t *testing.T) {
 	runner := &timeoutStopRunner{}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
@@ -615,7 +645,7 @@ func TestInlineComposeEnvFilesPreservesSharedEnvFileWhenUploadingEnv(t *testing.
 	if err != nil {
 		t.Fatalf("inlineComposeEnvFilesWithFallbacks: %v", err)
 	}
-	if strings.Contains(out, "API_ONLY") || strings.Contains(out, "postgres://shared") {
+	if strings.Contains(out, "postgres://shared") {
 		t.Fatalf("expected uploaded shared .env to stay out of compose body, got:\n%s", out)
 	}
 	var parsed struct {
@@ -635,6 +665,12 @@ func TestInlineComposeEnvFilesPreservesSharedEnvFileWhenUploadingEnv(t *testing.
 	}
 	if got := parsed.Services["api"].Environment["DATABASE_URL"]; got != "postgres://compose" {
 		t.Fatalf("expected explicit compose environment preserved, got %q in compose:\n%s", got, out)
+	}
+	if got := parsed.Services["api"].Environment["API_ONLY"]; got != "yes" {
+		t.Fatalf("expected service-specific fallback env to inline into only api service, got %q in compose:\n%s", got, out)
+	}
+	if _, exists := parsed.Services["web"].Environment["API_ONLY"]; exists {
+		t.Fatalf("did not expect api fallback env on web service, got:\n%s", out)
 	}
 }
 
@@ -908,6 +944,109 @@ func TestApplySyncVolumeStopsRunningTargetForCopy(t *testing.T) {
 	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:redis -> /data"}
 	if err := client.applySyncVolume(context.Background(), actx, step); err != nil {
 		t.Fatalf("applySyncVolume: %v", err)
+	}
+}
+
+func TestTargetWriterKeepServicesKeepsOnlyLogicalStores(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.DataStores = []preparer.DataStoreResource{
+		{Kind: "postgres", Service: "db", Strategy: "migrate"},
+		{Kind: "redis", Service: "redis", Strategy: "migrate"},
+		{Kind: "postgres", Service: "scratch", Strategy: "recreate"},
+	}
+	keep := targetWriterKeepServices(Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}, "api")
+	if _, ok := keep["db"]; !ok {
+		t.Fatalf("expected logical postgres service to stay running, got %#v", keep)
+	}
+	for _, service := range []string{"redis", "scratch"} {
+		if _, ok := keep[service]; ok {
+			t.Fatalf("expected %s not to be kept during target writer pause, got %#v", service, keep)
+		}
+	}
+}
+
+func TestPauseTargetWritersWaitsForExpectedNonKeptServices(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatalf("mkdir app dir: %v", err)
+	}
+	compose := `services:
+  db:
+    image: postgres:16
+  web:
+    image: example/web
+`
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte(compose), 0o600); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+	app := preparer.AppPlan{Name: "api", Directory: "api"}
+	app.Resources.DataStores = []preparer.DataStoreResource{{Kind: "postgres", Service: "db", Strategy: "migrate"}}
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
+	runner := &stagedTargetWriterRunner{}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{
+		Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}},
+	}}
+	actx.entry("api").ComposeAppName = "stack-1"
+
+	if err := client.pauseTargetWriters(context.Background(), runner, actx, "api", targetWriterKeepServices(actx.plan, "api")); err != nil {
+		t.Fatalf("pauseTargetWriters: %v", err)
+	}
+	if runner.psCalls < 2 {
+		t.Fatalf("expected discovery to wait for web service, got %d ps calls", runner.psCalls)
+	}
+	if !fakeOutputCalled(&fakeDockerRunner{outputArgs: runner.outputArgs}, "stop", "web-id") {
+		t.Fatalf("expected web writer to be stopped, calls=%#v", runner.outputArgs)
+	}
+	if fakeOutputCalled(&fakeDockerRunner{outputArgs: runner.outputArgs}, "stop", "db-id") {
+		t.Fatalf("did not expect logical postgres service to be stopped, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestPrimeResumeStateRecordsAlreadyStoppedTargetWriters(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatalf("mkdir app dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte("services:\n  web:\n    image: example/web\n"), 0o600); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+	app := preparer.AppPlan{Name: "api", Directory: "api"}
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter label=com.docker.compose.project=stack-api --format {{.ID}}": []byte("web-id\n"),
+		"inspect --type container web-id":                                            []byte(`[{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-api"}},"State":{"Running":false,"Status":"exited"}}]`),
+		"start web-id":                                                               []byte("web-id\n"),
+	}}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{
+		Steps:   []Step{{Kind: StepPauseSource, App: "api", Ref: "api"}, {Kind: StepResumeTarget, App: "api", Ref: "api"}},
+		Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}},
+	}}
+	actx.entry("api").ComposeAppName = "stack-api"
+	pausedApps := map[string]struct{}{}
+	coolifyProxyStopped := false
+
+	err := client.primeResumeState(context.Background(), actx,
+		[]Step{{Kind: StepPushImage, App: "api", Ref: "api"}},
+		Step{Kind: StepPauseSource, App: "other", Ref: "other"},
+		pausedApps,
+		&coolifyProxyStopped,
+	)
+	if err != nil {
+		t.Fatalf("primeResumeState: %v", err)
+	}
+	stopped := actx.entry("api").TargetWritersStopped
+	if len(stopped) != 1 || stopped[0].ID != "web-id" {
+		t.Fatalf("expected stopped target writer to be reconstructed, got %#v", stopped)
+	}
+	if err := client.applyResumeTarget(context.Background(), actx, Step{Kind: StepResumeTarget, App: "api", Ref: "api"}); err != nil {
+		t.Fatalf("applyResumeTarget: %v", err)
+	}
+	if !fakeOutputCalled(runner, "start", "web-id") {
+		t.Fatalf("expected reconstructed target writer to restart, calls=%#v", runner.outputArgs)
 	}
 }
 

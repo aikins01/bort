@@ -54,6 +54,26 @@ func TestWritePlanFlagsMissingDeployableMetadata(t *testing.T) {
 	}
 }
 
+func TestWritePlanRedactsRepositoryCredentials(t *testing.T) {
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:     "api",
+		Platform: "coolify",
+		Git:      &manifest.GitSource{Repository: "https://token:secret@example.com/org/api.git", Branch: "main"},
+		Services: []manifest.Service{{Name: "api", Image: "example/api:latest"}},
+	}}}
+	var out bytes.Buffer
+	if err := writePlan(&out, m, "dokploy"); err != nil {
+		t.Fatal(err)
+	}
+	plan := out.String()
+	if strings.Contains(plan, "token") || strings.Contains(plan, "secret@") {
+		t.Fatalf("expected repository credentials to be redacted, got:\n%s", plan)
+	}
+	if !strings.Contains(plan, "https://example.com/org/api.git") {
+		t.Fatalf("expected redacted repository host/path, got:\n%s", plan)
+	}
+}
+
 func TestWritePlanShowsTopologyAnalysis(t *testing.T) {
 	m := manifest.Manifest{
 		Source: manifest.Source{Platform: "coolify-local", Hostname: "example.com"},

@@ -42,42 +42,7 @@ func runWizard(ctx context.Context, run loadedMigrationRun, stdin io.Reader, std
 	}
 
 	writeAppFirstCockpit(stdout, current)
-
-	if current.Run.Target == "dokploy" {
-		if _, err := ensureDokployClient(ctx, current.Run.Target, stdin, stdout, stderr); err != nil {
-			if errors.Is(err, errDokploySetupSkipped) {
-				return nil
-			}
-			return err
-		}
-	}
-
-	confirm, err := confirmApply(current)
-	if err != nil {
-		return err
-	}
-	if !confirm {
-		fmt.Fprintf(stdout, "Skipped live apply. Run `%s` later when you are ready.\n", liveApplyCommand(current))
-		return nil
-	}
-
-	if err := executeWithProgress(ctx, current, stdout, stderr); err != nil {
-		return err
-	}
-
-	fmt.Fprintln(stdout, "Live apply complete. Verify the target before retiring the source.")
-	commit, err := confirmCommitApply(current)
-	if err != nil {
-		return err
-	}
-	if !commit {
-		fmt.Fprintln(stdout, "Source kept running. Re-run `bort commit --apply` when you're ready to retire it.")
-		return nil
-	}
-	if err := applyCommitFromArgs(ctx, current.Run.RunDir, stderr); err != nil {
-		return err
-	}
-	fmt.Fprintln(stdout, "Source retired. Migration committed.")
+	fmt.Fprintf(stdout, "Live apply is explicit. Run `%s` when you are ready.\n", liveApplyCommand(current))
 	return nil
 }
 

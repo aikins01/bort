@@ -43,9 +43,6 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 			if err != nil {
 				return err
 			}
-			if isRealTTY(stdin, stdout) {
-				return executeWithProgress(ctx, run, stdout, stderr)
-			}
 			writeAppFirstCockpit(stdout, run)
 			return nil
 		}

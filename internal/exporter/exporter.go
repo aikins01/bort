@@ -408,9 +408,7 @@ func isSourcePlatformLabel(key string) bool {
 	return strings.HasPrefix(key, "coolify.") ||
 		key == "traefik.enable" ||
 		strings.HasPrefix(key, "traefik.") ||
-		key == "caddy" ||
-		strings.HasPrefix(key, "caddy_") ||
-		strings.HasPrefix(key, "caddy.")
+		strings.HasPrefix(key, "caddy")
 }
 
 func isSourcePlatformEnvName(name string) bool {
@@ -576,7 +574,7 @@ func report(app manifest.App, warnings []string) string {
 	}
 	if app.Git != nil {
 		builder.WriteString("## git\n\n")
-		builder.WriteString(fmt.Sprintf("repository: `%s`\n\n", planutil.Fallback(app.Git.Repository, "unknown")))
+		builder.WriteString(fmt.Sprintf("repository: `%s`\n\n", planutil.Fallback(planutil.RedactRepositoryCredentials(app.Git.Repository), "unknown")))
 		builder.WriteString(fmt.Sprintf("branch: `%s`\n\n", planutil.Fallback(app.Git.Branch, "unknown")))
 		if app.Git.Provider != "" {
 			builder.WriteString(fmt.Sprintf("provider: `%s`\n\n", app.Git.Provider))

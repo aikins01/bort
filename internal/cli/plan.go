@@ -273,7 +273,7 @@ func describeSourceControl(app manifest.App) string {
 	if app.Git == nil {
 		return "none"
 	}
-	parts := []string{planutil.Fallback(app.Git.Repository, "repository metadata detected")}
+	parts := []string{planutil.Fallback(planutil.RedactRepositoryCredentials(app.Git.Repository), "repository metadata detected")}
 	if app.Git.Branch != "" {
 		parts = append(parts, "branch="+app.Git.Branch)
 	}

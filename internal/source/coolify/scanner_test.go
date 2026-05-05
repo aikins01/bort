@@ -96,6 +96,41 @@ func TestScanApplicationsFromCoolifyAPI(t *testing.T) {
 	}
 }
 
+func TestScanRedactsRepositoryCredentials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/applications":
+			writeJSON(t, w, []map[string]any{{"uuid": "app-1", "name": "api"}})
+		case "/api/v1/applications/app-1":
+			writeJSON(t, w, map[string]any{
+				"uuid":           "app-1",
+				"name":           "api",
+				"git_repository": "https://user:token@github.com/example/private-app.git",
+			})
+		case "/api/v1/applications/app-1/envs", "/api/v1/applications/app-1/storages", "/api/v1/services", "/api/v1/databases":
+			writeJSON(t, w, []map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	scanner, err := NewScanner(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := scanner.Scan(context.Background(), source.ScanOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Apps) != 1 || manifest.Apps[0].Git == nil {
+		t.Fatalf("expected scanned git source, got %#v", manifest.Apps)
+	}
+	if got := manifest.Apps[0].Git.Repository; got != "https://github.com/example/private-app.git" {
+		t.Fatalf("expected credential-redacted repository, got %q", got)
+	}
+}
+
 func TestEnvVarsIncludeValuesWhenRequested(t *testing.T) {
 	vars := envVars([]map[string]any{{"key": "API_KEY", "real_value": "abc"}}, true)
 	if len(vars) != 1 {

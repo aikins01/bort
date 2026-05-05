@@ -232,7 +232,7 @@ func sourceControl(app manifest.App) *SourceControl {
 		return nil
 	}
 	control := &SourceControl{
-		Repository:   strings.TrimSpace(app.Git.Repository),
+		Repository:   planutil.RedactRepositoryCredentials(app.Git.Repository),
 		Branch:       strings.TrimSpace(app.Git.Branch),
 		CommitSHA:    strings.TrimSpace(app.Git.CommitSHA),
 		Provider:     strings.TrimSpace(app.Git.Provider),
@@ -250,7 +250,6 @@ func sourceControl(app manifest.App) *SourceControl {
 	}
 	return control
 }
-
 func sourceControlAuth(control *SourceControl) string {
 	sourceType := strings.ToLower(control.SourceType)
 	switch {

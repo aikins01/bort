@@ -51,7 +51,7 @@ func TestCleanupStalePlatformProjectsBacksUpThenDeletesMetadata(t *testing.T) {
 		t.Fatalf("expected psql delete second, got %q", got)
 	}
 	sql := string(runner.runs[1].Stdin)
-	for _, want := range []string{"('proxy')", "('source')", "refusing to delete stale platform projects with domains", "delete from project"} {
+	for _, want := range []string{"('proxy', null)", "('source', null)", "project_id text", "refusing to delete stale platform projects with attached Dokploy resources", "compose_count", "delete from project"} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("expected cleanup sql to contain %q, got:\n%s", want, sql)
 		}

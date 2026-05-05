@@ -36,6 +36,14 @@ func TestNewClientFromEnvRequiresURLAndToken(t *testing.T) {
 	}
 }
 
+func TestNewClientFromEnvRejectsRemoteHTTP(t *testing.T) {
+	t.Setenv(EnvBaseURL, "http://dokploy.example")
+	t.Setenv(EnvToken, "secret")
+	if _, err := NewClientFromEnv(); err == nil || !strings.Contains(err.Error(), "non-loopback http") {
+		t.Fatalf("expected remote http URL to be rejected, got %v", err)
+	}
+}
+
 func TestApplyDumpDataStoreNoopsForVolumeStrategyKinds(t *testing.T) {
 	// mysql has no logical-dump implementation yet, so it migrates via
 	// stopped-volume copy. the dump step in the plan must be a noop, not

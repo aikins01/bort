@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -131,12 +130,22 @@ func runCleanup(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	result := planCleanup(ctx, run, target)
 	result.DryRun = !apply
 	if apply {
-		client, err := resolveDokployClient(ctx, target, os.Stdin, stderr)
+		if collisions := cleanupStaleProjectNameCollisions(run, defaultStaleDokployPlatformProjects); len(collisions) > 0 {
+			return fmt.Errorf("refusing cleanup --apply because stale platform project name(s) match target app project(s): %s", strings.Join(collisions, ", "))
+		}
+		applyNames := cleanupStaleProjectNamesForApply(result.StalePlatformRecords)
+		if len(applyNames) == 0 {
+			result.Applied = true
+			result.Actions = append(result.Actions, cleanupAction{Kind: "dokploy_metadata", Ref: strings.Join(defaultStaleDokployPlatformProjects, ","), Safety: "metadata_only", Status: "noop", Message: "no empty zero-domain stale Dokploy platform project records are ready to delete"})
+			return writeFormattedOutput(stdout, outputPath, format, result, writeCleanupText)
+		}
+		client, err := lookupDokployClient(target)
 		if err != nil {
 			return err
 		}
 		applied, err := client.CleanupStalePlatformProjects(ctx, dokploy.StalePlatformCleanupOptions{
-			ProjectNames: defaultStaleDokployPlatformProjects,
+			ProjectNames: applyNames,
+			ProjectIDs:   cleanupStaleProjectIDs(result.StalePlatformRecords),
 			BackupDir:    backupDir,
 			BackupPrefix: "dokploy-stale-platform-records",
 		})
@@ -151,7 +160,7 @@ func runCleanup(ctx context.Context, args []string, stdout, stderr io.Writer) er
 			Ref:     strings.Join(defaultStaleDokployPlatformProjects, ","),
 			Safety:  "metadata_only",
 			Status:  "applied",
-			Message: fmt.Sprintf("deleted %d stale zero-domain Dokploy platform project record(s); backup written before delete", len(applied.Deleted)),
+			Message: fmt.Sprintf("deleted %d stale empty zero-domain Dokploy platform project record(s); backup written before delete", len(applied.Deleted)),
 		})
 	}
 
@@ -166,6 +175,59 @@ func loadCleanupRun(runRef string) (loadedMigrationRun, error) {
 		return loadMigrationRun(latest)
 	}
 	return loadedMigrationRun{}, fmt.Errorf("no migration run found; run `bort` or pass --run before cleanup")
+}
+
+func cleanupStaleProjectNameCollisions(run loadedMigrationRun, names []string) []string {
+	staleNames := map[string]struct{}{}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			staleNames[name] = struct{}{}
+		}
+	}
+	if len(staleNames) == 0 {
+		return nil
+	}
+	collisions := []string{}
+	seen := map[string]struct{}{}
+	for _, app := range run.Prepare.Apps {
+		if app.TargetResources == nil || app.TargetResources.Dokploy == nil {
+			continue
+		}
+		name := strings.TrimSpace(app.TargetResources.Dokploy.Project.Name)
+		if _, ok := staleNames[name]; !ok {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		collisions = append(collisions, name)
+	}
+	sort.Strings(collisions)
+	return collisions
+}
+
+func cleanupStaleProjectIDs(records []cleanupStalePlatformRecord) map[string]string {
+	ids := map[string]string{}
+	for _, record := range records {
+		if record.Status != "present" || strings.TrimSpace(record.ProjectID) == "" {
+			continue
+		}
+		ids[record.Name] = record.ProjectID
+	}
+	return ids
+}
+
+func cleanupStaleProjectNamesForApply(records []cleanupStalePlatformRecord) []string {
+	names := []string{}
+	for _, record := range records {
+		if record.Status == "present" && strings.TrimSpace(record.ProjectID) != "" {
+			names = append(names, record.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func planCleanup(ctx context.Context, run loadedMigrationRun, target string) cleanupResult {
@@ -221,7 +283,7 @@ func planCleanup(ctx context.Context, run loadedMigrationRun, target string) cle
 func inspectStalePlatformRecords(ctx context.Context, target string) ([]cleanupStalePlatformRecord, []string) {
 	records := make([]cleanupStalePlatformRecord, 0, len(defaultStaleDokployPlatformProjects))
 	for _, name := range defaultStaleDokployPlatformProjects {
-		records = append(records, cleanupStalePlatformRecord{Name: name, Status: "unknown", Message: "will verify zero domains against Dokploy DB before deleting"})
+		records = append(records, cleanupStalePlatformRecord{Name: name, Status: "unknown", Message: "will verify the project is empty and has zero domains against Dokploy DB before deleting"})
 	}
 	client, err := lookupDokployClient(target)
 	if err != nil {
@@ -267,7 +329,7 @@ func inspectStalePlatformRecords(ctx context.Context, target string) ([]cleanupS
 		}
 		if inspectionIncomplete {
 			records[i].Status = "unknown"
-			records[i].Message = "live domain inspection was incomplete; cleanup --apply will recheck zero domains in the Dokploy DB before deleting"
+			records[i].Message = "live inspection was incomplete; cleanup --apply will recheck empty project and zero-domain conditions in the Dokploy DB before deleting"
 			continue
 		}
 		if records[i].DomainCount > 0 {
@@ -275,8 +337,13 @@ func inspectStalePlatformRecords(ctx context.Context, target string) ([]cleanupS
 			records[i].Message = fmt.Sprintf("refusing automatic metadata cleanup because %d domain(s) are attached", records[i].DomainCount)
 			continue
 		}
+		if len(records[i].ComposeIDs) > 0 {
+			records[i].Status = "blocked"
+			records[i].Message = fmt.Sprintf("refusing automatic metadata cleanup because %d compose app record(s) are still attached", len(records[i].ComposeIDs))
+			continue
+		}
 		records[i].Status = "present"
-		records[i].Message = "safe metadata cleanup candidate: zero domains visible"
+		records[i].Message = "safe metadata cleanup candidate: empty project with zero domains visible"
 	}
 	return records, warnings
 }
@@ -428,7 +495,7 @@ func writeCleanupText(w io.Writer, result cleanupResult) {
 	fmt.Fprintf(w, "Cleanup plan: %s -> %s\n", firstCleanupValue(result.RunDir, result.RunName, "run"), result.Target)
 	fmt.Fprintf(w, "Mode: %s\n\n", mode)
 
-	if result.Applied {
+	if result.Applied && result.BackupPath != "" {
 		fmt.Fprintf(w, "Backup: %s\n", result.BackupPath)
 		if len(result.DeletedProjects) == 0 {
 			fmt.Fprintln(w, "Deleted stale Dokploy metadata: none")

@@ -80,11 +80,11 @@ func writePrimaryHelp(w io.Writer, st *styler) {
 		{verb: "bort", desc: "scan and show app-first migration status"},
 		{verb: "bort env <app> KEY=value ...", desc: "record env values for an app in .bort/state.json"},
 		{verb: "bort data <app> <store> --recreate|--migrate|--managed", desc: "record a data store strategy in .bort/state.json"},
-		{verb: "bort migrate", desc: "create/update local dry-run migration artifacts"},
+		{verb: "bort migrate", desc: "create/update a run; --live applies after gates are clear"},
 		{verb: "bort rollback", desc: "plan a rollback to the source"},
-		{verb: "bort commit", desc: "plan final target acceptance"},
-		{verb: "bort cleanup", desc: "inventory leftovers and remove safe stale Dokploy metadata"},
-		{verb: "bort init-target dokploy", desc: "bootstrap a dokploy admin + api key from coolify credentials"},
+		{verb: "bort commit", desc: "plan final target acceptance; --apply stops source app containers"},
+		{verb: "bort cleanup", desc: "inventory leftovers; --apply removes safe metadata only"},
+		{verb: "bort init-target dokploy", desc: "bootstrap target credentials for live execution"},
 	})
 	writeHelpSection(w, st, "Other:", []helpLine{
 		{verb: "bort help [--advanced]", desc: "show this help (advanced lists power-user verbs)"},
@@ -97,10 +97,10 @@ func writeAdvancedHelp(w io.Writer, st *styler) {
 		{verb: "bort", desc: "start or resume a migration (linear, app-first)"},
 		{verb: "bort env", desc: "record env values for an app in .bort/state.json"},
 		{verb: "bort data", desc: "record a data store strategy in .bort/state.json"},
-		{verb: "bort migrate", desc: "create/update local dry-run migration artifacts"},
+		{verb: "bort migrate", desc: "create/update a run; --live applies after gates are clear"},
 		{verb: "bort rollback", desc: "plan a rollback to the source"},
-		{verb: "bort commit", desc: "plan final target acceptance"},
-		{verb: "bort cleanup", desc: "dry-run leftover cleanup; --apply only removes safe Dokploy metadata"},
+		{verb: "bort commit", desc: "plan final target acceptance; --apply stops source app containers"},
+		{verb: "bort cleanup", desc: "inventory leftovers; --apply removes safe metadata only"},
 	})
 	writeHelpSection(w, st, "Power-user pipeline (each step is local and dry-run only):", []helpLine{
 		{verb: "bort scan", desc: "discover local resources and write a migration manifest"},
