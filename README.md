@@ -95,9 +95,22 @@ Not implemented yet:
 
 ## Quick start
 
+Install from Homebrew after the first tagged release:
+
+```sh
+brew install aikins01/tap/bort
+```
+
+Or install from source with Go:
+
+```sh
+go install github.com/aikins01/bort/cmd/bort@latest
+```
+
 Build the CLI:
 
 ```sh
+mkdir -p bin
 go build -o bin/bort ./cmd/bort
 ```
 
@@ -237,6 +250,19 @@ Near-term product priorities:
 4. add transfer adapters for cross-server moves;
 5. graduate third-party adapters only when Bort can classify what is safe,
    blocked, or manual without hiding risk.
+
+## Release process
+
+Releases are automated by GitHub Actions and GoReleaser: push a `v*` tag and the
+release workflow builds macOS, Linux, and Windows artifacts, Linux
+`.deb`/`.rpm` packages, checksums, and updates the `aikins01/homebrew-tap` formula.
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The Homebrew tap update uses the `TAP_GITHUB_TOKEN` repository secret.
 
 ## Name
 
