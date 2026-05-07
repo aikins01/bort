@@ -874,6 +874,36 @@ volumes:
 	}
 }
 
+func TestAttachDokployNetworkAliasesRewritesQuotedExternalTrueToBool(t *testing.T) {
+	compose := `services:
+  db:
+    image: postgres:17-alpine
+    networks:
+      default: {}
+      dokploy-network:
+        aliases:
+          - db
+networks:
+  dokploy-network:
+    external: "true"
+`
+	out, err := attachDokployNetworkAliases(compose)
+	if err != nil {
+		t.Fatalf("attachDokployNetworkAliases: %v", err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("parse compose: %v\n%s", err, out)
+	}
+	root := doc.Content[0]
+	networks := mappingValue(root, "networks")
+	dokployNetwork := mappingValue(networks, "dokploy-network")
+	external := mappingValue(dokployNetwork, "external")
+	if external == nil || external.Kind != yaml.ScalarNode || external.Tag != "!!bool" || external.Value != "true" {
+		t.Fatalf("expected dokploy-network external to be bool true, got %#v in:\n%s", external, out)
+	}
+}
+
 func TestInlineComposeEnvFilesSanitizesCoolifyRuntimeCompose(t *testing.T) {
 	appDir := t.TempDir()
 	compose := `services:
