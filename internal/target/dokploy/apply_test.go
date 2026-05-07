@@ -665,3 +665,50 @@ func TestApplyActivateRoutesUpdatesDomainsAndRedeploys(t *testing.T) {
 		t.Fatalf("expected one compose deploy after domain update, got %d", deploys)
 	}
 }
+
+func TestApplyActivateRoutesDetectsMigratedVolumeDriftAfterDeploy(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatalf("mkdir app dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte("services:\n  web:\n    image: example/web\n"), 0o600); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+	deploys := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			deploys++
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	runner := &latePostDeployTargetRunner{}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	app := preparer.AppPlan{Name: "api", Directory: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", Target: "/data"}}
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}}}
+	entry := actx.entry("api")
+	entry.ComposeID = "c1"
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+
+	err := client.applyActivateRoutes(context.Background(), actx, Step{Kind: StepActivateRoutes, App: "api", Ref: "routes"})
+	if err == nil || !strings.Contains(err.Error(), "changed from migrated volume migrated-vol to fresh-vol") {
+		t.Fatalf("expected migrated volume drift after deploy, got %v", err)
+	}
+	if deploys != 1 {
+		t.Fatalf("expected route activation deploy before validation, got %d", deploys)
+	}
+	if !fakeOutputCalled(&fakeDockerRunner{outputArgs: runner.outputArgs}, "stop", "web-id") {
+		t.Fatalf("expected drifted target container to stop, calls=%#v", runner.outputArgs)
+	}
+}
