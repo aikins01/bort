@@ -113,6 +113,73 @@ func (r *stagedTargetWriterRunner) Run(context.Context, io.Reader, io.Writer, ..
 	return nil
 }
 
+type latePostDeployTargetRunner struct {
+	psCalls    int
+	outputArgs [][]string
+	stopped    bool
+	emptyFirst bool
+}
+
+func (r *latePostDeployTargetRunner) Output(_ context.Context, args ...string) ([]byte, error) {
+	r.outputArgs = append(r.outputArgs, append([]string{}, args...))
+	key := strings.Join(args, " ")
+	switch key {
+	case "ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}":
+		r.psCalls++
+		if r.emptyFirst && r.psCalls == 1 {
+			return []byte(""), nil
+		}
+		return []byte("web-id\n"), nil
+	case "inspect --type container web-id":
+		if r.stopped {
+			return []byte(`[{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":false,"Status":"exited"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`), nil
+		}
+		return []byte(`[{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`), nil
+	case "stop web-id":
+		r.stopped = true
+		return []byte("web-id\n"), nil
+	default:
+		return nil, errors.New("docker output not stubbed: " + key)
+	}
+}
+
+func (r *latePostDeployTargetRunner) Run(context.Context, io.Reader, io.Writer, ...string) error {
+	return nil
+}
+
+type postDeployRecreateRunner struct {
+	inspectCalls int
+	outputArgs   [][]string
+	stopped      bool
+}
+
+func (r *postDeployRecreateRunner) Output(_ context.Context, args ...string) ([]byte, error) {
+	r.outputArgs = append(r.outputArgs, append([]string{}, args...))
+	key := strings.Join(args, " ")
+	switch key {
+	case "ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}":
+		return []byte("web-id\n"), nil
+	case "inspect --type container web-id":
+		r.inspectCalls++
+		if r.stopped {
+			return []byte(`[{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":false,"Status":"exited"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`), nil
+		}
+		if r.inspectCalls == 1 {
+			return []byte(`[{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"migrated-vol","Destination":"/data","RW":true}]}]`), nil
+		}
+		return []byte(`[{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`), nil
+	case "stop web-id":
+		r.stopped = true
+		return []byte("web-id\n"), nil
+	default:
+		return nil, errors.New("docker output not stubbed: " + key)
+	}
+}
+
+func (r *postDeployRecreateRunner) Run(context.Context, io.Reader, io.Writer, ...string) error {
+	return nil
+}
+
 func TestStopContainerKillsAfterStopTimeout(t *testing.T) {
 	runner := &timeoutStopRunner{}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
@@ -303,6 +370,50 @@ func TestApplyPushImageTagsMissingComposeImageFromSourceContainer(t *testing.T) 
 	}
 	if !fakeOutputCalled(runner, "tag", "sha256:worker-image", "example/worker:local") {
 		t.Fatalf("expected missing image to be tagged from source container, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestApplyPushImageDetectsMigratedVolumeDriftAfterDeploy(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatalf("mkdir app dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte("services:\n  web:\n    image: example/web\n"), 0o600); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+	deploys := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy" {
+			deploys++
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	runner := &latePostDeployTargetRunner{}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	app := preparer.AppPlan{Name: "api", Directory: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", Target: "/data"}}
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}}}
+	entry := actx.entry("api")
+	entry.ComposeID = "c1"
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+
+	err := client.applyPushImage(context.Background(), actx, Step{Kind: StepPushImage, App: "api", Ref: "api"})
+	if err == nil || !strings.Contains(err.Error(), "changed from migrated volume migrated-vol to fresh-vol") {
+		t.Fatalf("expected migrated volume drift after push deploy, got %v", err)
+	}
+	if deploys != 1 {
+		t.Fatalf("expected push deploy before validation, got %d", deploys)
+	}
+	if !fakeOutputCalled(&fakeDockerRunner{outputArgs: runner.outputArgs}, "stop", "web-id") {
+		t.Fatalf("expected drifted target container to stop, calls=%#v", runner.outputArgs)
 	}
 }
 
@@ -712,6 +823,57 @@ func TestInlineComposeEnvFilesAddsSharedEnvFileForAppServices(t *testing.T) {
 	}
 }
 
+func TestReadComposeFileAddsDokployNetworkAliasForSupportCompose(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "sts-db-instance")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatalf("mkdir app dir: %v", err)
+	}
+	compose := `services:
+  p0sow4sccoo8cssoos8w0g0o:
+    image: postgres:17-alpine
+    expose:
+      - "5432"
+    volumes:
+      - postgres-data-p0sow4sccoo8cssoos8w0g0o:/var/lib/postgresql/data
+volumes:
+  postgres-data-p0sow4sccoo8cssoos8w0g0o: {}
+`
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte(compose), 0o600); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+	app := preparer.AppPlan{Name: "sts-db-instance", Directory: "sts-db-instance", Role: "support"}
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
+	out, err := readComposeFile(Plan{Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}}, "sts-db-instance")
+	if err != nil {
+		t.Fatalf("readComposeFile: %v", err)
+	}
+	var parsed struct {
+		Services map[string]struct {
+			Networks map[string]struct {
+				Aliases []string `yaml:"aliases"`
+			} `yaml:"networks"`
+		} `yaml:"services"`
+		Networks map[string]struct {
+			External bool `yaml:"external"`
+		} `yaml:"networks"`
+	}
+	if err := yaml.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("parse compose: %v\n%s", err, out)
+	}
+	service := parsed.Services["p0sow4sccoo8cssoos8w0g0o"]
+	if _, ok := service.Networks["default"]; !ok {
+		t.Fatalf("expected support service to keep default network, got:\n%s", out)
+	}
+	aliases := service.Networks["dokploy-network"].Aliases
+	if len(aliases) != 1 || aliases[0] != "p0sow4sccoo8cssoos8w0g0o" {
+		t.Fatalf("expected dokploy-network alias for source host, got %#v in:\n%s", aliases, out)
+	}
+	if !parsed.Networks["dokploy-network"].External {
+		t.Fatalf("expected top-level dokploy-network external=true, got:\n%s", out)
+	}
+}
+
 func TestInlineComposeEnvFilesSanitizesCoolifyRuntimeCompose(t *testing.T) {
 	appDir := t.TempDir()
 	compose := `services:
@@ -944,6 +1106,250 @@ func TestApplySyncVolumeStopsRunningTargetForCopy(t *testing.T) {
 	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:redis -> /data"}
 	if err := client.applySyncVolume(context.Background(), actx, step); err != nil {
 		t.Fatalf("applySyncVolume: %v", err)
+	}
+}
+
+func TestApplyResumeTargetDetectsMigratedVolumeDrift(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{
+		Service: "redis",
+		Type:    "volume",
+		Name:    "src-vol",
+		Target:  "/data",
+	}}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("dst-id\n"),
+			"inspect --type container dst-id":                                          []byte(`[{"Id":"dst-id","Name":"/dokploy-redis","Config":{"Labels":{"com.docker.compose.service":"redis","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"migrated-vol","Destination":"/data","RW":true}]}]`),
+			"volume inspect src-vol":                                                   []byte(`[{"Name":"src-vol"}]`),
+			"volume inspect migrated-vol":                                              []byte(`[{"Name":"migrated-vol"}]`),
+			"stop dst-id":                                                              []byte("dst-id\n"),
+			"start dst-id":                                                             []byte("dst-id\n"),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}}
+	actx.entry("api").ComposeAppName = "stack-1"
+	actx.plan = Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}
+
+	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:redis -> /data"}
+	if err := client.applySyncVolume(context.Background(), actx, step); err != nil {
+		t.Fatalf("applySyncVolume: %v", err)
+	}
+	actx.entry("api").TargetWritersStopped = []dockerContainer{{ID: "writer-id"}}
+	runner.outputs["inspect --type container dst-id"] = []byte(`[{"Id":"dst-id","Name":"/dokploy-redis","Config":{"Labels":{"com.docker.compose.service":"redis","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`)
+	runner.outputArgs = nil
+
+	err := client.applyResumeTarget(context.Background(), actx, Step{Kind: StepResumeTarget, App: "api", Ref: "api"})
+	if err == nil || !strings.Contains(err.Error(), "changed from migrated volume migrated-vol to fresh-vol") {
+		t.Fatalf("expected migrated volume drift error, got %v", err)
+	}
+	if !fakeOutputCalled(runner, "stop", "dst-id") {
+		t.Fatalf("expected unsafe target container to stop, calls=%#v", runner.outputArgs)
+	}
+	if fakeOutputCalled(runner, "start", "writer-id") {
+		t.Fatalf("target writer started before volume drift validation, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestApplyResumeTargetLoadsPersistedMigratedVolumeState(t *testing.T) {
+	runDir := t.TempDir()
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{
+		Service: "redis",
+		Type:    "volume",
+		Name:    "src-vol",
+		Target:  "/data",
+	}}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("dst-id\n"),
+			"inspect --type container dst-id":                                          []byte(`[{"Id":"dst-id","Name":"/dokploy-redis","Config":{"Labels":{"com.docker.compose.service":"redis","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"migrated-vol","Destination":"/data","RW":true}]}]`),
+			"volume inspect src-vol":                                                   []byte(`[{"Name":"src-vol"}]`),
+			"volume inspect migrated-vol":                                              []byte(`[{"Name":"migrated-vol"}]`),
+			"stop dst-id":                                                              []byte("dst-id\n"),
+			"start dst-id":                                                             []byte("dst-id\n"),
+		},
+	}
+	client := &Client{Docker: runner}
+	plan := Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}, RunDir: runDir}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: plan}
+	actx.entry("api").ComposeAppName = "stack-1"
+	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:redis -> /data"}
+	if err := client.applySyncVolume(context.Background(), actx, step); err != nil {
+		t.Fatalf("applySyncVolume: %v", err)
+	}
+
+	resumed := &applyContext{cache: map[string]*appCache{}, plan: plan}
+	resumed.entry("api").ComposeAppName = "stack-1"
+	pausedApps := map[string]struct{}{}
+	coolifyProxyStopped := false
+	if err := client.primeResumeState(context.Background(), resumed, nil, Step{Kind: StepResumeTarget, App: "api", Ref: "api"}, pausedApps, &coolifyProxyStopped); err != nil {
+		t.Fatalf("primeResumeState: %v", err)
+	}
+	runner.outputs["inspect --type container dst-id"] = []byte(`[{"Id":"dst-id","Name":"/dokploy-redis","Config":{"Labels":{"com.docker.compose.service":"redis","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`)
+
+	err := client.applyResumeTarget(context.Background(), resumed, Step{Kind: StepResumeTarget, App: "api", Ref: "api"})
+	if err == nil || !strings.Contains(err.Error(), "changed from migrated volume migrated-vol to fresh-vol") {
+		t.Fatalf("expected persisted migrated volume drift error, got %v", err)
+	}
+}
+
+func TestRecordMigratedStoreMountsFeedsResumeValidation(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{
+		Service: "db",
+		Type:    "volume",
+		Target:  "/var/lib/postgresql/data",
+	}}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("db-id\n"),
+		"inspect --type container db-id":                                           []byte(`[{"Id":"db-id","Name":"/db","Config":{"Labels":{"com.docker.compose.service":"db","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-db","Destination":"/var/lib/postgresql/data","RW":true}]}]`),
+	}}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	actx.entry("api").ComposeAppName = "stack-1"
+	if err := recordMigratedStoreMounts(actx, "api", app, "db", dockerContainer{Mounts: []dockerMount{{Type: "volume", Name: "restored-db", Destination: "/var/lib/postgresql/data"}}}); err != nil {
+		t.Fatalf("recordMigratedStoreMounts: %v", err)
+	}
+
+	err := client.applyResumeTarget(context.Background(), actx, Step{Kind: StepResumeTarget, App: "api", Ref: "api"})
+	if err == nil || !strings.Contains(err.Error(), "changed from migrated volume restored-db to fresh-db") {
+		t.Fatalf("expected restored store volume drift error, got %v", err)
+	}
+}
+
+func TestBestEffortResumeSkipsTargetWritersAfterUnsafeResumeError(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container source-id": []byte(`[{"Id":"source-id","Name":"/source","State":{"Running":false,"Status":"exited"}}]`),
+		"start source-id":                    []byte("source-id\n"),
+	}}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}}
+	actx.entry("api").TargetWritersStopped = []dockerContainer{{ID: "target-id"}}
+	plan := Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "source-app", Resources: preparer.ResourceSpecs{Volumes: []preparer.VolumeResource{{Service: "web", Type: "volume", Target: "/data", SourceContainerID: "source-id"}}}}}}}
+	client.bestEffortResume(context.Background(), actx, plan, 1, map[string]struct{}{"source-app": {}}, false, true)
+
+	if fakeOutputCalled(runner, "start", "target-id") {
+		t.Fatalf("target writer restarted after unsafe resume error, calls=%#v", runner.outputArgs)
+	}
+	if !fakeOutputCalled(runner, "start", "source-id") {
+		t.Fatalf("expected source app to resume, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestBestEffortResumeValidatesTargetWritersBeforeRestart(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("web-id\n"),
+		"inspect --type container web-id":                                          []byte(`[{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":false,"Status":"exited"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`),
+	}}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}}}}
+	entry := actx.entry("api")
+	entry.ComposeAppName = "stack-1"
+	entry.TargetWritersStopped = []dockerContainer{{ID: "target-id"}}
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+
+	client.bestEffortResume(context.Background(), actx, actx.plan, 1, nil, false, false)
+
+	if fakeOutputCalled(runner, "start", "target-id") {
+		t.Fatalf("target writer restarted despite migrated volume drift, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestValidateMigratedVolumeMountsDoesNotRedeployForDiscovery(t *testing.T) {
+	deploys := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "c1", AppName: "stack-1", ComposeStatus: "done"})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			deploys++
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte(""),
+	}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{}}
+	entry := actx.entry("api")
+	entry.ComposeID = "c1"
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := client.validateMigratedVolumeMounts(ctx, actx, "api")
+	if err == nil || !isUnsafeTargetResumeError(err) {
+		t.Fatalf("expected unsafe validation error while target service is missing, got %v", err)
+	}
+	if deploys != 0 {
+		t.Fatalf("validation redeployed compose during discovery, deploys=%d", deploys)
+	}
+}
+
+func TestStopTargetComposeContainersWaitsForLatePostDeployTarget(t *testing.T) {
+	runner := &latePostDeployTargetRunner{emptyFirst: true}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{}}
+	entry := actx.entry("api")
+	entry.ComposeAppName = "stack-1"
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := client.stopTargetComposeContainers(ctx, actx, "api"); err != nil {
+		t.Fatalf("stopTargetComposeContainers: %v", err)
+	}
+	if !fakeOutputCalled(&fakeDockerRunner{outputArgs: runner.outputArgs}, "stop", "web-id") {
+		t.Fatalf("expected late post-deploy target to stop, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestPostDeployValidationIgnoresCanceledApplyContextAndStopsLateTarget(t *testing.T) {
+	runner := &latePostDeployTargetRunner{emptyFirst: true}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{}}
+	entry := actx.entry("api")
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := client.validateMigratedVolumeMountsAfterDeploy(canceledCtx, actx, "api")
+	if err == nil || !strings.Contains(err.Error(), "changed from migrated volume migrated-vol to fresh-vol") {
+		t.Fatalf("expected fresh safety context to detect late migrated volume drift, got %v", err)
+	}
+	if !fakeOutputCalled(&fakeDockerRunner{outputArgs: runner.outputArgs}, "stop", "web-id") {
+		t.Fatalf("expected late post-deploy target to stop, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestPostDeployValidationDoesNotPassOnPreDeployContainer(t *testing.T) {
+	runner := &postDeployRecreateRunner{}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{}}
+	entry := actx.entry("api")
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+
+	err := client.validateMigratedVolumeMountsAfterDeploy(context.Background(), actx, "api")
+	if err == nil || !strings.Contains(err.Error(), "changed from migrated volume migrated-vol to fresh-vol") {
+		t.Fatalf("expected post-deploy validation to keep watching past the pre-deploy container, got %v", err)
+	}
+	if !fakeOutputCalled(&fakeDockerRunner{outputArgs: runner.outputArgs}, "stop", "web-id") {
+		t.Fatalf("expected recreated target container to stop, calls=%#v", runner.outputArgs)
 	}
 }
 

@@ -2,6 +2,7 @@ package dokploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -237,6 +238,7 @@ type appCache struct {
 	ComposeAppName             string
 	DiscoveryRedeployAttempted bool
 	TargetWritersStopped       []dockerContainer
+	MigratedVolumeMounts       map[string]migratedVolumeMount
 }
 
 type applyContext struct {
@@ -317,7 +319,7 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 		err := c.applyStep(ctx, actx, step)
 		if err != nil {
 			emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusError, Err: err})
-			c.bestEffortResume(ctx, actx, plan, total, pausedApps, coolifyProxyStopped)
+			c.bestEffortResume(ctx, actx, plan, total, pausedApps, coolifyProxyStopped, isUnsafeTargetResumeError(err))
 			return fmt.Errorf("dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
 		}
 		emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusOK})
@@ -341,6 +343,9 @@ func isPlatformAppRole(role string) bool {
 }
 
 func (c *Client) primeResumeState(ctx context.Context, actx *applyContext, completed []Step, next Step, pausedApps map[string]struct{}, coolifyProxyStopped *bool) error {
+	if err := actx.loadMigratedVolumeMounts(); err != nil {
+		return err
+	}
 	pushedApps := map[string]struct{}{}
 	resumedTargetApps := map[string]struct{}{}
 	for _, step := range completed {
@@ -401,11 +406,17 @@ func (c *Client) primeResumeState(ctx context.Context, actx *applyContext, compl
 // original failure; operators can still re-run apply or rollback. it
 // uses a fresh context so a Ctrl-C that cancelled apply can still
 // clean up — without that, source containers would stay stopped.
-func (c *Client) bestEffortResume(_ context.Context, actx *applyContext, plan Plan, total int, pausedApps map[string]struct{}, coolifyProxyStopped bool) {
-	if len(pausedApps) == 0 && !coolifyProxyStopped && !actx.hasStoppedTargetWriters() {
+func (c *Client) bestEffortResume(_ context.Context, actx *applyContext, plan Plan, total int, pausedApps map[string]struct{}, coolifyProxyStopped bool, skipTargetWriters bool) {
+	if actx == nil {
+		actx = &applyContext{}
+	}
+	actx.plan = plan
+	if len(pausedApps) == 0 && !coolifyProxyStopped && (skipTargetWriters || !actx.hasStoppedTargetWriters()) {
 		return
 	}
-	c.bestEffortResumeTargetWriters(actx, plan, total)
+	if !skipTargetWriters {
+		c.bestEffortResumeTargetWriters(actx, plan, total)
+	}
 	for app := range pausedApps {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), dockerStartTimeout)
 		resumeStep := Step{Kind: StepResumeSource, App: app, Ref: app}
@@ -451,18 +462,16 @@ func (c *Client) bestEffortResumeTargetWriters(actx *applyContext, plan Plan, to
 	if actx == nil {
 		return
 	}
-	runner := c.dockerRunner()
 	for app, entry := range actx.cache {
 		if len(entry.TargetWritersStopped) == 0 {
 			continue
 		}
 		resumeStep := Step{Kind: StepResumeTarget, App: app, Ref: app}
 		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusStarted})
-		if err := startStoppedTargetWriters(runner, entry.TargetWritersStopped); err != nil {
+		if err := c.applyResumeTarget(context.Background(), actx, resumeStep); err != nil {
 			emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusError, Err: err})
 			continue
 		}
-		entry.TargetWritersStopped = nil
 		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeStep, Status: StepStatusOK})
 	}
 }
@@ -472,6 +481,11 @@ func emitProgress(fn *func(StepProgress), progress StepProgress) {
 		return
 	}
 	(*fn)(progress)
+}
+
+func isUnsafeTargetResumeError(err error) bool {
+	var unsafe unsafeTargetResumeError
+	return errors.As(err, &unsafe)
 }
 
 func (c *Client) applyStep(ctx context.Context, actx *applyContext, step Step) error {
@@ -605,6 +619,12 @@ func (c *Client) applyPushImage(ctx context.Context, actx *applyContext, step St
 		return err
 	}
 	if err := c.DeployCompose(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
+		if safetyErr := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, step.App); safetyErr != nil && isUnsafeTargetResumeError(safetyErr) {
+			return fmt.Errorf("deploy dokploy compose: %w; post-deploy safety check: %v", err, safetyErr)
+		}
+		return err
+	}
+	if err := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, step.App); err != nil {
 		return err
 	}
 	return c.pauseTargetWritersForState(ctx, c.dockerRunner(), actx, step.App)
@@ -804,7 +824,13 @@ func (c *Client) applyActivateRoutes(ctx context.Context, actx *applyContext, st
 			return err
 		}
 	}
-	return c.DeployCompose(ctx, entry.ComposeID, deployComposeTitle(actx.plan))
+	if err := c.DeployCompose(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
+		if safetyErr := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, step.App); safetyErr != nil && isUnsafeTargetResumeError(safetyErr) {
+			return fmt.Errorf("deploy dokploy compose: %w; post-deploy safety check: %v", err, safetyErr)
+		}
+		return err
+	}
+	return c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, step.App)
 }
 
 func (c *Client) ensureRouteDomain(ctx context.Context, composeID string, route gateway.Route) error {
@@ -1119,7 +1145,54 @@ func readComposeFile(plan Plan, appName string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("prepare compose file %s for dokploy: %w", full, err)
 	}
+	if shouldAttachDokployNetworkAliases(app) {
+		compose, err = attachDokployNetworkAliases(compose)
+		if err != nil {
+			return "", fmt.Errorf("prepare dokploy network aliases for %s: %w", full, err)
+		}
+	}
 	return compose, nil
+}
+
+func shouldAttachDokployNetworkAliases(app preparer.AppPlan) bool {
+	return strings.EqualFold(strings.TrimSpace(app.Role), "support")
+}
+
+func attachDokployNetworkAliases(contents string) (string, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(contents), &doc); err != nil {
+		return "", err
+	}
+	root := &doc
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		root = doc.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return contents, nil
+	}
+	services := mappingValue(root, "services")
+	if services == nil || services.Kind != yaml.MappingNode {
+		return contents, nil
+	}
+	changed := ensureTopLevelDokployNetwork(root)
+	for i := 0; i+1 < len(services.Content); i += 2 {
+		serviceName := strings.TrimSpace(services.Content[i].Value)
+		service := services.Content[i+1]
+		if serviceName == "" || service.Kind != yaml.MappingNode {
+			continue
+		}
+		if ensureServiceDokployNetworkAlias(service, serviceName) {
+			changed = true
+		}
+	}
+	if !changed {
+		return contents, nil
+	}
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 func inlineComposeEnvFiles(contents, appDir string) (string, error) {
@@ -1432,6 +1505,97 @@ func sanitizeComposeTopLevelResources(root *yaml.Node) bool {
 	return changed
 }
 
+func ensureTopLevelDokployNetwork(root *yaml.Node) bool {
+	networks := mappingValue(root, "networks")
+	changed := false
+	if networks == nil || networks.Kind != yaml.MappingNode {
+		networks = &yaml.Node{Kind: yaml.MappingNode}
+		setMappingNode(root, "networks", networks)
+		changed = true
+	}
+	network := mappingValue(networks, "dokploy-network")
+	if network == nil || network.Kind != yaml.MappingNode {
+		network = &yaml.Node{Kind: yaml.MappingNode}
+		setMappingNode(networks, "dokploy-network", network)
+		changed = true
+	}
+	if ensureMappingBool(network, "external", true) {
+		changed = true
+	}
+	return changed
+}
+
+func ensureServiceDokployNetworkAlias(service *yaml.Node, serviceName string) bool {
+	networks := mappingValue(service, "networks")
+	changed := false
+	if networks == nil {
+		networks = &yaml.Node{Kind: yaml.MappingNode}
+		setMappingNode(service, "networks", networks)
+		setMappingNode(networks, "default", &yaml.Node{Kind: yaml.MappingNode})
+		changed = true
+	} else if networks.Kind == yaml.SequenceNode {
+		networks = composeNetworkSequenceToMapping(networks)
+		setMappingNode(service, "networks", networks)
+		changed = true
+	} else if networks.Kind != yaml.MappingNode {
+		networks = &yaml.Node{Kind: yaml.MappingNode}
+		setMappingNode(service, "networks", networks)
+		changed = true
+	}
+	network := mappingValue(networks, "dokploy-network")
+	if network == nil || network.Kind != yaml.MappingNode {
+		network = &yaml.Node{Kind: yaml.MappingNode}
+		setMappingNode(networks, "dokploy-network", network)
+		changed = true
+	}
+	if ensureServiceNetworkAlias(network, serviceName) {
+		changed = true
+	}
+	return changed
+}
+
+func composeNetworkSequenceToMapping(sequence *yaml.Node) *yaml.Node {
+	mapping := &yaml.Node{Kind: yaml.MappingNode}
+	for _, item := range sequence.Content {
+		if item.Kind != yaml.ScalarNode || strings.TrimSpace(item.Value) == "" {
+			continue
+		}
+		setMappingNode(mapping, strings.TrimSpace(item.Value), &yaml.Node{Kind: yaml.MappingNode})
+	}
+	return mapping
+}
+
+func ensureServiceNetworkAlias(network *yaml.Node, alias string) bool {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return false
+	}
+	aliases := mappingValue(network, "aliases")
+	if aliases == nil {
+		setMappingNode(network, "aliases", &yaml.Node{Kind: yaml.SequenceNode, Content: []*yaml.Node{stringNode(alias)}})
+		return true
+	}
+	if aliases.Kind != yaml.SequenceNode {
+		preserved := strings.TrimSpace(aliases.Value)
+		items := []*yaml.Node{}
+		if preserved != "" {
+			items = append(items, stringNode(preserved))
+		}
+		if preserved != alias {
+			items = append(items, stringNode(alias))
+		}
+		setMappingNode(network, "aliases", &yaml.Node{Kind: yaml.SequenceNode, Content: items})
+		return true
+	}
+	for _, item := range aliases.Content {
+		if item.Kind == yaml.ScalarNode && strings.TrimSpace(item.Value) == alias {
+			return false
+		}
+	}
+	aliases.Content = append(aliases.Content, stringNode(alias))
+	return true
+}
+
 func readComposeEnvFilePathListValues(appDir string, paths []string) (map[string]string, error) {
 	values := map[string]string{}
 	for _, envPath := range paths {
@@ -1653,6 +1817,37 @@ func setMappingScalar(node *yaml.Node, key, value string) {
 		&yaml.Node{Kind: yaml.ScalarNode, Value: key},
 		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value},
 	)
+}
+
+func setMappingNode(node *yaml.Node, key string, value *yaml.Node) {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value != key {
+			continue
+		}
+		node.Content[i+1] = value
+		return
+	}
+	node.Content = append(node.Content, stringNode(key), value)
+}
+
+func ensureMappingBool(node *yaml.Node, key string, value bool) bool {
+	want := "false"
+	if value {
+		want = "true"
+	}
+	current := mappingValue(node, key)
+	if current != nil && current.Kind == yaml.ScalarNode && current.Value == want {
+		return false
+	}
+	setMappingNode(node, key, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: want})
+	return true
+}
+
+func stringNode(value string) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value}
 }
 
 func removeMappingKey(node *yaml.Node, key string) bool {

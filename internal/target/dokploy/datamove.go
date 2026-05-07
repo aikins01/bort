@@ -3,6 +3,7 @@ package dokploy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,41 +46,176 @@ func (c *Client) applySyncVolume(ctx context.Context, actx *applyContext, step S
 	if err != nil {
 		return err
 	}
-	return withTargetStopped(ctx, runner, target, copy)
+	if err := withTargetStopped(ctx, runner, target, copy.Run); err != nil {
+		return err
+	}
+	if copy.TargetVolumeName != "" {
+		if err := actx.recordMigratedVolumeMount(step.App, migratedVolumeMount{
+			Service:    volume.Service,
+			Target:     volume.Target,
+			VolumeName: copy.TargetVolumeName,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type plannedVolumeCopy struct {
+	Run              func() error
+	TargetVolumeName string
+}
+
+type migratedVolumeMount struct {
+	Service    string `json:"service"`
+	Target     string `json:"target"`
+	VolumeName string `json:"volumeName"`
 }
 
 // planVolumeCopy resolves source/target locations and returns the copy
 // closure to invoke once the target container is stopped.
-func (c *Client) planVolumeCopy(ctx context.Context, runner dockerRunner, volume preparer.VolumeResource, target dockerContainer) (func() error, error) {
+func (c *Client) planVolumeCopy(ctx context.Context, runner dockerRunner, volume preparer.VolumeResource, target dockerContainer) (plannedVolumeCopy, error) {
 	switch volume.Type {
 	case "volume":
 		mount, ok := findMountByTarget(target, volume.Target)
 		if !ok || mount.Type != "volume" || mount.Name == "" {
-			return nil, fmt.Errorf("named volume for target %s not found on dokploy compose container", volume.Target)
+			return plannedVolumeCopy{}, fmt.Errorf("named volume for target %s not found on dokploy compose container", volume.Target)
 		}
 		srcVolName, err := resolveSourceVolume(ctx, runner, volume)
 		if err != nil {
-			return nil, err
+			return plannedVolumeCopy{}, err
 		}
 		dstVolName := mount.Name
-		return func() error { return copyNamedVolume(ctx, runner, srcVolName, dstVolName) }, nil
+		return plannedVolumeCopy{
+			Run:              func() error { return copyNamedVolume(ctx, runner, srcVolName, dstVolName) },
+			TargetVolumeName: dstVolName,
+		}, nil
 	case "bind":
 		mount, ok := findMountByTarget(target, volume.Target)
 		if !ok || mount.Type != "bind" || mount.Source == "" {
-			return nil, fmt.Errorf("bind mount for target %s not found on dokploy compose container", volume.Target)
+			return plannedVolumeCopy{}, fmt.Errorf("bind mount for target %s not found on dokploy compose container", volume.Target)
 		}
 		if !mount.RW {
-			return nil, fmt.Errorf("dokploy bind mount %s -> %s is read-only; refusing to sync", mount.Source, volume.Target)
+			return plannedVolumeCopy{}, fmt.Errorf("dokploy bind mount %s -> %s is read-only; refusing to sync", mount.Source, volume.Target)
 		}
 		srcPath, err := resolveSourceBindPath(ctx, runner, volume)
 		if err != nil {
-			return nil, err
+			return plannedVolumeCopy{}, err
 		}
 		dstPath := mount.Source
-		return func() error { return rsyncBindMount(ctx, runner, srcPath, dstPath) }, nil
+		return plannedVolumeCopy{Run: func() error { return rsyncBindMount(ctx, runner, srcPath, dstPath) }}, nil
 	default:
-		return nil, fmt.Errorf("%w: volume type %q is not supported", ErrNotImplemented, volume.Type)
+		return plannedVolumeCopy{}, fmt.Errorf("%w: volume type %q is not supported", ErrNotImplemented, volume.Type)
 	}
+}
+
+func (a *applyContext) recordMigratedVolumeMount(appName string, mount migratedVolumeMount) error {
+	if a == nil || strings.TrimSpace(mount.Service) == "" || strings.TrimSpace(mount.Target) == "" || strings.TrimSpace(mount.VolumeName) == "" {
+		return nil
+	}
+	entry := a.entry(appName)
+	if entry.MigratedVolumeMounts == nil {
+		entry.MigratedVolumeMounts = map[string]migratedVolumeMount{}
+	}
+	entry.MigratedVolumeMounts[migratedMountKey(mount.Service, mount.Target)] = mount
+	return a.persistMigratedVolumeMounts()
+}
+
+func migratedMountKey(service, target string) string {
+	return strings.TrimSpace(service) + "\x00" + strings.TrimSpace(target)
+}
+
+const migratedVolumeMountsArtifact = "migrated-volumes.json"
+
+type migratedVolumeMountsState struct {
+	APIVersion string                           `json:"apiVersion"`
+	Apps       map[string][]migratedVolumeMount `json:"apps,omitempty"`
+}
+
+const migratedVolumeMountsAPIVersion = "bort.migrated-volumes/v1alpha1"
+
+func (a *applyContext) persistMigratedVolumeMounts() error {
+	if a == nil || strings.TrimSpace(a.plan.RunDir) == "" {
+		return nil
+	}
+	path, err := migratedVolumeMountsPath(a.plan.RunDir)
+	if err != nil {
+		return err
+	}
+	state := migratedVolumeMountsState{
+		APIVersion: migratedVolumeMountsAPIVersion,
+		Apps:       map[string][]migratedVolumeMount{},
+	}
+	for app, entry := range a.cache {
+		if len(entry.MigratedVolumeMounts) == 0 {
+			continue
+		}
+		mounts := make([]migratedVolumeMount, 0, len(entry.MigratedVolumeMounts))
+		for _, mount := range entry.MigratedVolumeMounts {
+			mounts = append(mounts, mount)
+		}
+		sort.Slice(mounts, func(i, j int) bool {
+			return migratedMountKey(mounts[i].Service, mounts[i].Target) < migratedMountKey(mounts[j].Service, mounts[j].Target)
+		})
+		state.Apps[app] = mounts
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("prepare migrated volume state dir: %w", err)
+	}
+	contents, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode migrated volume state: %w", err)
+	}
+	contents = append(contents, '\n')
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		return fmt.Errorf("write migrated volume state: %w", err)
+	}
+	return nil
+}
+
+func (a *applyContext) loadMigratedVolumeMounts() error {
+	if a == nil || strings.TrimSpace(a.plan.RunDir) == "" {
+		return nil
+	}
+	path, err := migratedVolumeMountsPath(a.plan.RunDir)
+	if err != nil {
+		return err
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read migrated volume state: %w", err)
+	}
+	var state migratedVolumeMountsState
+	if err := json.Unmarshal(contents, &state); err != nil {
+		return fmt.Errorf("decode migrated volume state: %w", err)
+	}
+	if state.APIVersion != "" && state.APIVersion != migratedVolumeMountsAPIVersion {
+		return fmt.Errorf("%s has unsupported apiVersion %q (want %q)", path, state.APIVersion, migratedVolumeMountsAPIVersion)
+	}
+	for app, mounts := range state.Apps {
+		entry := a.entry(app)
+		if entry.MigratedVolumeMounts == nil {
+			entry.MigratedVolumeMounts = map[string]migratedVolumeMount{}
+		}
+		for _, mount := range mounts {
+			if strings.TrimSpace(mount.Service) == "" || strings.TrimSpace(mount.Target) == "" || strings.TrimSpace(mount.VolumeName) == "" {
+				continue
+			}
+			entry.MigratedVolumeMounts[migratedMountKey(mount.Service, mount.Target)] = mount
+		}
+	}
+	return nil
+}
+
+func migratedVolumeMountsPath(runDir string) (string, error) {
+	path := filepath.Join(runDir, migratedVolumeMountsArtifact)
+	if err := safepath.ContainedPath(runDir, path); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // withTargetStopped runs op while the dokploy target container is
@@ -311,14 +447,174 @@ func targetContainerSetSignature(containers []dockerContainer) string {
 
 func (c *Client) applyResumeTarget(ctx context.Context, actx *applyContext, step Step) error {
 	entry := actx.entry(step.App)
-	if len(entry.TargetWritersStopped) == 0 {
-		return nil
-	}
-	if err := startStoppedTargetWriters(c.dockerRunner(), entry.TargetWritersStopped); err != nil {
+	if err := c.validateMigratedVolumeMounts(ctx, actx, step.App); err != nil {
+		if isUnsafeTargetResumeError(err) {
+			stopCtx, cancelStop := context.WithTimeout(context.Background(), targetDiscoveryTimeout)
+			defer cancelStop()
+			if stopErr := c.stopTargetComposeContainers(stopCtx, actx, step.App); stopErr != nil {
+				return fmt.Errorf("%w (also failed to stop unsafe target containers: %v)", err, stopErr)
+			}
+		}
 		return err
 	}
-	entry.TargetWritersStopped = nil
+	if len(entry.TargetWritersStopped) > 0 {
+		if err := startStoppedTargetWriters(c.dockerRunner(), entry.TargetWritersStopped); err != nil {
+			return err
+		}
+		entry.TargetWritersStopped = nil
+	}
 	return nil
+}
+
+func (c *Client) validateMigratedVolumeMountsAfterDeploy(_ context.Context, actx *applyContext, appName string) error {
+	validationCtx, cancelValidation := context.WithTimeout(context.Background(), targetDiscoveryTimeout)
+	defer cancelValidation()
+	if err := c.validateMigratedVolumeMountsStable(validationCtx, actx, appName); err != nil {
+		if isUnsafeTargetResumeError(err) {
+			stopCtx, cancelStop := context.WithTimeout(context.Background(), targetDiscoveryTimeout)
+			defer cancelStop()
+			if stopErr := c.stopTargetComposeContainers(stopCtx, actx, appName); stopErr != nil {
+				return fmt.Errorf("%w (also failed to stop unsafe target containers: %v)", err, stopErr)
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+func (c *Client) validateMigratedVolumeMounts(ctx context.Context, actx *applyContext, appName string) error {
+	_, err := c.validateMigratedVolumeMountsSnapshot(ctx, actx, appName)
+	return err
+}
+
+func (c *Client) validateMigratedVolumeMountsStable(ctx context.Context, actx *applyContext, appName string) error {
+	entry := actx.entry(appName)
+	if len(entry.MigratedVolumeMounts) == 0 {
+		return nil
+	}
+	lastSignature := ""
+	stableSince := time.Time{}
+	for {
+		signature, err := c.validateMigratedVolumeMountsSnapshot(ctx, actx, appName)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		if signature != lastSignature {
+			lastSignature = signature
+			stableSince = now
+		} else if !stableSince.IsZero() && now.Sub(stableSince) >= targetPostDeployStableWindow {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return unsafeTargetResumeError{err: ctx.Err()}
+		case <-time.After(targetWriterDiscoveryDelay):
+		}
+	}
+}
+
+func (c *Client) validateMigratedVolumeMountsSnapshot(ctx context.Context, actx *applyContext, appName string) (string, error) {
+	entry := actx.entry(appName)
+	if len(entry.MigratedVolumeMounts) == 0 {
+		return "", nil
+	}
+	runner := c.dockerRunner()
+	parts := make([]string, 0, len(entry.MigratedVolumeMounts))
+	for _, expected := range entry.MigratedVolumeMounts {
+		container, err := c.targetContainerForServiceNoRedeploy(ctx, runner, actx, appName, expected.Service)
+		if err != nil {
+			return "", unsafeTargetResumeError{err: err}
+		}
+		mount, ok := findMountByTarget(container, expected.Target)
+		if !ok || mount.Type != "volume" || mount.Name == "" {
+			return "", unsafeTargetResumeError{err: fmt.Errorf("target service %s no longer has migrated volume mounted at %s", expected.Service, expected.Target)}
+		}
+		if mount.Name != expected.VolumeName {
+			return "", unsafeTargetResumeError{err: fmt.Errorf("target service %s volume mount %s changed from migrated volume %s to %s; refusing to accept a deploy that may be using fresh state", expected.Service, expected.Target, expected.VolumeName, mount.Name)}
+		}
+		parts = append(parts, migratedMountKey(expected.Service, expected.Target)+"\x00"+container.ID+"\x00"+mount.Name)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\x1e"), nil
+}
+
+type unsafeTargetResumeError struct {
+	err error
+}
+
+func (e unsafeTargetResumeError) Error() string {
+	if e.err == nil {
+		return "target resume is unsafe"
+	}
+	return e.err.Error()
+}
+
+func (e unsafeTargetResumeError) Unwrap() error {
+	return e.err
+}
+
+func (c *Client) stopTargetComposeContainers(ctx context.Context, actx *applyContext, appName string) error {
+	entry := actx.entry(appName)
+	if entry.ComposeAppName == "" {
+		if err := c.refreshComposeAppName(ctx, entry); err != nil {
+			return err
+		}
+	}
+	runner := c.dockerRunner()
+	var result error
+	var quietSince time.Time
+	stoppedIDs := map[string]struct{}{}
+	for {
+		containers, err := listContainersByLabel(ctx, runner, "com.docker.compose.project="+entry.ComposeAppName)
+		if err != nil {
+			if result != nil {
+				return fmt.Errorf("%w; list target containers: %v", result, err)
+			}
+			return err
+		}
+		sawRunning := false
+		hadStopError := false
+		for _, container := range containers {
+			if !container.State.Running {
+				continue
+			}
+			if _, stopped := stoppedIDs[container.ID]; stopped {
+				continue
+			}
+			sawRunning = true
+			quietSince = time.Time{}
+			if err := stopContainer(ctx, runner, container.ID); err != nil {
+				hadStopError = true
+				if result != nil {
+					result = fmt.Errorf("%w; stop target container %s: %v", result, container.ID, err)
+					continue
+				}
+				result = fmt.Errorf("stop target container %s: %w", container.ID, err)
+				continue
+			}
+			stoppedIDs[container.ID] = struct{}{}
+		}
+		if hadStopError {
+			return result
+		}
+		if !sawRunning {
+			if quietSince.IsZero() {
+				quietSince = time.Now()
+			}
+			if time.Since(quietSince) >= targetStopQuietWindow {
+				return result
+			}
+		}
+		select {
+		case <-ctx.Done():
+			if result != nil {
+				return result
+			}
+			return ctx.Err()
+		case <-time.After(targetWriterDiscoveryDelay):
+		}
+	}
 }
 
 func startStoppedTargetWriters(runner dockerRunner, containers []dockerContainer) error {
@@ -410,7 +706,7 @@ func (c *Client) applyRestoreDataStore(ctx context.Context, actx *applyContext, 
 	}
 	creds := postgresCredsFromEnv(envMap(dst.Config.Env))
 
-	return c.withTargetWritersStopped(ctx, runner, actx, step.App, map[string]struct{}{store.Service: {}}, func() error {
+	if err := c.withTargetWritersStopped(ctx, runner, actx, step.App, map[string]struct{}{store.Service: {}}, func() error {
 		if err := waitPostgresReady(ctx, runner, dst.ID, creds); err != nil {
 			return err
 		}
@@ -445,7 +741,30 @@ func (c *Client) applyRestoreDataStore(ctx context.Context, actx *applyContext, 
 			args = append(args, "-L", restoreListPath)
 		}
 		return runner.Run(ctx, file, nil, args...)
-	})
+	}); err != nil {
+		return err
+	}
+	return recordMigratedStoreMounts(actx, step.App, app, store.Service, dst)
+}
+
+func recordMigratedStoreMounts(actx *applyContext, appName string, app preparer.AppPlan, service string, container dockerContainer) error {
+	for _, volume := range app.Resources.Volumes {
+		if volume.Service != service || volume.Type != "volume" || volume.Target == "" {
+			continue
+		}
+		mount, ok := findMountByTarget(container, volume.Target)
+		if !ok || mount.Type != "volume" || mount.Name == "" {
+			continue
+		}
+		if err := actx.recordMigratedVolumeMount(appName, migratedVolumeMount{
+			Service:    service,
+			Target:     volume.Target,
+			VolumeName: mount.Name,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func preparePgRestoreList(ctx context.Context, runner dockerRunner, containerID, dumpPath, appName, ref string) (string, func(), error) {
@@ -935,15 +1254,25 @@ func resolveSourceBindPath(ctx context.Context, runner dockerRunner, volume prep
 }
 
 const (
-	targetDiscoveryTimeout     = 60 * time.Second
-	targetDiscoveryDelay       = 2 * time.Second
-	targetWriterDiscoveryDelay = 250 * time.Millisecond
+	targetDiscoveryTimeout       = 60 * time.Second
+	targetDiscoveryDelay         = 2 * time.Second
+	targetWriterDiscoveryDelay   = 250 * time.Millisecond
+	targetStopQuietWindow        = 2 * targetWriterDiscoveryDelay
+	targetPostDeployStableWindow = targetDiscoveryDelay
 )
 
 // targetContainerForService discovers the dokploy-managed container for a
 // compose service by docker label, polling briefly because compose.deploy
 // returns before the containers may finish starting.
 func (c *Client) targetContainerForService(ctx context.Context, runner dockerRunner, actx *applyContext, appName, service string) (dockerContainer, error) {
+	return c.targetContainerForServiceWithRedeploy(ctx, runner, actx, appName, service, true)
+}
+
+func (c *Client) targetContainerForServiceNoRedeploy(ctx context.Context, runner dockerRunner, actx *applyContext, appName, service string) (dockerContainer, error) {
+	return c.targetContainerForServiceWithRedeploy(ctx, runner, actx, appName, service, false)
+}
+
+func (c *Client) targetContainerForServiceWithRedeploy(ctx context.Context, runner dockerRunner, actx *applyContext, appName, service string, allowRedeploy bool) (dockerContainer, error) {
 	entry := actx.entry(appName)
 	if entry.ComposeAppName == "" {
 		if err := c.refreshComposeAppName(ctx, entry); err != nil {
@@ -962,7 +1291,7 @@ func (c *Client) targetContainerForService(ctx context.Context, runner dockerRun
 		if err := c.composeDeploymentError(ctx, entry); err != nil {
 			return dockerContainer{}, err
 		}
-		if len(containers) == 0 && entry.ComposeID != "" && !entry.DiscoveryRedeployAttempted {
+		if allowRedeploy && len(containers) == 0 && entry.ComposeID != "" && !entry.DiscoveryRedeployAttempted {
 			entry.DiscoveryRedeployAttempted = true
 			if err := c.DeployCompose(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
 				return dockerContainer{}, fmt.Errorf("redeploy dokploy compose project %q for target discovery: %w", entry.ComposeAppName, err)
