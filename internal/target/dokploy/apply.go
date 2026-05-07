@@ -1839,7 +1839,7 @@ func ensureMappingBool(node *yaml.Node, key string, value bool) bool {
 		want = "true"
 	}
 	current := mappingValue(node, key)
-	if current != nil && current.Kind == yaml.ScalarNode && current.Value == want {
+	if current != nil && current.Kind == yaml.ScalarNode && current.Tag == "!!bool" && current.Value == want {
 		return false
 	}
 	setMappingNode(node, key, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: want})
