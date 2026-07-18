@@ -3,7 +3,9 @@ package coolify
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -16,6 +18,8 @@ import (
 	"github.com/aikins01/bort/internal/secrets"
 	"github.com/aikins01/bort/internal/source"
 )
+
+const defaultHTTPTimeout = 30 * time.Second
 
 type Scanner struct {
 	BaseURL    string
@@ -32,18 +36,91 @@ func NewScanner(baseURL, token string) (*Scanner, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, fmt.Errorf("BORT_COOLIFY_TOKEN is required for --source coolify")
 	}
+	if err := validateTokenBaseURL(baseURL); err != nil {
+		return nil, err
+	}
 
 	return &Scanner{
 		BaseURL:    baseURL,
 		Token:      token,
-		HTTPClient: http.DefaultClient,
+		HTTPClient: tokenHTTPClient(baseURL),
 		Now:        time.Now,
 	}, nil
 }
 
+// redirects must re-validate: Go forwards Authorization on same-host redirects
+// even across an https->http downgrade, and on subdomain hops.
+func tokenHTTPClient(rawBase string) *http.Client {
+	base, err := url.Parse(rawBase)
+	if err != nil {
+		return &http.Client{Timeout: defaultHTTPTimeout}
+	}
+	return &http.Client{
+		Timeout: defaultHTTPTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			if err := validateTokenBaseURL(req.URL.String()); err != nil {
+				return fmt.Errorf("refusing Coolify redirect with API token: %w", err)
+			}
+			if !sameURLOrigin(req.URL, base) {
+				return fmt.Errorf("refusing Coolify redirect with API token to different origin %s://%s", req.URL.Scheme, req.URL.Host)
+			}
+			return nil
+		},
+	}
+}
+
+func validateTokenBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("invalid Coolify URL: must be an absolute http or https URL")
+	}
+	if u.User != nil {
+		return errors.New("Coolify URL must not embed credentials")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("Coolify URL must use http or https")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return errors.New("Coolify URL must include a host")
+	}
+	if u.Scheme == "http" && !isLoopbackHost(host) {
+		return fmt.Errorf("refusing to send Coolify API token to non-loopback http host %q; use https or a loopback address", host)
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+func sameURLOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) && normalizedURLHost(a) == normalizedURLHost(b)
+}
+
+// default ports are the same origin as no port (rfc 6454), so normalize
+// before comparing or https://host:443 and https://host diverge.
+func normalizedURLHost(u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port == "" || (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		return host
+	}
+	return net.JoinHostPort(host, port)
+}
+
 func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.Manifest, error) {
 	if s.HTTPClient == nil {
-		s.HTTPClient = http.DefaultClient
+		s.HTTPClient = tokenHTTPClient(s.BaseURL)
 	}
 	if s.Now == nil {
 		s.Now = time.Now
@@ -196,8 +273,11 @@ func (s *Scanner) endpoint(path string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if parsed.Host != base.Host {
-			return "", fmt.Errorf("refusing Coolify pagination URL outside %s: %s", base.Host, parsed.Host)
+		if !sameURLOrigin(parsed, base) {
+			return "", fmt.Errorf("refusing Coolify pagination URL outside %s://%s: %s://%s", base.Scheme, base.Host, parsed.Scheme, parsed.Host)
+		}
+		if err := validateTokenBaseURL(parsed.String()); err != nil {
+			return "", err
 		}
 		return path, nil
 	}

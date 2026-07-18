@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -201,5 +202,142 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNewScannerURLPolicy(t *testing.T) {
+	tests := []struct {
+		name    string
+		baseURL string
+		wantErr string
+		forbid  string
+	}{
+		{name: "https remote accepted", baseURL: "https://coolify.example.com"},
+		{name: "http localhost accepted", baseURL: "http://localhost:8000"},
+		{name: "http loopback IPv4 accepted", baseURL: "http://127.0.0.1:8000"},
+		{name: "http loopback IPv6 accepted", baseURL: "http://[::1]:8000"},
+		{name: "http remote rejected", baseURL: "http://coolify.example.com", wantErr: "non-loopback http"},
+		{name: "http remote IP rejected", baseURL: "http://203.0.113.10", wantErr: "non-loopback http"},
+		{name: "unsupported scheme rejected", baseURL: "ftp://coolify.example.com", wantErr: "must use http or https"},
+		{name: "userinfo rejected", baseURL: "https://user:sup3rsecret@coolify.example.com", wantErr: "must not embed credentials", forbid: "sup3rsecret"},
+		{name: "malformed userinfo not echoed", baseURL: "https://user:sup3rsecret@coolify exam ple.com", wantErr: "invalid Coolify URL", forbid: "sup3rsecret"},
+		{name: "scheme error does not echo credentials", baseURL: "ftp://user:sup3rsecret@coolify.example.com", wantErr: "must not embed credentials", forbid: "sup3rsecret"},
+		{name: "empty host userinfo not echoed", baseURL: "http://user:sup3rsecret@", wantErr: "must not embed credentials", forbid: "sup3rsecret"},
+		{name: "missing host rejected", baseURL: "http://", wantErr: "must include a host"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewScanner(tt.baseURL, "token")
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected success, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
+			}
+			if tt.forbid != "" && strings.Contains(err.Error(), tt.forbid) {
+				t.Fatalf("error leaked embedded credential %q: %v", tt.forbid, err)
+			}
+		})
+	}
+}
+
+func TestEndpointPaginationURLPolicy(t *testing.T) {
+	scanner := &Scanner{BaseURL: "https://coolify.example.com", Token: "token"}
+
+	tests := []struct {
+		name    string
+		path    string
+		wantErr string
+	}{
+		{name: "same origin absolute accepted", path: "https://coolify.example.com/api/v1/applications?page=2"},
+		{name: "explicit default https port accepted", path: "https://coolify.example.com:443/api/v1/applications?page=2"},
+		{name: "relative path accepted", path: "/api/v1/applications?page=2"},
+		{name: "query relative accepted", path: "?page=2"},
+		{name: "scheme downgrade rejected", path: "http://coolify.example.com/api/v1/applications?page=2", wantErr: "refusing Coolify pagination URL"},
+		{name: "cross host rejected", path: "https://evil.example.com/api/v1/applications?page=2", wantErr: "refusing Coolify pagination URL"},
+		{name: "non default port rejected", path: "https://coolify.example.com:8443/api/v1/applications?page=2", wantErr: "refusing Coolify pagination URL"},
+		{name: "userinfo absolute rejected", path: "https://user@coolify.example.com/api/v1/applications?page=2", wantErr: "must not embed credentials"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := scanner.endpoint(tt.path)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected success, got %v", err)
+				}
+				if !strings.HasPrefix(got, "https://coolify.example.com") {
+					t.Fatalf("unexpected endpoint %q", got)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestTokenHTTPClientRedirectPolicy(t *testing.T) {
+	newVia := func(raw string) []*http.Request {
+		return []*http.Request{httptest.NewRequest(http.MethodGet, raw, nil)}
+	}
+
+	t.Run("https to http downgrade rejected", func(t *testing.T) {
+		client := tokenHTTPClient("https://coolify.example.com")
+		req := httptest.NewRequest(http.MethodGet, "http://coolify.example.com/api/v1/applications", nil)
+		if err := client.CheckRedirect(req, newVia("https://coolify.example.com/api/v1/applications")); err == nil || !strings.Contains(err.Error(), "refusing Coolify redirect") {
+			t.Fatalf("expected redirect refusal, got %v", err)
+		}
+	})
+
+	t.Run("cross origin subdomain rejected", func(t *testing.T) {
+		client := tokenHTTPClient("https://coolify.example.com")
+		req := httptest.NewRequest(http.MethodGet, "https://api.coolify.example.com/api/v1/applications", nil)
+		if err := client.CheckRedirect(req, newVia("https://coolify.example.com/api/v1/applications")); err == nil || !strings.Contains(err.Error(), "different origin") {
+			t.Fatalf("expected redirect refusal, got %v", err)
+		}
+	})
+
+	t.Run("same origin with default port allowed", func(t *testing.T) {
+		client := tokenHTTPClient("https://coolify.example.com")
+		req := httptest.NewRequest(http.MethodGet, "https://coolify.example.com:443/api/v1/applications?page=2", nil)
+		if err := client.CheckRedirect(req, newVia("https://coolify.example.com/api/v1/applications")); err != nil {
+			t.Fatalf("expected redirect to be allowed, got %v", err)
+		}
+	})
+
+	t.Run("loopback http stays allowed", func(t *testing.T) {
+		client := tokenHTTPClient("http://localhost:3000")
+		req := httptest.NewRequest(http.MethodGet, "http://localhost:3000/api/v1/applications?page=2", nil)
+		if err := client.CheckRedirect(req, newVia("http://localhost:3000/api/v1/applications")); err != nil {
+			t.Fatalf("expected redirect to be allowed, got %v", err)
+		}
+	})
+
+	t.Run("ipv6 port-colliding origin rejected", func(t *testing.T) {
+		client := tokenHTTPClient("https://[2001:db8::1]:8443")
+		req := httptest.NewRequest(http.MethodGet, "https://[2001:db8::1:8443]/api/v1/applications", nil)
+		if err := client.CheckRedirect(req, newVia("https://[2001:db8::1]:8443/api/v1/applications")); err == nil || !strings.Contains(err.Error(), "different origin") {
+			t.Fatalf("expected redirect refusal, got %v", err)
+		}
+	})
+}
+
+func TestEndpointPaginationIPv6PortCollision(t *testing.T) {
+	scanner := &Scanner{BaseURL: "https://[2001:db8::1]:8443", Token: "token"}
+
+	if _, err := scanner.endpoint("https://[2001:db8::1:8443]/api/v1/applications?page=2"); err == nil || !strings.Contains(err.Error(), "refusing Coolify pagination URL") {
+		t.Fatalf("expected colliding IPv6 origin to be refused, got %v", err)
+	}
+	if _, err := scanner.endpoint("https://[2001:db8::1]:8443/api/v1/applications?page=2"); err != nil {
+		t.Fatalf("expected same IPv6 origin to be accepted, got %v", err)
+	}
+
+	defaultPortScanner := &Scanner{BaseURL: "https://[2001:db8::1]", Token: "token"}
+	if _, err := defaultPortScanner.endpoint("https://[2001:db8::1]:443/api/v1/applications?page=2"); err != nil {
+		t.Fatalf("expected explicit default port to match bare IPv6 host, got %v", err)
 	}
 }
