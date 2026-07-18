@@ -10,9 +10,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -62,7 +66,7 @@ type shellDokployInstaller struct{}
 
 func runInitTarget(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	return runInitTargetWith(ctx, args, stdin, stdout, stderr, initTargetDeps{
-		lister:    &coolifyDBLister{envPath: defaultCoolifyEnvPath, container: defaultCoolifyDBContainer},
+		lister:    &coolifyDBLister{envPath: defaultCoolifyEnvPath, container: defaultCoolifyDBContainer, stderr: stderr},
 		installer: shellDokployInstaller{},
 		newClient: defaultDokployClient,
 		statePath: defaultStatePath(),
@@ -71,9 +75,33 @@ func runInitTarget(ctx context.Context, args []string, stdin io.Reader, stdout, 
 
 func defaultDokployClient(baseURL string) *dokploy.Client {
 	return &dokploy.Client{
-		BaseURL:    strings.TrimRight(baseURL, "/"),
-		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		BaseURL: strings.TrimRight(baseURL, "/"),
+		HTTPClient: &http.Client{
+			Timeout: 30 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return errors.New("dokploy bootstrap stopped after 10 redirects")
+				}
+				if !sameURLOrigin(req.URL, via[0].URL) {
+					return fmt.Errorf("refusing Dokploy bootstrap redirect to %s://%s: credentials stay on the original origin", req.URL.Scheme, req.URL.Host)
+				}
+				return nil
+			},
+		},
 	}
+}
+
+func sameURLOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) && normalizedURLHost(a) == normalizedURLHost(b)
+}
+
+func normalizedURLHost(u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port == "" || (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		return host
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, deps initTargetDeps) error {
@@ -83,7 +111,6 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 	var (
 		target       string
 		email        string
-		password     string
 		dokployURL   string
 		nameOverride string
 		apiKeyName   string
@@ -94,7 +121,6 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 	)
 	fs.StringVar(&target, "target", "dokploy", "target platform to bootstrap (only dokploy is supported)")
 	fs.StringVar(&email, "coolify-email", "", "coolify admin email to reuse (prompted if absent and multiple admins exist)")
-	fs.StringVar(&password, "coolify-password", "", "coolify admin plaintext password (env BORT_COOLIFY_ADMIN_PASSWORD also accepted)")
 	fs.StringVar(&dokployURL, "dokploy-url", "", "dokploy base url (defaults to BORT_DOKPLOY_URL)")
 	fs.StringVar(&nameOverride, "name", "", "display name for the dokploy admin (defaults to coolify user name)")
 	fs.StringVar(&apiKeyName, "api-key-name", defaultDokployAPIName, "label for the dokploy api key")
@@ -112,6 +138,14 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 	}
 	if target != "dokploy" {
 		return fmt.Errorf("init-target only supports --target=dokploy, got %q", target)
+	}
+	if install {
+		if err := validateInstallPort(installPort); err != nil {
+			return err
+		}
+		if err := validateDokployVersionTag(version); err != nil {
+			return err
+		}
 	}
 	if dokployURL == "" {
 		dokployURL = strings.TrimSpace(os.Getenv(dokploy.EnvBaseURL))
@@ -138,10 +172,13 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 	if err != nil {
 		return err
 	}
-
-	if password == "" {
-		password = strings.TrimSpace(os.Getenv(envCoolifyAdminPwd))
+	if install {
+		if err := validateACMEEmail(admin.Email); err != nil {
+			return err
+		}
 	}
+
+	password := strings.TrimSpace(os.Getenv(envCoolifyAdminPwd))
 	if password == "" {
 		password, err = promptPassword(stdin, stdout, fmt.Sprintf("Password for %s: ", admin.Email))
 		if err != nil {
@@ -219,7 +256,10 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 func validateDokployBootstrapURL(raw string) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return fmt.Errorf("invalid --dokploy-url %q", raw)
+		return errors.New("invalid --dokploy-url: must be an absolute http or https URL with a host")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("--dokploy-url must not embed credentials")
 	}
 	if parsed.Scheme == "https" {
 		return nil
@@ -228,13 +268,46 @@ func validateDokployBootstrapURL(raw string) error {
 		return fmt.Errorf("--dokploy-url must use https, or http on loopback for same-VPS bootstrap")
 	}
 	host := parsed.Hostname()
-	if host == "localhost" {
+	if strings.EqualFold(host, "localhost") {
 		return nil
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		return nil
 	}
-	return fmt.Errorf("refusing to send Coolify admin credentials to non-loopback http Dokploy URL %q; use https or http://127.0.0.1:<port>", raw)
+	return fmt.Errorf("refusing to send Coolify admin credentials to non-loopback http Dokploy host %q; use https or http://127.0.0.1:<port>", host)
+}
+
+var dokployVersionTagPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
+
+// keep the acme email inside a yaml-plain-safe character class: it is
+// interpolated unquoted into traefik.yml by the install script.
+var acmeEmailSafePattern = regexp.MustCompile(`^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$`)
+
+func validateInstallPort(port string) error {
+	trimmed := strings.TrimSpace(port)
+	n, err := strconv.Atoi(trimmed)
+	if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != trimmed {
+		return fmt.Errorf("invalid --install-port %q: must be an integer between 1 and 65535", port)
+	}
+	return nil
+}
+
+func validateDokployVersionTag(tag string) error {
+	if !dokployVersionTagPattern.MatchString(tag) {
+		return fmt.Errorf("invalid --dokploy-version %q: must be a docker tag matching [A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag)
+	}
+	return nil
+}
+
+func validateACMEEmail(email string) error {
+	parsed, err := mail.ParseAddress(email)
+	if err != nil || parsed.Address != email {
+		return fmt.Errorf("invalid coolify admin email %q for ACME registration", email)
+	}
+	if !acmeEmailSafePattern.MatchString(email) {
+		return fmt.Errorf("coolify admin email %q contains characters unsafe for the ACME config; use --dokploy-url with an existing dokploy instead", email)
+	}
+	return nil
 }
 
 func (shellDokployInstaller) InstallDokploy(ctx context.Context, opts dokployInstallOptions, stdout, stderr io.Writer) error {
@@ -403,7 +476,16 @@ func promptPassword(stdin io.Reader, stdout io.Writer, prompt string) (string, e
 type coolifyDBLister struct {
 	envPath    string
 	container  string
+	stderr     io.Writer
 	runCommand func(ctx context.Context, name string, args ...string) ([]byte, error)
+}
+
+func (l *coolifyDBLister) warnf(format string, args ...any) {
+	w := l.stderr
+	if w == nil {
+		w = os.Stderr
+	}
+	fmt.Fprintf(w, format, args...)
 }
 
 type coolifyDBCredentials struct {
@@ -429,9 +511,18 @@ func (l *coolifyDBLister) listAdmins(ctx context.Context) ([]coolifyAdmin, error
 	if runCommand == nil {
 		runCommand = runDockerCommand
 	}
+	pgpassPath, cleanup, err := stageCoolifyPgpass(ctx, runCommand, container, creds.Password)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := cleanup(); err != nil {
+			l.warnf("warning: %v; the file holds the coolify database password, remove it manually\n", err)
+		}
+	}()
 	args := []string{
 		"exec",
-		"-e", "PGPASSWORD=" + creds.Password,
+		"-e", "PGPASSFILE=" + pgpassPath,
 		container,
 		"psql", "-U", creds.User, "-d", creds.Database,
 		"-A", "-F", psqlAdminFieldSeparator, "-t", "-X", "-q",
@@ -442,6 +533,62 @@ func (l *coolifyDBLister) listAdmins(ctx context.Context) ([]coolifyAdmin, error
 		return nil, fmt.Errorf("docker exec psql in %s: %w", container, err)
 	}
 	return parsePsqlAdminRows(out)
+}
+
+func coolifyPgpassFileContent(password string) string {
+	escaped := strings.NewReplacer(`\`, `\\`, `:`, `\:`).Replace(password)
+	return "*:*:*:*:" + escaped + "\n"
+}
+
+// the coolify db password must not ride on process argv, so it is staged as a
+// private .pgpass file and referenced by path only.
+func stageCoolifyPgpass(ctx context.Context, runCommand func(context.Context, string, ...string) ([]byte, error), container, password string) (string, func() error, error) {
+	noop := func() error { return nil }
+	if strings.ContainsAny(password, "\r\n") {
+		return "", noop, fmt.Errorf("coolify database password must not contain newline characters")
+	}
+	tmp, err := os.CreateTemp("", "bort-pgpass-")
+	if err != nil {
+		return "", noop, fmt.Errorf("create pgpass file: %w", err)
+	}
+	hostPath := tmp.Name()
+	removeHost := func() { _ = os.Remove(hostPath) }
+	if _, err := tmp.WriteString(coolifyPgpassFileContent(password)); err != nil {
+		_ = tmp.Close()
+		removeHost()
+		return "", noop, fmt.Errorf("write pgpass file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		removeHost()
+		return "", noop, fmt.Errorf("close pgpass file: %w", err)
+	}
+
+	containerPath := "/tmp/" + filepath.Base(hostPath)
+	if _, err := runCommand(ctx, "docker", "cp", hostPath, container+":"+containerPath); err != nil {
+		removeHost()
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, _ = runCommand(cleanupCtx, "docker", "exec", container, "rm", "-f", containerPath)
+		cancel()
+		return "", noop, fmt.Errorf("stage pgpass file in %s: %w", container, err)
+	}
+	removeHost()
+	cleanup := func() error {
+		hostErr := os.Remove(hostPath)
+		if errors.Is(hostErr, os.ErrNotExist) {
+			hostErr = nil
+		}
+		if hostErr != nil {
+			hostErr = fmt.Errorf("remove host pgpass file: %w", hostErr)
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, rmErr := runCommand(cleanupCtx, "docker", "exec", container, "rm", "-f", containerPath)
+		if rmErr != nil {
+			rmErr = fmt.Errorf("remove pgpass file %s from container %s: %w", containerPath, container, rmErr)
+		}
+		return errors.Join(hostErr, rmErr)
+	}
+	return containerPath, cleanup, nil
 }
 
 func readCoolifyDBCredentials(env map[string]string, envPath string) (coolifyDBCredentials, error) {
@@ -540,6 +687,11 @@ VERSION_TAG="${DOKPLOY_VERSION:-latest}"
 ACME_EMAIL="${ACME_EMAIL:-admin@dokploy.local}"
 TRAEFIK_IMAGE="${DOKPLOY_TRAEFIK_IMAGE:-traefik:v3.6.7}"
 
+if ! [[ "$ACME_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+    echo "invalid ACME_EMAIL \"$ACME_EMAIL\"" >&2
+    exit 1
+fi
+
 log() {
     printf 'BORT_INSTALL_STEP\t%s\n' "$*"
 }
@@ -554,6 +706,14 @@ if ! command -v docker >/dev/null 2>&1; then
     echo "docker is required before installing Dokploy" >&2
     exit 1
 fi
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required before installing Dokploy" >&2
+    exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required before installing Dokploy" >&2
+    exit 1
+fi
 
 private_ip() {
     ip -o -4 addr show scope global 2>/dev/null | awk 'first == "" { split($4, a, "/"); first = a[1] } END { print first }'
@@ -566,6 +726,10 @@ if [ -z "$ADVERTISE_ADDR" ]; then
 fi
 if [ -z "$ADVERTISE_ADDR" ]; then
     echo "could not determine an address for docker swarm; set ADVERTISE_ADDR and rerun" >&2
+    exit 1
+fi
+if ! python3 -c 'import ipaddress, sys; ipaddress.ip_address(sys.argv[1])' "$ADVERTISE_ADDR" 2>/dev/null; then
+    echo "ADVERTISE_ADDR \"$ADVERTISE_ADDR\" is not a valid IP address; set ADVERTISE_ADDR and rerun" >&2
     exit 1
 fi
 
@@ -664,7 +828,8 @@ docker network inspect dokploy-network >/dev/null 2>&1 || \
 
 log "Preparing Dokploy config files"
 mkdir -p /etc/dokploy/traefik/dynamic
-chmod 777 /etc/dokploy
+chown root:root /etc/dokploy /etc/dokploy/traefik /etc/dokploy/traefik/dynamic
+chmod 755 /etc/dokploy /etc/dokploy/traefik /etc/dokploy/traefik/dynamic
 touch /etc/dokploy/traefik/dynamic/acme.json
 chmod 600 /etc/dokploy/traefik/dynamic/acme.json
 
@@ -759,9 +924,9 @@ if ! docker service inspect dokploy-redis >/dev/null 2>&1; then
 fi
 
 DOCKER_IMAGE="dokploy/dokploy:${VERSION_TAG}"
-release_tag_env=""
+release_tag_args=()
 if [ "$VERSION_TAG" != "latest" ]; then
-    release_tag_env="-e RELEASE_TAG=${VERSION_TAG}"
+    release_tag_args=(-e "RELEASE_TAG=$VERSION_TAG")
 fi
 
 log "Starting Dokploy UI/API on port ${HOST_PORT}"
@@ -779,7 +944,7 @@ if ! docker service inspect dokploy >/dev/null 2>&1; then
         --update-parallelism 1 \
         --update-order stop-first \
         --constraint 'node.role == manager' \
-        $release_tag_env \
+        "${release_tag_args[@]}" \
         -e ADVERTISE_ADDR="$ADVERTISE_ADDR" \
         -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
         "$DOCKER_IMAGE" >/dev/null

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -671,7 +672,16 @@ func (c *Client) applyDumpDataStore(ctx context.Context, actx *applyContext, ste
 
 	args := []string{"exec"}
 	if creds.Password != "" {
-		args = append(args, "-e", "PGPASSWORD="+creds.Password)
+		pgpassPath, cleanupPgpass, err := stageContainerPgpass(ctx, runner, src.ID, filepath.Dir(dumpPath), creds.Password)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := cleanupPgpass(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: %v; the file holds the postgres database password, remove it manually\n", err)
+			}
+		}()
+		args = append(args, "-e", "PGPASSFILE="+pgpassPath)
 	}
 	args = append(args, src.ID, "pg_dump", "-w",
 		"-U", creds.User,
@@ -729,7 +739,16 @@ func (c *Client) applyRestoreDataStore(ctx context.Context, actx *applyContext, 
 
 		args := []string{"exec", "-i"}
 		if creds.Password != "" {
-			args = append(args, "-e", "PGPASSWORD="+creds.Password)
+			pgpassPath, cleanupPgpass, err := stageContainerPgpass(ctx, runner, dst.ID, filepath.Dir(dumpPath), creds.Password)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if err := cleanupPgpass(); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: %v; the file holds the postgres database password, remove it manually\n", err)
+				}
+			}()
+			args = append(args, "-e", "PGPASSFILE="+pgpassPath)
 		}
 		args = append(args, dst.ID, "pg_restore", "-w",
 			"-U", creds.User,
@@ -765,6 +784,59 @@ func recordMigratedStoreMounts(actx *applyContext, appName string, app preparer.
 		}
 	}
 	return nil
+}
+
+func pgpassFileContent(password string) string {
+	escaped := strings.NewReplacer(`\`, `\\`, `:`, `\:`).Replace(password)
+	return "*:*:*:*:" + escaped + "\n"
+}
+
+func stageContainerPgpass(ctx context.Context, runner dockerRunner, containerID, hostDir, password string) (string, func() error, error) {
+	noop := func() error { return nil }
+	if strings.ContainsAny(password, "\r\n") {
+		return "", noop, fmt.Errorf("postgres password for %s must not contain newline characters", containerID)
+	}
+	tmp, err := os.CreateTemp(hostDir, ".bort-pgpass-")
+	if err != nil {
+		return "", noop, fmt.Errorf("create pgpass file: %w", err)
+	}
+	hostPath := tmp.Name()
+	removeHost := func() error {
+		if err := os.Remove(hostPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove host pgpass file %s: %w", hostPath, err)
+		}
+		return nil
+	}
+	if _, err := tmp.WriteString(pgpassFileContent(password)); err != nil {
+		_ = tmp.Close()
+		_ = removeHost()
+		return "", noop, fmt.Errorf("write pgpass file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = removeHost()
+		return "", noop, fmt.Errorf("close pgpass file: %w", err)
+	}
+
+	containerPath := "/tmp/" + strings.TrimPrefix(filepath.Base(hostPath), ".")
+	if _, err := runner.Output(ctx, "cp", hostPath, containerID+":"+containerPath); err != nil {
+		_ = removeHost()
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, _ = runner.Output(cleanupCtx, "exec", containerID, "rm", "-f", containerPath)
+		cancel()
+		return "", noop, fmt.Errorf("stage pgpass file in %s: %w", containerID, err)
+	}
+	_ = removeHost()
+	cleanup := func() error {
+		hostErr := removeHost()
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, containerErr := runner.Output(cleanupCtx, "exec", containerID, "rm", "-f", containerPath)
+		if containerErr != nil {
+			containerErr = fmt.Errorf("remove pgpass file %s from container %s: %w", containerPath, containerID, containerErr)
+		}
+		return errors.Join(hostErr, containerErr)
+	}
+	return containerPath, cleanup, nil
 }
 
 func preparePgRestoreList(ctx context.Context, runner dockerRunner, containerID, dumpPath, appName, ref string) (string, func(), error) {
@@ -1007,11 +1079,7 @@ func isSupabaseRealtimePublicationListLine(fields []string) bool {
 func waitPostgresReady(ctx context.Context, runner dockerRunner, containerID string, creds postgresCreds) error {
 	deadline := time.Now().Add(targetDiscoveryTimeout)
 	for {
-		args := []string{"exec"}
-		if creds.Password != "" {
-			args = append(args, "-e", "PGPASSWORD="+creds.Password)
-		}
-		args = append(args, containerID, "pg_isready", "-q", "-U", creds.User, "-d", creds.Database)
+		args := []string{"exec", containerID, "pg_isready", "-q", "-U", creds.User, "-d", creds.Database}
 		if err := runner.Run(ctx, nil, nil, args...); err == nil {
 			return nil
 		}
