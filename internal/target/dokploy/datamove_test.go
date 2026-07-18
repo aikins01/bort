@@ -252,6 +252,129 @@ func (r *stopKillInspectRunner) Run(context.Context, io.Reader, io.Writer, ...st
 	return nil
 }
 
+func TestPgpassFileContentEscapesColonAndBackslash(t *testing.T) {
+	got := pgpassFileContent(`pa:ss\wo:rd`)
+	want := `*:*:*:*:pa\:ss\\wo\:rd` + "\n"
+	if got != want {
+		t.Fatalf("pgpass content = %q, want %q", got, want)
+	}
+}
+
+func TestStageContainerPgpassCleanupReportsFailure(t *testing.T) {
+	secret := "cl3anup-fail-s3cret"
+	runner := &fakeDockerRunner{}
+
+	hostDir := t.TempDir()
+	containerPath, cleanup, err := stageContainerPgpass(t.Context(), runner, "container", hostDir, secret)
+	if err != nil {
+		t.Fatalf("stageContainerPgpass returned error: %v", err)
+	}
+
+	cleanupErr := cleanup()
+	if cleanupErr == nil {
+		t.Fatal("expected cleanup error")
+	}
+	if !strings.Contains(cleanupErr.Error(), "remove pgpass file") {
+		t.Fatalf("expected cleanup context in error, got %v", cleanupErr)
+	}
+	if strings.Contains(cleanupErr.Error(), secret) {
+		t.Fatalf("cleanup error leaked secret: %v", cleanupErr)
+	}
+
+	hostPath := filepath.Join(hostDir, "."+filepath.Base(containerPath))
+	if _, err := os.Stat(hostPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("host pgpass file should be removed, stat error: %v", err)
+	}
+
+	sawCleanup := false
+	for _, args := range runner.outputArgs {
+		joined := strings.Join(args, " ")
+		if strings.HasPrefix(joined, "exec container rm -f ") {
+			sawCleanup = true
+		}
+		if strings.Contains(joined, secret) {
+			t.Fatalf("docker command leaked secret: %s", joined)
+		}
+	}
+	if !sawCleanup {
+		t.Fatal("expected container rm -f cleanup command")
+	}
+}
+
+func TestStageContainerPgpassRejectsNewlinePassword(t *testing.T) {
+	secret := "line-one\nline-two"
+	runner := &fakeDockerRunner{}
+
+	hostDir := t.TempDir()
+	_, _, err := stageContainerPgpass(t.Context(), runner, "container", hostDir, secret)
+	if err == nil {
+		t.Fatal("expected newline-containing password to be rejected")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error leaked password: %v", err)
+	}
+	entries, readErr := os.ReadDir(hostDir)
+	if readErr != nil {
+		t.Fatalf("read host dir: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("no pgpass file should be staged for a rejected password, found %d entries", len(entries))
+	}
+	if len(runner.outputArgs) != 0 {
+		t.Fatalf("no docker commands should run for a rejected password, got %v", runner.outputArgs)
+	}
+}
+
+type failingCpRunner struct {
+	outputArgs [][]string
+}
+
+func (r *failingCpRunner) Output(_ context.Context, args ...string) ([]byte, error) {
+	r.outputArgs = append(r.outputArgs, append([]string{}, args...))
+	if len(args) == 3 && args[0] == "cp" {
+		return nil, errors.New("cp exploded")
+	}
+	return []byte{}, nil
+}
+
+func (r *failingCpRunner) Run(context.Context, io.Reader, io.Writer, ...string) error {
+	return nil
+}
+
+func TestStageContainerPgpassCpFailureCleansContainer(t *testing.T) {
+	secret := "cp-fail-secret"
+	runner := &failingCpRunner{}
+
+	hostDir := t.TempDir()
+	_, _, err := stageContainerPgpass(t.Context(), runner, "container", hostDir, secret)
+	if err == nil {
+		t.Fatal("expected staging error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error leaked password: %v", err)
+	}
+	entries, readErr := os.ReadDir(hostDir)
+	if readErr != nil {
+		t.Fatalf("read host dir: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("host pgpass should be removed after cp failure, found %d entries", len(entries))
+	}
+	sawCleanup := false
+	for _, args := range runner.outputArgs {
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, secret) {
+			t.Fatalf("command leaked password: %q", joined)
+		}
+		if strings.HasPrefix(joined, "exec container rm -f /tmp/bort-pgpass-") {
+			sawCleanup = true
+		}
+	}
+	if !sawCleanup {
+		t.Fatalf("expected container rm -f after failed cp, got %v", runner.outputArgs)
+	}
+}
+
 func TestApplyDumpDataStorePostgres(t *testing.T) {
 	runDir := t.TempDir()
 	app := preparer.AppPlan{Name: "api"}
@@ -283,7 +406,7 @@ func TestApplyDumpDataStorePostgres(t *testing.T) {
 		t.Fatalf("expected 1 docker run, got %d: %#v", len(runner.runs), runner.runs)
 	}
 	got := runner.runs[0]
-	wantContains := []string{"exec", "-e", "PGPASSWORD=secret", "src-id", "pg_dump", "-U", "bob", "-d", "app"}
+	wantContains := []string{"exec", "-e", "src-id", "pg_dump", "-U", "bob", "-d", "app"}
 	for _, fragment := range wantContains {
 		found := false
 		for _, arg := range got.Args {
@@ -294,6 +417,32 @@ func TestApplyDumpDataStorePostgres(t *testing.T) {
 		}
 		if !found {
 			t.Fatalf("expected dump args to contain %q, got %v", fragment, got.Args)
+		}
+	}
+	foundPgpassEnv := false
+	for _, arg := range got.Args {
+		if strings.Contains(arg, "secret") || strings.HasPrefix(arg, "PGPASSWORD=") {
+			t.Fatalf("dump args must not expose the password, got %v", got.Args)
+		}
+		if strings.HasPrefix(arg, "PGPASSFILE=/tmp/bort-pgpass-") {
+			foundPgpassEnv = true
+		}
+	}
+	if !foundPgpassEnv {
+		t.Fatalf("expected dump args to reference a staged PGPASSFILE, got %v", got.Args)
+	}
+	if len(runner.copies) != 1 {
+		t.Fatalf("expected one staged pgpass copy, got %#v", runner.copies)
+	}
+	if runner.copies[0].Destination != "src-id:/tmp/"+strings.TrimPrefix(filepath.Base(runner.copies[0].Source), ".") {
+		t.Fatalf("unexpected pgpass destination: %#v", runner.copies[0])
+	}
+	if runner.copies[0].Contents != "*:*:*:*:secret\n" {
+		t.Fatalf("unexpected pgpass contents: %q", runner.copies[0].Contents)
+	}
+	for _, output := range runner.outputArgs {
+		if strings.Contains(strings.Join(output, " "), "secret") {
+			t.Fatalf("docker command leaked password: %v", output)
 		}
 	}
 
@@ -508,19 +657,40 @@ func TestApplyRestoreDataStoreFiltersEventTriggers(t *testing.T) {
 	if err := client.applyRestoreDataStore(context.Background(), actx, step); err != nil {
 		t.Fatalf("applyRestoreDataStore: %v", err)
 	}
-	if len(runner.copies) != 1 {
-		t.Fatalf("expected one staged restore list, got %#v", runner.copies)
-	}
-	if runner.copies[0].Destination != "dst-id:/tmp/bort-restore-list-api-db.list" {
-		t.Fatalf("unexpected restore list destination: %#v", runner.copies[0])
-	}
-	for _, blocked := range []string{"EVENT TRIGGER", "SCHEMA - auth", "EXTENSION - supabase_vault", "TABLE auth users", "TABLE DATA auth schema_migrations", "VIEW vault decrypted_secrets"} {
-		if strings.Contains(runner.copies[0].Contents, blocked) {
-			t.Fatalf("expected %q filtered, got:\n%s", blocked, runner.copies[0].Contents)
+	var listCopy *fakeDockerCopy
+	for i := range runner.copies {
+		if strings.HasSuffix(runner.copies[i].Destination, ".list") {
+			listCopy = &runner.copies[i]
+			break
 		}
 	}
-	if !strings.Contains(runner.copies[0].Contents, "TABLE public widgets") || !strings.Contains(runner.copies[0].Contents, "TABLE DATA public widgets") || !strings.Contains(runner.copies[0].Contents, "TABLE DATA auth users") {
-		t.Fatalf("expected non-event-trigger entries retained, got:\n%s", runner.copies[0].Contents)
+	if listCopy == nil {
+		t.Fatalf("expected staged restore list, got %#v", runner.copies)
+	}
+	if listCopy.Destination != "dst-id:/tmp/bort-restore-list-api-db.list" {
+		t.Fatalf("unexpected restore list destination: %#v", *listCopy)
+	}
+	for _, blocked := range []string{"EVENT TRIGGER", "SCHEMA - auth", "EXTENSION - supabase_vault", "TABLE auth users", "TABLE DATA auth schema_migrations", "VIEW vault decrypted_secrets"} {
+		if strings.Contains(listCopy.Contents, blocked) {
+			t.Fatalf("expected %q filtered, got:\n%s", blocked, listCopy.Contents)
+		}
+	}
+	if !strings.Contains(listCopy.Contents, "TABLE public widgets") || !strings.Contains(listCopy.Contents, "TABLE DATA public widgets") || !strings.Contains(listCopy.Contents, "TABLE DATA auth users") {
+		t.Fatalf("expected non-event-trigger entries retained, got:\n%s", listCopy.Contents)
+	}
+
+	var pgpassCopy *fakeDockerCopy
+	for i := range runner.copies {
+		if strings.Contains(runner.copies[i].Destination, "bort-pgpass-") {
+			pgpassCopy = &runner.copies[i]
+			break
+		}
+	}
+	if pgpassCopy == nil {
+		t.Fatalf("expected staged pgpass copy, got %#v", runner.copies)
+	}
+	if pgpassCopy.Contents != "*:*:*:*:secret\n" {
+		t.Fatalf("unexpected pgpass contents: %q", pgpassCopy.Contents)
 	}
 
 	var restoreRun fakeDockerRun
@@ -548,6 +718,11 @@ func TestApplyRestoreDataStoreFiltersEventTriggers(t *testing.T) {
 	}
 	if !foundListFlag {
 		t.Fatalf("expected restore args to include filtered list, got %v", restoreRun.Args)
+	}
+	for _, arg := range restoreRun.Args {
+		if strings.Contains(arg, "secret") || strings.HasPrefix(arg, "PGPASSWORD=") {
+			t.Fatalf("restore args must not expose the password, got %v", restoreRun.Args)
+		}
 	}
 }
 
