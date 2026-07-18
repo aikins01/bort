@@ -69,7 +69,7 @@ nfpms:
       - rpm
     bindir: /usr/bin
 
-brews:
+homebrew_casks:
   - name: bort
     ids:
       - bort
@@ -78,14 +78,15 @@ brews:
       name: homebrew-tap
       branch: main
       token: "{{ .Env.TAP_GITHUB_TOKEN }}"
-    directory: Formula
     homepage: https://github.com/aikins01/bort
     description: migration cockpit for self-hosted PaaS platform moves
     license: MIT
     commit_author:
       name: goreleaserbot
       email: bot@goreleaser.com
-    install: |
-      bin.install "bort"
-    test: |
-      system "#{bin}/bort", "version"
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/bort"]
+          end
