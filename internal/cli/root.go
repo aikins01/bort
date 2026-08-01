@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -14,7 +16,12 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	return RunWithInput(ctx, args, os.Stdin, stdout, stderr)
 }
 
-func RunWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+func RunWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (err error) {
+	defer func() {
+		if errors.Is(err, flag.ErrHelp) {
+			err = nil
+		}
+	}()
 	if len(args) == 0 {
 		return runGuide(ctx, stdin, stdout, stderr)
 	}
@@ -37,7 +44,7 @@ func RunWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	case "commit":
 		return runCommit(ctx, args[1:], stdout, stderr)
 	case "cleanup":
-		return runCleanup(ctx, args[1:], stdout, stderr)
+		return runCleanupWithInput(ctx, args[1:], stdin, stdout, stderr)
 	case "scan":
 		return runScan(ctx, args[1:], stdout, stderr)
 	case "plan":
@@ -77,30 +84,26 @@ func printHelp(w io.Writer, advanced bool) error {
 
 func writePrimaryHelp(w io.Writer, st *styler) {
 	writeHelpSection(w, st, "Usage:", []helpLine{
-		{verb: "bort", desc: "scan and show app-first migration status"},
-		{verb: "bort env <app> KEY=value ...", desc: "record env values for an app in .bort/state.json"},
-		{verb: "bort data <app> <store> --recreate|--migrate|--managed", desc: "record a data store strategy in .bort/state.json"},
-		{verb: "bort migrate", desc: "create/update a run; --live applies after gates are clear"},
-		{verb: "bort rollback", desc: "plan a rollback to the source"},
-		{verb: "bort commit", desc: "plan final target acceptance; --apply stops source app containers"},
-		{verb: "bort cleanup", desc: "inventory leftovers; --apply removes safe metadata only"},
-		{verb: "bort init-target dokploy", desc: "bootstrap target credentials for live execution"},
+		{verb: bortCommand(""), desc: "start or resume the current migration"},
+		{verb: bortCommand("migrate --live"), desc: "apply the reviewed current run to its target"},
+		{verb: bortCommand("rollback"), desc: "inspect the source rollback plan"},
+		{verb: bortCommand("commit --apply"), desc: "accept the target and retire source containers"},
+		{verb: bortCommand("cleanup"), desc: "audit leftovers; --apply removes safe metadata only"},
+		{verb: bortCommand("cleanup purge"), desc: "purge eligible source leftovers with confirmation"},
 	})
 	writeHelpSection(w, st, "Other:", []helpLine{
-		{verb: "bort help [--advanced]", desc: "show this help (advanced lists power-user verbs)"},
+		{verb: "bort help --advanced", desc: "show setup, automation, and artifact commands"},
 		{verb: "bort version", desc: "print the version"},
 	})
 }
 
 func writeAdvancedHelp(w io.Writer, st *styler) {
-	writeHelpSection(w, st, "Primary:", []helpLine{
-		{verb: "bort", desc: "start or resume a migration (linear, app-first)"},
-		{verb: "bort env", desc: "record env values for an app in .bort/state.json"},
-		{verb: "bort data", desc: "record a data store strategy in .bort/state.json"},
-		{verb: "bort migrate", desc: "create/update a run; --live applies after gates are clear"},
-		{verb: "bort rollback", desc: "plan a rollback to the source"},
-		{verb: "bort commit", desc: "plan final target acceptance; --apply stops source app containers"},
-		{verb: "bort cleanup", desc: "inventory leftovers; --apply removes safe metadata only"},
+	writeHelpSection(w, st, "Setup and automation:", []helpLine{
+		{verb: bortCommand("migrate --source <adapter>"), desc: "scan, export, and create a reviewed run in one command"},
+		{verb: bortCommand("migrate --manifest <path>"), desc: "create a run from an existing manifest"},
+		{verb: bortCommand("env <app> KEY=value ..."), desc: "record env values non-interactively"},
+		{verb: bortCommand("data <app> <store> --migrate|--recreate|--managed"), desc: "record a data strategy non-interactively"},
+		{verb: bortCommand("init-target dokploy"), desc: "bootstrap target credentials before live execution"},
 	})
 	writeHelpSection(w, st, "Power-user pipeline (each step is local and dry-run only):", []helpLine{
 		{verb: "bort scan", desc: "discover local resources and write a migration manifest"},
@@ -111,9 +114,9 @@ func writeAdvancedHelp(w io.Writer, st *styler) {
 		{verb: "bort sync", desc: "plan state sync work from prepared target resources"},
 		{verb: "bort cutover", desc: "plan route cutover and rollback"},
 	})
-	writeHelpSection(w, st, "Scripting helpers (rarely needed; the linear status view shows the same info):", []helpLine{
-		{verb: "bort status", desc: "print a run summary as text"},
-		{verb: "bort next", desc: "print the next safe action for a run"},
+	writeHelpSection(w, st, "Compatibility helpers (the default cockpit already includes both):", []helpLine{
+		{verb: bortCommand("status"), desc: "show the app-first cockpit for a selected run"},
+		{verb: bortCommand("next"), desc: "print only the next safe action"},
 	})
 	fmt.Fprintln(w, st.muted(`Run "bort <command> -h" for command-specific flags.`))
 }

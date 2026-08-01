@@ -233,18 +233,17 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 		return fmt.Errorf("dokploy createApiKey: %w", err)
 	}
 
-	state, err := readBortState(deps.statePath)
-	if err != nil {
-		return err
-	}
-	state = setTargetCredentials(state, target, targetCredentials{
+	creds := targetCredentials{
 		URL:            client.BaseURL,
 		Token:          apiKey,
 		AdminEmail:     admin.Email,
 		BootstrappedAt: time.Now().UTC(),
 		APIKeyName:     apiKeyName,
-	})
-	if err := writeBortState(deps.statePath, state); err != nil {
+	}
+	if err := mutateBortState(deps.statePath, func(state *bortState) bool {
+		*state = setTargetCredentials(*state, target, creds)
+		return true
+	}); err != nil {
 		return err
 	}
 

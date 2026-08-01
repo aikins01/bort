@@ -100,7 +100,19 @@ func TestApplyResumeFromPrimesCompletedCreateSteps(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+	client := &Client{
+		BaseURL:    server.URL,
+		Token:      "secret",
+		HTTPClient: server.Client(),
+		Docker: &fakeDockerRunner{
+			outputs: map[string][]byte{
+				"ps --format {{.Names}}": []byte("dokploy-postgres\n"),
+			},
+			runOutputs: map[string][]byte{
+				"exec -i dokploy-postgres psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": {},
+			},
+		},
+	}
 	plan := Plan{
 		ResumeFrom: 2,
 		Steps: []Step{
@@ -152,6 +164,154 @@ func TestApplySkipsPlatformAppSteps(t *testing.T) {
 	}
 	if skipped != len(plan.Steps) {
 		t.Fatalf("expected %d skipped platform steps, got %d progress=%#v", len(plan.Steps), skipped, progress)
+	}
+}
+
+func TestApplyStopsBeforeStepWhenPersistenceHookFails(t *testing.T) {
+	sentinel := errors.New("persist started step")
+	beforeStep := func(StepProgress) error {
+		return sentinel
+	}
+	var progress []StepProgress
+	onProgress := func(p StepProgress) {
+		progress = append(progress, p)
+	}
+	client := &Client{}
+	err := client.Apply(context.Background(), Plan{
+		Steps:      []Step{{Kind: StepCreateProject, App: "source", Ref: "source"}},
+		Prepare:    preparer.Result{Apps: []preparer.AppPlan{{Name: "source", Role: "platform"}}},
+		BeforeStep: &beforeStep,
+		OnProgress: &onProgress,
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected before-step failure, got %v", err)
+	}
+	if len(progress) != 0 {
+		t.Fatalf("expected no progress after before-step failure, got %#v", progress)
+	}
+}
+
+func TestApplyResumesPausedSourceWhenPersistenceFailsBetweenSteps(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", SourceContainerID: "web-id"}}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container web-id": []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+		"stop web-id":                     []byte("web-id\n"),
+	}}
+	var beforeCalls int
+	beforeStep := func(StepProgress) error {
+		beforeCalls++
+		if beforeCalls == 2 {
+			return errors.New("persist failed")
+		}
+		return nil
+	}
+	var progress []StepProgress
+	onProgress := func(p StepProgress) {
+		progress = append(progress, p)
+	}
+	client := &Client{Docker: runner}
+	err := client.Apply(context.Background(), Plan{
+		Steps:      []Step{{Kind: StepPauseSource, App: "api", Ref: "api"}, {Kind: StepCreateVolume, App: "api", Ref: "data"}},
+		Prepare:    preparer.Result{Apps: []preparer.AppPlan{app}},
+		BeforeStep: &beforeStep,
+		OnProgress: &onProgress,
+	})
+	if err == nil || !strings.Contains(err.Error(), "persist failed") {
+		t.Fatalf("expected persistence failure, got %v", err)
+	}
+	for _, p := range progress {
+		if p.Step.Kind == StepResumeSource && p.Status == StepStatusOK {
+			return
+		}
+	}
+	t.Fatalf("expected cleanup to resume the paused source, got %#v", progress)
+}
+
+func TestActivePatchGuardBlocksGitBackedCompose(t *testing.T) {
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"ps --format {{.Names}}": []byte("dokploy-postgres.1.task\n"),
+		},
+		runOutputs: map[string][]byte{
+			"exec -i dokploy-postgres.1.task psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": []byte(`{"patchId":"bort-api-compose","filePath":"docker|compose.yml","composeName":"api","sourceType":"github","repository":"owner/repo","branch":"main"}` + "\n"),
+		},
+	}
+	client := &Client{Docker: runner}
+	err := client.validateNoActiveBortOverrides(context.Background(), "compose-api")
+	if err == nil || !strings.Contains(err.Error(), "active Bort-owned Dokploy patch") || !strings.Contains(err.Error(), "bort-api-compose") || !strings.Contains(err.Error(), "docker|compose.yml") {
+		t.Fatalf("expected active patch guard, got %v", err)
+	}
+	if len(runner.runs) != 1 {
+		t.Fatalf("expected one Dokploy DB patch inspection, got %#v", runner.runs)
+	}
+	sql := string(runner.runs[0].Stdin)
+	for _, want := range []string{"c.\"composeId\" = 'compose-api'", "json_build_object", "p.\"patchId\" like 'bort-%'", "sourceType"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("expected patch guard sql to contain %q, got:\n%s", want, sql)
+		}
+	}
+}
+
+func TestApplyPushImageChecksActivePatchWithoutEnvOrRoutes(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte("services: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres.1.task\n")},
+		runOutputs: map[string][]byte{
+			"exec -i dokploy-postgres.1.task psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": []byte(`{"patchId":"bort-api-compose","filePath":"docker|compose.yml","composeName":"api","sourceType":"github","repository":"owner/repo","branch":"main"}` + "\n"),
+		},
+	}
+	client := &Client{Docker: runner}
+	app := preparer.AppPlan{Name: "api", Directory: "api", TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{
+		Project:    preparer.DokployProject{Name: "api", Environment: "production"},
+		ComposeApp: preparer.DokployComposeApp{Name: "api", ComposePath: "compose.yaml"},
+	}}}
+	actx := &applyContext{plan: Plan{Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}}, cache: map[string]*appCache{"api": {ComposeID: "compose-1"}}}
+	err := client.applyPushImage(context.Background(), actx, Step{Kind: StepPushImage, App: "api", Ref: "api"})
+	if err == nil || !strings.Contains(err.Error(), "active Bort-owned Dokploy patch") {
+		t.Fatalf("expected unconditional deployment path to block active patch, got %v", err)
+	}
+}
+
+func TestActivePatchGuardRejectsMissingComposeID(t *testing.T) {
+	client := &Client{Docker: &fakeDockerRunner{}}
+	if err := client.validateNoActiveBortOverrides(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "missing composeId") {
+		t.Fatalf("expected missing composeId to fail closed, got %v", err)
+	}
+}
+
+func TestParseActiveBortOverridePatchesFailsClosedOnMalformedRow(t *testing.T) {
+	if _, err := parseActiveBortOverridePatches("not-json\n"); err == nil {
+		t.Fatal("expected malformed patch row to fail closed")
+	}
+}
+
+func TestActivePatchGuardFailsClosedWhenInspectionCannotFindDokploy(t *testing.T) {
+	client := &Client{Docker: &fakeDockerRunner{}}
+	err := client.validateNoActiveBortOverrides(context.Background(), "compose-api")
+	if err == nil || !strings.Contains(err.Error(), "active patch inspection") || !strings.Contains(err.Error(), "docker output not stubbed") {
+		t.Fatalf("expected active patch inspection to fail closed, got %v", err)
+	}
+}
+
+func TestActivePatchGuardFailsClosedWhenDokployDatabaseIsUnavailable(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps --format {{.Names}}": []byte("unrelated\n"),
+	}}
+	client := &Client{Docker: runner}
+
+	if err := client.validateNoActiveBortOverrides(context.Background(), "compose-api"); err == nil || !strings.Contains(err.Error(), "dokploy postgres container was not found") {
+		t.Fatalf("expected missing Dokploy DB to fail closed, got %v", err)
+	}
+	if len(runner.runs) != 0 {
+		t.Fatalf("expected no Dokploy DB query when postgres is absent, got %#v", runner.runs)
 	}
 }
 
@@ -232,7 +392,19 @@ func TestApplyCreateStepsReuseGroupedProjectPerApp(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+	client := &Client{
+		BaseURL:    server.URL,
+		Token:      "secret",
+		HTTPClient: server.Client(),
+		Docker: &fakeDockerRunner{
+			outputs: map[string][]byte{
+				"ps --format {{.Names}}": []byte("dokploy-postgres\n"),
+			},
+			runOutputs: map[string][]byte{
+				"exec -i dokploy-postgres psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": {},
+			},
+		},
+	}
 	plan := Plan{
 		Steps: []Step{
 			{Kind: StepCreateProject, App: "demo-app", Ref: "demo-project"},
@@ -629,7 +801,19 @@ func TestApplyActivateRoutesUpdatesDomainsAndRedeploys(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: &fakeDockerRunner{outputs: map[string][]byte{}}}
+	client := &Client{
+		BaseURL:    server.URL,
+		Token:      "secret",
+		HTTPClient: server.Client(),
+		Docker: &fakeDockerRunner{
+			outputs: map[string][]byte{
+				"ps --format {{.Names}}": []byte("dokploy-postgres\n"),
+			},
+			runOutputs: map[string][]byte{
+				"exec -i dokploy-postgres psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": {},
+			},
+		},
+	}
 	plan := Plan{
 		Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{{
 			Name:      "example-app",

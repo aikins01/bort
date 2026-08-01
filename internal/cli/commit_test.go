@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	commitplan "github.com/aikins01/bort/internal/commit"
 	"github.com/aikins01/bort/internal/exporter"
@@ -98,6 +101,194 @@ func TestRunCommitWritesJSONPlan(t *testing.T) {
 	}
 }
 
+func TestRunCommitApplyRejectsIgnoredPlanningFlags(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := runCommit(context.Background(), []string{"--apply", "--app", "api"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "does not accept --app") {
+		t.Fatalf("expected commit apply to reject ignored app scope, got %v", err)
+	}
+}
+
+func TestRunCommitApplyRejectsPositionalArguments(t *testing.T) {
+	err := runCommit(context.Background(), []string{"--apply", "purge"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "does not accept positional argument") {
+		t.Fatalf("expected positional argument to be rejected before source retirement, got %v", err)
+	}
+}
+
+func TestRunCommitDefaultsToCurrentRun(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	bundleDir := filepath.Join(workDir, "reviewed-bundle")
+	writeTestBundle(t, bundleDir, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "reviewed-app", Services: []manifest.Service{{Name: "reviewed-app", Image: "example/reviewed:latest"}}}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "reviewed-run"})
+	reviewed, err := loadMigrationRun("reviewed-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestBundle(t, filepath.Join(workDir, "bort-bundle"), manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "stale-app", Services: []manifest.Service{{Name: "stale-app", Image: "example/stale:latest"}}}},
+	})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runCommit(context.Background(), nil, &stdout, &stderr); err != nil {
+		t.Fatalf("commit failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Commit plan: "+reviewed.Run.BundleDir+" -> dokploy") || !strings.Contains(stdout.String(), "reviewed-app") {
+		t.Fatalf("expected commit to use the current run artifact, got:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "stale-app") {
+		t.Fatalf("commit planned from the default bundle instead of the current run:\n%s", stdout.String())
+	}
+}
+
+func TestRunCommitHonorsExplicitRun(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	explicitBundle := filepath.Join(workDir, "explicit-bundle")
+	currentBundle := filepath.Join(workDir, "current-bundle")
+	writeTestBundle(t, explicitBundle, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "explicit-app", Services: []manifest.Service{{Name: "explicit-app", Image: "example/explicit:latest"}}}},
+	})
+	writeTestBundle(t, currentBundle, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "current-app", Services: []manifest.Service{{Name: "current-app", Image: "example/current:latest"}}}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", explicitBundle, "--run", "explicit-run"})
+	runCommand(t, runMigrate, []string{"--bundle", currentBundle, "--run", "current-run"})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runCommit(context.Background(), []string{"--run", "explicit-run"}, &stdout, &stderr); err != nil {
+		t.Fatalf("commit failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "explicit-app") || strings.Contains(stdout.String(), "current-app") {
+		t.Fatalf("expected explicit run to override current run, got:\n%s", stdout.String())
+	}
+}
+
+func TestRunCommitUsesDefaultBundleWithoutCurrentRun(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	reviewedBundle := filepath.Join(workDir, "reviewed-bundle")
+	writeTestBundle(t, reviewedBundle, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "reviewed-app", Services: []manifest.Service{{Name: "reviewed-app", Image: "example/reviewed:latest"}}}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", reviewedBundle, "--run", "reviewed-run"})
+	writeTestBundle(t, filepath.Join(workDir, "bort-bundle"), manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "default-app", Services: []manifest.Service{{Name: "default-app", Image: "example/default:latest"}}}},
+	})
+	if err := mutateBortState(defaultStatePath(), func(state *bortState) bool {
+		state.CurrentRun = ""
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	if err := runCommit(context.Background(), nil, &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "default-app") || strings.Contains(stdout.String(), "reviewed-app") {
+		t.Fatalf("expected bare commit to plan from the default bundle without a current run, got:\n%s", stdout.String())
+	}
+}
+
+func TestNewRunRequiresSuccessfulOutcomeBeforeCommit(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	bundleDir := filepath.Join(workDir, "bort-bundle")
+	writeTestBundle(t, bundleDir, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "api", Services: []manifest.Service{{Name: "api", Image: "example/api:latest"}}}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "missing-outcome"})
+	run, err := loadMigrationRun("missing-outcome")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !run.Run.ApplyOutcomeRequired {
+		t.Fatal("expected new run metadata to require a successful apply outcome")
+	}
+	steps := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps
+	applied := newRunApplied(run.Run)
+	for index, step := range steps {
+		applied.Steps = append(applied.Steps, appliedStep{
+			Index:  index,
+			Kind:   string(step.Kind),
+			App:    step.App,
+			Ref:    step.Ref,
+			Status: string(dokploy.StepStatusOK),
+		})
+	}
+	appliedPath, err := safeRunArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRunApplied(appliedPath, applied); err != nil {
+		t.Fatal(err)
+	}
+	run, err = loadMigrationRun("missing-outcome")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cockpit bytes.Buffer
+	writeAppFirstCockpit(&cockpit, run)
+	if strings.Contains(cockpit.String(), "TARGET LIVE") {
+		t.Fatalf("complete steps without a durable outcome were shown as target live:\n%s", cockpit.String())
+	}
+	if err := applyCommitFromArgs(context.Background(), "missing-outcome", io.Discard); err == nil || !strings.Contains(err.Error(), "no successful live-apply outcome") {
+		t.Fatalf("expected commit to reject complete steps without a durable outcome, got %v", err)
+	}
+}
+
+func TestLegacyCompleteLedgerDoesNotRequireSuccessfulOutcomeMarker(t *testing.T) {
+	run := loadedMigrationRun{
+		Run:     migrationRun{Name: "legacy-run"},
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}},
+		Cutover: gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}}}},
+	}
+	steps := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps
+	for index, step := range steps {
+		run.Applied.Steps = append(run.Applied.Steps, appliedStep{
+			Index:  index,
+			Kind:   string(step.Kind),
+			App:    step.App,
+			Ref:    step.Ref,
+			Status: string(dokploy.StepStatusOK),
+		})
+	}
+	if err := requireLiveApplySucceeded(run); err != nil {
+		t.Fatalf("expected a legacy complete ledger to remain accepted: %v", err)
+	}
+}
+
+func TestLiveApplyRecoveryErrorsPreserveExternalRunDirectory(t *testing.T) {
+	externalRunDir := filepath.Join(t.TempDir(), "selected-run")
+	run := loadedMigrationRun{
+		Run:     migrationRun{Name: "selected-run", RunDir: externalRunDir, ApplyOutcomeRequired: true},
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}},
+		Cutover: gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}}}},
+	}
+	want := liveApplyCommand(run)
+	if err := requireLiveApplySucceeded(run); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected missing-outcome recovery command %q, got %v", want, err)
+	}
+	run.Run.ApplyOutcomeRequired = false
+	if err := requireLiveApplySucceeded(run); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected missing-step recovery command %q, got %v", want, err)
+	}
+}
+
 func TestRequireLiveApplySucceededAcceptsSkippedPlatformSteps(t *testing.T) {
 	run := loadedMigrationRun{
 		Run: migrationRun{Name: "run-1"},
@@ -111,6 +302,8 @@ func TestRequireLiveApplySucceededAcceptsSkippedPlatformSteps(t *testing.T) {
 		}}},
 	}
 	steps := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps
+	succeededAt := time.Now().UTC()
+	run.Applied.SucceededAt = &succeededAt
 	for index, step := range steps {
 		status := string(dokploy.StepStatusOK)
 		if step.App == "proxy" {
@@ -126,5 +319,112 @@ func TestRequireLiveApplySucceededAcceptsSkippedPlatformSteps(t *testing.T) {
 	}
 	if err := requireLiveApplySucceeded(run); err != nil {
 		t.Fatalf("expected skipped platform steps to count as completed: %v", err)
+	}
+}
+
+func TestRequireLiveApplySucceededRejectsReorderedLedgerIndexes(t *testing.T) {
+	run := loadedMigrationRun{
+		Run:     migrationRun{Name: "run-1"},
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}, {Name: "worker"}}},
+		Cutover: gateway.Result{Apps: []gateway.AppPlan{
+			{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}},
+			{Name: "worker", Routes: []gateway.Route{{Host: "worker.example.com"}}},
+		}},
+	}
+	steps := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps
+	for index := len(steps) - 1; index >= 0; index-- {
+		step := steps[index]
+		run.Applied.Steps = append(run.Applied.Steps, appliedStep{
+			Index:  len(steps) - 1 - index,
+			Kind:   string(step.Kind),
+			App:    step.App,
+			Ref:    step.Ref,
+			Status: string(dokploy.StepStatusOK),
+		})
+	}
+	if err := requireLiveApplySucceeded(run); err == nil || !strings.Contains(err.Error(), "plan index") {
+		t.Fatalf("expected reordered completed ledger steps to be rejected, got %v", err)
+	}
+}
+
+func TestRequireLiveApplySucceededRejectsLaterFailedLedgerEntry(t *testing.T) {
+	run := loadedMigrationRun{
+		Run:     migrationRun{Name: "run-1"},
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}},
+		Cutover: gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}}}},
+	}
+	steps := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps
+	for index, step := range steps {
+		run.Applied.Steps = append(run.Applied.Steps, appliedStep{Index: index, Kind: string(step.Kind), App: step.App, Ref: step.Ref, Status: string(dokploy.StepStatusOK), UpdatedAt: time.Unix(1, 0)})
+	}
+	failed := steps[0]
+	run.Applied.Steps = append(run.Applied.Steps, appliedStep{Index: len(steps), Kind: string(failed.Kind), App: failed.App, Ref: failed.Ref, Status: string(dokploy.StepStatusError), UpdatedAt: time.Unix(2, 0)})
+	if err := requireLiveApplySucceeded(run); err == nil || !strings.Contains(err.Error(), string(failed.Kind)) {
+		t.Fatalf("expected later failed ledger entry to invalidate historical success, got %v", err)
+	}
+}
+
+func TestRequireLiveApplySucceededForAppsIgnoresUnselectedApps(t *testing.T) {
+	run := loadedMigrationRun{
+		Run:     migrationRun{Name: "run-1"},
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}, {Name: "worker"}}},
+		Cutover: gateway.Result{Apps: []gateway.AppPlan{
+			{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}},
+			{Name: "worker", Routes: []gateway.Route{{Host: "worker.example.com"}}},
+		}},
+	}
+	steps := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps
+	succeededAt := time.Now().UTC()
+	run.Applied.SucceededAt = &succeededAt
+	for index, step := range steps {
+		if step.App != "" && step.App != "api" {
+			continue
+		}
+		run.Applied.Steps = append(run.Applied.Steps, appliedStep{
+			Index:  index,
+			Kind:   string(step.Kind),
+			App:    step.App,
+			Ref:    step.Ref,
+			Status: string(dokploy.StepStatusOK),
+		})
+	}
+	if err := requireLiveApplySucceededForApps(run, map[string]struct{}{"api": {}}); err != nil {
+		t.Fatalf("expected selected app's completed ledger steps to count as successful live apply: %v", err)
+	}
+	if err := requireLiveApplySucceeded(run); err == nil || !strings.Contains(err.Error(), "worker") {
+		t.Fatalf("expected all-app guard to still reject missing worker steps, got %v", err)
+	}
+}
+
+func TestRequireLiveApplySucceededForAppsSkippingAllowsMissingSkippedKinds(t *testing.T) {
+	run := loadedMigrationRun{
+		Run:     migrationRun{Name: "run-1"},
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}},
+		Cutover: gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}}}},
+	}
+	steps := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps
+	if len(steps) == 0 {
+		t.Fatal("expected live plan steps")
+	}
+	succeededAt := time.Now().UTC()
+	run.Applied.SucceededAt = &succeededAt
+	skipKind := steps[0].Kind
+	for index, step := range steps {
+		if step.Kind == skipKind {
+			continue
+		}
+		run.Applied.Steps = append(run.Applied.Steps, appliedStep{
+			Index:  index,
+			Kind:   string(step.Kind),
+			App:    step.App,
+			Ref:    step.Ref,
+			Status: string(dokploy.StepStatusOK),
+		})
+	}
+	if err := requireLiveApplySucceededForAppsSkipping(run, nil, map[dokploy.StepKind]struct{}{skipKind: {}}); err != nil {
+		t.Fatalf("expected missing skipped step kind to be ignored: %v", err)
+	}
+	if err := requireLiveApplySucceeded(run); err == nil || !strings.Contains(err.Error(), string(skipKind)) {
+		t.Fatalf("expected regular guard to reject missing %s step, got %v", skipKind, err)
 	}
 }

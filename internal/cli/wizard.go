@@ -10,31 +10,41 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aikins01/bort/internal/target/dokploy"
-	"github.com/charmbracelet/bubbles/progress"
-	tea "github.com/charmbracelet/bubbletea"
+	"github.com/aikins01/bort/internal/preparer"
 	"github.com/charmbracelet/huh"
 )
 
-// runWizard drives the interactive flow after a migration run is created.
-// it loops over open decisions, persisting each answer to .bort/state.json
-// and re-planning, then offers an apply preview when everything is green.
 func runWizard(ctx context.Context, run loadedMigrationRun, stdin io.Reader, stdout, stderr io.Writer) error {
 	current := run
+	if len(current.Applied.Steps) > 0 {
+		writeAppFirstCockpit(stdout, current)
+		return nil
+	}
 	for {
-		decisions := openRunDecisions(current)
+		decisions, reviewOnly := nextWizardDecisions(current)
 		if len(decisions) == 0 {
 			break
 		}
 		decision := decisions[0]
-		handled, err := promptWizardDecision(ctx, current, decision, stdout)
+		var handled, replan bool
+		var err error
+		if reviewOnly {
+			handled, err = promptReviewDecision(current, decision, stdout)
+		} else {
+			handled, replan, err = promptWizardDecision(ctx, current, decision, stdout)
+		}
 		if err != nil {
 			return err
 		}
 		if !handled {
 			break
 		}
-		refreshed, err := refreshMigrationRun(current.Run.RunDir)
+		var refreshed loadedMigrationRun
+		if replan {
+			refreshed, err = refreshMigrationRun(current.Run.RunDir)
+		} else {
+			refreshed, err = loadMigrationRun(current.Run.RunDir)
+		}
 		if err != nil {
 			return err
 		}
@@ -46,46 +56,32 @@ func runWizard(ctx context.Context, run loadedMigrationRun, stdin io.Reader, std
 	return nil
 }
 
-// confirmCommitApply gates the wizard's source-retirement step behind an
-// explicit confirm. it runs only after the live apply succeeded so the
-// operator can poke at the target before stopping the source — this is
-// the last reversible moment without a manual docker start.
-func confirmCommitApply(run loadedMigrationRun) (bool, error) {
-	plan := dokploy.PlanForCommit(run.Prepare, run.Cutover)
-	confirm := false
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Retire source containers now?").
-			Description(fmt.Sprintf("Will stop %d source container group(s) plus coolify-proxy. Source is left in place — `docker start` recovers it.", len(plan.Steps)-1)).
-			Affirmative("Retire").
-			Negative("Skip").
-			Value(&confirm),
-	))
-	if err := form.Run(); err != nil {
-		return false, err
+func nextWizardDecisions(run loadedMigrationRun) ([]runDecision, bool) {
+	if decisions := openSetupDecisions(run); len(decisions) > 0 {
+		return decisions, false
 	}
-	return confirm, nil
+	return openReviewDecisions(run), true
 }
 
-func promptWizardDecision(ctx context.Context, run loadedMigrationRun, decision runDecision, stdout io.Writer) (bool, error) {
+func promptWizardDecision(ctx context.Context, run loadedMigrationRun, decision runDecision, stdout io.Writer) (bool, bool, error) {
 	statePath := defaultStatePath()
-	state, err := readBortState(statePath)
-	if err != nil {
-		return false, err
-	}
 	switch decision.Kind {
 	case "environment":
-		return promptEnvDecision(ctx, decision, state, statePath, stdout)
+		handled, err := promptEnvDecision(ctx, decision, statePath, stdout)
+		return handled, handled, err
 	case "data_stores":
-		return promptDataStoreDecision(ctx, decision, state, statePath, stdout)
-	case "routes":
-		return promptRoutesDecision(decision, stdout)
+		handled, err := promptDataStoreDecision(ctx, decision, statePath, stdout)
+		return handled, handled, err
 	}
-	fmt.Fprintf(stdout, "%s.\n%s.\nOpen %s for details and re-run when resolved.\n", decisionAction(decision), decisionReason(decision), runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Decisions))
-	return false, nil
+	if decision.Readiness != preparer.ReadinessNeedsDecision {
+		fmt.Fprintf(stdout, "%s.\n%s.\nOpen %s for details and re-run when resolved.\n", decisionAction(decision), decisionReason(decision), runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Decisions))
+		return false, false, nil
+	}
+	handled, err := promptReviewDecision(run, decision, stdout)
+	return handled, false, err
 }
 
-func promptEnvDecision(_ context.Context, decision runDecision, state bortState, statePath string, stdout io.Writer) (bool, error) {
+func promptEnvDecision(_ context.Context, decision runDecision, statePath string, stdout io.Writer) (bool, error) {
 	app := firstApp(decision)
 	if app == "" {
 		return false, nil
@@ -107,15 +103,17 @@ func promptEnvDecision(_ context.Context, decision runDecision, state bortState,
 		fmt.Fprintln(stdout, "No values entered; skipping.")
 		return false, nil
 	}
-	state = setAppEnv(state, app, values)
-	if err := writeBortState(statePath, state); err != nil {
+	if err := mutateBortState(statePath, func(state *bortState) bool {
+		*state = setAppEnv(*state, app, values)
+		return true
+	}); err != nil {
 		return false, err
 	}
 	fmt.Fprintf(stdout, "Recorded %d env value(s) for %s.\n", len(values), app)
 	return true, nil
 }
 
-func promptDataStoreDecision(_ context.Context, decision runDecision, state bortState, statePath string, stdout io.Writer) (bool, error) {
+func promptDataStoreDecision(_ context.Context, decision runDecision, statePath string, stdout io.Writer) (bool, error) {
 	stores := storesFromDataItems(decision.Items)
 	if len(stores) == 0 {
 		return false, nil
@@ -136,8 +134,10 @@ func promptDataStoreDecision(_ context.Context, decision runDecision, state bort
 		if err := form.Run(); err != nil {
 			return updated, err
 		}
-		state = setAppDataStrategy(state, item.app, item.store, strategy)
-		if err := writeBortState(statePath, state); err != nil {
+		if err := mutateBortState(statePath, func(state *bortState) bool {
+			*state = setAppDataStrategy(*state, item.app, item.store, strategy)
+			return true
+		}); err != nil {
 			return updated, err
 		}
 		fmt.Fprintf(stdout, "Recorded strategy %s for %s/%s.\n", strategy, item.app, item.store)
@@ -146,41 +146,75 @@ func promptDataStoreDecision(_ context.Context, decision runDecision, state bort
 	return updated, nil
 }
 
-func promptRoutesDecision(decision runDecision, stdout io.Writer) (bool, error) {
+func promptReviewDecision(run loadedMigrationRun, decision runDecision, stdout io.Writer) (bool, error) {
 	confirm := false
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().
-			Title("Confirm route plan").
+			Title(decisionAction(decision)).
 			Description(decisionAction(decision) + "\n" + decisionReason(decision)).
-			Affirmative("Continue").
-			Negative("Skip for now").
+			Affirmative("Reviewed").
+			Negative("Not yet").
 			Value(&confirm),
 	))
 	if err := form.Run(); err != nil {
 		return false, err
 	}
 	if !confirm {
-		fmt.Fprintln(stdout, "Routes left as-is; rerun the wizard after editing the bundle if needed.")
 		return false, nil
 	}
-	return false, nil
-}
-
-func confirmApply(run loadedMigrationRun) (bool, error) {
-	confirm := false
-	planned := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Apply this migration to dokploy now?").
-			Description(fmt.Sprintf("Will execute %d step(s) against %s. You can also skip and run `%s` later.", len(planned.Steps), run.Run.Target, liveApplyCommand(run))).
-			Affirmative("Apply").
-			Negative("Skip").
-			Value(&confirm),
-	))
-	if err := form.Run(); err != nil {
+	if err := recordReviewDecision(run, decision, time.Now().UTC()); err != nil {
 		return false, err
 	}
-	return confirm, nil
+	fmt.Fprintf(stdout, "Review recorded. You can re-run `%s` at any time to revisit the plan.\n", bortCommand(""))
+	return true, nil
+}
+
+func recordReviewDecision(run loadedMigrationRun, decision runDecision, at time.Time) error {
+	operationLock, err := acquireRunOperationLock(run.Run.RunDir)
+	if err != nil {
+		return err
+	}
+	defer operationLock.Release()
+	current, err := loadMigrationRun(run.Run.RunDir)
+	if err != nil {
+		return err
+	}
+	if run.Run.Artifacts.withDefaults() != current.Run.Artifacts.withDefaults() || !run.Run.UpdatedAt.Equal(current.Run.UpdatedAt) {
+		return fmt.Errorf("migration run plan changed while review was open; review the current plan and confirm again")
+	}
+	progress := markReviewDecisionDone(current, decision, at)
+	path, err := safeRunArtifactPath(current.Run.RunDir, current.Run.Artifacts.Progress)
+	if err != nil {
+		return err
+	}
+	if err := writeRunProgress(path, progress); err != nil {
+		return err
+	}
+	return nil
+}
+
+func markReviewDecisionDone(run loadedMigrationRun, decision runDecision, at time.Time) runProgress {
+	progress := markDecisionDone(run.Progress, decision, progressStatusResolved, "confirmed in guided review", at)
+	selected := map[string]struct{}{}
+	for _, item := range decision.Items {
+		selected[progressItemKey(item)] = struct{}{}
+	}
+	for _, current := range openRunDecisions(run) {
+		if current.Kind != decision.Kind {
+			continue
+		}
+		for _, item := range current.Items {
+			if _, ok := selected[progressItemKey(item)]; ok {
+				continue
+			}
+			state := progress.Decisions[decision.Kind]
+			state.Status = progressStatusOpen
+			state.Note = ""
+			progress.Decisions[decision.Kind] = state
+			return progress
+		}
+	}
+	return progress
 }
 
 var errDokploySetupSkipped = errors.New("dokploy setup skipped")
@@ -203,7 +237,7 @@ func promptInstallAndBootstrapDokploy(ctx context.Context, stdin io.Reader, stdo
 		return err
 	}
 	if !install {
-		fmt.Fprintln(stdout, "Skipped Dokploy setup. Run `bort` again when you're ready.")
+		fmt.Fprintf(stdout, "Skipped Dokploy setup. Run `%s` again when you're ready.\n", bortCommand(""))
 		return errDokploySetupSkipped
 	}
 	return promptInlineInitTargetWithOptions(ctx, stdin, stdout, stderr, inlineInitTargetOptions{Install: true, DefaultURL: defaultURL})
@@ -248,119 +282,6 @@ func promptInlineInitTargetWithOptions(ctx context.Context, stdin io.Reader, std
 	}
 	fmt.Fprintln(stdout, "Setting up Dokploy...")
 	return runInitTarget(ctx, args, stdin, stdout, stderr)
-}
-
-func executeWithProgress(ctx context.Context, run loadedMigrationRun, stdout, stderr io.Writer) error {
-	planned := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
-	total := len(planned.Steps)
-	if total == 0 {
-		return applyLiveMigration(ctx, run, stderr, nil)
-	}
-
-	bar := progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage())
-	bar.Width = 40
-	model := &progressModel{bar: bar, total: total, done: completedApplyPrefix(planned.Steps, run.Applied)}
-	program := tea.NewProgram(model, tea.WithOutput(stderr))
-
-	var applyErr error
-	go func() {
-		applyErr = applyLiveMigration(ctx, run, stderr, func(p dokploy.StepProgress) {
-			program.Send(progressTick{progress: p})
-		})
-		program.Send(progressDone{err: applyErr})
-	}()
-
-	if _, err := program.Run(); err != nil && !errors.Is(err, tea.ErrInterrupted) {
-		return err
-	}
-	if applyErr != nil {
-		return applyErr
-	}
-	return nil
-}
-
-type progressTick struct {
-	progress dokploy.StepProgress
-}
-
-type progressDone struct {
-	err error
-}
-
-type progressModel struct {
-	bar     progress.Model
-	total   int
-	done    int
-	current dokploy.StepProgress
-	err     error
-	closed  bool
-}
-
-func (m *progressModel) Init() tea.Cmd {
-	if m.total <= 0 || m.done <= 0 {
-		return nil
-	}
-	percent := float64(m.done) / float64(m.total)
-	if percent > 1 {
-		percent = 1
-	}
-	return m.bar.SetPercent(percent)
-}
-
-func (m *progressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case progressTick:
-		m.current = msg.progress
-		if m.total > 0 && msg.progress.Index >= 0 && msg.progress.Index < m.total {
-			done := msg.progress.Index
-			if msg.progress.Status == dokploy.StepStatusOK || msg.progress.Status == dokploy.StepStatusSkipped {
-				done++
-			}
-			if done > m.done {
-				m.done = done
-			}
-		}
-		percent := 0.0
-		if m.total > 0 {
-			percent = float64(m.done) / float64(m.total)
-			if percent > 1 {
-				percent = 1
-			}
-		}
-		return m, m.bar.SetPercent(percent)
-	case progressDone:
-		m.err = msg.err
-		m.closed = true
-		return m, tea.Quit
-	case progress.FrameMsg:
-		newModel, cmd := m.bar.Update(msg)
-		m.bar = newModel.(progress.Model)
-		return m, cmd
-	case tea.KeyMsg:
-		if msg.String() == "ctrl+c" {
-			return m, tea.Quit
-		}
-	}
-	return m, nil
-}
-
-func (m *progressModel) View() string {
-	var b strings.Builder
-	b.WriteString(m.bar.View())
-	b.WriteString("\n")
-	if m.current.Step.Kind != "" {
-		b.WriteString(fmt.Sprintf("  %d/%d  %s %s/%s", m.done, m.total, m.current.Status, m.current.Step.App, m.current.Step.Kind))
-	}
-	if m.closed {
-		if m.err != nil {
-			b.WriteString("\n  failed: ")
-			b.WriteString(m.err.Error())
-		} else {
-			b.WriteString("\n  done")
-		}
-	}
-	b.WriteString("\n")
-	return b.String()
 }
 
 type appStorePair struct {

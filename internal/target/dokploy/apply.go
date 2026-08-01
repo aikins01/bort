@@ -1,7 +1,9 @@
 package dokploy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -79,6 +81,7 @@ type Plan struct {
 	RunName    string
 	RunDir     string
 	ResumeFrom int
+	BeforeStep *func(StepProgress) error
 	OnProgress *func(StepProgress)
 }
 
@@ -264,19 +267,104 @@ func validatePlanReadyForLiveApply(plan Plan) error {
 			continue
 		}
 		switch app.Readiness {
-		case "", preparer.ReadinessReadyToCreate:
+		case "", preparer.ReadinessReadyToCreate, preparer.ReadinessNeedsDecision:
 		default:
 			return fmt.Errorf("live apply blocked by prepare readiness for app %s: %s", app.Name, app.Readiness)
 		}
 		for _, gate := range app.Gates {
 			switch gate.Readiness {
-			case preparer.ReadinessReadyToCreate:
+			case preparer.ReadinessReadyToCreate, preparer.ReadinessNeedsDecision:
 			default:
 				return fmt.Errorf("live apply blocked by prepare gate %s/%s: %s", app.Name, gate.Code, gate.Message)
 			}
 		}
 	}
 	return nil
+}
+
+type activeBortOverridePatch struct {
+	PatchID     string `json:"patchId"`
+	FilePath    string `json:"filePath"`
+	ComposeName string `json:"composeName"`
+	SourceType  string `json:"sourceType"`
+	Repository  string `json:"repository"`
+	Branch      string `json:"branch"`
+}
+
+func (c *Client) validateNoActiveBortOverrides(ctx context.Context, composeID string) error {
+	composeID = strings.TrimSpace(composeID)
+	if composeID == "" {
+		return fmt.Errorf("inspect active Dokploy patches: missing composeId")
+	}
+	patches, err := c.activeBortOverridePatches(ctx, composeID)
+	if err != nil {
+		return err
+	}
+	if len(patches) == 0 {
+		return nil
+	}
+	details := make([]string, 0, len(patches))
+	for _, patch := range patches {
+		repo := strings.Trim(strings.TrimSpace(patch.Repository)+"@"+strings.TrimSpace(patch.Branch), "@")
+		if repo == "" {
+			repo = strings.TrimSpace(patch.SourceType)
+		}
+		details = append(details, fmt.Sprintf("%s on %s (%s, %s)", patch.PatchID, patch.ComposeName, patch.FilePath, repo))
+	}
+	sort.Strings(details)
+	return fmt.Errorf("active Bort-owned Dokploy patch(es) override Git-backed compose app(s): %s; merge the patch contents into the repo or disable the patch before live apply so Git remains the source of truth", strings.Join(details, "; "))
+}
+
+func (c *Client) activeBortOverridePatches(ctx context.Context, composeID string) ([]activeBortOverridePatch, error) {
+	runner := c.dockerRunner()
+	pg, err := findDokployPostgresContainer(ctx, runner)
+	if err != nil {
+		return nil, fmt.Errorf("locate Dokploy postgres for active patch inspection: %w", err)
+	}
+	var out bytes.Buffer
+	if err := runner.Run(ctx, strings.NewReader(activeBortOverridePatchesSQL(composeID)), &out,
+		"exec", "-i", pg, "psql", "-U", "dokploy", "-d", "dokploy", "-v", "ON_ERROR_STOP=1", "-At"); err != nil {
+		return nil, fmt.Errorf("inspect active Dokploy patches: %w", err)
+	}
+	return parseActiveBortOverridePatches(out.String())
+}
+
+func activeBortOverridePatchesSQL(composeID string) string {
+	return fmt.Sprintf(`select json_build_object(
+       'patchId', p."patchId",
+       'filePath', p."filePath",
+       'composeName', c.name,
+       'sourceType', coalesce(c."sourceType"::text, ''),
+       'repository', concat_ws('/', nullif(c.owner, ''), nullif(c.repository, '')),
+       'branch', coalesce(c.branch, '')
+       )::text
+from patch p
+join compose c on c."composeId" = p."composeId"
+where p.enabled = true
+  and p."patchId" like 'bort-%%'
+  and c."composeId" = %s
+  and coalesce(c."sourceType"::text, '') not in ('', 'raw')
+order by c.name, p."patchId";
+`, sqlStringLiteral(composeID))
+}
+
+func parseActiveBortOverridePatches(output string) ([]activeBortOverridePatch, error) {
+	patches := []activeBortOverridePatch{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var patch activeBortOverridePatch
+		if err := json.Unmarshal([]byte(line), &patch); err != nil {
+			return nil, fmt.Errorf("parse active Dokploy patch row: %w", err)
+		}
+		if strings.TrimSpace(patch.PatchID) == "" || strings.TrimSpace(patch.FilePath) == "" || strings.TrimSpace(patch.ComposeName) == "" {
+			return nil, fmt.Errorf("parse active Dokploy patch row: missing required identity")
+		}
+		patches = append(patches, patch)
+	}
+	return patches, nil
 }
 
 func (c *Client) Apply(ctx context.Context, plan Plan) error {
@@ -301,7 +389,14 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 	}
 	for index := resumeFrom; index < len(plan.Steps); index++ {
 		step := plan.Steps[index]
-		emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusStarted})
+		started := StepProgress{Index: index, Total: total, Step: step, Status: StepStatusStarted}
+		if plan.BeforeStep != nil {
+			if err := (*plan.BeforeStep)(started); err != nil {
+				c.bestEffortResume(ctx, actx, plan, total, pausedApps, coolifyProxyStopped, false)
+				return fmt.Errorf("before dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
+			}
+		}
+		emitProgress(plan.OnProgress, started)
 		if shouldSkipApplyStep(plan, step) {
 			emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusSkipped})
 			continue
@@ -603,6 +698,9 @@ func (c *Client) applyUploadEnv(ctx context.Context, actx *applyContext, step St
 	if err != nil {
 		return err
 	}
+	if err := c.validateNoActiveBortOverrides(ctx, entry.ComposeID); err != nil {
+		return err
+	}
 	return c.UpdateCompose(ctx, entry.ComposeID, composeFile, envContent)
 }
 
@@ -616,6 +714,9 @@ func (c *Client) applyPushImage(ctx context.Context, actx *applyContext, step St
 		return err
 	}
 	if err := ensureComposeImagesAvailable(ctx, c.dockerRunner(), actx.plan, step.App, composeFile); err != nil {
+		return err
+	}
+	if err := c.validateNoActiveBortOverrides(ctx, entry.ComposeID); err != nil {
 		return err
 	}
 	if err := c.DeployCompose(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
@@ -810,6 +911,9 @@ func (c *Client) applyActivateRoutes(ctx context.Context, actx *applyContext, st
 	}
 	envContent, err := readEnvContent(actx.plan, step.App)
 	if err != nil {
+		return err
+	}
+	if err := c.validateNoActiveBortOverrides(ctx, entry.ComposeID); err != nil {
 		return err
 	}
 	if err := c.UpdateCompose(ctx, entry.ComposeID, composeFile, envContent); err != nil {

@@ -37,10 +37,27 @@ type guidePromptInput interface {
 }
 
 func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
-	if runRef, ok := latestRunRef(); ok {
-		if applyRunActive(runRef) {
+	runRef, currentSelected, ok, err := guideRunRef()
+	if err != nil {
+		return err
+	}
+	if ok {
+		if !currentSelected {
 			run, err := loadMigrationRun(runRef)
 			if err != nil {
+				return err
+			}
+			writeAppFirstCockpit(stdout, run)
+			fmt.Fprintf(stdout, "This existing run is not selected for mutation. Run `%s` to make it current and refresh its dry-run.\n", bortCommand("migrate --run "+shellQuote(run.Run.Name)))
+			return nil
+		}
+		applyActive, applyActiveErr := applyRunActive(runRef)
+		if applyActive || applyActiveErr != nil {
+			run, err := loadMigrationRun(runRef)
+			if err != nil {
+				return err
+			}
+			if err := rememberCurrentRun(run.Run); err != nil {
 				return err
 			}
 			writeAppFirstCockpit(stdout, run)
@@ -50,7 +67,10 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 		if err != nil {
 			return err
 		}
-		if isRealTTY(stdin, stdout) && readyToOfferLiveApply(run) {
+		if err := rememberCurrentRun(run.Run); err != nil {
+			return err
+		}
+		if isRealTTY(stdin, stdout) {
 			return runWizard(ctx, run, stdin, stdout, stderr)
 		}
 		writeAppFirstCockpit(stdout, run)
@@ -65,6 +85,9 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 			RollbackWindowSeconds:    gateway.DefaultRollbackWindowSeconds,
 		})
 		if err != nil {
+			return err
+		}
+		if err := rememberCurrentRun(run.Run); err != nil {
 			return err
 		}
 		writeAppFirstCockpit(stdout, run)
@@ -92,6 +115,9 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 		if err != nil {
 			return err
 		}
+		if err := rememberCurrentRun(run.Run); err != nil {
+			return err
+		}
 		if isRealTTY(stdin, stdout) {
 			return runWizard(ctx, run, stdin, stdout, stderr)
 		}
@@ -102,29 +128,45 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 	return writeGuideStart(stdout)
 }
 
-func readyToOfferLiveApply(run loadedMigrationRun) bool {
-	return overallAppHealth(appsFromRun(run)) == appHealthReady
-}
-
 func refreshGuideRun(ctx context.Context, runRef string, stdin io.Reader, stdout io.Writer) (loadedMigrationRun, error) {
+	operationLock, err := acquireRunOperationLock(runRef)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	defer operationLock.Release()
 	runDir := filepath.FromSlash(runRef)
 	existing, err := readRunMetadata(filepath.Join(runDir, "run.json"))
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
-	if shouldAutoRescanRun(existing) && !runHasAppliedSteps(existing) {
+	hasAppliedSteps, err := runHasAppliedSteps(existing)
+	if err != nil {
+		return loadedMigrationRun{}, fmt.Errorf("read applied migration progress: %w", err)
+	}
+	if existing.LiveAppliedAt != nil || existing.CommittedAt != nil || existing.PurgedAt != nil || hasAppliedSteps {
+		return loadMigrationRun(runRef)
+	}
+	if shouldAutoRescanRun(existing) {
+		var refreshedBundle, refreshedManifest string
 		if isRealTTY(stdin, stdout) {
 			stopStatus := startScanStatus(stdout)
-			err = refreshRunSourceBundle(ctx, existing)
+			refreshedBundle, refreshedManifest, err = refreshRunSourceBundle(ctx, existing)
 			stopStatus(err)
 		} else {
-			err = refreshRunSourceBundle(ctx, existing)
+			refreshedBundle, refreshedManifest, err = refreshRunSourceBundle(ctx, existing)
 		}
 		if err != nil {
 			return loadedMigrationRun{}, err
 		}
+		defer os.RemoveAll(refreshedBundle)
+		refreshed, err := refreshMigrationRunLockedWithInputs(runRef, refreshedBundle, refreshedManifest)
+		if err != nil {
+			_ = os.Remove(refreshedManifest)
+			return loadedMigrationRun{}, err
+		}
+		return refreshed, nil
 	}
-	return refreshMigrationRun(runRef)
+	return refreshMigrationRunLocked(runRef)
 }
 
 func shouldAutoRescanRun(run migrationRun) bool {
@@ -140,36 +182,36 @@ func shouldAutoRescanRun(run migrationRun) bool {
 	return containedPath(runDir, bundleDir) == nil
 }
 
-func runHasAppliedSteps(run migrationRun) bool {
+func runHasAppliedSteps(run migrationRun) (bool, error) {
 	run.Artifacts = run.Artifacts.withDefaults()
 	runDir := filepath.FromSlash(run.RunDir)
 	if runDir == "" {
-		return false
+		return false, fmt.Errorf("migration run has no run directory")
 	}
 	appliedPath, err := safeRunArtifactPath(runDir, run.Artifacts.Applied)
 	if err != nil {
-		return false
+		return false, err
 	}
 	applied, err := readRunApplied(appliedPath, run)
-	return err == nil && len(applied.Steps) > 0
+	if err != nil {
+		return false, err
+	}
+	return len(applied.Steps) > 0, nil
 }
 
-func refreshRunSourceBundle(ctx context.Context, run migrationRun) error {
+func refreshRunSourceBundle(ctx context.Context, run migrationRun) (string, string, error) {
 	runDir := filepath.FromSlash(run.RunDir)
-	bundleDir := filepath.FromSlash(run.BundleDir)
 	setup := guidedSetup{Source: run.Source, Target: run.Target, ManifestPath: run.ManifestPath}
-	m, _, err := guidedManifest(ctx, setup, runDir)
+	m, manifestPath, err := guidedManifest(ctx, setup, runDir)
 	if err != nil {
-		return err
+		return "", "", err
 	}
-	if err := containedPath(runDir, bundleDir); err != nil {
-		return err
+	bundleDir, err := exportRunSourceBundle(runDir, m, run.AppName)
+	if err != nil {
+		_ = os.Remove(manifestPath)
+		return "", "", err
 	}
-	if err := os.RemoveAll(bundleDir); err != nil {
-		return err
-	}
-	_, err = exporter.Export(m, exporter.Options{OutputDir: bundleDir, AppName: run.AppName, IncludeEnvValues: true})
-	return err
+	return bundleDir, manifestPath, nil
 }
 
 // isRealTTY reports whether stdin and stdout are both attached to an
@@ -262,8 +304,21 @@ func promptGuidedSetupWithReader(reader *bufio.Reader, stdout io.Writer, now tim
 }
 
 func createGuidedMigrationRun(ctx context.Context, setup guidedSetup) (loadedMigrationRun, error) {
-	runDir, _ := newRunDir(setup.RunName, "", "", time.Now().UTC())
+	return createMigrationRunFromSource(ctx, setup, gateway.DefaultObservationWindowSeconds, gateway.DefaultRollbackWindowSeconds)
+}
+
+func createMigrationRunFromSource(ctx context.Context, setup guidedSetup, observationWindowSeconds, rollbackWindowSeconds int) (loadedMigrationRun, error) {
+	now := time.Now().UTC()
+	runDir, runName := newRunDir(setup.RunName, "", "", now)
 	if err := ensurePrivateRunDir(runDir); err != nil {
+		return loadedMigrationRun{}, err
+	}
+	operationLock, err := acquireRunOperationLock(runDir)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	defer operationLock.Release()
+	if _, err := existingMutableMigrationRun(runDir, runName); err != nil {
 		return loadedMigrationRun{}, err
 	}
 
@@ -271,27 +326,62 @@ func createGuidedMigrationRun(ctx context.Context, setup guidedSetup) (loadedMig
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
+	removeManifest := true
+	defer func() {
+		if removeManifest {
+			_ = os.Remove(manifestPath)
+		}
+	}()
 
-	bundleDir := filepath.Join(runDir, "bundle")
-	if _, err := exporter.Export(m, exporter.Options{OutputDir: bundleDir, IncludeEnvValues: true}); err != nil {
+	bundleDir, err := exportRunSourceBundle(runDir, m, "")
+	if err != nil {
 		return loadedMigrationRun{}, err
 	}
+	defer os.RemoveAll(bundleDir)
 
-	return createMigrationRun(migrationRunOptions{
+	run, err := createMigrationRunLocked(migrationRunOptions{
 		BundleDir:                bundleDir,
 		Target:                   setup.Target,
 		RunRef:                   runDir,
 		Source:                   setup.Source,
 		ManifestPath:             manifestPath,
-		ObservationWindowSeconds: gateway.DefaultObservationWindowSeconds,
-		RollbackWindowSeconds:    gateway.DefaultRollbackWindowSeconds,
-	})
+		ObservationWindowSeconds: observationWindowSeconds,
+		RollbackWindowSeconds:    rollbackWindowSeconds,
+	}, runDir, runName, now)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	removeManifest = false
+	return run, nil
+}
+
+func exportRunSourceBundle(runDir string, m manifest.Manifest, appName string) (string, error) {
+	bundleDir, err := os.MkdirTemp(runDir, "source-bundle-")
+	if err != nil {
+		return "", err
+	}
+	if err := os.Chmod(bundleDir, 0o700); err != nil {
+		_ = os.RemoveAll(bundleDir)
+		return "", err
+	}
+	if _, err := exporter.Export(m, exporter.Options{OutputDir: bundleDir, AppName: appName, IncludeEnvValues: true}); err != nil {
+		_ = os.RemoveAll(bundleDir)
+		return "", err
+	}
+	return bundleDir, nil
 }
 
 func guidedManifest(ctx context.Context, setup guidedSetup, runDir string) (manifest.Manifest, string, error) {
 	if setup.Source == "manifest" {
 		m, err := readManifestFile(setup.ManifestPath)
-		return m, setup.ManifestPath, err
+		if err != nil {
+			return manifest.Manifest{}, "", err
+		}
+		manifestPath, err := writeRunSourceManifest(runDir, m)
+		if err != nil {
+			return manifest.Manifest{}, "", err
+		}
+		return m, manifestPath, nil
 	}
 
 	scanOptions := source.ScanOptions{
@@ -309,11 +399,32 @@ func guidedManifest(ctx context.Context, setup guidedSetup, runDir string) (mani
 	if err != nil {
 		return manifest.Manifest{}, "", err
 	}
-	manifestPath := filepath.Join(runDir, "manifest.json")
-	if err := writeJSONArtifact(manifestPath, m); err != nil {
+	manifestPath, err := writeRunSourceManifest(runDir, m)
+	if err != nil {
 		return manifest.Manifest{}, "", err
 	}
 	return m, manifestPath, nil
+}
+
+func writeRunSourceManifest(runDir string, m manifest.Manifest) (string, error) {
+	file, err := os.CreateTemp(runDir, "manifest-*.json")
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := writeJSONArtifact(path, m); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
 }
 
 func readManifestFile(path string) (manifest.Manifest, error) {
@@ -445,6 +556,53 @@ func latestRunRef() (string, bool) {
 	return runs[0].Path, true
 }
 
+func guideRunRef() (string, bool, bool, error) {
+	current, ok, err := currentRunRef()
+	if err != nil {
+		return "", false, false, err
+	}
+	if ok {
+		if !migrationRunMetadataExists(current) {
+			return "", false, false, fmt.Errorf("current migration run %q no longer exists; run `%s` to select another run", current, bortCommand("migrate --run <name>"))
+		}
+		return current, true, true, nil
+	}
+	latest, found := latestRunRef()
+	return latest, false, found, nil
+}
+
+func selectedRunRef(allowLatest bool) (string, bool, error) {
+	current, ok, err := currentRunRef()
+	if err != nil {
+		return "", false, err
+	}
+	if ok && migrationRunMetadataExists(current) {
+		return current, true, nil
+	}
+	if ok && !allowLatest {
+		return "", false, fmt.Errorf("current migration run %q no longer exists; pass --run to select a run", current)
+	}
+	if allowLatest {
+		latest, found := latestRunRef()
+		return latest, found, nil
+	}
+	return "", false, nil
+}
+
+func resolveRunRef(explicit string, allowLatest bool) (string, error) {
+	if ref := strings.TrimSpace(explicit); ref != "" {
+		return ref, nil
+	}
+	ref, ok, err := selectedRunRef(allowLatest)
+	if err != nil {
+		return "", err
+	}
+	if ok {
+		return ref, nil
+	}
+	return "", fmt.Errorf("no current migration run; run `%s` to start one or pass --run", bortCommand(""))
+}
+
 type runCandidate struct {
 	Path      string
 	UpdatedAt time.Time
@@ -459,17 +617,12 @@ func writeGuideStart(w io.Writer) error {
 	st := newStyler(w)
 	fmt.Fprintln(w, st.emph("bort")+" "+st.muted("— migrate self-hosted apps between PaaS platforms"))
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, st.muted("No local migration run or default bundle was found."))
+	fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("No migration run was found. Run `%s` in a terminal for guided setup.", bortCommand(""))))
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, st.emph("To get started:"))
-	for _, cmd := range []string{
-		"bort scan --output manifest.json",
-		"bort export --manifest manifest.json --output-dir bort-bundle",
-		"bort",
-	} {
-		fmt.Fprintf(w, "  %s\n", st.emph(cmd))
-	}
+	fmt.Fprintln(w, st.emph("For non-interactive setup:"))
+	fmt.Fprintf(w, "  %s\n", st.emph(bortCommand("migrate --source coolify-local")))
+	fmt.Fprintf(w, "  %s\n", st.muted("or: "+bortCommand("migrate --manifest manifest.json")))
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, st.muted("See `bort help` for more."))
+	fmt.Fprintln(w, st.muted("This single command scans, exports a private bundle, and creates the current run."))
 	return nil
 }

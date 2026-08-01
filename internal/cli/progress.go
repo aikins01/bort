@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/aikins01/bort/internal/planfile"
-	"github.com/aikins01/bort/internal/preparer"
 )
 
 const progressAPIVersion = "bort.progress/v1alpha1"
@@ -133,21 +132,7 @@ func applyProgressToDecisions(decisions []runDecision, progress runProgress) []r
 			continue
 		}
 
-		decision.Items = items
-		decision.Count = len(items)
-		decision.Apps = nil
-		decision.Codes = nil
-		decision.Readiness = preparer.ReadinessReadyToCreate
-		for _, item := range items {
-			decision.Apps = uniqueAppend(decision.Apps, item.App)
-			decision.Codes = uniqueAppend(decision.Codes, item.Code)
-			decision.Readiness = preparer.WorseReadiness(decision.Readiness, item.Readiness)
-		}
-		decision.Apps = sortedStrings(decision.Apps)
-		decision.Codes = sortedStrings(decision.Codes)
-		decision.Action = decisionAction(decision)
-		decision.Reason = decisionReason(decision)
-		filtered = append(filtered, decision)
+		filtered = append(filtered, runDecisionWithItems(decision, items))
 	}
 	sortRunDecisions(filtered)
 	return filtered
