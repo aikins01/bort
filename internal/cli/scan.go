@@ -83,7 +83,7 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 
 	if !includeEnvValues {
 		st := newStyler(stderr)
-		fmt.Fprintln(stderr, st.muted("note: env values were not captured (default). Re-run with --include-env-values, or use `bort` (no args) which captures by default."))
+		fmt.Fprintln(stderr, st.muted(fmt.Sprintf("note: env values were not captured (default). Re-run with --include-env-values, or use `%s` (no args) which captures by default.", bortCommand(""))))
 	}
 
 	return nil

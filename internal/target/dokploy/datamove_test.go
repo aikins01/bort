@@ -124,6 +124,8 @@ func (r *latePostDeployTargetRunner) Output(_ context.Context, args ...string) (
 	r.outputArgs = append(r.outputArgs, append([]string{}, args...))
 	key := strings.Join(args, " ")
 	switch key {
+	case "ps --format {{.Names}}":
+		return []byte("dokploy-postgres.1.task\n"), nil
 	case "ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}":
 		r.psCalls++
 		if r.emptyFirst && r.psCalls == 1 {
@@ -506,6 +508,9 @@ func TestApplyPushImageTagsMissingComposeImageFromSourceContainer(t *testing.T) 
 		"image inspect redis:7":                        []byte(`[{}]`),
 		"inspect --type container src-worker":          []byte(`[{"Id":"src-worker","Name":"/worker","Image":"sha256:worker-image","Config":{"Image":"example/worker:old"}}]`),
 		"tag sha256:worker-image example/worker:local": []byte(""),
+		"ps --format {{.Names}}":                       []byte("dokploy-postgres.1.task\n"),
+	}, runOutputs: map[string][]byte{
+		"exec -i dokploy-postgres.1.task psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": {},
 	}}
 	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
 	app := preparer.AppPlan{Name: "api", Directory: "api"}

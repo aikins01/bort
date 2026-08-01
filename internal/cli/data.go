@@ -15,8 +15,13 @@ import (
 // Exactly one strategy flag must be supplied. The recorded strategy is read
 // back by `bort` so the user's choice persists across runs.
 func runData(_ context.Context, args []string, stdout, stderr io.Writer) error {
+	usage := "usage: " + bortCommand("data <app> <store> --recreate|--migrate|--managed")
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		fmt.Fprintln(stdout, usage)
+		return nil
+	}
 	if len(args) < 2 {
-		return fmt.Errorf("usage: bort data <app> <store> --recreate|--migrate|--managed")
+		return fmt.Errorf("%s", usage)
 	}
 	app := strings.TrimSpace(args[0])
 	store := strings.TrimSpace(args[1])
@@ -42,12 +47,10 @@ func runData(_ context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 
 	statePath := defaultStatePath()
-	state, err := readBortState(statePath)
-	if err != nil {
-		return err
-	}
-	state = setAppDataStrategy(state, app, store, strategy)
-	if err := writeBortState(statePath, state); err != nil {
+	if err := mutateBortState(statePath, func(state *bortState) bool {
+		*state = setAppDataStrategy(*state, app, store, strategy)
+		return true
+	}); err != nil {
 		return err
 	}
 
@@ -57,7 +60,7 @@ func runData(_ context.Context, args []string, stdout, stderr io.Writer) error {
 		st.emph(strategy),
 		st.emph(app+"/"+store),
 	)
-	fmt.Fprintln(stdout, st.muted("Stored in .bort/state.json. Run `bort` to recheck."))
+	fmt.Fprintf(stdout, "%s\n", st.muted(fmt.Sprintf("Stored in .bort/state.json. Run `%s` to recheck.", bortCommand(""))))
 	return nil
 }
 

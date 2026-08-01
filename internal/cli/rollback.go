@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strings"
 
 	rollbackplan "github.com/aikins01/bort/internal/rollback"
 )
@@ -19,6 +20,7 @@ func runRollback(_ context.Context, args []string, stdout, stderr io.Writer) err
 	var format string
 	var outputPath string
 	var cutoverPlanPath string
+	var runRef string
 	observationWindowSeconds := rollbackplan.DefaultObservationWindowSeconds
 
 	fs.StringVar(&bundleDir, "bundle", "bort-bundle", "migration bundle directory")
@@ -27,6 +29,7 @@ func runRollback(_ context.Context, args []string, stdout, stderr io.Writer) err
 	fs.StringVar(&format, "format", "text", "output format: text, json")
 	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
 	fs.StringVar(&cutoverPlanPath, "from-cutover", "", "read a prior cutover JSON plan artifact")
+	fs.StringVar(&runRef, "run", "", "run name under .bort/runs, or a run directory path")
 	fs.IntVar(&observationWindowSeconds, "observation-window", rollbackplan.DefaultObservationWindowSeconds, "observation window in seconds")
 
 	if err := fs.Parse(args); err != nil {
@@ -35,9 +38,32 @@ func runRollback(_ context.Context, args []string, stdout, stderr io.Writer) err
 	if err := checkOutputFormat("rollback", format); err != nil {
 		return err
 	}
+	if strings.TrimSpace(runRef) != "" {
+		for _, name := range []string{"app", "bundle", "from-cutover", "observation-window", "target"} {
+			if flagSet(fs, name) {
+				return fmt.Errorf("rollback --run does not accept --%s; the run already owns its reviewed rollback plan", name)
+			}
+		}
+	}
 
 	var result rollbackplan.Result
-	if cutoverPlanPath != "" {
+	useCurrentRun := cutoverPlanPath == "" && !flagSet(fs, "bundle") && !flagSet(fs, "target") && !flagSet(fs, "app") && !flagSet(fs, "observation-window")
+	resolvedRun := strings.TrimSpace(runRef)
+	useReviewedRun := resolvedRun != ""
+	if !useReviewedRun && useCurrentRun {
+		var err error
+		resolvedRun, useReviewedRun, err = selectedRunRef(false)
+		if err != nil {
+			return err
+		}
+	}
+	if useReviewedRun {
+		run, err := loadMigrationRun(resolvedRun)
+		if err != nil {
+			return err
+		}
+		result = run.Rollback
+	} else if cutoverPlanPath != "" {
 		expect := artifactExpectations{AppName: appName}
 		if flagWasSet(fs, "bundle") {
 			expect.BundleDir = bundleDir

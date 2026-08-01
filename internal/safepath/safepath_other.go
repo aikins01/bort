@@ -34,3 +34,7 @@ func rejectFinalSymlink(path string) error {
 	}
 	return nil
 }
+
+func syncParentDir(string) error {
+	return nil
+}

@@ -14,18 +14,22 @@ import (
 const stateAPIVersion = "bort.state/v1alpha1"
 
 const (
+	stateLockRetryInterval = 10 * time.Millisecond
+	stateLockWait          = 5 * time.Second
+)
+
+var errBortStateActive = errors.New("workspace state update already in progress")
+
+const (
 	dataStrategyRecreate = "recreate"
 	dataStrategyMigrate  = "migrate"
 	dataStrategyManaged  = "managed"
 )
 
-// bortState is the single user-edited file the linear UX writes to. It
-// captures everything the user has decided locally (env values, data store
-// strategies) so subsequent `bort` runs see the same answers without an
-// interactive cockpit.
 type bortState struct {
 	APIVersion string                       `json:"apiVersion"`
 	UpdatedAt  time.Time                    `json:"updatedAt"`
+	CurrentRun string                       `json:"currentRun,omitempty"`
 	Apps       map[string]appStateData      `json:"apps,omitempty"`
 	Targets    map[string]targetCredentials `json:"targets,omitempty"`
 }
@@ -91,14 +95,8 @@ func writeBortState(path string, state bortState) error {
 	if state.UpdatedAt.IsZero() {
 		state.UpdatedAt = time.Now().UTC()
 	}
-	dir := filepath.Dir(path)
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return err
-		}
+	if err := ensurePrivateStateDir(path); err != nil {
+		return err
 	}
 	contents, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -109,6 +107,51 @@ func writeBortState(path string, state bortState) error {
 		return err
 	}
 	return os.Chmod(path, 0o600)
+}
+
+func ensurePrivateStateDir(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "" || dir == "." {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o700)
+}
+
+func acquireBortStateLock(path string) (*applyLock, error) {
+	if err := ensurePrivateStateDir(path); err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(filepath.Dir(path), "state.lock")
+	deadline := time.Now().Add(stateLockWait)
+	for {
+		lock, err := acquireApplyLock(lockPath)
+		if !errors.Is(err, errApplyAlreadyRunning) {
+			return lock, err
+		}
+		if !time.Now().Before(deadline) {
+			return nil, errBortStateActive
+		}
+		time.Sleep(stateLockRetryInterval)
+	}
+}
+
+func mutateBortState(path string, mutate func(*bortState) bool) error {
+	lock, err := acquireBortStateLock(path)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	state, err := readBortState(path)
+	if err != nil {
+		return err
+	}
+	if !mutate(&state) {
+		return nil
+	}
+	return writeBortState(path, state)
 }
 
 func emptyBortState() bortState {
@@ -155,6 +198,30 @@ func setTargetCredentials(state bortState, target string, creds targetCredential
 	state.Targets[target] = creds
 	state.UpdatedAt = time.Now().UTC()
 	return state
+}
+
+func rememberCurrentRun(run migrationRun) error {
+	ref := filepath.ToSlash(filepath.Clean(run.RunDir))
+	if ref == "" || ref == "." {
+		return fmt.Errorf("cannot remember migration run with empty directory")
+	}
+	return mutateBortState(defaultStatePath(), func(state *bortState) bool {
+		if state.CurrentRun == ref {
+			return false
+		}
+		state.CurrentRun = ref
+		state.UpdatedAt = time.Now().UTC()
+		return true
+	})
+}
+
+func currentRunRef() (string, bool, error) {
+	state, err := readBortState(defaultStatePath())
+	if err != nil {
+		return "", false, err
+	}
+	ref := strings.TrimSpace(state.CurrentRun)
+	return ref, ref != "", nil
 }
 
 func parseKeyValueArgs(args []string) (map[string]string, error) {

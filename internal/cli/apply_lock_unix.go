@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 var errApplyAlreadyRunning = errors.New("live apply already running")
@@ -17,13 +18,13 @@ type applyLock struct {
 }
 
 func acquireApplyLock(path string) (*applyLock, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := openLockFile(path, unix.O_CREAT|unix.O_RDWR)
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		file.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
 			return nil, errApplyAlreadyRunning
 		}
 		return nil, err
@@ -47,14 +48,49 @@ func (l *applyLock) Release() {
 	if l == nil || l.file == nil {
 		return
 	}
-	_ = syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	_ = unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
 	_ = l.file.Close()
 }
 
-func applyLockPIDRunning(pid int) bool {
-	if pid <= 0 {
-		return false
+func applyLockActive(path string) (bool, error) {
+	file, err := openLockFile(path, unix.O_RDWR)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
 	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	defer file.Close()
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			return true, nil
+		}
+		return false, err
+	}
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_UN); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func openLockFile(path string, flags int) (*os.File, error) {
+	fd, err := unix.Open(path, flags|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("open lock file %s", path)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 {
+		_ = file.Close()
+		return nil, fmt.Errorf("lock file %s must be a single-link regular file", path)
+	}
+	return file, nil
 }

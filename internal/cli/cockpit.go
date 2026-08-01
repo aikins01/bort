@@ -14,7 +14,7 @@ import (
 func writeAppFirstCockpit(w io.Writer, run loadedMigrationRun) {
 	apps := appsFromRun(run)
 	summary := summarizeMigrationRun(run)
-	overall := overallAppHealth(apps)
+	phase := migrationRunPhase(run)
 	st := newStyler(w)
 
 	ready, blocked := 0, 0
@@ -36,7 +36,7 @@ func writeAppFirstCockpit(w io.Writer, run loadedMigrationRun) {
 	if blocked > 0 {
 		header += " · " + st.glyph(fmt.Sprintf("%d blocked", blocked), sevBad)
 	}
-	header += " " + st.pill("DRY RUN", sevWarn)
+	header += " " + st.pill(migrationRunPhaseLabel(phase), severityForMigrationRunPhase(phase))
 	fmt.Fprintln(w, header)
 	fmt.Fprintln(w)
 
@@ -99,10 +99,91 @@ func writeAppFirstCockpit(w io.Writer, run loadedMigrationRun) {
 	if line := appliedFooter(run.Applied); line != "" {
 		fmt.Fprintln(w, st.muted(line))
 	}
-	if overall != appHealthReady {
+	downstreamBlockers := openDownstreamBlockingDecisions(run)
+	if len(downstreamBlockers) > 0 {
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Downstream blockers: %d open", len(downstreamBlockers))))
+		writeCockpitDecisions(w, st, downstreamBlockers)
+	}
+	reviewDecisions := openReviewDecisions(run)
+	if len(reviewDecisions) > 0 {
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Review-only decisions: %d open (non-blocking before live apply)", len(reviewDecisions))))
+		writeCockpitDecisions(w, st, reviewDecisions)
+	}
+	switch phase {
+	case "lock-error":
+		fmt.Fprintln(w, st.muted("Live apply lock state could not be verified. Inspect the run's apply.lock before retrying."))
+	case "applying":
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Live apply is running. Run `%s` to attach to its current status.", liveApplyCommand(run))))
+	case "partial":
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Live apply is incomplete. Run `%s` to resume safely.", liveApplyCommand(run))))
+	case "applied":
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Target is live. Verify it through the rollback window, then run `%s` to retire the source.", runScopedCommand(run, "commit --apply"))))
+	case "committed":
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Target accepted and source containers retired. Run `%s` to audit leftovers.", runScopedCommand(run, "cleanup"))))
+	case "purged":
+		fmt.Fprintln(w, st.muted("Migration complete. Target resources and source-control credentials were preserved."))
+	case "planning":
 		fmt.Fprintln(w, st.muted(issueActionFooter(apps)))
-	} else {
-		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("All app inputs ready. Run `%s` to apply, or run `bort` interactively to continue.", liveApplyCommand(run))))
+	default:
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("All app inputs ready. Run `%s` to apply, or run `%s` interactively to continue.", liveApplyCommand(run), bortCommand(""))))
+	}
+}
+
+func writeCockpitDecisions(w io.Writer, st *styler, decisions []runDecision) {
+	limit := min(len(decisions), 3)
+	for _, decision := range decisions[:limit] {
+		fmt.Fprintf(w, "  %s %s: %s (%d item(s))\n", decision.Kind, decision.Readiness, decision.Action, decision.Count)
+	}
+	if remaining := len(decisions) - limit; remaining > 0 {
+		fmt.Fprintf(w, "  %s\n", st.muted(fmt.Sprintf("and %d more", remaining)))
+	}
+}
+
+func migrationRunPhase(run loadedMigrationRun) string {
+	applyActive, applyActiveErr := applyRunActive(run.Run.RunDir)
+	switch {
+	case run.Run.PurgedAt != nil:
+		return "purged"
+	case run.Run.CommittedAt != nil:
+		return "committed"
+	case run.Run.LiveAppliedAt != nil || liveApplySucceeded(run):
+		return "applied"
+	case applyActiveErr != nil:
+		return "lock-error"
+	case applyActive:
+		return "applying"
+	case len(run.Applied.Steps) > 0:
+		return "partial"
+	case len(openSetupDecisions(run)) > 0:
+		return "planning"
+	case len(liveApplyBlockingDecisions(run)) == 0:
+		return "ready"
+	default:
+		return "planning"
+	}
+}
+
+func migrationRunPhaseLabel(phase string) string {
+	switch phase {
+	case "applied":
+		return "TARGET LIVE"
+	case "purged":
+		return "COMPLETE"
+	case "lock-error":
+		return "LOCK ERROR"
+	default:
+		return strings.ToUpper(phase)
+	}
+}
+
+func severityForMigrationRunPhase(phase string) severity {
+	switch phase {
+	case "ready", "applied", "committed", "purged":
+		return sevGood
+	case "partial", "lock-error":
+		return sevBad
+	default:
+		return sevWarn
 	}
 }
 
@@ -119,13 +200,13 @@ func issueActionFooter(apps []appView) string {
 	}
 	switch {
 	case hasFix && hasNext:
-		return "Run the shown `fix:` commands and use the `next:` notes as a checklist, then re-run `bort` to recheck."
+		return fmt.Sprintf("Run the shown `fix:` commands and use the `next:` notes as a checklist, then re-run `%s` to recheck.", bortCommand(""))
 	case hasFix:
-		return "Run the shown `fix:` commands, then re-run `bort` to recheck."
+		return fmt.Sprintf("Run the shown `fix:` commands, then re-run `%s` to recheck.", bortCommand(""))
 	case hasNext:
-		return "Use the `next:` notes as a checklist. Re-run `bort` after changing Coolify/Dokploy settings or the bundle."
+		return fmt.Sprintf("Use the `next:` notes as a checklist. Re-run `%s` after changing Coolify/Dokploy settings or the bundle.", bortCommand(""))
 	default:
-		return "Resolve the issues above, then re-run `bort` to recheck."
+		return fmt.Sprintf("Resolve the issues above, then re-run `%s` to recheck.", bortCommand(""))
 	}
 }
 
