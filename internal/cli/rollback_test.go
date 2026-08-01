@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -87,5 +89,77 @@ func TestRunRollbackWritesJSONPlan(t *testing.T) {
 	}
 	if result.Apps[0].ObservationWindowSeconds != 0 {
 		t.Fatalf("expected explicit zero observation window, got %#v", result.Apps[0])
+	}
+}
+
+func TestRunRollbackDefaultsToCurrentRun(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	bundleDir := filepath.Join(workDir, "reviewed-bundle")
+	writeTestBundle(t, bundleDir, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps: []manifest.App{{
+			Name:     "reviewed-app",
+			Services: []manifest.Service{{Name: "reviewed-app", Image: "example/reviewed:latest"}},
+			Routes:   []manifest.Route{{Host: "reviewed.example.com", ServiceName: "reviewed-app"}},
+		}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "reviewed-run"})
+	reviewed, err := loadMigrationRun("reviewed-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestBundle(t, filepath.Join(workDir, "bort-bundle"), manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "stale-app", Services: []manifest.Service{{Name: "stale-app", Image: "example/stale:latest"}}}},
+	})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runRollback(context.Background(), nil, &stdout, &stderr); err != nil {
+		t.Fatalf("rollback failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Rollback plan: "+reviewed.Run.BundleDir+" -> dokploy") || !strings.Contains(stdout.String(), "reviewed-app") {
+		t.Fatalf("expected rollback to use the current run artifact, got:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "stale-app") {
+		t.Fatalf("rollback planned from the default bundle instead of the current run:\n%s", stdout.String())
+	}
+}
+
+func TestRunRollbackUsesDefaultBundleWithoutCurrentRun(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	reviewedBundle := filepath.Join(workDir, "reviewed-bundle")
+	writeTestBundle(t, reviewedBundle, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps: []manifest.App{{
+			Name:     "reviewed-app",
+			Services: []manifest.Service{{Name: "reviewed-app", Image: "example/reviewed:latest"}},
+			Routes:   []manifest.Route{{Host: "reviewed.example.com", ServiceName: "reviewed-app"}},
+		}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", reviewedBundle, "--run", "reviewed-run"})
+	writeTestBundle(t, filepath.Join(workDir, "bort-bundle"), manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps: []manifest.App{{
+			Name:     "default-app",
+			Services: []manifest.Service{{Name: "default-app", Image: "example/default:latest"}},
+			Routes:   []manifest.Route{{Host: "default.example.com", ServiceName: "default-app"}},
+		}},
+	})
+	if err := mutateBortState(defaultStatePath(), func(state *bortState) bool {
+		state.CurrentRun = ""
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	if err := runRollback(context.Background(), nil, &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "default-app") || strings.Contains(stdout.String(), "reviewed-app") {
+		t.Fatalf("expected bare rollback to plan from the default bundle without a current run, got:\n%s", stdout.String())
 	}
 }

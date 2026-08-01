@@ -15,8 +15,13 @@ import (
 // modify the source apps; subsequent `bort` runs read the recorded values
 // instead of asking again.
 func runEnv(_ context.Context, args []string, stdout, _ io.Writer) error {
+	usage := "usage: " + bortCommand("env <app> KEY=value [KEY=value ...]")
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		fmt.Fprintln(stdout, usage)
+		return nil
+	}
 	if len(args) < 2 {
-		return fmt.Errorf("usage: bort env <app> KEY=value [KEY=value ...]")
+		return fmt.Errorf("%s", usage)
 	}
 	app := strings.TrimSpace(args[0])
 	if app == "" {
@@ -31,12 +36,10 @@ func runEnv(_ context.Context, args []string, stdout, _ io.Writer) error {
 	}
 
 	statePath := defaultStatePath()
-	state, err := readBortState(statePath)
-	if err != nil {
-		return err
-	}
-	state = setAppEnv(state, app, values)
-	if err := writeBortState(statePath, state); err != nil {
+	if err := mutateBortState(statePath, func(state *bortState) bool {
+		*state = setAppEnv(*state, app, values)
+		return true
+	}); err != nil {
 		return err
 	}
 
@@ -48,7 +51,7 @@ func runEnv(_ context.Context, args []string, stdout, _ io.Writer) error {
 		st.emph(app),
 		strings.Join(keys, ", "),
 	)
-	fmt.Fprintln(stdout, st.muted("Stored in .bort/state.json (mode 0600). Run `bort` to recheck."))
+	fmt.Fprintf(stdout, "%s\n", st.muted(fmt.Sprintf("Stored in .bort/state.json (mode 0600). Run `%s` to recheck.", bortCommand(""))))
 	return nil
 }
 

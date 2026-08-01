@@ -2,6 +2,7 @@ package dokploy
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,6 +56,514 @@ func TestCleanupStalePlatformProjectsBacksUpThenDeletesMetadata(t *testing.T) {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("expected cleanup sql to contain %q, got:\n%s", want, sql)
 		}
+	}
+}
+
+func TestPurgeSourceResourcesRemovesDockerResources(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container cid123": []byte(`[{"Id":"cid123","Name":"/web","Config":{"Labels":{"coolify.managed":"true"}},"State":{"Running":false,"Status":"exited"}}]`),
+		"rm -f cid123":                    []byte("cid123\n"),
+		"network inspect api-net":         []byte(`[{"Id":"network-id","Name":"api-net"}]`),
+		"network rm network-id":           []byte("network-id\n"),
+	}}
+	client := &Client{Docker: runner}
+
+	options, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{
+		Containers: []SourcePurgeContainer{{App: "api", Service: "web", ContainerID: "cid123", ContainerName: "web"}},
+		Networks:   []SourcePurgeNetwork{{App: "api", Name: "api-net"}},
+	})
+	if err != nil {
+		t.Fatalf("IdentifySourcePurgeResources: %v", err)
+	}
+	result, err := client.PurgeSourceResources(context.Background(), options)
+	if err != nil {
+		t.Fatalf("PurgeSourceResources: %v", err)
+	}
+	if len(result.Containers) != 1 || result.Containers[0].Status != "removed" || result.Containers[0].Ref != "web" {
+		t.Fatalf("unexpected container result: %#v", result.Containers)
+	}
+	if len(result.Networks) != 1 || result.Networks[0].Status != "removed" {
+		t.Fatalf("unexpected network result: %#v", result.Networks)
+	}
+	gotArgs := []string{}
+	for _, args := range runner.outputArgs {
+		gotArgs = append(gotArgs, strings.Join(args, " "))
+	}
+	for _, want := range []string{"inspect --type container cid123", "rm -f cid123", "network inspect api-net", "network rm network-id"} {
+		found := false
+		for _, got := range gotArgs {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected docker command %q in %#v", want, gotArgs)
+		}
+	}
+}
+
+func TestIdentifySourcePurgeResourcesRejectsNameOnlyDuplicate(t *testing.T) {
+	client := &Client{Docker: &fakeDockerRunner{}}
+	_, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{Containers: []SourcePurgeContainer{
+		{ContainerID: "cid123", ContainerName: "web"},
+		{ContainerName: "web"},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "without a stable container ID") {
+		t.Fatalf("expected name-only coordinate to remain unresolved, got %v", err)
+	}
+}
+
+func TestIdentifySourcePurgeResourcesRejectsConflictingDuplicateContainerID(t *testing.T) {
+	client := &Client{Docker: &fakeDockerRunner{}}
+	for _, containers := range [][]SourcePurgeContainer{
+		{{Service: "web", ContainerID: "cid123", ContainerName: "web"}, {Service: "web", ContainerID: "cid123", ContainerName: "replacement"}},
+		{{Service: "web", ContainerID: "cid123", ContainerName: "web"}, {Service: "worker", ContainerID: "cid123", ContainerName: "web"}},
+	} {
+		if _, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{Containers: containers}); err == nil || !strings.Contains(err.Error(), "conflicting") {
+			t.Fatalf("expected duplicate container ID conflict, got %v", err)
+		}
+	}
+}
+
+func TestIdentifySourcePurgeResourcesCanonicalizesReviewedShortContainerID(t *testing.T) {
+	shortID := "123456789abc"
+	fullID := shortID + strings.Repeat("d", 52)
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container " + shortID: []byte(`[{"Id":"` + fullID + `","Name":"/web","State":{"Running":false,"Status":"exited"}}]`),
+	}}
+	client := &Client{Docker: runner}
+	identified, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{
+		Containers: []SourcePurgeContainer{{ContainerID: shortID, ContainerName: "web"}},
+	})
+	if err != nil {
+		t.Fatalf("IdentifySourcePurgeResources: %v", err)
+	}
+	if len(identified.Containers) != 1 || identified.Containers[0].ContainerID != fullID {
+		t.Fatalf("expected canonical reviewed container ID %q, got %#v", fullID, identified.Containers)
+	}
+}
+
+func TestCleanupSourcePurgeContainersDeduplicatesShortAndCanonicalIDs(t *testing.T) {
+	shortID := "123456789abc"
+	fullID := shortID + strings.Repeat("d", 52)
+	for _, ids := range [][2]string{{shortID, fullID}, {fullID, shortID}} {
+		containers, err := cleanupSourcePurgeContainers([]SourcePurgeContainer{
+			{Service: "web", ContainerID: ids[0], ContainerName: "web"},
+			{Service: "web", ContainerID: ids[1], ContainerName: "web"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(containers) != 1 || containers[0].ContainerID != fullID {
+			t.Fatalf("expected one canonical container coordinate for order %#v, got %#v", ids, containers)
+		}
+	}
+}
+
+func TestPurgeSourceResourcesSkipsAbsentAllowedPath(t *testing.T) {
+	client := &Client{Docker: &fakeDockerRunner{}}
+	options, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{Paths: []SourcePurgePath{{Path: "/data/coolify/applications/app-1"}}})
+	if err != nil {
+		t.Fatalf("IdentifySourcePurgeResources: %v", err)
+	}
+	result, err := client.PurgeSourceResources(context.Background(), options)
+	if err != nil {
+		t.Fatalf("PurgeSourceResources: %v", err)
+	}
+	if len(result.Paths) != 1 || result.Paths[0].Status != "skipped" || !strings.Contains(result.Paths[0].Message, "remains absent") {
+		t.Fatalf("unexpected path result: %#v", result.Paths)
+	}
+}
+
+func TestPurgeSourceResourcesDoesNotFallbackFromStaleIDToName(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container web": []byte(`[{"Id":"new-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+		"rm -f new-id":                 []byte("new-id\n"),
+	}}
+	client := &Client{Docker: runner}
+
+	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{Containers: []SourcePurgeContainer{{App: "api", ContainerID: "missing-id", ContainerName: "web"}}})
+	if err == nil || !strings.Contains(err.Error(), "docker inspect missing-id") {
+		t.Fatalf("expected stale ID inspect error, got err=%v result=%#v", err, result)
+	}
+	for _, args := range runner.outputArgs {
+		if strings.Join(args, " ") == "inspect --type container web" || strings.Join(args, " ") == "rm -f new-id" {
+			t.Fatalf("purge fell back to name after stale ID: %#v", runner.outputArgs)
+		}
+	}
+}
+
+func TestPurgeSourceResourcesPreservesReplacementAfterReviewedContainerDisappears(t *testing.T) {
+	runner := &cleanupDockerRunner{
+		fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+			"inspect --type container web": []byte(`[{"Id":"replacement-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+		}},
+		outputErrors: map[string]error{
+			"inspect --type container reviewed-id": errors.New("Error: No such container: reviewed-id"),
+		},
+	}
+	client := &Client{Docker: runner}
+	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{Containers: []SourcePurgeContainer{{ContainerID: "reviewed-id", ContainerName: "web"}}})
+	if err == nil || !strings.Contains(err.Error(), "now refers to container ID") {
+		t.Fatalf("expected replacement container to block purge, got result=%#v err=%v", result, err)
+	}
+	for _, args := range runner.outputArgs {
+		if strings.HasPrefix(strings.Join(args, " "), "rm -f ") {
+			t.Fatalf("replacement container was removed: %#v", runner.outputArgs)
+		}
+	}
+}
+
+func TestPurgeSourceResourcesRejectsMismatchedInspectedContainerID(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container reviewed-id": []byte(`[{"Id":"replacement-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+		"rm -f replacement-id":                 []byte("replacement-id\n"),
+	}}
+	client := &Client{Docker: runner}
+	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{Containers: []SourcePurgeContainer{{ContainerID: "reviewed-id", ContainerName: "web"}}})
+	if err == nil || !strings.Contains(err.Error(), "not the reviewed ID") {
+		t.Fatalf("expected mismatched inspected ID to block purge, got result=%#v err=%v", result, err)
+	}
+	for _, args := range runner.outputArgs {
+		if strings.HasPrefix(strings.Join(args, " "), "rm -f ") {
+			t.Fatalf("mismatched inspected container was removed: %#v", runner.outputArgs)
+		}
+	}
+}
+
+func TestPurgeSourceNetworkPreservesReplacementAfterReviewedIDDisappears(t *testing.T) {
+	runner := &cleanupDockerRunner{
+		fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+			"network inspect api-net": []byte(`[{"Id":"replacement-id","Name":"api-net"}]`),
+		}},
+		outputErrors: map[string]error{
+			"network rm reviewed-id": errors.New("Error response from daemon: network reviewed-id not found"),
+		},
+	}
+	client := &Client{Docker: runner}
+	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+		Networks: []SourcePurgeNetwork{{Name: "api-net", ExpectedIdentity: "reviewed-id"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "appeared after confirmation") {
+		t.Fatalf("expected replacement network to be preserved, got result=%#v err=%v", result, err)
+	}
+	for _, args := range runner.outputArgs {
+		if strings.Join(args, " ") == "network rm replacement-id" {
+			t.Fatalf("replacement network was removed: %#v", runner.outputArgs)
+		}
+	}
+}
+
+func TestPurgeSourceResourcesReturnsPartialResults(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container cid123": []byte(`[{"Id":"cid123","Name":"/web","State":{"Running":false,"Status":"exited"}}]`),
+		"rm -f cid123":                    []byte("cid123\n"),
+		"network inspect api-net":         []byte(`[{"Id":"network-id","Name":"api-net"}]`),
+	}}
+	client := &Client{Docker: runner}
+	options, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{
+		Containers: []SourcePurgeContainer{{App: "api", ContainerID: "cid123", ContainerName: "web"}},
+		Networks:   []SourcePurgeNetwork{{App: "api", Name: "api-net"}},
+	})
+	if err != nil {
+		t.Fatalf("IdentifySourcePurgeResources: %v", err)
+	}
+	result, err := client.PurgeSourceResources(context.Background(), options)
+	if err == nil {
+		t.Fatal("expected purge to stop on the network failure")
+	}
+	if len(result.Containers) != 1 || result.Containers[0].Status != "removed" || len(result.Networks) != 1 || result.Networks[0].Status != "error" {
+		t.Fatalf("expected completed and failed resource results, got %#v", result)
+	}
+}
+
+func TestSourcePurgeRequiresNamedVolumeToRemainAbsent(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect api-data": []byte(`[{"Name":"api-data"}]`),
+	}}
+	client := &Client{Docker: runner}
+	if _, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{Volumes: []SourcePurgeVolume{{Name: "api-data"}}}); err == nil || !strings.Contains(err.Error(), "remove it manually") {
+		t.Fatalf("expected existing named volume to block before confirmation, got %v", err)
+	}
+	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+		Volumes: []SourcePurgeVolume{{Name: "api-data", ExpectedAbsent: true}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "appeared after confirmation") {
+		t.Fatalf("expected recreated volume to remain preserved, got result=%#v err=%v", result, err)
+	}
+	for _, args := range runner.outputArgs {
+		if strings.Join(args, " ") == "volume rm api-data" {
+			t.Fatalf("changed volume was removed: %#v", runner.outputArgs)
+		}
+	}
+}
+
+func TestSourcePurgeRechecksAbsenceBeforeRemovingContainers(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect api-data":         []byte(`[{"Name":"api-data"}]`),
+		"inspect --type container cid123": []byte(`[{"Id":"cid123","Name":"/web","State":{"Running":false,"Status":"exited"}}]`),
+		"rm -f cid123":                    []byte("cid123\n"),
+	}}
+	client := &Client{Docker: runner}
+	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+		Containers: []SourcePurgeContainer{{ContainerID: "cid123", ContainerName: "web"}},
+		Volumes:    []SourcePurgeVolume{{Name: "api-data", ExpectedAbsent: true}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "appeared after confirmation") {
+		t.Fatalf("expected recreated volume to block before container removal, got result=%#v err=%v", result, err)
+	}
+	for _, args := range runner.outputArgs {
+		if strings.Join(args, " ") == "rm -f cid123" {
+			t.Fatalf("container was removed before prerequisites passed: %#v", runner.outputArgs)
+		}
+	}
+}
+
+func TestSourcePurgeWithAbsencePrerequisitesRequiresManualContainerRemoval(t *testing.T) {
+	runner := &stagedPurgeRunner{fakeDockerRunner: fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container cid123": []byte(`[{"Id":"cid123","Name":"/web","State":{"Running":false,"Status":"exited"}}]`),
+		"rm -f cid123":                    []byte("cid123\n"),
+	}}}
+	client := &Client{Docker: runner}
+	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+		Containers: []SourcePurgeContainer{{ContainerID: "cid123", ContainerName: "web"}},
+		Volumes:    []SourcePurgeVolume{{Name: "api-data", ExpectedAbsent: true}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "remove it manually") {
+		t.Fatalf("expected manual-completion strategy to block automatic removal, got result=%#v err=%v", result, err)
+	}
+	for _, args := range runner.outputArgs {
+		if strings.Join(args, " ") == "rm -f cid123" {
+			t.Fatalf("container was removed after a prerequisite reappeared: %#v", runner.outputArgs)
+		}
+	}
+}
+
+func TestIdentifySourcePurgeResourcesRejectsMixedAutomaticAndAbsenceOnlyPurge(t *testing.T) {
+	shortID := "123456789abc"
+	fullID := shortID + strings.Repeat("d", 52)
+	runner := &cleanupDockerRunner{
+		fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+			"inspect --type container " + shortID: []byte(`[{"Id":"` + fullID + `","Name":"/web","State":{"Running":false,"Status":"exited"}}]`),
+		}},
+		outputErrors: map[string]error{
+			"volume inspect api-data": errors.New("Error response from daemon: get api-data: no such volume"),
+		},
+	}
+	client := &Client{Docker: runner}
+	_, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{
+		Containers: []SourcePurgeContainer{{ContainerID: shortID, ContainerName: "web"}},
+		Volumes:    []SourcePurgeVolume{{Name: "api-data"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "remove all listed containers and networks manually") {
+		t.Fatalf("expected mixed automatic and absence-only purge to fail before confirmation, got %v", err)
+	}
+	if strings.Contains(err.Error(), "not the reviewed ID") {
+		t.Fatalf("short reviewed ID was treated as a different container: %v", err)
+	}
+	for _, args := range runner.outputArgs {
+		if strings.HasPrefix(strings.Join(args, " "), "rm -f ") {
+			t.Fatalf("container was removed while identifying an ineligible purge: %#v", runner.outputArgs)
+		}
+	}
+}
+
+func TestSourcePurgeManualCompletionPreservesReplacementContainerByName(t *testing.T) {
+	runner := &cleanupDockerRunner{
+		fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+			"inspect --type container web": []byte(`[{"Id":"replacement-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+		}},
+		outputErrors: map[string]error{
+			"volume inspect api-data":           errors.New("Error response from daemon: get api-data: no such volume"),
+			"inspect --type container reviewed": errors.New("Error: No such container: reviewed"),
+		},
+	}
+	client := &Client{Docker: runner}
+	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+		Containers: []SourcePurgeContainer{{ContainerID: "reviewed", ContainerName: "web"}},
+		Volumes:    []SourcePurgeVolume{{Name: "api-data", ExpectedAbsent: true}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "now refers to container ID") {
+		t.Fatalf("expected replacement container to block absence verification, got result=%#v err=%v", result, err)
+	}
+	for _, args := range runner.outputArgs {
+		if strings.HasPrefix(strings.Join(args, " "), "rm -f ") {
+			t.Fatalf("replacement container was removed: %#v", runner.outputArgs)
+		}
+	}
+}
+
+func TestPurgeSourceResourcesStopsBeforeNextMutationWhenProgressPersistenceFails(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container cid1": []byte(`[{"Id":"cid1","Name":"/one","State":{"Running":false,"Status":"exited"}}]`),
+		"rm -f cid1":                    []byte("cid1\n"),
+		"inspect --type container cid2": []byte(`[{"Id":"cid2","Name":"/two","State":{"Running":false,"Status":"exited"}}]`),
+		"rm -f cid2":                    []byte("cid2\n"),
+	}}
+	var durable SourcePurgeResult
+	client := &Client{Docker: runner}
+	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+		Containers: []SourcePurgeContainer{{ContainerID: "cid1", ContainerName: "one"}, {ContainerID: "cid2", ContainerName: "two"}},
+		OnProgress: func(progress SourcePurgeResult) error {
+			latest := progress.Containers[len(progress.Containers)-1]
+			if latest.Ref == "cid2" && latest.Status == "started" {
+				return errors.New("backup unavailable")
+			}
+			durable = progress
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "persist source purge progress") {
+		t.Fatalf("expected progress persistence failure, got result=%#v err=%v", result, err)
+	}
+	if len(durable.Containers) != 1 || durable.Containers[0].Status != "removed" {
+		t.Fatalf("expected first outcome to remain durable, got %#v", durable)
+	}
+	for _, args := range runner.outputArgs {
+		if strings.Join(args, " ") == "inspect --type container cid2" || strings.Join(args, " ") == "rm -f cid2" {
+			t.Fatalf("second resource mutated after persistence failure: %#v", runner.outputArgs)
+		}
+	}
+}
+
+type stagedPurgeRunner struct {
+	fakeDockerRunner
+	volumeInspects int
+}
+
+func (r *stagedPurgeRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	if strings.Join(args, " ") == "volume inspect api-data" {
+		r.outputArgs = append(r.outputArgs, append([]string{}, args...))
+		r.volumeInspects++
+		if r.volumeInspects == 1 {
+			return nil, errors.New("Error response from daemon: get api-data: no such volume")
+		}
+		return []byte(`[{"Name":"api-data"}]`), nil
+	}
+	return r.fakeDockerRunner.Output(ctx, args...)
+}
+
+func TestSourcePurgeAcceptsNamedVolumeThatRemainsAbsent(t *testing.T) {
+	runner := &cleanupDockerRunner{
+		fakeDockerRunner: &fakeDockerRunner{},
+		outputErrors: map[string]error{
+			"volume inspect api-data": errors.New("Error response from daemon: get api-data: no such volume"),
+		},
+	}
+	client := &Client{Docker: runner}
+	options, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{
+		Volumes: []SourcePurgeVolume{{Name: "api-data"}},
+	})
+	if err != nil {
+		t.Fatalf("IdentifySourcePurgeResources: %v", err)
+	}
+	result, err := client.PurgeSourceResources(context.Background(), options)
+	if err != nil {
+		t.Fatalf("PurgeSourceResources: %v", err)
+	}
+	if len(result.Volumes) != 1 || result.Volumes[0].Status != "skipped" || !strings.Contains(result.Volumes[0].Message, "remains absent") {
+		t.Fatalf("unexpected volume result: %#v", result.Volumes)
+	}
+}
+
+type cleanupDockerRunner struct {
+	*fakeDockerRunner
+	outputErrors map[string]error
+}
+
+func (r *cleanupDockerRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	if err, ok := r.outputErrors[strings.Join(args, " ")]; ok {
+		return nil, err
+	}
+	return r.fakeDockerRunner.Output(ctx, args...)
+}
+
+func TestDockerMissingResourceClassifierRejectsInfrastructureErrors(t *testing.T) {
+	if isDockerVolumeOrNetworkMissingErr(errors.New(`exec: "docker": executable file not found in $PATH`)) {
+		t.Fatal("missing Docker executable was classified as an absent resource")
+	}
+	for _, err := range []error{
+		errors.New("Error response from daemon: remove api-data: no such volume"),
+		errors.New("Error response from daemon: network api-net not found"),
+	} {
+		if !isDockerVolumeOrNetworkMissingErr(err) {
+			t.Fatalf("expected missing Docker resource classification for %v", err)
+		}
+	}
+}
+
+func TestProtectedSourcePurgeNetworkNamesAreCaseSensitive(t *testing.T) {
+	for _, name := range []string{"bridge", "host", "none", "ingress"} {
+		if !IsProtectedSourcePurgeNetwork(name) {
+			t.Fatalf("expected %q to be protected", name)
+		}
+	}
+	for _, name := range []string{"Bridge", "Proxy", "HOST", "coolify", "coolify-proxy", "proxy"} {
+		if IsProtectedSourcePurgeNetwork(name) {
+			t.Fatalf("expected distinct user network %q not to be protected", name)
+		}
+	}
+}
+
+func TestPurgeSourceResourcesRejectsProtectedHostPath(t *testing.T) {
+	client := &Client{Docker: &fakeDockerRunner{}}
+	_, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{Paths: []SourcePurgePath{{Path: "/data"}}})
+	if err == nil || !strings.Contains(err.Error(), "protected host path") {
+		t.Fatalf("expected protected path error, got %v", err)
+	}
+}
+
+func TestPathAbsentNoFollowRejectsAncestorSymlink(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("windows refuses source path purge")
+	}
+	root := t.TempDir()
+	outside := t.TempDir()
+	outsideTarget := filepath.Join(outside, "target")
+	if err := os.Mkdir(outsideTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(outsideTarget, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "swapped")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := pathAbsentNoFollow(filepath.Join(root, "swapped", "target")); err == nil {
+		t.Fatal("expected ancestor symlink to block absence validation")
+	}
+	if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "keep" {
+		t.Fatalf("outside path changed through ancestor symlink: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestPathAbsentNoFollowPreservesExistingDirectoryTree(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("windows refuses source path purge")
+	}
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "target")
+	if err := os.MkdirAll(filepath.Join(target, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "nested", "file"), []byte("remove"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	absent, err := pathAbsentNoFollow(target)
+	if err != nil {
+		t.Fatalf("check no-follow path absence: %v", err)
+	}
+	if absent {
+		t.Fatal("expected existing target tree not to be reported absent")
+	}
+	if contents, err := os.ReadFile(filepath.Join(target, "nested", "file")); err != nil || string(contents) != "remove" {
+		t.Fatalf("absence validation changed the target tree: contents=%q err=%v", contents, err)
 	}
 }
 

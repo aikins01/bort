@@ -34,21 +34,52 @@ func runCommit(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
 	fs.StringVar(&cutoverPlanPath, "from-cutover", "", "read a prior cutover JSON plan artifact")
 	fs.BoolVar(&apply, "apply", false, "execute commit cleanup (stop source containers and coolify-proxy)")
-	fs.StringVar(&runRef, "run", "", "run name under .bort/runs, or a run directory path (with --apply)")
+	fs.StringVar(&runRef, "run", "", "run name under .bort/runs, or a run directory path")
 	fs.IntVar(&rollbackWindowSeconds, "rollback-window", commitplan.DefaultRollbackWindowSeconds, "rollback window in seconds")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("commit does not accept positional argument %q", fs.Arg(0))
+	}
 	if apply {
+		for _, name := range []string{"app", "bundle", "format", "from-cutover", "output", "rollback-window", "target"} {
+			if flagSet(fs, name) {
+				return fmt.Errorf("commit --apply does not accept --%s; select the reviewed run with --run", name)
+			}
+		}
 		return applyCommitFromArgs(ctx, runRef, stderr)
 	}
 	if err := checkOutputFormat("commit", format); err != nil {
 		return err
 	}
+	if strings.TrimSpace(runRef) != "" {
+		for _, name := range []string{"app", "bundle", "from-cutover", "rollback-window", "target"} {
+			if flagSet(fs, name) {
+				return fmt.Errorf("commit --run does not accept --%s; the run already owns its reviewed commit plan", name)
+			}
+		}
+	}
 
 	var result commitplan.Result
-	if cutoverPlanPath != "" {
+	useCurrentRun := cutoverPlanPath == "" && !flagSet(fs, "bundle") && !flagSet(fs, "target") && !flagSet(fs, "app") && !flagSet(fs, "rollback-window")
+	resolvedRun := strings.TrimSpace(runRef)
+	useReviewedRun := resolvedRun != ""
+	if !useReviewedRun && useCurrentRun {
+		var err error
+		resolvedRun, useReviewedRun, err = selectedRunRef(false)
+		if err != nil {
+			return err
+		}
+	}
+	if useReviewedRun {
+		run, err := loadMigrationRun(resolvedRun)
+		if err != nil {
+			return err
+		}
+		result = run.Commit
+	} else if cutoverPlanPath != "" {
 		expect := artifactExpectations{AppName: appName}
 		if flagWasSet(fs, "bundle") {
 			expect.BundleDir = bundleDir
@@ -131,19 +162,17 @@ func writeCommitText(w io.Writer, result commitplan.Result) {
 	fmt.Fprintln(w, "Dry run only: no target ownership was committed and no source resources were retired.")
 }
 
-// applyCommitFromArgs executes the commit-time cleanup against the
-// requested run (or the latest run if none was named). it stops every
-// source app container and reasserts that coolify-proxy is stopped, but
-// does not remove anything — operators on a long rollback window can
-// still docker start the source manually.
 func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) error {
-	if strings.TrimSpace(runRef) == "" {
-		latest, ok := latestRunRef()
-		if !ok {
-			return fmt.Errorf("no migration run found; create one before commit --apply")
-		}
-		runRef = latest
+	var err error
+	runRef, err = resolveRunRef(runRef, false)
+	if err != nil {
+		return err
 	}
+	operationLock, err := acquireRunOperationLock(runRef)
+	if err != nil {
+		return fmt.Errorf("commit run %q: %w", runRef, err)
+	}
+	defer operationLock.Release()
 	run, err := loadMigrationRun(runRef)
 	if err != nil {
 		return err
@@ -161,37 +190,79 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 	plan := dokploy.PlanForCommit(run.Prepare, run.Cutover)
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
-	fmt.Fprintf(stderr, "commit apply: planned %d step(s) to retire source\n", len(plan.Steps))
-	return client.Apply(ctx, plan)
+	fmt.Fprintf(stderr, "commit apply: run %s; planned %d step(s) to retire source\n", run.Run.Name, len(plan.Steps))
+	if err := client.Apply(ctx, plan); err != nil {
+		return err
+	}
+	if err := markRunCommittedLocked(run.Run); err != nil {
+		return fmt.Errorf("source retirement completed, but migration commit metadata could not be recorded: %w", err)
+	}
+	return nil
 }
 
-// requireLiveApplySucceeded blocks commit --apply on runs whose live
-// migrate phase never finished. without this guard, commit --apply on a
-// freshly-planned (or partially-applied) run would stop production
-// source containers before the target was actually serving traffic.
-// each step in the computed live plan must have a matching ledger entry
-// at the same index with a completed status and identical kind/app/ref —
-// anything else means the live apply is stale or incomplete.
 func requireLiveApplySucceeded(run loadedMigrationRun) error {
+	return requireLiveApplySucceededForAppsSkipping(run, nil, nil)
+}
+
+func liveApplySucceeded(run loadedMigrationRun) bool {
+	return requireLiveApplySucceeded(run) == nil
+}
+
+func requireLiveApplySucceededForApps(run loadedMigrationRun, apps map[string]struct{}) error {
+	return requireLiveApplySucceededForAppsSkipping(run, apps, nil)
+}
+
+func requireLiveApplySucceededForAppsSkipping(run loadedMigrationRun, apps map[string]struct{}, skipKinds map[dokploy.StepKind]struct{}) error {
+	if run.Run.ApplyOutcomeRequired && run.Applied.SucceededAt == nil {
+		return fmt.Errorf("run %q has no successful live-apply outcome recorded; run `%s` first", run.Run.Name, liveApplyCommand(run))
+	}
 	live := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
 	if len(live.Steps) == 0 {
 		return fmt.Errorf("run %q has no live apply steps; nothing to commit", run.Run.Name)
 	}
 	byIndex := map[int]appliedStep{}
+	latest := map[string]appliedStep{}
 	for _, step := range run.Applied.Steps {
-		byIndex[step.Index] = step
+		if current, ok := byIndex[step.Index]; !ok || !step.UpdatedAt.Before(current.UpdatedAt) {
+			byIndex[step.Index] = step
+		}
+		key := appliedStepKey(step.Kind, step.App, step.Ref)
+		if current, ok := latest[key]; !ok || !step.UpdatedAt.Before(current.UpdatedAt) {
+			latest[key] = step
+		}
 	}
+	checked := 0
 	for index, step := range live.Steps {
-		got, ok := byIndex[index]
-		if !ok {
-			return fmt.Errorf("run %q has not been live-applied; missing applied step %d %s. run `bort migrate --live --run %s` first", run.Run.Name, index, step.Kind, run.Run.Name)
+		if _, skip := skipKinds[step.Kind]; skip {
+			continue
 		}
-		if got.Kind != string(step.Kind) || got.App != step.App || got.Ref != step.Ref {
-			return fmt.Errorf("run %q live apply ledger is stale at step %d (expected %s %s/%s, got %s %s/%s); rerun the live apply before commit", run.Run.Name, index, step.Kind, step.App, step.Ref, got.Kind, got.App, got.Ref)
+		if !liveApplyStepInScope(step, apps) {
+			continue
 		}
-		if !appliedStepCompleted(got) {
-			return fmt.Errorf("run %q live apply step %d (%s %s/%s) finished with status %q, not complete; resolve before commit", run.Run.Name, index, step.Kind, step.App, step.Ref, got.Status)
+		checked++
+		key := appliedStepKey(string(step.Kind), step.App, step.Ref)
+		recorded, ok := byIndex[index]
+		if !ok || !appliedStepCompleted(recorded) || !appliedStepMatches(recorded, step) {
+			return fmt.Errorf("run %q has not been live-applied; missing completed applied step %s %s/%s at plan index %d. run `%s` first", run.Run.Name, step.Kind, step.App, step.Ref, index, liveApplyCommand(run))
 		}
+		if current, ok := latest[key]; !ok || !appliedStepCompleted(current) {
+			return fmt.Errorf("run %q has not been live-applied; latest applied outcome for step %s %s/%s is not complete. run `%s` first", run.Run.Name, step.Kind, step.App, step.Ref, liveApplyCommand(run))
+		}
+	}
+	if checked == 0 {
+		return fmt.Errorf("run %q has no live apply steps for the selected purge scope", run.Run.Name)
 	}
 	return nil
+}
+
+func liveApplyStepInScope(step dokploy.Step, apps map[string]struct{}) bool {
+	if len(apps) == 0 || step.App == "" {
+		return true
+	}
+	_, ok := apps[step.App]
+	return ok
+}
+
+func appliedStepKey(kind, app, ref string) string {
+	return kind + "\x00" + app + "\x00" + ref
 }

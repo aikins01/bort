@@ -3,9 +3,21 @@ package cli
 import (
 	"io"
 	"os"
+	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 )
+
+func bortCommand(args string) string {
+	command := "bort"
+	if strings.TrimSpace(os.Getenv("SUDO_UID")) != "" {
+		command = "sudo bort"
+	}
+	if strings.TrimSpace(args) == "" {
+		return command
+	}
+	return command + " " + args
+}
 
 type styler struct {
 	color bool

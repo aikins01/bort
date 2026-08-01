@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/aikins01/bort/internal/target/dokploy"
-	"github.com/charmbracelet/bubbles/progress"
 )
 
 func TestAppliedLedgerRecordsAndPersists(t *testing.T) {
@@ -76,6 +75,47 @@ func TestAppliedLedgerOverwritesByIndex(t *testing.T) {
 	}
 }
 
+func TestAppliedLedgerRetainsPersistenceFailure(t *testing.T) {
+	ledger := &appliedLedger{
+		state: newRunApplied(migrationRun{Name: "run-failure"}),
+		persist: func(string, runApplied) error {
+			return errors.New("persist failed")
+		},
+	}
+	progress := dokploy.StepProgress{Index: 0, Step: dokploy.Step{Kind: dokploy.StepCreateProject, App: "api", Ref: "api"}, Status: dokploy.StepStatusStarted}
+	if err := ledger.Record(progress); err == nil || err.Error() != "persist failed" {
+		t.Fatalf("expected persistence failure, got %v", err)
+	}
+	if err := ledger.Err(); err == nil || err.Error() != "persist failed" {
+		t.Fatalf("expected retained persistence failure, got %v", err)
+	}
+	if err := ledger.Record(progress); err == nil || err.Error() != "persist failed" {
+		t.Fatalf("expected later records to stop at the retained failure, got %v", err)
+	}
+	if err := ledger.MarkSucceeded(); err == nil || err.Error() != "persist failed" {
+		t.Fatalf("expected success marking to stop at the retained failure, got %v", err)
+	}
+}
+
+func TestAppliedLedgerPersistsSuccessfulOutcome(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "applied.json")
+	run := migrationRun{Name: "run-success", BundleDir: "bundle", Target: "dokploy"}
+	ledger, err := newAppliedLedger(path, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.MarkSucceeded(); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := readRunApplied(path, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.SucceededAt == nil {
+		t.Fatal("expected a durable successful live-apply outcome")
+	}
+}
+
 func TestReadRunAppliedRejectsUnknownAPIVersion(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "applied.json")
@@ -134,36 +174,5 @@ func TestCompletedApplyPrefixRequiresContiguousIndexedSteps(t *testing.T) {
 	}}
 	if got := completedApplyPrefix(steps, applied); got != 1 {
 		t.Fatalf("expected prefix to stop at mismatched index 1, got %d", got)
-	}
-}
-
-func TestProgressModelUsesStepIndexWhenResuming(t *testing.T) {
-	model := &progressModel{bar: progress.New(progress.WithoutPercentage()), total: 5, done: 3}
-	model.Update(progressTick{progress: dokploy.StepProgress{
-		Index:  3,
-		Total:  5,
-		Step:   dokploy.Step{Kind: dokploy.StepRestoreDataStore, App: "api", Ref: "data-store:db"},
-		Status: dokploy.StepStatusStarted,
-	}})
-	if model.done != 3 {
-		t.Fatalf("expected started step to preserve resumed count 3, got %d", model.done)
-	}
-	model.Update(progressTick{progress: dokploy.StepProgress{
-		Index:  3,
-		Total:  5,
-		Step:   dokploy.Step{Kind: dokploy.StepRestoreDataStore, App: "api", Ref: "data-store:db"},
-		Status: dokploy.StepStatusOK,
-	}})
-	if model.done != 4 {
-		t.Fatalf("expected completed resumed step to advance to 4, got %d", model.done)
-	}
-	model.Update(progressTick{progress: dokploy.StepProgress{
-		Index:  5,
-		Total:  5,
-		Step:   dokploy.Step{Kind: dokploy.StepResumeSource, App: "api", Ref: "api"},
-		Status: dokploy.StepStatusOK,
-	}})
-	if model.done != 4 {
-		t.Fatalf("expected out-of-plan cleanup step not to advance count, got %d", model.done)
 	}
 }

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -30,14 +31,21 @@ const (
 	decisionsAPIVersion = "bort.decisions/v1alpha1"
 )
 
+var errRunOperationActive = errors.New("migration run operation already in progress")
+
 type migrationRun struct {
 	APIVersion               string       `json:"apiVersion"`
 	Name                     string       `json:"name"`
 	RunDir                   string       `json:"runDir"`
 	CreatedAt                time.Time    `json:"createdAt"`
 	UpdatedAt                time.Time    `json:"updatedAt"`
+	LiveAppliedAt            *time.Time   `json:"liveAppliedAt,omitempty"`
+	CommittedAt              *time.Time   `json:"committedAt,omitempty"`
+	PurgedAt                 *time.Time   `json:"purgedAt,omitempty"`
+	ApplyOutcomeRequired     bool         `json:"applyOutcomeRequired,omitempty"`
 	Source                   string       `json:"source,omitempty"`
 	BundleDir                string       `json:"bundleDir"`
+	SourceBundleDir          string       `json:"sourceBundleDir,omitempty"`
 	ManifestPath             string       `json:"manifest,omitempty"`
 	Target                   string       `json:"target"`
 	AppName                  string       `json:"app,omitempty"`
@@ -175,6 +183,8 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	var target string
 	var appName string
 	var runRef string
+	var sourceName string
+	var manifestPath string
 	var live bool
 	observationWindowSeconds := gateway.DefaultObservationWindowSeconds
 	rollbackWindowSeconds := gateway.DefaultRollbackWindowSeconds
@@ -183,6 +193,8 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	fs.StringVar(&target, "target", "dokploy", "target platform")
 	fs.StringVar(&appName, "app", "", "optional app name to include in the run")
 	fs.StringVar(&runRef, "run", "", "run name under .bort/runs, or a run directory path")
+	fs.StringVar(&sourceName, "source", "", "scan a source directly: docker, coolify, coolify-local, or manifest")
+	fs.StringVar(&manifestPath, "manifest", "", "existing manifest path (implies --source manifest)")
 	fs.BoolVar(&live, "live", false, "execute against the target platform (default dry-run only)")
 	fs.IntVar(&observationWindowSeconds, "observation-window", gateway.DefaultObservationWindowSeconds, "observation window in seconds")
 	fs.IntVar(&rollbackWindowSeconds, "rollback-window", gateway.DefaultRollbackWindowSeconds, "rollback window in seconds")
@@ -191,6 +203,50 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		return err
 	}
 	bundleFlagSet := flagSet(fs, "bundle")
+	if live {
+		for _, name := range []string{"app", "bundle", "manifest", "observation-window", "rollback-window", "source", "target"} {
+			if flagSet(fs, name) {
+				return fmt.Errorf("--live applies an existing reviewed run and does not accept --%s; create or update the dry-run first, then apply it with --run or the current-run default", name)
+			}
+		}
+	}
+	if strings.TrimSpace(manifestPath) != "" && strings.TrimSpace(sourceName) == "" {
+		sourceName = "manifest"
+	}
+	if strings.TrimSpace(sourceName) != "" {
+		if bundleFlagSet {
+			return fmt.Errorf("migrate accepts either --source/--manifest or --bundle, not both")
+		}
+		if appName != "" {
+			return fmt.Errorf("--app is only supported with --bundle; source scans create a complete run")
+		}
+		if live {
+			return fmt.Errorf("--live cannot create a run from --source; run the dry-run command first, review it with `%s`, then apply", bortCommand(""))
+		}
+		if sourceName == "manifest" && strings.TrimSpace(manifestPath) == "" {
+			return fmt.Errorf("--manifest is required with --source manifest")
+		}
+		if sourceName != "manifest" && strings.TrimSpace(manifestPath) != "" {
+			return fmt.Errorf("--manifest can only be used with --source manifest")
+		}
+		if strings.TrimSpace(runRef) == "" {
+			runRef = defaultGuideRunName(sourceName, time.Now().UTC())
+		}
+		loadedRun, err := createMigrationRunFromSource(ctx, guidedSetup{
+			Source:       sourceName,
+			Target:       target,
+			RunName:      runRef,
+			ManifestPath: manifestPath,
+		}, observationWindowSeconds, rollbackWindowSeconds)
+		if err != nil {
+			return err
+		}
+		if err := rememberCurrentRun(loadedRun.Run); err != nil {
+			return err
+		}
+		writeAppFirstCockpit(stdout, loadedRun)
+		return nil
+	}
 
 	opts := migrationRunOptions{
 		BundleDir:                bundleDir,
@@ -201,81 +257,193 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		RollbackWindowSeconds:    rollbackWindowSeconds,
 	}
 	if live {
-		if activeRef, ok := activeApplyRunRefForMigrate(opts, bundleFlagSet); ok {
+		activeRef, ok, err := activeApplyRunRefForMigrate(opts, bundleFlagSet)
+		if err != nil {
+			return err
+		}
+		if ok {
 			loadedRun, err := loadMigrationRun(activeRef)
 			if err != nil {
 				return err
 			}
+			if err := rememberCurrentRun(loadedRun.Run); err != nil {
+				return err
+			}
 			summary := summarizeMigrationRun(loadedRun)
 			writeLiveMigrationRunText(stdout, "Migration run loaded", summary)
-			return applyLiveMigration(ctx, loadedRun, stderr, nil)
+			return attachLiveMigrationRun(ctx, loadedRun, stderr, nil)
 		}
+		resolved, err := resolveRunRef(opts.RunRef, false)
+		if err != nil {
+			return err
+		}
+		if !migrationRunMetadataExists(resolved) {
+			return fmt.Errorf("migration run %q does not exist; run `%s` to create or select a run before --live", resolved, bortCommand(""))
+		}
+		operationLock, err := acquireRunOperationLock(resolved)
+		if err != nil {
+			applyActive, applyActiveErr := applyRunActive(resolved)
+			if applyActiveErr != nil {
+				return fmt.Errorf("check live migration for run %q: %w", resolved, applyActiveErr)
+			}
+			if errors.Is(err, errRunOperationActive) && applyActive {
+				loadedRun, loadErr := loadMigrationRun(resolved)
+				if loadErr != nil {
+					return loadErr
+				}
+				writeLiveMigrationRunText(stdout, "Migration run loaded", summarizeMigrationRun(loadedRun))
+				return attachLiveMigrationRun(ctx, loadedRun, stderr, nil)
+			}
+			return fmt.Errorf("start live migration for run %q: %w", resolved, err)
+		}
+		defer operationLock.Release()
+		loadedRun, err := loadMigrationRun(resolved)
+		if err != nil {
+			return err
+		}
+		if err := rememberCurrentRun(loadedRun.Run); err != nil {
+			return err
+		}
+		writeLiveMigrationRunText(stdout, "Migration run loaded", summarizeMigrationRun(loadedRun))
+		if err := validateLiveApplyReady(loadedRun); err != nil {
+			return err
+		}
+		return applyLiveMigrationLocked(ctx, loadedRun, stderr, nil)
 	}
 
-	loadedRun, err := migrationRunForMigrateCommand(opts, live, bundleFlagSet)
+	loadedRun, err := migrationRunForMigrateCommand(opts, bundleFlagSet)
 	if err != nil {
+		return err
+	}
+	if err := rememberCurrentRun(loadedRun.Run); err != nil {
 		return err
 	}
 
 	summary := summarizeMigrationRun(loadedRun)
-	if live {
-		writeLiveMigrationRunText(stdout, "Migration run created", summary)
-		if err := validateLiveApplyReady(loadedRun); err != nil {
-			return err
-		}
-		return applyLiveMigration(ctx, loadedRun, stderr, nil)
-	}
 	writeMigrationRunText(stdout, "Migration run created", summary)
 	return nil
 }
 
-func migrationRunForMigrateCommand(opts migrationRunOptions, live, bundleFlagSet bool) (loadedMigrationRun, error) {
+func migrationRunForMigrateCommand(opts migrationRunOptions, bundleFlagSet bool) (loadedMigrationRun, error) {
 	if strings.TrimSpace(opts.RunRef) != "" && !bundleFlagSet && migrationRunMetadataExists(opts.RunRef) {
-		return refreshMigrationRun(opts.RunRef)
-	}
-	if live && strings.TrimSpace(opts.RunRef) == "" && !bundleFlagSet && opts.BundleDir == "bort-bundle" && !defaultBundleExists() {
-		if latestRef, ok := latestRunRef(); ok {
-			return refreshMigrationRun(latestRef)
-		}
+		return refreshMigrationRunSafely(opts.RunRef)
 	}
 	return createMigrationRun(opts)
 }
 
-func activeApplyRunRefForMigrate(opts migrationRunOptions, bundleFlagSet bool) (string, bool) {
-	if strings.TrimSpace(opts.RunRef) != "" && migrationRunMetadataExists(opts.RunRef) && applyRunActive(opts.RunRef) {
-		return opts.RunRef, true
-	}
-	if strings.TrimSpace(opts.RunRef) == "" && !bundleFlagSet {
-		if latestRef, ok := latestRunRef(); ok && applyRunActive(latestRef) {
-			return latestRef, true
+func activeApplyRunRefForMigrate(opts migrationRunOptions, bundleFlagSet bool) (string, bool, error) {
+	if strings.TrimSpace(opts.RunRef) != "" && migrationRunMetadataExists(opts.RunRef) {
+		active, err := applyRunActive(opts.RunRef)
+		if err != nil {
+			return "", false, err
+		}
+		if active {
+			return opts.RunRef, true, nil
 		}
 	}
-	return "", false
+	if strings.TrimSpace(opts.RunRef) == "" && !bundleFlagSet {
+		current, err := resolveRunRef("", false)
+		if err != nil {
+			return "", false, err
+		}
+		active, err := applyRunActive(current)
+		if err != nil {
+			return "", false, err
+		}
+		if active {
+			return current, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func refreshMigrationRunSafely(runRef string) (loadedMigrationRun, error) {
+	operationLock, err := acquireRunOperationLock(runRef)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	defer operationLock.Release()
+	return refreshMigrationRunSafelyLocked(runRef)
+}
+
+func refreshMigrationRunSafelyLocked(runRef string) (loadedMigrationRun, error) {
+	runDir, err := existingRunDir(runRef)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	run, err := readRunMetadata(filepath.Join(runDir, "run.json"))
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	hasAppliedSteps, err := runHasAppliedSteps(run)
+	if err != nil {
+		return loadedMigrationRun{}, fmt.Errorf("read applied migration progress: %w", err)
+	}
+	if run.LiveAppliedAt != nil || run.CommittedAt != nil || run.PurgedAt != nil || hasAppliedSteps {
+		return loadMigrationRun(runRef)
+	}
+	return refreshMigrationRunLocked(runRef)
 }
 
 func validateLiveApplyReady(run loadedMigrationRun) error {
-	if decisions := openRunDecisions(run); len(decisions) > 0 {
+	if decisions := liveApplyBlockingDecisions(run); len(decisions) > 0 {
 		decision := decisions[0]
 		action := strings.TrimSpace(decision.Action)
 		if action == "" {
 			action = "resolve the open migration decision"
 		}
-		runRef := strings.TrimSpace(run.Run.Name)
-		if runRef == "" {
-			runRef = run.Run.RunDir
-		}
-		return fmt.Errorf("live apply is blocked by %d open decision(s); next safe step: %s (run `bort next --run %s`)", len(decisions), action, shellQuote(runRef))
+		return fmt.Errorf("live apply is blocked by %d unresolved requirement(s); next safe step: %s (run `%s` to review this run)", len(decisions), action, runScopedCommand(run, "status"))
 	}
 	return nil
 }
 
-func applyRunActive(runRef string) bool {
+func liveApplyBlockingDecisions(run loadedMigrationRun) []runDecision {
+	return openFilteredDecisions(run, func(item runDecisionItem) bool {
+		if item.Stage == "prepare" || item.Readiness == preparer.ReadinessBlocked || item.Readiness == preparer.ReadinessNeedsInput {
+			return true
+		}
+		if item.Readiness != preparer.ReadinessNeedsDecision {
+			return false
+		}
+		switch item.Stage {
+		case "cutover", "rollback", "commit":
+			return false
+		default:
+			return true
+		}
+	})
+}
+
+func applyRunActive(runRef string) (bool, error) {
 	runDir, err := existingRunDir(runRef)
 	if err != nil {
-		return false
+		return false, err
 	}
-	pid := readApplyLockPID(filepath.Join(runDir, "apply.lock"))
-	return pid > 0 && applyLockPIDRunning(pid)
+	return applyLockActive(filepath.Join(runDir, "apply.lock"))
+}
+
+func acquireRunOperationLock(runRef string) (*applyLock, error) {
+	runDir, err := existingRunDir(runRef)
+	if err != nil {
+		return nil, err
+	}
+	lockPath, err := safeRunArtifactPath(runDir, "operation.lock")
+	if err != nil {
+		return nil, err
+	}
+	lock, err := acquireApplyLock(lockPath)
+	if errors.Is(err, errApplyAlreadyRunning) {
+		return nil, errRunOperationActive
+	}
+	return lock, err
+}
+
+func runOperationActive(runRef string) (bool, error) {
+	runDir, err := existingRunDir(runRef)
+	if err != nil {
+		return false, err
+	}
+	return applyLockActive(filepath.Join(runDir, "operation.lock"))
 }
 
 func migrationRunMetadataExists(runRef string) bool {
@@ -297,9 +465,29 @@ func flagSet(fs *flag.FlagSet, name string) bool {
 	return found
 }
 
-func applyLiveMigration(ctx context.Context, run loadedMigrationRun, stderr io.Writer, onProgress func(dokploy.StepProgress)) error {
+func attachLiveMigrationRun(ctx context.Context, run loadedMigrationRun, stderr io.Writer, onProgress func(dokploy.StepProgress)) error {
+	appliedPath, err := safeRunArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied)
+	if err != nil {
+		return err
+	}
+	lockPath, err := safeRunArtifactPath(run.Run.RunDir, "apply.lock")
+	if err != nil {
+		return err
+	}
+	if err := attachLiveMigration(ctx, run, appliedPath, lockPath, stderr, onProgress); err != nil {
+		return err
+	}
+	return finalizeAttachedLiveMigration(ctx, run.Run.RunDir)
+}
+
+func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stderr io.Writer, onProgress func(dokploy.StepProgress)) error {
 	if run.Run.Target != "dokploy" {
 		return fmt.Errorf("--live is only supported for target dokploy, got %q", run.Run.Target)
+	}
+	var err error
+	run, err = ensureSelfContainedLiveRunLocked(run)
+	if err != nil {
+		return err
 	}
 	appliedPath, err := safeRunArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied)
 	if err != nil {
@@ -312,13 +500,27 @@ func applyLiveMigration(ctx context.Context, run loadedMigrationRun, stderr io.W
 	lock, err := acquireApplyLock(lockPath)
 	if err != nil {
 		if err == errApplyAlreadyRunning {
-			return attachLiveMigration(ctx, run, appliedPath, lockPath, stderr, onProgress)
+			if err := attachLiveMigration(ctx, run, appliedPath, lockPath, stderr, onProgress); err != nil {
+				return err
+			}
+			current, err := loadMigrationRun(run.Run.RunDir)
+			if err != nil {
+				return err
+			}
+			if err := requireLiveApplySucceeded(current); err != nil {
+				return err
+			}
+			return markRunLiveAppliedLocked(current.Run)
 		}
 		return fmt.Errorf("lock live migration run: %w", err)
 	}
 	defer lock.Release()
 	if err := validateLiveApplyReady(run); err != nil {
 		return err
+	}
+	plan := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
+	if len(plan.Steps) == 0 {
+		return fmt.Errorf("live migration plan has no executable steps")
 	}
 	client, err := ensureDokployClient(ctx, run.Run.Target, os.Stdin, stderr, stderr)
 	if err != nil {
@@ -331,11 +533,14 @@ func applyLiveMigration(ctx context.Context, run loadedMigrationRun, stderr io.W
 	if err != nil {
 		return err
 	}
-	plan := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
 	resumeFrom := completedApplyPrefix(plan.Steps, ledger.Snapshot())
 	plan.ResumeFrom = resumeFrom
+	beforeStep := func(p dokploy.StepProgress) error {
+		return ledger.Record(p)
+	}
+	plan.BeforeStep = &beforeStep
 	fn := func(p dokploy.StepProgress) {
 		if p.Status == dokploy.StepStatusOK || p.Status == dokploy.StepStatusError || p.Status == dokploy.StepStatusSkipped {
 			if recordErr := ledger.Record(p); recordErr != nil {
@@ -354,7 +559,153 @@ func applyLiveMigration(ctx context.Context, run loadedMigrationRun, stderr io.W
 	if resumeFrom == len(plan.Steps) && len(plan.Steps) > 0 {
 		fmt.Fprintln(stderr, "live mode: all planned dokploy steps are already recorded as complete")
 	}
-	return client.Apply(ctx, plan)
+	if err := client.Apply(ctx, plan); err != nil {
+		return err
+	}
+	if err := ledger.Err(); err != nil {
+		return fmt.Errorf("live apply completed but applied ledger could not be persisted: %w", err)
+	}
+	if err := ledger.MarkSucceeded(); err != nil {
+		return fmt.Errorf("live apply completed but its successful outcome could not be persisted: %w", err)
+	}
+	return markRunLiveAppliedLocked(run.Run)
+}
+
+func ensureSelfContainedLiveRunLocked(run loadedMigrationRun) (loadedMigrationRun, error) {
+	if err := containedPath(run.Run.RunDir, run.Prepare.BundleDir); err == nil {
+		return run, nil
+	} else if run.Run.ApplyOutcomeRequired {
+		return loadedMigrationRun{}, fmt.Errorf("run %q does not have a self-contained reviewed bundle; run `%s` to refresh it before live apply: %w", run.Run.Name, runScopedCommand(run, "migrate"), err)
+	}
+
+	runDir := filepath.FromSlash(run.Run.RunDir)
+	bundleDir, err := snapshotMigrationBundle(run.Prepare.BundleDir, runDir)
+	if err != nil {
+		return loadedMigrationRun{}, fmt.Errorf("snapshot legacy run bundle: %w", err)
+	}
+	removeBundle := true
+	defer func() {
+		if removeBundle {
+			_ = os.RemoveAll(bundleDir)
+		}
+	}()
+	artifacts, artifactDir, err := nextRunArtifacts(runDir, run.Run)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	removeArtifacts := true
+	defer func() {
+		if removeArtifacts {
+			_ = os.RemoveAll(artifactDir)
+		}
+	}()
+
+	now := time.Now().UTC()
+	if strings.TrimSpace(run.Run.Source) == "" && strings.TrimSpace(run.Run.SourceBundleDir) == "" {
+		run.Run.SourceBundleDir = run.Run.BundleDir
+	}
+	run.Run.BundleDir = bundleDir
+	run.Run.ApplyOutcomeRequired = true
+	run.Run.UpdatedAt = now
+	run.Run.Artifacts = artifacts
+	run.Prepare.BundleDir = bundleDir
+	run.Sync.BundleDir = bundleDir
+	run.Cutover.BundleDir = bundleDir
+	run.Rollback.BundleDir = bundleDir
+	run.Commit.BundleDir = bundleDir
+	run.Decisions.RunName = run.Run.Name
+	run.Decisions.RunDir = run.Run.RunDir
+	run.Decisions.BundleDir = bundleDir
+	for decisionIndex := range run.Decisions.Decisions {
+		for itemIndex := range run.Decisions.Decisions[decisionIndex].Items {
+			item := &run.Decisions.Decisions[decisionIndex].Items[itemIndex]
+			switch item.Stage {
+			case "prepare":
+				item.Artifact = runArtifactPath(runDir, artifacts.Prepare)
+			case "sync":
+				item.Artifact = runArtifactPath(runDir, artifacts.Sync)
+			case "cutover":
+				item.Artifact = runArtifactPath(runDir, artifacts.Cutover)
+			case "rollback":
+				item.Artifact = runArtifactPath(runDir, artifacts.Rollback)
+			case "commit":
+				item.Artifact = runArtifactPath(runDir, artifacts.Commit)
+			}
+		}
+	}
+	run.Progress.RunName = run.Run.Name
+	run.Progress.RunDir = run.Run.RunDir
+	run.Progress.UpdatedAt = now
+	run.Applied.RunName = run.Run.Name
+	run.Applied.BundleDir = bundleDir
+	run.Applied.Target = run.Run.Target
+
+	if err := writeJSONArtifact(runArtifactPath(runDir, artifacts.Prepare), run.Prepare); err != nil {
+		return loadedMigrationRun{}, err
+	}
+	if err := writeJSONArtifact(runArtifactPath(runDir, artifacts.Sync), run.Sync); err != nil {
+		return loadedMigrationRun{}, err
+	}
+	if err := writeJSONArtifact(runArtifactPath(runDir, artifacts.Cutover), run.Cutover); err != nil {
+		return loadedMigrationRun{}, err
+	}
+	if err := writeJSONArtifact(runArtifactPath(runDir, artifacts.Rollback), run.Rollback); err != nil {
+		return loadedMigrationRun{}, err
+	}
+	if err := writeJSONArtifact(runArtifactPath(runDir, artifacts.Commit), run.Commit); err != nil {
+		return loadedMigrationRun{}, err
+	}
+	if err := writeJSONArtifact(runArtifactPath(runDir, artifacts.Decisions), run.Decisions); err != nil {
+		return loadedMigrationRun{}, err
+	}
+	if err := writeRunProgress(runArtifactPath(runDir, artifacts.Progress), run.Progress); err != nil {
+		return loadedMigrationRun{}, err
+	}
+	if err := writeRunApplied(runArtifactPath(runDir, artifacts.Applied), run.Applied); err != nil {
+		return loadedMigrationRun{}, err
+	}
+	if err := writeJSONArtifact(filepath.Join(runDir, "run.json"), run.Run); err != nil {
+		return loadedMigrationRun{}, err
+	}
+	removeBundle = false
+	removeArtifacts = false
+	return run, nil
+}
+
+const liveFinalizePollInterval = 50 * time.Millisecond
+
+func finalizeAttachedLiveMigration(ctx context.Context, runRef string) error {
+	ticker := time.NewTicker(liveFinalizePollInterval)
+	defer ticker.Stop()
+	for {
+		run, err := loadMigrationRun(runRef)
+		if err != nil {
+			return err
+		}
+		if run.Run.LiveAppliedAt != nil {
+			return nil
+		}
+		operationLock, err := acquireRunOperationLock(runRef)
+		if err == nil {
+			current, loadErr := loadMigrationRun(runRef)
+			if loadErr == nil {
+				loadErr = requireLiveApplySucceeded(current)
+			}
+			if loadErr == nil {
+				loadErr = markRunLiveAppliedLocked(current.Run)
+			}
+			operationLock.Release()
+			return loadErr
+		}
+		if !errors.Is(err, errRunOperationActive) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 const liveAttachPollInterval = 2 * time.Second
@@ -415,13 +766,11 @@ func attachLiveMigration(ctx context.Context, run loadedMigrationRun, appliedPat
 			if completedApplyPrefix(plan.Steps, applied) >= len(plan.Steps) {
 				return nil
 			}
-			if pid <= 0 {
-				if _, err := os.Stat(lockPath); errors.Is(err, os.ErrNotExist) {
-					return attachExitResult(run, plan.Steps, applied, startedAt)
-				}
-				continue
+			active, err := applyLockActive(lockPath)
+			if err != nil {
+				return fmt.Errorf("check live migration lock: %w", err)
 			}
-			if applyLockPIDRunning(pid) {
+			if active {
 				continue
 			}
 			return attachExitResult(run, plan.Steps, applied, startedAt)
@@ -530,7 +879,7 @@ func ensureDokployClient(ctx context.Context, target string, stdin io.Reader, st
 			}
 			return pingConfiguredDokployClient(ctx, target)
 		} else {
-			return nil, fmt.Errorf("dokploy is not reachable at %s: %w. run `bort init-target dokploy --install --dokploy-url %s`", client.BaseURL, pingErr, client.BaseURL)
+			return nil, fmt.Errorf("dokploy is not reachable at %s: %w. run `%s`", client.BaseURL, pingErr, bortCommand("init-target dokploy --install --dokploy-url "+shellQuote(client.BaseURL)))
 		}
 	}
 	if target == "dokploy" && stdinIsTerminal(stdin) {
@@ -568,7 +917,7 @@ func lookupDokployClient(target string) (*dokploy.Client, error) {
 		}
 		return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
 	}
-	return nil, fmt.Errorf("no dokploy credentials available: set %s and %s, or run `bort init-target dokploy --install`", dokploy.EnvBaseURL, dokploy.EnvToken)
+	return nil, fmt.Errorf("no dokploy credentials available: set %s and %s, or run `%s`", dokploy.EnvBaseURL, dokploy.EnvToken, bortCommand("init-target dokploy --install"))
 }
 
 func resolveDokployClient(ctx context.Context, target string, stdin io.Reader, stderr io.Writer) (*dokploy.Client, error) {
@@ -587,7 +936,7 @@ func resolveDokployClient(ctx context.Context, target string, stdin io.Reader, s
 		return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
 	}
 	if target == "dokploy" && stdinIsTerminal(stdin) {
-		fmt.Fprintln(stderr, "no dokploy credentials found; running `bort init-target dokploy` interactively")
+		fmt.Fprintf(stderr, "no dokploy credentials found; running `%s` interactively\n", bortCommand("init-target dokploy"))
 		if err := runInitTarget(ctx, nil, stdin, stderr, stderr); err != nil {
 			return nil, err
 		}
@@ -603,7 +952,7 @@ func resolveDokployClient(ctx context.Context, target string, stdin io.Reader, s
 			return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
 		}
 	}
-	return nil, fmt.Errorf("no dokploy credentials available: set %s and %s, or run `bort init-target dokploy` first", dokploy.EnvBaseURL, dokploy.EnvToken)
+	return nil, fmt.Errorf("no dokploy credentials available: set %s and %s, or run `%s` first", dokploy.EnvBaseURL, dokploy.EnvToken, bortCommand("init-target dokploy"))
 }
 
 func stdinIsTerminal(stdin io.Reader) bool {
@@ -612,6 +961,56 @@ func stdinIsTerminal(stdin io.Reader) bool {
 		return false
 	}
 	return isInteractiveTerminal(file)
+}
+
+func existingMutableMigrationRun(runDir, runName string) (migrationRun, error) {
+	immutableError := func() error {
+		return fmt.Errorf("run %q has started live execution and its reviewed plan is immutable; create a new run instead", runName)
+	}
+	metadataPath := filepath.Join(runDir, "run.json")
+	if _, err := os.Stat(metadataPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return migrationRun{}, err
+		}
+		appliedPath := filepath.Join(runDir, defaultRunArtifacts().Applied)
+		if _, err := os.Stat(appliedPath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return migrationRun{}, nil
+			}
+			return migrationRun{}, err
+		}
+		probe := migrationRun{Name: runName, RunDir: filepath.ToSlash(filepath.Clean(runDir)), Artifacts: defaultRunArtifacts()}
+		applied, err := readRunApplied(appliedPath, probe)
+		if err != nil {
+			return migrationRun{}, fmt.Errorf("refusing to rewrite run %q because its apply ledger cannot be verified: %w", runName, err)
+		}
+		if len(applied.Steps) > 0 {
+			return migrationRun{}, immutableError()
+		}
+		return migrationRun{}, nil
+	}
+
+	existing, err := readRunMetadata(metadataPath)
+	if err != nil {
+		return migrationRun{}, fmt.Errorf("refusing to rewrite run %q because its metadata cannot be read: %w", runName, err)
+	}
+	existing.RunDir = filepath.ToSlash(filepath.Clean(runDir))
+	existing.Artifacts = existing.Artifacts.withDefaults()
+	if existing.LiveAppliedAt != nil || existing.CommittedAt != nil || existing.PurgedAt != nil {
+		return migrationRun{}, immutableError()
+	}
+	appliedPath, err := safeRunArtifactPath(runDir, existing.Artifacts.Applied)
+	if err != nil {
+		return migrationRun{}, fmt.Errorf("refusing to rewrite run %q because its apply ledger path is invalid: %w", runName, err)
+	}
+	applied, err := readRunApplied(appliedPath, existing)
+	if err != nil {
+		return migrationRun{}, fmt.Errorf("refusing to rewrite run %q because its apply ledger cannot be verified: %w", runName, err)
+	}
+	if len(applied.Steps) > 0 {
+		return migrationRun{}, immutableError()
+	}
+	return existing, nil
 }
 
 func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
@@ -627,21 +1026,229 @@ func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
 	if err := ensurePrivateRunDir(runDir); err != nil {
 		return loadedMigrationRun{}, err
 	}
+	operationLock, err := acquireRunOperationLock(runDir)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	defer operationLock.Release()
+	return createMigrationRunLocked(opts, runDir, runName, now)
+}
+
+func snapshotMigrationBundle(sourceDir, runDir string) (string, error) {
+	info, err := os.Lstat(sourceDir)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", fmt.Errorf("migration bundle %s must be a directory and cannot be a symlink", sourceDir)
+	}
+	sourceAbs, err := filepath.Abs(sourceDir)
+	if err != nil {
+		return "", err
+	}
+	runAbs, err := filepath.Abs(runDir)
+	if err != nil {
+		return "", err
+	}
+	relRun, err := filepath.Rel(sourceAbs, runAbs)
+	if err != nil {
+		return "", err
+	}
+	if relRun == "." || (relRun != ".." && !strings.HasPrefix(relRun, ".."+string(os.PathSeparator))) {
+		return "", fmt.Errorf("migration bundle %s cannot contain run directory %s", sourceDir, runDir)
+	}
+	sourceDigest, err := digestMigrationBundle(sourceDir)
+	if err != nil {
+		return "", err
+	}
+
+	snapshotDir, err := os.MkdirTemp(runDir, "bundle-")
+	if err != nil {
+		return "", err
+	}
+	removeSnapshot := true
+	defer func() {
+		if removeSnapshot {
+			_ = os.RemoveAll(snapshotDir)
+		}
+	}()
+	if err := os.Chmod(snapshotDir, 0o700); err != nil {
+		return "", err
+	}
+	if err := filepath.WalkDir(sourceDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(sourceDir, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("migration bundle entry %s cannot be a symlink", path)
+		}
+		target := filepath.Join(snapshotDir, rel)
+		if entry.IsDir() {
+			if err := os.MkdirAll(target, 0o700); err != nil {
+				return err
+			}
+			return os.Chmod(target, 0o700)
+		}
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !entryInfo.Mode().IsRegular() {
+			return fmt.Errorf("migration bundle entry %s must be a regular file", path)
+		}
+		contents, err := readFileNoFollow(path)
+		if err != nil {
+			return err
+		}
+		return writeFileAtomic(target, contents, 0o600)
+	}); err != nil {
+		return "", err
+	}
+	if err := validateMigrationBundleSnapshot(sourceDir, snapshotDir, sourceDigest); err != nil {
+		return "", err
+	}
+	removeSnapshot = false
+	return filepath.Clean(snapshotDir), nil
+}
+
+func validateMigrationBundleSnapshot(sourceDir, snapshotDir string, sourceDigest [sha256.Size]byte) error {
+	afterDigest, err := digestMigrationBundle(sourceDir)
+	if err != nil {
+		return err
+	}
+	snapshotDigest, err := digestMigrationBundle(snapshotDir)
+	if err != nil {
+		return err
+	}
+	if afterDigest != sourceDigest || snapshotDigest != sourceDigest {
+		return fmt.Errorf("migration bundle %s changed while it was being snapshotted; retry after its files are stable", sourceDir)
+	}
+	return nil
+}
+
+func digestMigrationBundle(root string) ([sha256.Size]byte, error) {
+	digest := sha256.New()
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("migration bundle entry %s cannot be a symlink", path)
+		}
+		if rel == "." {
+			if !entry.IsDir() {
+				return fmt.Errorf("migration bundle %s must be a directory", root)
+			}
+			return nil
+		}
+		if err := writeMigrationBundleDigestField(digest, []byte(filepath.ToSlash(rel))); err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return writeMigrationBundleDigestField(digest, []byte("directory"))
+		}
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !entryInfo.Mode().IsRegular() {
+			return fmt.Errorf("migration bundle entry %s must be a regular file", path)
+		}
+		contents, err := readFileNoFollow(path)
+		if err != nil {
+			return err
+		}
+		if err := writeMigrationBundleDigestField(digest, []byte("file")); err != nil {
+			return err
+		}
+		return writeMigrationBundleDigestField(digest, contents)
+	})
+	var result [sha256.Size]byte
+	if err != nil {
+		return result, err
+	}
+	copy(result[:], digest.Sum(nil))
+	return result, nil
+}
+
+func writeMigrationBundleDigestField(w io.Writer, value []byte) error {
+	if _, err := fmt.Fprintf(w, "%d:", len(value)); err != nil {
+		return err
+	}
+	_, err := w.Write(value)
+	return err
+}
+
+func nextRunArtifacts(runDir string, existing migrationRun) (runArtifacts, string, error) {
+	artifacts := defaultRunArtifacts()
+	if existing.APIVersion == "" {
+		return artifacts, "", nil
+	}
+	dir, err := os.MkdirTemp(runDir, "plan-")
+	if err != nil {
+		return runArtifacts{}, "", err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		_ = os.RemoveAll(dir)
+		return runArtifacts{}, "", err
+	}
+	prefix := filepath.Base(dir)
+	artifacts.Prepare = filepath.ToSlash(filepath.Join(prefix, artifacts.Prepare))
+	artifacts.Sync = filepath.ToSlash(filepath.Join(prefix, artifacts.Sync))
+	artifacts.Cutover = filepath.ToSlash(filepath.Join(prefix, artifacts.Cutover))
+	artifacts.Rollback = filepath.ToSlash(filepath.Join(prefix, artifacts.Rollback))
+	artifacts.Commit = filepath.ToSlash(filepath.Join(prefix, artifacts.Commit))
+	artifacts.Decisions = filepath.ToSlash(filepath.Join(prefix, artifacts.Decisions))
+	artifacts.Progress = filepath.ToSlash(filepath.Join(prefix, artifacts.Progress))
+	artifacts.Applied = filepath.ToSlash(filepath.Join(prefix, artifacts.Applied))
+	return artifacts, dir, nil
+}
+
+func createMigrationRunLocked(opts migrationRunOptions, runDir, runName string, now time.Time) (loadedMigrationRun, error) {
+	existingRun, err := existingMutableMigrationRun(runDir, runName)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	bundleDir, err := snapshotMigrationBundle(opts.BundleDir, runDir)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	sourceBundleDir := ""
+	removeSnapshot := true
+	if strings.TrimSpace(opts.Source) == "" {
+		sourceBundleDir = opts.BundleDir
+	}
+	defer func() {
+		if removeSnapshot {
+			_ = os.RemoveAll(bundleDir)
+		}
+	}()
 
 	createdAt := now
-	if existing, err := readRunMetadata(filepath.Join(runDir, "run.json")); err == nil && !existing.CreatedAt.IsZero() {
-		createdAt = existing.CreatedAt
+	if !existingRun.CreatedAt.IsZero() {
+		createdAt = existingRun.CreatedAt
 	}
 
 	state, err := readBortState(defaultStatePath())
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
-	if _, err := applyStateEnvToBundle(state, opts.BundleDir); err != nil {
+	if _, err := applyStateEnvToBundle(state, bundleDir); err != nil {
 		return loadedMigrationRun{}, err
 	}
 
-	preparePlan, err := preparer.Plan(preparer.Options{BundleDir: opts.BundleDir, Target: opts.Target, AppName: opts.AppName})
+	preparePlan, err := preparer.Plan(preparer.Options{BundleDir: bundleDir, Target: opts.Target, AppName: opts.AppName})
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
@@ -659,6 +1266,16 @@ func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
+	artifacts, artifactDir, err := nextRunArtifacts(runDir, existingRun)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	removeArtifacts := artifactDir != ""
+	defer func() {
+		if removeArtifacts {
+			_ = os.RemoveAll(artifactDir)
+		}
+	}()
 
 	run := migrationRun{
 		APIVersion:               runAPIVersion,
@@ -666,15 +1283,20 @@ func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
 		RunDir:                   filepath.ToSlash(filepath.Clean(runDir)),
 		CreatedAt:                createdAt,
 		UpdatedAt:                now,
+		LiveAppliedAt:            existingRun.LiveAppliedAt,
+		CommittedAt:              existingRun.CommittedAt,
+		PurgedAt:                 existingRun.PurgedAt,
+		ApplyOutcomeRequired:     true,
 		Source:                   opts.Source,
-		BundleDir:                opts.BundleDir,
+		BundleDir:                bundleDir,
+		SourceBundleDir:          sourceBundleDir,
 		ManifestPath:             opts.ManifestPath,
 		Target:                   opts.Target,
 		AppName:                  opts.AppName,
 		DryRun:                   true,
 		ObservationWindowSeconds: opts.ObservationWindowSeconds,
 		RollbackWindowSeconds:    opts.RollbackWindowSeconds,
-		Artifacts:                defaultRunArtifacts(),
+		Artifacts:                artifacts,
 	}
 
 	if err := writeJSONArtifact(runArtifactPath(runDir, run.Artifacts.Prepare), preparePlan); err != nil {
@@ -701,8 +1323,21 @@ func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
-	progress, err := readRunProgress(progressPath, run)
-	if err != nil {
+	progress := emptyRunProgress(run)
+	if existingRun.APIVersion != "" {
+		existingProgressPath, err := safeRunArtifactPath(runDir, existingRun.Artifacts.Progress)
+		if err != nil {
+			return loadedMigrationRun{}, err
+		}
+		progress, err = readRunProgress(existingProgressPath, existingRun)
+		if err != nil {
+			return loadedMigrationRun{}, err
+		}
+	}
+	progress.RunName = run.Name
+	progress.RunDir = run.RunDir
+	progress.UpdatedAt = now
+	if err := writeRunProgress(progressPath, progress); err != nil {
 		return loadedMigrationRun{}, err
 	}
 	loadedRun.Progress = progress
@@ -714,15 +1349,33 @@ func createMigrationRun(opts migrationRunOptions) (loadedMigrationRun, error) {
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
+	if err := writeRunApplied(appliedPath, applied); err != nil {
+		return loadedMigrationRun{}, err
+	}
 	loadedRun.Applied = applied
 	if err := writeJSONArtifact(filepath.Join(runDir, "run.json"), run); err != nil {
 		return loadedMigrationRun{}, err
 	}
 
+	removeSnapshot = false
+	removeArtifacts = false
 	return loadedRun, nil
 }
 
 func refreshMigrationRun(runRef string) (loadedMigrationRun, error) {
+	operationLock, err := acquireRunOperationLock(runRef)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
+	defer operationLock.Release()
+	return refreshMigrationRunLocked(runRef)
+}
+
+func refreshMigrationRunLocked(runRef string) (loadedMigrationRun, error) {
+	return refreshMigrationRunLockedWithInputs(runRef, "", "")
+}
+
+func refreshMigrationRunLockedWithInputs(runRef, bundleOverride, manifestOverride string) (loadedMigrationRun, error) {
 	runDir, err := existingRunDir(runRef)
 	if err != nil {
 		return loadedMigrationRun{}, err
@@ -733,11 +1386,21 @@ func refreshMigrationRun(runRef string) (loadedMigrationRun, error) {
 	}
 	existing.Artifacts = existing.Artifacts.withDefaults()
 	manifestPath := existing.ManifestPath
+	if strings.TrimSpace(manifestOverride) != "" {
+		manifestPath = manifestOverride
+	}
 	if manifestPath == "" && strings.TrimSpace(existing.Source) != "" {
 		manifestPath = runArtifactPath(runDir, "manifest.json")
 	}
-	return createMigrationRun(migrationRunOptions{
-		BundleDir:                existing.BundleDir,
+	bundleDir := strings.TrimSpace(bundleOverride)
+	if bundleDir == "" {
+		bundleDir = existing.BundleDir
+	}
+	if strings.TrimSpace(bundleOverride) == "" && strings.TrimSpace(existing.Source) == "" && strings.TrimSpace(existing.SourceBundleDir) != "" {
+		bundleDir = existing.SourceBundleDir
+	}
+	return createMigrationRunLocked(migrationRunOptions{
+		BundleDir:                bundleDir,
 		Target:                   existing.Target,
 		AppName:                  existing.AppName,
 		RunRef:                   runDir,
@@ -745,20 +1408,20 @@ func refreshMigrationRun(runRef string) (loadedMigrationRun, error) {
 		ManifestPath:             manifestPath,
 		ObservationWindowSeconds: existing.ObservationWindowSeconds,
 		RollbackWindowSeconds:    existing.RollbackWindowSeconds,
-	})
+	}, runDir, runNameFromDir(runDir), time.Now().UTC())
 }
 
 func runStatus(_ context.Context, args []string, stdout, stderr io.Writer) error {
-	run, err := loadRunFromArgs("status", args, stderr, false)
+	run, err := loadRunFromArgs("status", args, stderr)
 	if err != nil {
 		return err
 	}
-	writeMigrationRunText(stdout, "Migration run", summarizeMigrationRun(run))
+	writeAppFirstCockpit(stdout, run)
 	return nil
 }
 
 func runNext(_ context.Context, args []string, stdout, stderr io.Writer) error {
-	run, err := loadRunFromArgs("next", args, stderr, true)
+	run, err := loadRunFromArgs("next", args, stderr)
 	if err != nil {
 		return err
 	}
@@ -766,7 +1429,7 @@ func runNext(_ context.Context, args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func loadRunFromArgs(command string, args []string, stderr io.Writer, allowLatest bool) (loadedMigrationRun, error) {
+func loadRunFromArgs(command string, args []string, stderr io.Writer) (loadedMigrationRun, error) {
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -778,16 +1441,11 @@ func loadRunFromArgs(command string, args []string, stderr io.Writer, allowLates
 	if runRef == "" && fs.NArg() == 1 {
 		runRef = fs.Arg(0)
 	}
-	if strings.TrimSpace(runRef) == "" {
-		if allowLatest {
-			if latestRef, ok := latestRunRef(); ok {
-				return loadMigrationRun(latestRef)
-			}
-			return loadedMigrationRun{}, fmt.Errorf("no migration run found; run bort to start one")
-		}
-		return loadedMigrationRun{}, fmt.Errorf("--run is required")
+	resolved, err := resolveRunRef(runRef, false)
+	if err != nil {
+		return loadedMigrationRun{}, err
 	}
-	return loadMigrationRun(runRef)
+	return loadMigrationRun(resolved)
 }
 
 func loadMigrationRun(runRef string) (loadedMigrationRun, error) {
@@ -810,11 +1468,6 @@ func loadMigrationRun(runRef string) (loadedMigrationRun, error) {
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
-	state, err := readBortState(defaultStatePath())
-	if err != nil {
-		return loadedMigrationRun{}, err
-	}
-	applyStateOverridesToPrepare(state, &preparePlan)
 	syncResult, err := readSyncArtifact(runArtifactPath(runDir, run.Artifacts.Sync), expect)
 	if err != nil {
 		return loadedMigrationRun{}, err
@@ -919,10 +1572,11 @@ func summarizeMigrationRun(run loadedMigrationRun) migrationRunSummary {
 		}
 	}
 
+	blockingDecisions := liveApplyBlockingDecisions(run)
 	summary.Decisions = openRunDecisions(run)
 	summary.Progress = progressSummary(run.Progress)
 	summary.FirstGates = firstUnresolvedRunGates(run, 3)
-	summary.Next = nextSafeStep(run, summary.Decisions)
+	summary.Next = nextSafeStep(run, blockingDecisions)
 	return summary
 }
 
@@ -940,8 +1594,27 @@ func firstUnresolvedRunGates(run loadedMigrationRun, limit int) []runGateSummary
 }
 
 func nextSafeStep(run loadedMigrationRun, decisions []runDecision) runNextStep {
+	if run.Run.PurgedAt != nil {
+		return runNextStep{Action: "migration complete", Reason: "selected source leftovers were purged after target acceptance"}
+	}
+	if run.Run.CommittedAt != nil {
+		return runNextStep{Action: fmt.Sprintf("run `%s` to audit remaining metadata and source leftovers", runScopedCommand(run, "cleanup")), Reason: "the target is accepted and source app containers are retired"}
+	}
+	if run.Run.LiveAppliedAt != nil || liveApplySucceeded(run) {
+		return runNextStep{Action: fmt.Sprintf("verify the target, then run `%s` after the rollback window", runScopedCommand(run, "commit --apply")), Reason: "the live apply completed and the source remains available for rollback"}
+	}
+	applyActive, applyActiveErr := applyRunActive(run.Run.RunDir)
+	if applyActiveErr != nil {
+		return runNextStep{Action: fmt.Sprintf("inspect the live-apply lock for run %s before retrying", shellQuote(run.Run.Name)), Reason: applyActiveErr.Error()}
+	}
+	if applyActive {
+		return runNextStep{Action: fmt.Sprintf("run `%s` to view the active apply", liveApplyCommand(run)), Reason: "another process is applying this run"}
+	}
+	if len(run.Applied.Steps) > 0 {
+		return runNextStep{Action: fmt.Sprintf("run `%s` to resume the interrupted apply", liveApplyCommand(run)), Reason: "the apply ledger contains incomplete work"}
+	}
 	if decisions == nil {
-		decisions = openRunDecisions(run)
+		decisions = liveApplyBlockingDecisions(run)
 	}
 	if len(decisions) > 0 {
 		decision := decisions[0]
@@ -953,36 +1626,32 @@ func nextSafeStep(run loadedMigrationRun, decisions []runDecision) runNextStep {
 		}
 	}
 
-	for _, readiness := range []preparer.Readiness{preparer.ReadinessBlocked, preparer.ReadinessNeedsInput, preparer.ReadinessNeedsDecision} {
-		gates := gatesWithReadiness(run, readiness)
-		if len(gates) == 0 {
-			continue
-		}
-		gate := gates[0]
-		return runNextStep{Action: nextAction(gate), Reason: gateReason(gate), Artifact: gate.Artifact}
-	}
-	if run.Run.Target == "dokploy" && !hasDokployCredentials(run.Run.Target) {
-		return runNextStep{
-			Action: "run `bort init-target dokploy` to bootstrap the target api key",
-			Reason: "all gates are clear but no dokploy credentials are stored in .bort/state.json",
-		}
-	}
 	return runNextStep{
 		Action:   fmt.Sprintf("run `%s` to apply the planned steps against the target", liveApplyCommand(run)),
-		Reason:   "all gates are clear and target credentials are stored",
+		Reason:   "all setup requirements are resolved; interactive target setup runs inline if needed",
 		Artifact: runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Commit),
 	}
 }
 
 func liveApplyCommand(run loadedMigrationRun) string {
-	runRef := strings.TrimSpace(run.Run.Name)
-	if runRef == "" {
-		runRef = run.Run.RunDir
+	return runScopedCommand(run, "migrate --live")
+}
+
+func runScopedCommand(run loadedMigrationRun, args string) string {
+	runRef := strings.TrimSpace(run.Run.RunDir)
+	runName := strings.TrimSpace(run.Run.Name)
+	if runName != "" {
+		expectedDir := filepath.Join(".bort", "runs", runName)
+		runDirAbs, runDirErr := filepath.Abs(runRef)
+		expectedDirAbs, expectedDirErr := filepath.Abs(expectedDir)
+		if runRef == "" || (runDirErr == nil && expectedDirErr == nil && filepath.Clean(runDirAbs) == filepath.Clean(expectedDirAbs)) {
+			runRef = runName
+		}
 	}
 	if runRef == "" {
-		return "bort migrate --live"
+		return bortCommand(args)
 	}
-	return "bort migrate --live --run " + shellQuote(runRef)
+	return bortCommand(args + " --run " + shellQuote(runRef))
 }
 
 func hasDokployCredentials(target string) bool {
@@ -1002,6 +1671,68 @@ func openRunDecisions(run loadedMigrationRun) []runDecision {
 		decisions = generateRunDecisions(run, run.Run.UpdatedAt).Decisions
 	}
 	return applyProgressToDecisions(decisions, run.Progress)
+}
+
+func openSetupDecisions(run loadedMigrationRun) []runDecision {
+	return openFilteredDecisions(run, func(item runDecisionItem) bool {
+		return item.Stage == "prepare"
+	})
+}
+
+func openReviewDecisions(run loadedMigrationRun) []runDecision {
+	return openFilteredDecisions(run, func(item runDecisionItem) bool {
+		if item.Readiness != preparer.ReadinessNeedsDecision {
+			return false
+		}
+		switch item.Stage {
+		case "cutover", "rollback", "commit":
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+func openDownstreamBlockingDecisions(run loadedMigrationRun) []runDecision {
+	return openFilteredDecisions(run, func(item runDecisionItem) bool {
+		return item.Stage != "prepare" && (item.Readiness == preparer.ReadinessBlocked || item.Readiness == preparer.ReadinessNeedsInput)
+	})
+}
+
+func openFilteredDecisions(run loadedMigrationRun, include func(runDecisionItem) bool) []runDecision {
+	decisions := []runDecision{}
+	for _, decision := range openRunDecisions(run) {
+		items := make([]runDecisionItem, 0, len(decision.Items))
+		for _, item := range decision.Items {
+			if include(item) {
+				items = append(items, item)
+			}
+		}
+		if len(items) == 0 {
+			continue
+		}
+		decisions = append(decisions, runDecisionWithItems(decision, items))
+	}
+	sortRunDecisions(decisions)
+	return decisions
+}
+
+func runDecisionWithItems(decision runDecision, items []runDecisionItem) runDecision {
+	decision.Items = items
+	decision.Count = len(items)
+	decision.Apps = nil
+	decision.Codes = nil
+	decision.Readiness = preparer.ReadinessReadyToCreate
+	for _, item := range items {
+		decision.Apps = uniqueAppend(decision.Apps, item.App)
+		decision.Codes = uniqueAppend(decision.Codes, item.Code)
+		decision.Readiness = preparer.WorseReadiness(decision.Readiness, item.Readiness)
+	}
+	decision.Apps = sortedStrings(decision.Apps)
+	decision.Codes = sortedStrings(decision.Codes)
+	decision.Action = decisionAction(decision)
+	decision.Reason = decisionReason(decision)
+	return decision
 }
 
 func generateRunDecisions(run loadedMigrationRun, generatedAt time.Time) runDecisions {
@@ -1625,6 +2356,41 @@ func readRunMetadata(path string) (migrationRun, error) {
 	return run, nil
 }
 
+func markRunLiveAppliedLocked(run migrationRun) error {
+	return updateRunLifecycleLocked(run, func(current *migrationRun, now time.Time) {
+		if current.LiveAppliedAt == nil {
+			current.LiveAppliedAt = &now
+		}
+	})
+}
+
+func markRunCommittedLocked(run migrationRun) error {
+	return updateRunLifecycleLocked(run, func(current *migrationRun, now time.Time) {
+		if current.CommittedAt == nil {
+			current.CommittedAt = &now
+		}
+	})
+}
+
+func markRunPurgedLocked(run migrationRun) error {
+	return updateRunLifecycleLocked(run, func(current *migrationRun, now time.Time) {
+		if current.PurgedAt == nil {
+			current.PurgedAt = &now
+		}
+	})
+}
+
+func updateRunLifecycleLocked(run migrationRun, update func(*migrationRun, time.Time)) error {
+	runDir := filepath.FromSlash(run.RunDir)
+	path := filepath.Join(runDir, "run.json")
+	current, err := readRunMetadata(path)
+	if err != nil {
+		return err
+	}
+	update(&current, time.Now().UTC())
+	return writeJSONArtifact(path, current)
+}
+
 func readRunDecisions(path string, run migrationRun) (runDecisions, error) {
 	var decisions runDecisions
 	if err := planfile.Read(path, &decisions); err != nil {
@@ -1646,9 +2412,10 @@ func readRunDecisions(path string, run migrationRun) (runDecisions, error) {
 }
 
 func writeJSONArtifact(path string, value any) error {
-	return writeOutput(io.Discard, path, func(out io.Writer) error {
-		encoder := json.NewEncoder(out)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(value)
-	})
+	contents, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	contents = append(contents, '\n')
+	return writeFileAtomic(path, contents, 0o600)
 }

@@ -37,7 +37,8 @@ shaped:
 - **private local artifacts** so migration bundles, state, and target API keys stay
   on the server.
 - **safe cleanup** that inventories leftovers and only applies narrow metadata
-  cleanup after a database backup.
+  cleanup after a database backup, plus a separate confirmed source purge path
+  for post-acceptance Coolify leftovers.
 
 ## Why Bort exists
 
@@ -67,8 +68,13 @@ Bort is at the local-first same-VPS migration stage.
   handling.
 - Show a linear status view with per-app health, attention items, and `fix:`
   commands.
+- Persist one explicitly selected current run in `.bort/state.json` so live apply,
+  acceptance, and cleanup operate on the run you reviewed instead of guessing by
+  file modification time.
 - Record env answers and data-store strategies in `.bort/state.json` so resolved
   issues disappear from the next run.
+- Keep each source-created run self-contained under `.bort/runs/<name>` with its
+  private manifest, bundle, plans, progress, and apply ledger.
 - Prepare Dokploy resources in dry-run form, then create/reuse projects and compose
   apps in explicit live mode.
 - Upload sanitized env and deploy the captured raw compose/image snapshot without
@@ -80,6 +86,10 @@ Bort is at the local-first same-VPS migration stage.
   apply.
 - Run non-destructive cleanup inventory and, when explicitly applied, remove only
   safe empty zero-domain Dokploy metadata after backing up the Dokploy database.
+- Dry-run a source purge, then remove eligible source containers and networks
+  only with an explicit scope and confirmation phrase. When named volumes or host
+  paths are present, every listed source resource must instead be removed manually
+  before Bort verifies the completed purge.
 
 Not implemented yet:
 
@@ -88,9 +98,8 @@ Not implemented yet:
 - Continuous volume delta sync.
 - Database replication adapters beyond the current local dump/restore and
   stopped-copy paths.
-- Destructive source purge. Non-destructive cleanup inventory and metadata-only
-  Dokploy cleanup are implemented, but Bort does not delete Coolify containers,
-  volumes, networks, credentials, or target apps.
+- Automatic source image pruning. `cleanup purge` intentionally leaves Docker
+  images alone because image tags/layers can be shared with target workloads.
 - Reverse and third-party platform adapters listed in the roadmap below.
 
 ## Quick start
@@ -114,67 +123,177 @@ mkdir -p bin
 go build -o bin/bort ./cmd/bort
 ```
 
-Run the safest same-VPS audit from the source Coolify server:
+The examples below use an installed `bort`; substitute `./bin/bort` when using
+the local build.
+
+For a guided same-VPS Coolify → Dokploy migration, run Bort from the source
+server in a terminal:
 
 ```sh
-sudo bin/bort scan --source coolify-local --output manifest.json
-bin/bort export --manifest manifest.json --output-dir bort-bundle
-bin/bort
+sudo bort
 ```
 
-`bort` with no subcommand is the normal product surface. It resumes the latest run
-when one exists, creates a dry-run from `bort-bundle` when that default bundle
-exists, or prompts interactively when it needs a source and run name.
+`bort` is the normal migration cockpit. It starts guided setup when needed and
+otherwise resumes the current run. Review each app, follow the shown `fix:` and
+`next:` guidance, and rerun `sudo bort` until the cockpit shows `READY`. Target
+setup is offered inline when credentials are needed.
+
+Use one privilege model for the whole lifecycle. Same-VPS discovery, state copy,
+proxy cutover, source retirement, and purge need host-level Docker and filesystem
+access, so the examples consistently use `sudo`. Bort keeps `.bort` private to
+that OS identity (`0700` directories and `0600` files) and preserves the `sudo`
+prefix in copy-paste guidance. If your regular account already has all required
+Docker and source-path access, omit `sudo` from the first command and every later
+lifecycle command instead; do not switch identities within one workspace.
+
+The noninteractive start command performs discovery, exports a private bundle,
+creates all run artifacts, and selects the new run in one step:
+
+```sh
+sudo bort migrate --source coolify-local
+sudo bort
+sudo bort migrate --live
+sudo bort commit --apply
+sudo bort cleanup
+```
+
+The lifecycle is deliberately explicit:
+
+1. `sudo bort` or `sudo bort migrate --source ...` starts or resumes a reviewed
+   dry-run.
+2. `sudo bort` shows setup blockers and records interactive fixes.
+3. `sudo bort migrate --live` applies only the selected reviewed run.
+4. `sudo bort commit --apply` accepts the target and retires source app
+   containers.
+5. `sudo bort cleanup` audits leftovers; optional apply and purge commands remain
+   separately gated.
+
+For an existing manifest, use the same consolidated path:
+
+```sh
+sudo bort migrate --manifest manifest.json
+```
+
+Source and manifest starts create a self-contained directory under
+`.bort/runs/<name>` containing the private manifest, exported bundle, reviewed
+plans, progress, and apply ledger. `.bort/state.json` stores the current run along
+with recorded env/data decisions and target credentials. Pass `--run <name>` to
+select another run explicitly. Mutating commands never choose a run by mtime.
 
 When Bort asks for missing values or data decisions, use the fix commands it
 prints:
 
 ```sh
-bin/bort env demo-app API_TOKEN=secret DATABASE_URL=postgres://...
-bin/bort data demo-app postgres --migrate
-bin/bort
-```
-
-Create or refresh a named dry-run run:
-
-```sh
-bin/bort migrate --bundle bort-bundle --target dokploy --run demo-run
-bin/bort status --run demo-run
-bin/bort next --run demo-run
-```
-
-Only after `bort next` says the gates are clear, bootstrap target credentials and
-apply live:
-
-```sh
-bin/bort init-target dokploy --install --dokploy-url http://127.0.0.1:3030
-bin/bort migrate --live --run demo-run
+sudo bort env demo-app API_TOKEN=secret DATABASE_URL=postgres://...
+sudo bort data demo-app postgres --migrate
+sudo bort
 ```
 
 After you accept the target, retire the source app stack and audit leftovers:
 
 ```sh
-bin/bort commit --apply --run demo-run
-bin/bort cleanup --run demo-run
-bin/bort cleanup --apply --run demo-run
+sudo bort commit --apply
+sudo bort cleanup
+sudo bort cleanup --apply
+sudo bort cleanup purge
+sudo bort cleanup purge --apply --app demo-app --confirm "purge <run-name>"
 ```
 
 `cleanup` is the non-destructive cleanup surface. `cleanup --apply` is
 metadata-only: it does not remove source containers, volumes, networks,
 source-control credentials, or Dokploy target apps.
 
+`cleanup purge` is the destructive source cleanup surface. It is still dry-run by
+default, and `--apply` refuses to run unless you pass an explicit scope
+(`--app`, `--project`, or `--all-apps`), the run has a successful live apply
+ledger, the target has been accepted with `sudo bort commit --apply`, and you provide
+the confirmation phrase shown in the dry-run output. It writes a private
+purge-plan backup before deleting eligible source containers and source networks
+by their exact inspected Docker IDs. Bort never deletes named volumes or host
+source paths. If either is included, the dry run requires manual removal of every
+listed container, volume, network, and path; `--apply` only verifies that the
+whole scope remains absent instead of combining absence checks with automatic
+deletion. Verification-only purges do not set `PurgedAt`, because Bort cannot
+lock external tools out of recreating an absent resource. `--all-apps`
+covers non-platform apps by default; platform-role leftovers such as Coolify
+source/proxy resources require `--include-platform`. It does not remove
+source-control credentials, target Dokploy resources, or Docker images. A full
+`--all-apps` purge marks the migration complete; app- or project-scoped purges do
+not claim that the whole run is finished.
+
+## Acceptance trace
+
+The automated lifecycle trace uses a disposable workspace, fake Dokploy HTTP
+API, and fake Docker executable. It creates a self-contained run, performs live
+apply, verifies `TARGET LIVE`, commits, verifies `COMMITTED`, inventories cleanup,
+applies a confirmed all-app purge, and verifies `COMPLETE`:
+
+```sh
+go test ./internal/cli -run '^TestLifecycleAcceptanceTraceWithFakeDokploy$' -v
+```
+
+Real container, volume, network, bind-path, and proxy behavior still needs a
+throwaway same-VPS host. Never run this destructive acceptance pass on a host
+containing data you intend to keep. On a fresh VM or restorable snapshot:
+
+1. Install Coolify and Dokploy, then deploy one stateless disposable Coolify app
+   with a route, source network, and non-secret test env value.
+2. Record the source container, network, and target project names before migration.
+3. Run the complete lifecycle under one identity:
+
+   ```sh
+   run="bort-acceptance-$(date +%Y%m%d-%H%M%S)"
+   sudo bort migrate --source coolify-local --run "$run"
+   sudo bort
+   sudo bort migrate --live --run "$run"
+   sudo bort status --run "$run"
+   sudo bort commit --apply --run "$run"
+   sudo bort cleanup --run "$run"
+   sudo bort cleanup purge --run "$run" --all-apps
+   ```
+
+   Review the purge plan and verify the target still serves the disposable
+   workload before applying it:
+
+   ```sh
+   sudo bort cleanup purge --apply --run "$run" --all-apps --confirm "purge $run"
+   sudo bort status --run "$run"
+   ```
+
+4. Confirm the target app remains healthy, `run.json` contains all three
+   lifecycle timestamps, the selected source container and network are absent,
+   and target resources plus source-control credentials were not removed.
+5. Restore the clean snapshot and repeat with a disposable app that has a named
+   volume and bind mount under a disposable directory. After the purge dry run,
+   manually remove every listed source resource. Confirm `--apply` performs only
+   absence verification, leaves the run committed rather than complete, and does
+   not delete any replacement resource introduced before verification.
+6. Destroy the VM or restore the snapshot after saving only the redacted command
+   output and lifecycle metadata needed for release evidence.
+
 ## Safety model
 
 Bort is designed for production boxes where the safest default is "look first."
 
-- **dry-run first:** scan, plan, validate, prepare, sync planning, cutover planning,
-  rollback planning, commit planning, and cleanup inventory are non-mutating by
-  default.
-- **explicit live path:** target creation and traffic movement only happen through
-  `bort migrate --live` after readiness gates are clear.
-- **resume instead of restart:** live apply writes an apply lock and
-  `.bort/runs/<name>/applied.json`, so reruns can resume or attach without
-  replaying completed steps blindly.
+- **dry-run first:** source setup, plan, validate, prepare, sync, cutover,
+  rollback, commit, cleanup, and purge planning are non-mutating by default.
+- **explicit live path:** target creation and traffic movement happen only through
+  `sudo bort migrate --live` after setup blockers are clear. Live mode never creates a
+  run implicitly and rejects source/planning flags.
+- **explicit run ownership:** `.bort/state.json` names the current reviewed run.
+  `--run` overrides it explicitly, and mutating commands never infer a destructive
+  target from whichever `run.json` has the newest mtime.
+- **immutable live plans:** after live execution begins, Bort will not regenerate
+  that run's reviewed plan or reorder its apply steps. Create a new run when the
+  plan itself must change.
+- **serialized run mutation:** planning, live apply, target acceptance, cleanup
+  apply, and purge apply share a per-run operation lock. Live apply also writes a
+  separate attachable apply lock and `.bort/runs/<name>/applied.json`, so reruns
+  can attach or resume without racing another mutation or replaying completed
+  steps blindly.
+- **persisted lifecycle:** `run.json` records when the target went live, when the
+  target was accepted, and when a full source purge completed. Older runs remain
+  compatible through apply-ledger inference.
 - **private files:** migration bundles, state, env, and target credentials are local
   artifacts with private permissions.
 - **no token flags:** Coolify API tokens are read from `BORT_COOLIFY_TOKEN`, not from
@@ -191,23 +310,48 @@ Bort is designed for production boxes where the safest default is "look first."
 - **narrow cleanup:** `cleanup --apply` backs up the Dokploy database and only deletes
   stale Dokploy platform metadata records named `coolify-proxy`, `proxy`, or
   `source` when the project is empty and still has zero domains.
+- **separate purge:** destructive source deletion lives under `cleanup purge`,
+  never under regular app entrypoints or metadata cleanup. `--apply` requires a
+  selected `--app`, `--project`, or `--all-apps` scope, a successful live apply
+  ledger, a committed target, and the exact `purge <run-name>` confirmation
+  phrase. Bort removes identified containers and networks only when the scope has
+  no absence-only prerequisite. A scope containing named volumes or host paths
+  requires manual removal of every listed source resource, which Bort verifies
+  remains absent without performing destructive operations or recording durable
+  lifecycle completion.
+- **rollback stays inspectable:** `sudo bort rollback` prints the selected run's stored
+  rollback plan. Executable rollback is not implemented yet.
 
 ## Product surface
 
-The main product is eight verbs:
+The primary product follows one lifecycle:
 
 ```text
-bort             # show app-first migration status and fix hints
-bort env         # record env values for an app
-bort data        # record a data-store strategy for an app
-bort migrate     # create/update a run; --live applies after gates are clear
-bort rollback    # plan rollback to the source
-bort commit      # accept the target; --apply stops source app containers
-bort cleanup     # inventory leftovers; --apply removes safe metadata only
-bort init-target # bootstrap target credentials for live execution
+sudo bort                       # start or resume the current run and review fixes
+sudo bort migrate --live        # apply only the reviewed current run
+sudo bort rollback              # inspect the current run's source rollback plan
+sudo bort commit --apply        # accept the target and retire source containers
+sudo bort cleanup               # audit leftovers; --apply removes safe metadata only
+sudo bort cleanup purge         # review source purge and manual prerequisites
 ```
 
-The power-user pipeline is still available when you want each artifact explicitly:
+Setup and automation commands remain available for noninteractive use and future
+source/target adapters:
+
+```text
+sudo bort migrate --source <adapter>       # scan, export, and create a current run
+sudo bort migrate --manifest <path>        # create a current run from a manifest
+sudo bort migrate --bundle <path>          # create or refresh an advanced bundle run
+sudo bort env <app> KEY=value ...          # record env values noninteractively
+sudo bort data <app> <store> --migrate|--recreate|--managed    # record a data-store strategy
+sudo bort init-target dokploy              # bootstrap target credentials explicitly
+sudo bort status                           # compatibility alias for the current cockpit
+sudo bort next                             # compatibility helper for one next action
+```
+
+The artifact pipeline is also retained for inspection, scripting, compatibility,
+and adapter development. Every command below is local and dry-run only, so it can
+run unprivileged when its input and output paths are accessible:
 
 ```text
 bort scan      # extract source platform state
@@ -217,9 +361,6 @@ bort validate  # validate compose, env, routes, storage, and portability
 bort prepare   # plan target resources before creating anything
 bort sync      # plan state copy or replication work
 bort cutover   # plan traffic movement and rollback windows
-bort status    # summarize a persisted run
-bort next      # show the next safe action for a run
-bort cleanup   # inventory and safely apply metadata-only cleanup
 ```
 
 ## Roadmap and status

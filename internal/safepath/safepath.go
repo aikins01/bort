@@ -76,6 +76,11 @@ func WriteFileAtomicNoFollow(path string, data []byte, mode os.FileMode) error {
 		os.Remove(tmp)
 		return err
 	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
 		return err
@@ -84,7 +89,7 @@ func WriteFileAtomicNoFollow(path string, data []byte, mode os.FileMode) error {
 		os.Remove(tmp)
 		return err
 	}
-	return nil
+	return syncParentDir(path)
 }
 
 func evalExistingSymlinks(path string) (string, error) {

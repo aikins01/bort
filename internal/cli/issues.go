@@ -61,7 +61,7 @@ func (i appIssue) FixCommand(app string) string {
 	case issueKindEnv:
 		keys := envKeysFromItems(i.Items)
 		if len(keys) == 0 {
-			return fmt.Sprintf("bort env %s KEY=value", quotedApp)
+			return fmt.Sprintf("%s %s KEY=value", bortCommand("env"), quotedApp)
 		}
 		const maxKeys = 5
 		shown := keys
@@ -78,7 +78,7 @@ func (i appIssue) FixCommand(app string) string {
 				parts = append(parts, "KEY=value")
 			}
 		}
-		cmd := fmt.Sprintf("bort env %s %s", quotedApp, strings.Join(parts, " "))
+		cmd := fmt.Sprintf("%s %s %s", bortCommand("env"), quotedApp, strings.Join(parts, " "))
 		if more > 0 {
 			cmd += fmt.Sprintf("   # +%d more key(s)", more)
 		}
@@ -86,9 +86,9 @@ func (i appIssue) FixCommand(app string) string {
 	case issueKindData:
 		stores := dataStoresFromItems(i.Items)
 		if len(stores) == 0 {
-			return fmt.Sprintf("bort data %s <store> --migrate   # or choose --recreate / --managed", quotedApp)
+			return fmt.Sprintf("%s %s <store> --migrate   # or choose --recreate / --managed", bortCommand("data"), quotedApp)
 		}
-		return fmt.Sprintf("bort data %s %s --migrate   # or choose --recreate / --managed", quotedApp, shellQuote(stores[0]))
+		return fmt.Sprintf("%s %s %s --migrate   # or choose --recreate / --managed", bortCommand("data"), quotedApp, shellQuote(stores[0]))
 	default:
 		return ""
 	}

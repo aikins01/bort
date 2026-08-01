@@ -19,13 +19,14 @@ const appliedAPIVersion = "bort.applied/v1alpha1"
 // step the live applier walks through so a partial run can be inspected and
 // safely retried.
 type runApplied struct {
-	APIVersion string                `json:"apiVersion"`
-	RunName    string                `json:"runName"`
-	BundleDir  string                `json:"bundleDir,omitempty"`
-	Target     string                `json:"target,omitempty"`
-	UpdatedAt  time.Time             `json:"updatedAt"`
-	Steps      []appliedStep         `json:"steps,omitempty"`
-	Apps       map[string]appliedApp `json:"apps,omitempty"`
+	APIVersion  string                `json:"apiVersion"`
+	RunName     string                `json:"runName"`
+	BundleDir   string                `json:"bundleDir,omitempty"`
+	Target      string                `json:"target,omitempty"`
+	UpdatedAt   time.Time             `json:"updatedAt"`
+	SucceededAt *time.Time            `json:"succeededAt,omitempty"`
+	Steps       []appliedStep         `json:"steps,omitempty"`
+	Apps        map[string]appliedApp `json:"apps,omitempty"`
 }
 
 type appliedStep struct {
@@ -133,6 +134,7 @@ type appliedLedger struct {
 	path    string
 	state   runApplied
 	persist func(string, runApplied) error
+	err     error
 }
 
 func newAppliedLedger(path string, run migrationRun) (*appliedLedger, error) {
@@ -146,8 +148,36 @@ func newAppliedLedger(path string, run migrationRun) (*appliedLedger, error) {
 func (l *appliedLedger) Record(progress dokploy.StepProgress) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.err != nil {
+		return l.err
+	}
 	l.state = recordAppliedStep(l.state, progress)
-	return l.persist(l.path, l.state)
+	if err := l.persist(l.path, l.state); err != nil {
+		l.err = err
+		return err
+	}
+	return nil
+}
+
+func (l *appliedLedger) Err() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.err
+}
+
+func (l *appliedLedger) MarkSucceeded() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err != nil {
+		return l.err
+	}
+	now := time.Now().UTC()
+	l.state.SucceededAt = &now
+	if err := l.persist(l.path, l.state); err != nil {
+		l.err = err
+		return err
+	}
+	return nil
 }
 
 func (l *appliedLedger) Snapshot() runApplied {

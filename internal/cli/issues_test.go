@@ -101,3 +101,14 @@ func TestFixCommandShellQuotesUntrustedNames(t *testing.T) {
 		t.Fatalf("expected unsafe key replaced with KEY=value, got %q", got)
 	}
 }
+
+func TestFixAndLiveCommandsPreserveSudoLifecycle(t *testing.T) {
+	t.Setenv("SUDO_UID", "501")
+	issue := appIssue{Kind: issueKindEnv, Items: []runDecisionItem{{Code: "env.values_required", ResourceRef: "env:KEY"}}}
+	if got := issue.FixCommand("api"); got != "sudo bort env api KEY=value" {
+		t.Fatalf("expected sudo fix command, got %q", got)
+	}
+	if got := liveApplyCommand(loadedMigrationRun{Run: migrationRun{Name: "demo"}}); got != "sudo bort migrate --live --run demo" {
+		t.Fatalf("expected sudo live command, got %q", got)
+	}
+}
