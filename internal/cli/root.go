@@ -85,7 +85,7 @@ func printHelp(w io.Writer, advanced bool) error {
 func writePrimaryHelp(w io.Writer, st *styler) {
 	writeHelpSection(w, st, "Usage:", []helpLine{
 		{verb: bortCommand(""), desc: "start or resume the current migration"},
-		{verb: bortCommand("migrate --live"), desc: "apply the reviewed current run to its target"},
+		{verb: bortCommand("migrate --live"), desc: "apply the selected planned run to its target"},
 		{verb: bortCommand("rollback"), desc: "inspect the source rollback plan"},
 		{verb: bortCommand("commit --apply"), desc: "accept the target and retire source containers"},
 		{verb: bortCommand("cleanup"), desc: "audit leftovers; --apply removes safe metadata only"},
@@ -99,7 +99,7 @@ func writePrimaryHelp(w io.Writer, st *styler) {
 
 func writeAdvancedHelp(w io.Writer, st *styler) {
 	writeHelpSection(w, st, "Setup and automation:", []helpLine{
-		{verb: bortCommand("migrate --source <adapter>"), desc: "scan, export, and create a reviewed run in one command"},
+		{verb: bortCommand("migrate --source <adapter>"), desc: "scan, export, and create a planned run in one command"},
 		{verb: bortCommand("migrate --manifest <path>"), desc: "create a run from an existing manifest"},
 		{verb: bortCommand("env <app> KEY=value ..."), desc: "record env values non-interactively"},
 		{verb: bortCommand("data <app> <store> --migrate|--recreate|--managed"), desc: "record a data strategy non-interactively"},
