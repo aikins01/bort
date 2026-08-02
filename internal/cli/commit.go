@@ -46,7 +46,7 @@ func runCommit(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if apply {
 		for _, name := range []string{"app", "bundle", "format", "from-cutover", "output", "rollback-window", "target"} {
 			if flagSet(fs, name) {
-				return fmt.Errorf("commit --apply does not accept --%s; select the reviewed run with --run", name)
+				return fmt.Errorf("commit --apply does not accept --%s; select the run with --run", name)
 			}
 		}
 		return applyCommitFromArgs(ctx, runRef, stderr)

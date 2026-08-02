@@ -3,9 +3,8 @@
 This guide covers Bort's current supported migration: moving applications from
 Coolify to Dokploy on the same Linux VPS.
 
-The live migration still needs a recorded test on a disposable Linux host before
-it should be relied on in production. Use a fresh VM or a restorable snapshot
-for testing, and keep an independent backup of any data you need to retain.
+Start with a fresh VM or a restorable snapshot and keep an independent backup of
+any data you need to retain.
 
 ## Prerequisites
 
@@ -23,8 +22,8 @@ Before starting, confirm that:
   directory and OS user throughout the migration;
 - Dokploy will run on this same VPS and use Bort's side-by-side layout, which the
   CLI calls `same-VPS shadow mode`; either it is already prepared in that layout
-  or it will be installed through Bort's guided setup. This layout prevents
-  Dokploy's proxy from taking ports 80/443 before Bort switches traffic;
+  or the `migrate --live` preflight will offer to install it. This layout
+  prevents Dokploy's proxy from taking ports 80/443 before Bort switches traffic;
 - the VPS has a current provider snapshot or another independently tested
   recovery path.
 
@@ -89,7 +88,8 @@ other than the workspace default.
 
 The guided screen shows whether each application is ready, what must be fixed,
 and the next safe action. Follow the generated `fix:` commands and rerun Bort
-until it shows `READY`.
+until it shows `READY`. This means the inputs that block live apply are resolved;
+it does not clear non-blocking review items.
 
 Use the guided screen for secret values so they are not placed in command
 arguments, shell history, or process and sudo audit records. The direct command
@@ -101,11 +101,11 @@ sudo bort data demo-app postgres --migrate
 sudo bort
 ```
 
-Review application routes, environment values, database and storage choices,
-named volumes, bind mounts, and source-control details. `READY` means the plan
-has been reviewed; the server has not been changed yet.
+Before continuing, review application routes, environment values, database and
+storage choices, named volumes, bind mounts, source-control details, and any
+remaining `next:` notes. The server has not been changed yet.
 
-## Apply the reviewed run
+## Apply the selected run
 
 Live apply is a separate explicit command:
 
@@ -203,5 +203,3 @@ Ordinary cleanup and destructive source purge are separate operations. See the
 | Databases and persistent data | Supports local database dump/restore and copying while a service is stopped. Continuous syncing and other replication methods are not implemented. |
 | Named volumes and bind mounts | Lists them and asks how they should be handled when manual review is required. Source purge never automatically deletes named volumes or host paths. |
 | Source control | Records repository details and deploy-key hints, but does not copy, revoke, or recreate GitHub Apps, deploy keys, webhooks, or equivalent credentials. |
-
-For release-level validation, use the [acceptance guide](acceptance.md).

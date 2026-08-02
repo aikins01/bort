@@ -208,7 +208,7 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	if live {
 		for _, name := range []string{"app", "bundle", "manifest", "observation-window", "rollback-window", "source", "target"} {
 			if flagSet(fs, name) {
-				return fmt.Errorf("--live applies an existing reviewed run and does not accept --%s; create or update the dry-run first, then apply it with --run or the current-run default", name)
+				return fmt.Errorf("--live applies an existing planned run and does not accept --%s; create or update the dry-run first, then apply it with --run or the current-run default", name)
 			}
 		}
 	}

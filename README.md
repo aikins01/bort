@@ -26,9 +26,10 @@ command before each destructive step.
 Bort organizes the migration by app rather than exposing a wall of Docker
 details. It shows what is ready, provides copy-paste fixes, saves your answers,
 and tells you what to do next. Discovery and planning only preview app changes.
-The guided setup can offer to install Dokploy before live apply, but it explains
-the server changes and asks first. Moving apps, data, and traffic begins only
-when you explicitly run the live command.
+If Dokploy is not prepared, the `migrate --live` preflight can offer to install
+it before application migration begins. Bort explains the server changes and
+asks first. Moving apps, data, and traffic begins only when you explicitly run
+the live command.
 
 ## Supported path
 
@@ -40,8 +41,6 @@ The current product path is **Coolify → Dokploy on the same Linux VPS**.
 | Explicit live apply and resume | Implemented |
 | Accepting Dokploy and stopping source containers | Implemented |
 | Safe Dokploy database cleanup and separately confirmed source removal | Implemented |
-| Automated end-to-end test with fake Docker and Dokploy | Implemented |
-| End-to-end test on a disposable Linux host | Still required before relying on the live path in production |
 | Executable rollback | Not implemented; Bort only prints the stored rollback plan |
 | Dokploy → Coolify or cross-server migration | Not implemented |
 
@@ -62,8 +61,8 @@ Today Bort can:
 - prepare Dokploy projects and compose applications before explicit live apply;
 - move supported local data by exporting and importing databases or copying data
   while a service is stopped;
-- switch web traffic after health checks and a waiting period, save progress for
-  retries, and store rollback instructions;
+- switch web traffic during explicit live apply, save progress for retries, and
+  store rollback instructions;
 - accept the target only after successful live apply;
 - list leftovers, remove only eligible unused records from Dokploy, and
   separately remove eligible source containers and networks after confirmation.
@@ -95,16 +94,13 @@ live migration. In particular, Bort does not yet execute rollback.
 Install from Homebrew:
 
 ```sh
-brew install aikins01/tap/bort
+brew install --cask aikins01/tap/bort
 ```
 
-Install from source with Go:
+Official archives and Linux packages are available from
+[GitHub Releases](https://github.com/aikins01/bort/releases).
 
-```sh
-go install github.com/aikins01/bort/cmd/bort@latest
-```
-
-Or build the current checkout:
+Build the current checkout from source with:
 
 ```sh
 make build
@@ -125,7 +121,8 @@ sudo bort
 
 The guided screen starts setup when needed and otherwise resumes the current
 run. Review each application, follow its generated `fix:` and `next:` guidance,
-and rerun `sudo bort` until the run shows `READY`.
+and rerun `sudo bort` until the run shows `READY`. This means blocking inputs
+are resolved; review any remaining non-blocking notes before live apply.
 
 To start discovery directly without the setup questions:
 
@@ -138,7 +135,7 @@ The migration uses separate commands for each important step:
 
 ```text
 sudo bort                 # start or resume, then review and fix
-sudo bort migrate --live  # apply only the selected reviewed run
+sudo bort migrate --live  # apply only the selected planned run
 sudo bort rollback        # inspect the stored manual rollback plan
 sudo bort commit --apply  # accept the target and retire source containers
 sudo bort cleanup         # audit leftovers without deleting source resources
@@ -160,21 +157,21 @@ before applying cleanup or purge.
 
 ## Safety model
 
-Bort is designed for production boxes where the safest default is “look first.”
+Bort's safety model defaults to “look first.”
 
 - **Preview first:** discovery, planning, validation, rollback inspection,
   acceptance planning, cleanup, and purge planning do not change the server.
-- **Confirmed Dokploy installation:** the guided setup may offer to install
-  Dokploy in Bort's side-by-side same-VPS layout before live apply. It warns that
-  this writes system configuration, creates Docker resources, initializes Swarm
-  when needed, and may disable Docker live-restore and reload Docker before
-  asking for confirmation.
+- **Confirmed Dokploy installation:** the `migrate --live` preflight may offer to
+  install Dokploy in Bort's side-by-side same-VPS layout. It warns that this
+  writes system configuration, creates Docker resources, initializes Swarm when
+  needed, and may disable Docker live-restore and reload Docker before asking
+  for confirmation. Application migration begins only after confirmation.
 - **Explicit live apply:** creating target apps, copying data, and moving traffic
-  only happen through `bort migrate --live` for an existing reviewed run.
+  only happen through `bort migrate --live` for an existing planned run.
 - **Known current run:** `.bort/state.json` identifies the current run. Commands
   that make changes do not guess based on which file was modified most recently.
 - **Plans are locked during live work:** once live execution begins, changing
-  the reviewed plan requires a new run.
+  the selected plan requires a new run.
 - **One change at a time:** Bort prevents two commands from changing the same run
   at once, saves live progress for retries, and keeps `status` available.
 - **Private files:** bundles, state, environment values, live progress, and
@@ -194,8 +191,6 @@ Bort is designed for production boxes where the safest default is “look first.
   rules, review, live apply, validation, acceptance, and recovery.
 - [Cleanup and purge](docs/cleanup-and-purge.md): safe Dokploy cleanup, source
   removal, manual steps, completion, and recovery from a partial failure.
-- [End-to-end acceptance](docs/acceptance.md): automated test, disposable-host
-  test cases, destructive test procedure, and safe evidence handling.
 - `bort help`: main migration commands.
 - `bort help --advanced`: setup, automation, and migration-file commands.
 
@@ -209,26 +204,23 @@ Bort is designed for production boxes where the safest default is “look first.
   recorded as details but are not copied, recreated, or revoked.
 - Bort does not automatically delete source Docker images because the target may
   share their layers and tags.
-- The full real-host acceptance matrix remains to be recorded on a disposable
-  Linux VPS.
 
 ## Roadmap
 
 Near-term work remains focused on making the same-VPS Coolify → Dokploy path
 boring and safe before adding more platforms:
 
-1. complete the disposable-host end-to-end tests;
-2. make workspace selection, requirement checks, and failure recovery clearer
+1. make workspace selection, requirement checks, and failure recovery clearer
    in the guided screen;
-3. decide how automated rollback should work;
-4. add Dokploy source scanning and Coolify target creation;
-5. add cross-server transfers after the same-VPS steps are proven.
+2. decide how automated rollback should work;
+3. add Dokploy source scanning and Coolify target creation;
+4. add cross-server transfers after the same-VPS steps are proven.
 
 Other Docker-, Compose-, and Swarm-based platforms remain possible future
 targets. Bort should only support one when it can clearly say which resources
 are safe to move, which are blocked, and which need manual work.
 
-## Development and releases
+## Development
 
 Run the repository checks with:
 
@@ -237,14 +229,6 @@ make test
 make vet
 make build
 ```
-
-The fake end-to-end trace and destructive disposable-host checklist are in the
-[acceptance guide](docs/acceptance.md).
-
-Releases are automated by GitHub Actions and GoReleaser. A new `v*` tag builds
-macOS, Linux, and Windows archives, Linux packages, checksums, and the Homebrew
-cask update. Use the intended release version rather than copying an old tag
-from this README.
 
 ## Name
 

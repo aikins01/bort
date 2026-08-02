@@ -69,10 +69,11 @@ such as its source and proxy services, additionally require
 `--include-platform`.
 
 Review every listed resource and use the exact apply command and confirmation
-phrase emitted by the dry run. A named example is:
+phrase emitted by the dry run. To select a named run, replace `RUN_NAME` in this
+example:
 
 ```sh
-run="bort-acceptance-20260802-120000"
+run="RUN_NAME"
 sudo bort cleanup purge --run "$run" --all-apps
 sudo bort cleanup purge --apply --run "$run" --all-apps --confirm "purge $run"
 ```
@@ -150,5 +151,5 @@ removed. If purge reports an incomplete result:
 Do not recreate a source resource under the same name and assume it is the same
 object. Bort checks Docker IDs and refuses a different replacement resource.
 
-Use the destructive scenarios in the [acceptance guide](acceptance.md) only on a
-fresh VM or restorable snapshot.
+While evaluating Bort, exercise destructive cleanup only on a fresh VM or
+restorable snapshot containing no data you intend to keep.
