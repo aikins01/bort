@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
@@ -55,6 +56,9 @@ func TestRunMigrateCreatesLocalRunArtifactsAndSummary(t *testing.T) {
 	if err := containedPath(runDir, run.BundleDir); err != nil {
 		t.Fatalf("expected a self-contained reviewed bundle: %v", err)
 	}
+	if run.BundleDigest == "" {
+		t.Fatal("expected the reviewed bundle digest to be recorded")
+	}
 	prepareResult := readJSONFile[preparer.Result](t, filepath.Join(runDir, "prepare.json"))
 	syncResult := readJSONFile[syncplan.Result](t, filepath.Join(runDir, "sync.json"))
 	cutoverResult := readJSONFile[gateway.Result](t, filepath.Join(runDir, "cutover.json"))
@@ -76,6 +80,9 @@ func TestRunMigrateCreatesLocalRunArtifactsAndSummary(t *testing.T) {
 	}
 	if err := validateLiveApplyReady(loaded); err != nil {
 		t.Fatalf("expected downstream review decision to remain visible without blocking live apply: %v", err)
+	}
+	if err := verifyReviewedMigrationBundle(loaded); err != nil {
+		t.Fatalf("expected the recorded bundle digest to match: %v", err)
 	}
 
 	output := stdout.String()
@@ -200,6 +207,101 @@ func TestRunMigrateLivePreservesReviewedArtifactsAfterBundleChanges(t *testing.T
 	}
 }
 
+func TestApplyLiveMigrationRejectsChangedReviewedBundle(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		partialApply bool
+		guidance     string
+	}{
+		{name: "before apply", guidance: "to re-plan before live apply"},
+		{name: "partial apply resume", partialApply: true, guidance: "cannot be re-planned; reconcile any applied target changes, then create a new run"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				http.Error(w, "unexpected request", http.StatusInternalServerError)
+			}))
+			defer server.Close()
+			t.Setenv(dokploy.EnvBaseURL, server.URL)
+			t.Setenv(dokploy.EnvToken, "token")
+
+			workDir := t.TempDir()
+			t.Chdir(workDir)
+			bundleDir := filepath.Join(workDir, "bort-bundle")
+			writeTestBundle(t, bundleDir, manifest.Manifest{
+				Source: manifest.Source{Platform: "docker"},
+				Apps:   []manifest.App{{Name: "api", Services: []manifest.Service{{Name: "api", Image: "example/api:v1"}}}},
+			})
+			runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "changed-bundle"})
+			run, err := loadMigrationRun("changed-bundle")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.partialApply {
+				steps := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps
+				if len(steps) == 0 {
+					t.Fatal("expected live apply steps")
+				}
+				applied := newRunApplied(run.Run)
+				applied.Steps = []appliedStep{{Index: 0, Kind: string(steps[0].Kind), App: steps[0].App, Ref: steps[0].Ref, Status: string(dokploy.StepStatusOK)}}
+				if err := writeRunApplied(runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied), applied); err != nil {
+					t.Fatal(err)
+				}
+				run, err = loadMigrationRun("changed-bundle")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			composePath := filepath.Join(run.Run.BundleDir, filepath.FromSlash(run.Prepare.Apps[0].Directory), run.Prepare.Apps[0].Resources.App.ComposePath)
+			compose, err := os.ReadFile(composePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(composePath, append(compose, []byte("\nchanged: true\n")...), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			err = applyLiveMigrationLocked(context.Background(), run, io.Discard, nil)
+			if err == nil || !strings.Contains(err.Error(), "changed after planning") || !strings.Contains(err.Error(), test.guidance) {
+				t.Fatalf("expected changed reviewed bundle to block live apply with valid recovery guidance, got %v", err)
+			}
+			if requests != 0 {
+				t.Fatalf("changed reviewed bundle contacted dokploy %d time(s)", requests)
+			}
+		})
+	}
+}
+
+func TestLegacySelfContainedRunWithoutBundleDigestRemainsLoadable(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	bundleDir := filepath.Join(workDir, "bort-bundle")
+	writeTestBundle(t, bundleDir, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "api", Services: []manifest.Service{{Name: "api", Image: "example/api:v1"}}}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "legacy-contained"})
+	run, err := loadMigrationRun("legacy-contained")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.Run.BundleDigest = ""
+	if err := writeJSONArtifact(filepath.Join(run.Run.RunDir, "run.json"), run.Run); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadMigrationRun("legacy-contained")
+	if err != nil {
+		t.Fatalf("legacy run without a bundle digest did not load: %v", err)
+	}
+	if loaded.Run.BundleDigest != "" {
+		t.Fatalf("legacy run unexpectedly acquired a digest while loading: %q", loaded.Run.BundleDigest)
+	}
+	if err := verifyReviewedMigrationBundle(loaded); err == nil || !strings.Contains(err.Error(), "predates reviewed bundle digests") || !strings.Contains(err.Error(), "to re-plan before live apply") {
+		t.Fatalf("legacy run without a bundle digest did not require a safe re-plan before live apply: %v", err)
+	}
+}
+
 func TestLoadMigrationRunDoesNotApplyLaterWorkspaceState(t *testing.T) {
 	workDir := t.TempDir()
 	t.Chdir(workDir)
@@ -261,26 +363,39 @@ func TestValidateLiveApplyReadyBlocksEveryPrepareRequirement(t *testing.T) {
 		t.Fatalf("expected prepare-stage needs_decision to block live apply with run-scoped review guidance, got %v", err)
 	}
 
+	reviewOnlyItems := []runDecisionItem{
+		{Stage: "cutover", Code: "cutover.sync_verification_required"},
+		{Stage: "cutover", Code: "cutover.health_check_required"},
+		{Stage: "rollback", Code: "rollback.trigger_required"},
+		{Stage: "rollback", Code: "rollback.source_health_required"},
+		{Stage: "commit", Code: "commit.target_acceptance_required"},
+		{Stage: "commit", Code: "commit.target_route_acceptance_required"},
+		{Stage: "commit", Code: "commit.rollback_window_closed"},
+	}
+	for _, item := range reviewOnlyItems {
+		item.Readiness = preparer.ReadinessNeedsDecision
+		run.Decisions.Decisions[0].Items[0] = item
+		if err := validateLiveApplyReady(run); err != nil {
+			t.Fatalf("expected %s not to block live apply, got %v", item.Code, err)
+		}
+	}
 	for _, stage := range []string{"cutover", "rollback", "commit"} {
-		run.Decisions.Decisions[0].Items[0].Stage = stage
-		if err := validateLiveApplyReady(run); err != nil {
-			t.Fatalf("expected %s-stage review decision not to block live apply, got %v", stage, err)
+		run.Decisions.Decisions[0].Items[0] = runDecisionItem{Stage: stage, Code: stage + ".future_requirement", Readiness: preparer.ReadinessNeedsDecision}
+		if err := validateLiveApplyReady(run); err == nil {
+			t.Fatalf("expected unknown %s-stage needs_decision to block live apply", stage)
+		}
+		if decisions := openDownstreamBlockingDecisions(run); len(decisions) != 1 {
+			t.Fatalf("expected unknown %s-stage needs_decision to be surfaced as a downstream blocker, got %#v", stage, decisions)
 		}
 	}
-	for _, kind := range []string{"data_stores", "database_review"} {
-		run.Decisions.Decisions[0].Kind = kind
-		if err := validateLiveApplyReady(run); err != nil {
-			t.Fatalf("expected downstream %s review decision not to block live apply, got %v", kind, err)
-		}
-	}
-	run.Decisions.Decisions[0].Items[0].Stage = ""
+	run.Decisions.Decisions[0].Items[0] = runDecisionItem{Code: "cutover.sync_verification_required", Readiness: preparer.ReadinessNeedsDecision}
 	if err := validateLiveApplyReady(run); err == nil {
 		t.Fatal("expected needs_decision with an unknown stage to block live apply")
 	}
 	if decisions := openReviewDecisions(run); len(decisions) != 0 {
 		t.Fatalf("expected needs_decision with an unknown stage to stay out of review-only decisions, got %#v", decisions)
 	}
-	run.Decisions.Decisions[0].Items[0].Stage = "cutover"
+	run.Decisions.Decisions[0].Items[0] = reviewOnlyItems[0]
 	for _, readiness := range []preparer.Readiness{preparer.ReadinessBlocked, preparer.ReadinessNeedsInput} {
 		run.Decisions.Decisions[0].Readiness = readiness
 		run.Decisions.Decisions[0].Items[0].Readiness = readiness
@@ -315,14 +430,19 @@ func TestApplyLiveMigrationRejectsEmptyPlan(t *testing.T) {
 	if err := os.Mkdir(bundleDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	bundleDigest, err := digestMigrationBundle(bundleDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	run := loadedMigrationRun{
 		Run: migrationRun{
-			Name:      "empty",
-			RunDir:    runDir,
-			BundleDir: bundleDir,
-			Target:    "dokploy",
-			DryRun:    true,
-			Artifacts: defaultRunArtifacts(),
+			Name:         "empty",
+			RunDir:       runDir,
+			BundleDir:    bundleDir,
+			BundleDigest: hex.EncodeToString(bundleDigest[:]),
+			Target:       "dokploy",
+			DryRun:       true,
+			Artifacts:    defaultRunArtifacts(),
 		},
 		Prepare: preparer.Result{BundleDir: bundleDir},
 	}
@@ -1007,6 +1127,7 @@ func TestLegacyRunBundleIsSnapshottedBeforeLiveResume(t *testing.T) {
 	legacy.Run.ApplyOutcomeRequired = false
 	legacy.Run.SourceBundleDir = ""
 	legacy.Run.BundleDir = bundleDir
+	legacy.Run.BundleDigest = ""
 	legacy.Prepare.BundleDir = bundleDir
 	legacy.Sync.BundleDir = bundleDir
 	legacy.Cutover.BundleDir = bundleDir
@@ -1059,6 +1180,12 @@ func TestLegacyRunBundleIsSnapshottedBeforeLiveResume(t *testing.T) {
 	}
 	if !upgraded.Run.ApplyOutcomeRequired || upgraded.Run.SourceBundleDir != bundleDir || upgraded.Run.BundleDir == bundleDir {
 		t.Fatalf("unexpected upgraded legacy metadata: %#v", upgraded.Run)
+	}
+	if upgraded.Run.BundleDigest == "" {
+		t.Fatal("expected upgraded legacy run to record its reviewed bundle digest")
+	}
+	if err := verifyReviewedMigrationBundle(upgraded); err != nil {
+		t.Fatalf("expected upgraded legacy bundle digest to match: %v", err)
 	}
 	if err := containedPath(upgraded.Run.RunDir, upgraded.Run.BundleDir); err != nil {
 		t.Fatalf("legacy run bundle was not snapshotted into the run: %v", err)
