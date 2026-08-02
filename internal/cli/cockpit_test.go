@@ -184,7 +184,7 @@ func TestNextWizardDecisionsIncludesDownstreamReview(t *testing.T) {
 			Items: []runDecisionItem{{
 				Stage:     "cutover",
 				App:       "api",
-				Code:      "cutover.review",
+				Code:      "cutover.health_check_required",
 				Readiness: preparer.ReadinessNeedsDecision,
 			}},
 		}},
@@ -196,7 +196,7 @@ func TestNextWizardDecisionsIncludesDownstreamReview(t *testing.T) {
 }
 
 func TestMarkReviewDecisionDoneKeepsExcludedBlockersOpen(t *testing.T) {
-	reviewItem := runDecisionItem{Stage: "cutover", App: "api", Code: "cutover.review", Readiness: preparer.ReadinessNeedsDecision}
+	reviewItem := runDecisionItem{Stage: "cutover", App: "api", Code: "cutover.health_check_required", Readiness: preparer.ReadinessNeedsDecision}
 	blockedItem := runDecisionItem{Stage: "cutover", App: "api", Code: "cutover.blocked", Readiness: preparer.ReadinessBlocked}
 	run := loadedMigrationRun{
 		Decisions: runDecisions{
@@ -254,7 +254,7 @@ func TestCockpitShowsDownstreamDecisionsAsReviewOnly(t *testing.T) {
 				Items: []runDecisionItem{{
 					Stage:     "cutover",
 					App:       "api",
-					Code:      "cutover.review",
+					Code:      "cutover.health_check_required",
 					Readiness: preparer.ReadinessNeedsDecision,
 				}},
 			}},

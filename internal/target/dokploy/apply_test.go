@@ -45,6 +45,60 @@ func TestNewClientFromEnvRejectsRemoteHTTP(t *testing.T) {
 	}
 }
 
+func TestPlanBundleFilesPinComposeAndEnvContents(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(appDir, "compose.yaml")
+	envPath := filepath.Join(appDir, ".env")
+	reviewedCompose := []byte("services:\n  api:\n    image: example/api:v1\n")
+	reviewedEnv := []byte("TOKEN=reviewed\n")
+	if err := os.WriteFile(composePath, reviewedCompose, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envPath, reviewedEnv, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := preparer.AppPlan{
+		Name:      "api",
+		Directory: "api",
+		TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{
+			ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"},
+			EnvFiles:   []preparer.DokployEnvFile{{Path: ".env"}},
+		}},
+	}
+	plan := Plan{
+		Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}},
+		BundleFiles: map[string][]byte{
+			filepath.Clean(composePath): reviewedCompose,
+			filepath.Clean(envPath):     reviewedEnv,
+		},
+	}
+	if err := os.WriteFile(composePath, []byte("services:\n  api:\n    image: example/api:v2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envPath, []byte("TOKEN=changed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	compose, err := readComposeFile(plan, "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(compose, "example/api:v1") || strings.Contains(compose, "example/api:v2") {
+		t.Fatalf("compose did not use captured reviewed contents:\n%s", compose)
+	}
+	env, err := readEnvContent(plan, "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env != "TOKEN=reviewed\n" {
+		t.Fatalf("env did not use captured reviewed contents: %q", env)
+	}
+}
+
 func TestApplyDumpDataStoreNoopsForVolumeStrategyKinds(t *testing.T) {
 	// mysql has no logical-dump implementation yet, so it migrates via
 	// stopped-volume copy. the dump step in the plan must be a noop, not

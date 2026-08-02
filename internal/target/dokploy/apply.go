@@ -74,15 +74,16 @@ type StepProgress struct {
 }
 
 type Plan struct {
-	Steps      []Step
-	Prepare    preparer.Result
-	Sync       syncplan.Result
-	Cutover    gateway.Result
-	RunName    string
-	RunDir     string
-	ResumeFrom int
-	BeforeStep *func(StepProgress) error
-	OnProgress *func(StepProgress)
+	Steps       []Step
+	Prepare     preparer.Result
+	Sync        syncplan.Result
+	Cutover     gateway.Result
+	BundleFiles map[string][]byte
+	RunName     string
+	RunDir      string
+	ResumeFrom  int
+	BeforeStep  *func(StepProgress) error
+	OnProgress  *func(StepProgress)
 }
 
 func PlanFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result) Plan {
@@ -1268,11 +1269,13 @@ func readComposeFile(plan Plan, appName string) (string, error) {
 	if err := safepath.ContainedPath(appDir, full); err != nil {
 		return "", err
 	}
-	contents, err := safepath.ReadFileNoFollow(full)
+	contents, err := readPlanBundleFile(plan, full)
 	if err != nil {
 		return "", fmt.Errorf("read compose file %s: %w", full, err)
 	}
-	compose, err := inlineComposeEnvFilesWithFallbacks(string(contents), appDir, composeEnvFileFallbackPaths(app.TargetResources.Dokploy.EnvFiles))
+	compose, err := inlineComposeEnvFilesWithFallbacksReader(string(contents), appDir, composeEnvFileFallbackPaths(app.TargetResources.Dokploy.EnvFiles), func(path string) ([]byte, error) {
+		return readPlanBundleFile(plan, path)
+	})
 	if err != nil {
 		return "", fmt.Errorf("prepare compose file %s for dokploy: %w", full, err)
 	}
@@ -1331,6 +1334,10 @@ func inlineComposeEnvFiles(contents, appDir string) (string, error) {
 }
 
 func inlineComposeEnvFilesWithFallbacks(contents, appDir string, fallbackPaths []string) (string, error) {
+	return inlineComposeEnvFilesWithFallbacksReader(contents, appDir, fallbackPaths, safepath.ReadFileNoFollow)
+}
+
+func inlineComposeEnvFilesWithFallbacksReader(contents, appDir string, fallbackPaths []string, readFile func(string) ([]byte, error)) (string, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal([]byte(contents), &doc); err != nil {
 		return "", err
@@ -1373,7 +1380,7 @@ func inlineComposeEnvFilesWithFallbacks(contents, appDir string, fallbackPaths [
 				}
 				inlinePaths = append(inlinePaths, path)
 			}
-			envValues, err := readComposeEnvFilePathListValues(appDir, inlinePaths)
+			envValues, err := readComposeEnvFilePathListValues(appDir, inlinePaths, readFile)
 			if err != nil {
 				return "", err
 			}
@@ -1393,7 +1400,7 @@ func inlineComposeEnvFilesWithFallbacks(contents, appDir string, fallbackPaths [
 			changed = true
 		}
 		for _, path := range fallbacksByService[serviceName] {
-			envValues, err := readComposeEnvFilePathValues(appDir, path)
+			envValues, err := readComposeEnvFilePathValues(appDir, path, readFile)
 			if err != nil {
 				return "", err
 			}
@@ -1727,10 +1734,10 @@ func ensureServiceNetworkAlias(network *yaml.Node, alias string) bool {
 	return true
 }
 
-func readComposeEnvFilePathListValues(appDir string, paths []string) (map[string]string, error) {
+func readComposeEnvFilePathListValues(appDir string, paths []string, readFile func(string) ([]byte, error)) (map[string]string, error) {
 	values := map[string]string{}
 	for _, envPath := range paths {
-		envValues, err := readComposeEnvFilePathValues(appDir, envPath)
+		envValues, err := readComposeEnvFilePathValues(appDir, envPath, readFile)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
@@ -1775,12 +1782,12 @@ func normalizeComposeEnvFilePath(path string) string {
 	return path
 }
 
-func readComposeEnvFilePathValues(appDir, envPath string) (map[string]string, error) {
+func readComposeEnvFilePathValues(appDir, envPath string, readFile func(string) ([]byte, error)) (map[string]string, error) {
 	full := filepath.Join(appDir, filepath.FromSlash(envPath))
 	if err := safepath.ContainedPath(appDir, full); err != nil {
 		return nil, err
 	}
-	contents, err := safepath.ReadFileNoFollow(full)
+	contents, err := readFile(full)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, err
@@ -2014,7 +2021,7 @@ func readEnvContent(plan Plan, appName string) (string, error) {
 		if err := safepath.ContainedPath(appDir, full); err != nil {
 			return "", err
 		}
-		contents, err := safepath.ReadFileNoFollow(full)
+		contents, err := readPlanBundleFile(plan, full)
 		if err != nil {
 			return "", fmt.Errorf("read env file %s: %w", full, err)
 		}
@@ -2044,6 +2051,17 @@ func readEnvContent(plan Plan, appName string) (string, error) {
 		b.WriteString("\n")
 	}
 	return b.String(), nil
+}
+
+func readPlanBundleFile(plan Plan, path string) ([]byte, error) {
+	if plan.BundleFiles == nil {
+		return safepath.ReadFileNoFollow(path)
+	}
+	contents, ok := plan.BundleFiles[filepath.Clean(path)]
+	if !ok {
+		return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrNotExist}
+	}
+	return contents, nil
 }
 
 func isSharedDokployEnvFile(path string) bool {
