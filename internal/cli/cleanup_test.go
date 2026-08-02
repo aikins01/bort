@@ -812,22 +812,22 @@ func TestCleanupPurgeApplyCommandRejectsUnscopedReview(t *testing.T) {
 }
 
 func TestUpdateCleanupPurgeBackupPersistsPartialResults(t *testing.T) {
-	backupDir := t.TempDir()
+	backupDir := cleanupBackupTestDir(t)
 	result := cleanupPurgeResult{RunName: "partial", DryRun: false, PurgeResult: &dokploy.SourcePurgeResult{
 		Containers: []dokploy.SourcePurgeResourceResult{{Ref: "web", Status: "removed"}},
 	}}
-	path, err := writeCleanupPurgeBackup(backupDir, cleanupPurgeResult{RunName: result.RunName, DryRun: true})
+	recorder, err := newCleanupPurgeBackupRecorder(backupDir, &result)
 	if err != nil {
 		t.Fatal(err)
 	}
-	recorder := cleanupPurgeBackupRecorder{path: path, result: &result, persist: updateCleanupPurgeBackup}
+	defer recorder.Close()
 	if err := recorder.Start(); err != nil {
 		t.Fatal(err)
 	}
 	if err := recorder.Record(*result.PurgeResult); err != nil {
 		t.Fatal(err)
 	}
-	contents, err := os.ReadFile(path)
+	contents, err := os.ReadFile(recorder.path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -840,24 +840,156 @@ func TestUpdateCleanupPurgeBackupPersistsPartialResults(t *testing.T) {
 	}
 }
 
+func TestWriteCleanupPurgeBackupRejectsPermissiveDirectoryWithoutChangingMode(t *testing.T) {
+	backupDir := filepath.Join(cleanupBackupTestDir(t), "shared")
+	if err := os.Mkdir(backupDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(backupDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeCleanupPurgeBackup(backupDir, cleanupPurgeResult{RunName: "mode"}); err == nil {
+		t.Fatal("expected permissive backup directory to be rejected")
+	}
+	dirInfo, err := os.Stat(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirInfo.Mode().Perm() != 0o755 {
+		t.Fatalf("existing backup directory mode changed to %o", dirInfo.Mode().Perm())
+	}
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("permissive backup directory was modified: %#v", entries)
+	}
+}
+
+func TestWriteCleanupPurgeBackupCreatesPrivateDirectory(t *testing.T) {
+	backupDir := filepath.Join(cleanupBackupTestDir(t), "new", "backups")
+	path, err := writeCleanupPurgeBackup(backupDir, cleanupPurgeResult{RunName: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("created backup directory mode is %o, want 700", info.Mode().Perm())
+	}
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("backup file mode is %o, want 600", fileInfo.Mode().Perm())
+	}
+}
+
+func TestWriteCleanupPurgeBackupRejectsSymlinkDirectory(t *testing.T) {
+	root := cleanupBackupTestDir(t)
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "backups")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("create directory symlink: %v", err)
+	}
+	if _, err := writeCleanupPurgeBackup(link, cleanupPurgeResult{RunName: "linked"}); err == nil {
+		t.Fatal("expected symlinked backup directory to be rejected")
+	}
+	entries, err := os.ReadDir(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("symlink target was modified: %#v", entries)
+	}
+}
+
+func TestWriteCleanupPurgeBackupRejectsSymlinkAncestor(t *testing.T) {
+	root := cleanupBackupTestDir(t)
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "linked-parent")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("create directory symlink: %v", err)
+	}
+	if _, err := writeCleanupPurgeBackup(filepath.Join(link, "backups"), cleanupPurgeResult{RunName: "linked"}); err == nil {
+		t.Fatal("expected symlinked backup directory ancestor to be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(target, "backups")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("symlink ancestor target was modified: %v", err)
+	}
+}
+
+func TestCleanupPurgeBackupRecorderRetainsDirectoryIdentity(t *testing.T) {
+	root := cleanupBackupTestDir(t)
+	backupDir := filepath.Join(root, "backups")
+	result := cleanupPurgeResult{RunName: "identity"}
+	recorder, err := newCleanupPurgeBackupRecorder(backupDir, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recorder.Close()
+	heldDir := filepath.Join(root, "held")
+	if err := os.Rename(backupDir, heldDir); err != nil {
+		t.Fatal(err)
+	}
+	redirected := filepath.Join(root, "redirected")
+	if err := os.Mkdir(redirected, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(redirected, backupDir); err != nil {
+		t.Skipf("replace backup directory with symlink: %v", err)
+	}
+	if err := recorder.Start(); err == nil || !strings.Contains(err.Error(), "private directory path changed") {
+		t.Fatalf("expected replaced backup directory path to abort persistence, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(heldDir, filepath.Base(recorder.path))); err != nil {
+		t.Fatalf("held backup directory was not updated: %v", err)
+	}
+	entries, err := os.ReadDir(redirected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("replacement symlink target was modified: %#v", entries)
+	}
+}
+
+func cleanupBackupTestDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func TestCleanupPurgeBackupRecorderKeepsPersistenceFailureSticky(t *testing.T) {
 	result := cleanupPurgeResult{RunName: "partial"}
-	writes := 0
-	recorder := cleanupPurgeBackupRecorder{
-		path:   filepath.Join(t.TempDir(), "purge.json"),
-		result: &result,
-		persist: func(string, cleanupPurgeResult) error {
-			writes++
-			return errors.New("disk unavailable")
-		},
+	recorder, err := newCleanupPurgeBackupRecorder(cleanupBackupTestDir(t), &result)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := recorder.Start(); err == nil || !strings.Contains(err.Error(), "disk unavailable") {
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.Start(); err == nil || !strings.Contains(err.Error(), "private directory is closed") {
 		t.Fatalf("expected initial persistence failure, got %v", err)
 	}
-	if err := recorder.Record(dokploy.SourcePurgeResult{}); err == nil || !strings.Contains(err.Error(), "disk unavailable") {
+	firstErr := recorder.err
+	if err := recorder.Record(dokploy.SourcePurgeResult{}); err == nil || err != firstErr {
 		t.Fatalf("expected sticky persistence failure, got %v", err)
-	}
-	if writes != 1 {
-		t.Fatalf("expected persistence not to retry after failure, got %d writes", writes)
 	}
 }

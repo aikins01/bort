@@ -10,7 +10,10 @@ import (
 )
 
 func TestCleanupStalePlatformProjectsBacksUpThenDeletesMetadata(t *testing.T) {
-	backupDir := t.TempDir()
+	backupDir := dokployBackupTestDir(t)
+	if err := os.Chmod(backupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
 			"ps --format {{.Names}}": []byte("dokploy-postgres.1.task\n"),
@@ -42,6 +45,13 @@ func TestCleanupStalePlatformProjectsBacksUpThenDeletesMetadata(t *testing.T) {
 	if string(backup) != "dump-bytes" {
 		t.Fatalf("expected pg_dump backup contents, got %q", string(backup))
 	}
+	dirInfo, err := os.Stat(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("existing backup directory mode changed to %o", dirInfo.Mode().Perm())
+	}
 	if len(runner.runs) != 2 {
 		t.Fatalf("expected pg_dump and psql runs, got %#v", runner.runs)
 	}
@@ -57,6 +67,64 @@ func TestCleanupStalePlatformProjectsBacksUpThenDeletesMetadata(t *testing.T) {
 			t.Fatalf("expected cleanup sql to contain %q, got:\n%s", want, sql)
 		}
 	}
+}
+
+func TestBackupDokployDatabaseRejectsPermissiveDirectoryWithoutChangingMode(t *testing.T) {
+	backupDir := dokployBackupTestDir(t)
+	if err := os.Chmod(backupDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backupDokployDatabase(context.Background(), &fakeDockerRunner{}, "dokploy-postgres", backupDir, "cleanup"); err == nil {
+		t.Fatal("expected permissive backup directory to be rejected")
+	}
+	info, err := os.Stat(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("existing backup directory mode changed to %o", info.Mode().Perm())
+	}
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("permissive backup directory was modified: %#v", entries)
+	}
+}
+
+func TestBackupDokployDatabaseRejectsSymlinkDirectory(t *testing.T) {
+	root := dokployBackupTestDir(t)
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "backups")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("create directory symlink: %v", err)
+	}
+	if _, err := backupDokployDatabase(context.Background(), &fakeDockerRunner{}, "dokploy-postgres", link, "cleanup"); err == nil {
+		t.Fatal("expected symlinked backup directory to be rejected")
+	}
+	entries, err := os.ReadDir(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("symlink target was modified: %#v", entries)
+	}
+}
+
+func dokployBackupTestDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 func TestPurgeSourceResourcesRemovesDockerResources(t *testing.T) {
