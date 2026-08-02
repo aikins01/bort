@@ -204,6 +204,9 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("migrate does not accept positional argument %q", fs.Arg(0))
+	}
 	bundleFlagSet := flagSet(fs, "bundle")
 	if live {
 		for _, name := range []string{"app", "bundle", "manifest", "observation-window", "rollback-window", "source", "target"} {

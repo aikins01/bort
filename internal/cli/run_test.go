@@ -409,7 +409,7 @@ func TestValidateLiveApplyReadyBlocksEveryPrepareRequirement(t *testing.T) {
 	}
 }
 
-func TestApprovedPrepareDecisionsRequireResolvedProgress(t *testing.T) {
+func TestApprovedPrepareDecisionsRequireResolvedOrSkippedProgress(t *testing.T) {
 	item := runDecisionItem{
 		Stage:     "prepare",
 		App:       "api",
@@ -418,17 +418,30 @@ func TestApprovedPrepareDecisionsRequireResolvedProgress(t *testing.T) {
 		Readiness: preparer.ReadinessNeedsDecision,
 	}
 	decision := runDecision{ID: "prepare-review", Kind: "prepare-review", Items: []runDecisionItem{item}}
-	run := loadedMigrationRun{
-		Decisions: runDecisions{APIVersion: decisionsAPIVersion, Decisions: []runDecision{decision}},
-		Progress:  runProgress{Decisions: map[string]decisionProgress{}},
+	tests := []struct {
+		name   string
+		status string
+		want   bool
+	}{
+		{name: "unresolved"},
+		{name: "resolved", status: progressStatusResolved, want: true},
+		{name: "skipped", status: progressStatusSkipped, want: true},
 	}
-	if approved := approvedPrepareDecisions(run); len(approved) != 0 {
-		t.Fatalf("unresolved prepare decision was approved: %#v", approved)
-	}
-	run.Progress = markDecisionDone(run.Progress, decision, progressStatusResolved, "reviewed", time.Now().UTC())
-	approved := dokploy.NewPrepareDecision(item.App, item.Code, item.ResourceRef, item.Readiness, item.Message)
-	if _, ok := approvedPrepareDecisions(run)[approved]; !ok {
-		t.Fatalf("resolved prepare decision code was not approved")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			run := loadedMigrationRun{
+				Decisions: runDecisions{APIVersion: decisionsAPIVersion, Decisions: []runDecision{decision}},
+				Progress:  runProgress{Decisions: map[string]decisionProgress{}},
+			}
+			if tt.status != "" {
+				run.Progress = markDecisionDone(run.Progress, decision, tt.status, "reviewed", time.Now().UTC())
+			}
+			approved := dokploy.NewPrepareDecision(item.App, item.Code, item.ResourceRef, item.Readiness, item.Message)
+			_, ok := approvedPrepareDecisions(run)[approved]
+			if ok != tt.want {
+				t.Fatalf("approved = %t, want %t", ok, tt.want)
+			}
+		})
 	}
 }
 
@@ -563,6 +576,19 @@ func TestRunMigrateLiveRequiresReviewedRun(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(workDir, ".bort", "runs")); !os.IsNotExist(statErr) {
 		t.Fatalf("live apply created a run from the default bundle: %v", statErr)
+	}
+}
+
+func TestRunMigrateRejectsPositionalArgument(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+
+	err := runMigrate(context.Background(), []string{"--live", "intended-run"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), `migrate does not accept positional argument "intended-run"`) {
+		t.Fatalf("expected positional argument rejection, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(workDir, ".bort")); !os.IsNotExist(statErr) {
+		t.Fatalf("positional argument rejection reached migration run setup: %v", statErr)
 	}
 }
 
