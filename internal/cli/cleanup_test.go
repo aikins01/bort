@@ -452,6 +452,129 @@ func TestRunCleanupPurgePreservesResourcesSharedWithUnselectedApps(t *testing.T)
 	}
 }
 
+func TestPlanCleanupPurgePreservesResourceSharedWithUnselectedSameNameApp(t *testing.T) {
+	run := sameNameCleanupPurgeRun(t)
+	result, err := planCleanupPurge(run, "dokploy", cleanupPurgeFilters{Projects: []string{"project-a"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.SourceContainers) != 0 {
+		t.Fatalf("expected the shared container to be preserved, got %#v", result.SourceContainers)
+	}
+	if len(result.SourceNetworks) != 0 || len(result.SourcePaths) != 0 {
+		t.Fatalf("expected shared networks and paths to be preserved, got networks=%#v paths=%#v", result.SourceNetworks, result.SourcePaths)
+	}
+	for _, volume := range result.SourceVolumes {
+		if volume.Action != "preserve_shared_with_unselected_app" {
+			t.Fatalf("expected shared volume to be preserved, got %#v", volume)
+		}
+	}
+	warnings := strings.Join(result.Warnings, "\n")
+	for _, want := range []string{
+		"source container selected-id-name for api is also referenced by unselected app(s): api-2",
+		"source container shared-name for api is also referenced by unselected app(s): api-2",
+		"named volume shared-data for api is also referenced by unselected app(s): api-2",
+		"bind mount source /data/coolify/applications/shared/storage for api is also referenced by unselected app(s): api-2",
+		"source network shared-net for api is also referenced by unselected app(s): api-2",
+	} {
+		if !strings.Contains(warnings, want) {
+			t.Fatalf("expected warning %q for the unselected same-name app, got %q", want, warnings)
+		}
+	}
+}
+
+func TestPlanCleanupPurgeRejectsSourceDirSharedWithUnselectedSameNameApp(t *testing.T) {
+	run := sameNameCleanupPurgeRun(t)
+	_, err := planCleanupPurge(run, "dokploy", cleanupPurgeFilters{Projects: []string{"project-a"}}, []string{"/data/coolify/applications/shared"})
+	if err == nil || !strings.Contains(err.Error(), "refusing source-dir /data/coolify/applications/shared because it overlaps bind mount(s) for unselected app(s): api-2") {
+		t.Fatalf("expected the unselected same-name app to block the shared source directory, got %v", err)
+	}
+}
+
+func sameNameCleanupPurgeRun(t *testing.T) loadedMigrationRun {
+	t.Helper()
+	bundleDir := t.TempDir()
+	for _, directory := range []string{"api", "api-2"} {
+		appDir := filepath.Join(bundleDir, directory)
+		if err := os.MkdirAll(appDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(appDir, "topology.json"), []byte(`{"networks":["shared-net"]}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return loadedMigrationRun{Prepare: preparer.Result{
+		BundleDir: bundleDir,
+		Apps: []preparer.AppPlan{
+			{
+				Name:         "api",
+				Directory:    "api",
+				ProjectGroup: &preparer.ProjectGroup{Name: "project-a"},
+				Resources: preparer.ResourceSpecs{
+					SourceServices: []preparer.SourceServiceRef{
+						{ServiceName: "id-owner", ContainerID: "shared-id", ContainerName: "selected-id-name"},
+						{ServiceName: "name-owner", ContainerID: "selected-name-id", ContainerName: "shared-name"},
+					},
+					Volumes: []preparer.VolumeResource{
+						{Service: "web", Type: "volume", Name: "shared-data", Target: "/data"},
+						{Service: "web", Type: "bind", Source: "/data/coolify/applications/shared/storage", Target: "/storage"},
+					},
+				},
+			},
+			{
+				Name:         "api",
+				Directory:    "api-2",
+				ProjectGroup: &preparer.ProjectGroup{Name: "project-b"},
+				Resources: preparer.ResourceSpecs{
+					SourceServices: []preparer.SourceServiceRef{
+						{ServiceName: "id-owner", ContainerID: "shared-id", ContainerName: "unselected-id-name"},
+						{ServiceName: "name-owner", ContainerID: "unselected-name-id", ContainerName: "shared-name"},
+					},
+					Volumes: []preparer.VolumeResource{
+						{Service: "web", Type: "volume", Name: "shared-data", Target: "/data"},
+						{Service: "web", Type: "bind", Source: "/data/coolify/applications/shared/storage", Target: "/storage"},
+					},
+				},
+			},
+		},
+	}}
+}
+
+func TestCleanupPurgeAppRefsSeparateDirectoriesFromLegacyNames(t *testing.T) {
+	selected := cleanupSelectedAppRefs([]preparer.AppPlan{{Name: "selected", Directory: "api"}})
+	owners := []string{
+		cleanupPurgeAppRef(preparer.AppPlan{Name: "selected", Directory: "api"}),
+		cleanupPurgeAppRef(preparer.AppPlan{Name: "api"}),
+	}
+	outside := cleanupOwnersOutsideSelected(owners, selected)
+	if len(outside) != 1 || outside[0] != "api (legacy name)" {
+		t.Fatalf("expected the legacy name owner to remain unselected, got %#v", outside)
+	}
+	outside = cleanupOwnersOutsideSelected(owners, nil)
+	if len(outside) != 2 || outside[0] != "api" || outside[1] != "api (legacy name)" {
+		t.Fatalf("expected directory and legacy name labels to remain distinct, got %#v", outside)
+	}
+}
+
+func TestPlanCleanupPurgeRejectsDuplicateAppRefs(t *testing.T) {
+	run := sameNameCleanupPurgeRun(t)
+	run.Prepare.Apps[1].Directory = "api"
+	_, err := planCleanupPurge(run, "dokploy", cleanupPurgeFilters{AllApps: true}, nil)
+	if err == nil || !strings.Contains(err.Error(), `app reference "api" is not unique`) {
+		t.Fatalf("expected duplicate app references to fail closed, got %v", err)
+	}
+}
+
+func TestPlanCleanupPurgeRejectsMissingAppRef(t *testing.T) {
+	run := sameNameCleanupPurgeRun(t)
+	run.Prepare.Apps[1].Name = ""
+	run.Prepare.Apps[1].Directory = ""
+	_, err := planCleanupPurge(run, "dokploy", cleanupPurgeFilters{AllApps: true}, nil)
+	if err == nil || !strings.Contains(err.Error(), "app 2 has no name or directory reference") {
+		t.Fatalf("expected a missing app reference to fail closed, got %v", err)
+	}
+}
+
 func TestCleanupPurgeFailsClosedWhenTopologyIsUnavailable(t *testing.T) {
 	workDir := t.TempDir()
 	t.Chdir(workDir)

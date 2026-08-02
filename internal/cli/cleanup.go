@@ -436,11 +436,14 @@ func runCleanupPurge(ctx context.Context, args []string, stdin io.Reader, stdout
 }
 
 func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurgeFilters, extraSourceDirs []string) (cleanupPurgeResult, error) {
+	if err := validateCleanupPurgeAppRefs(run.Prepare.Apps); err != nil {
+		return cleanupPurgeResult{}, err
+	}
 	selected, err := cleanupPurgeSelectedApps(run, filters)
 	if err != nil {
 		return cleanupPurgeResult{}, err
 	}
-	selectedNames := cleanupSelectedAppNames(selected)
+	selectedRefs := cleanupSelectedAppRefs(selected)
 	owners, err := cleanupPurgeResourceOwners(run)
 	if err != nil {
 		return cleanupPurgeResult{}, err
@@ -472,7 +475,7 @@ func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurg
 			if strings.TrimSpace(container.ContainerID) == "" {
 				continue
 			}
-			if sharedWith := cleanupContainerOwnersOutsideSelected(owners, container, selectedNames); len(sharedWith) > 0 {
+			if sharedWith := cleanupContainerOwnersOutsideSelected(owners, container, selectedRefs); len(sharedWith) > 0 {
 				result.CompletesLifecycle = false
 				result.Warnings = append(result.Warnings, fmt.Sprintf("source container %s for %s is also referenced by unselected app(s): %s", firstCleanupValue(container.ContainerName, container.ContainerID), app.Name, strings.Join(sharedWith, ", ")))
 				continue
@@ -487,7 +490,7 @@ func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurg
 					result.CompletesLifecycle = false
 					volume.Action = "inspect_manually_before_purge"
 					result.Warnings = append(result.Warnings, fmt.Sprintf("named volume for %s/%s has no recorded name and is not scheduled for purge", app.Name, volume.Service))
-				} else if sharedWith := cleanupOwnersOutsideSelected(owners.NamedVolumes[volume.Name], selectedNames); len(sharedWith) > 0 {
+				} else if sharedWith := cleanupOwnersOutsideSelected(owners.NamedVolumes[volume.Name], selectedRefs); len(sharedWith) > 0 {
 					result.CompletesLifecycle = false
 					volume.Action = "preserve_shared_with_unselected_app"
 					result.Warnings = append(result.Warnings, fmt.Sprintf("named volume %s for %s is also referenced by unselected app(s): %s", volume.Name, app.Name, strings.Join(sharedWith, ", ")))
@@ -504,7 +507,7 @@ func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurg
 				} else if path == nil {
 					result.CompletesLifecycle = false
 					volume.Action = "inspect_manually_before_purge"
-				} else if sharedWith := cleanupPathOwnersOutsideSelected(owners.BindPaths, path.Path, selectedNames); len(sharedWith) > 0 {
+				} else if sharedWith := cleanupPathOwnersOutsideSelected(owners.BindPaths, path.Path, selectedRefs); len(sharedWith) > 0 {
 					result.CompletesLifecycle = false
 					volume.Action = "preserve_shared_with_unselected_app"
 					result.Warnings = append(result.Warnings, fmt.Sprintf("bind mount source %s for %s is also referenced by unselected app(s): %s", path.Path, app.Name, strings.Join(sharedWith, ", ")))
@@ -533,7 +536,7 @@ func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurg
 				result.Warnings = append(result.Warnings, fmt.Sprintf("source network %s for %s is a platform network and requires --include-platform for purge", network.Name, app.Name))
 				continue
 			}
-			if sharedWith := cleanupOwnersOutsideSelected(owners.Networks[network.Name], selectedNames); len(sharedWith) > 0 {
+			if sharedWith := cleanupOwnersOutsideSelected(owners.Networks[network.Name], selectedRefs); len(sharedWith) > 0 {
 				result.CompletesLifecycle = false
 				result.Warnings = append(result.Warnings, fmt.Sprintf("source network %s for %s is also referenced by unselected app(s): %s", network.Name, app.Name, strings.Join(sharedWith, ", ")))
 				continue
@@ -551,7 +554,7 @@ func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurg
 		if err := dokploy.ValidateSourcePurgePath(cleaned, filters.IncludePlatform); err != nil {
 			return cleanupPurgeResult{}, err
 		}
-		if sharedWith := cleanupPathOwnersOutsideSelected(owners.BindPaths, cleaned, selectedNames); len(sharedWith) > 0 {
+		if sharedWith := cleanupPathOwnersOutsideSelected(owners.BindPaths, cleaned, selectedRefs); len(sharedWith) > 0 {
 			return cleanupPurgeResult{}, fmt.Errorf("refusing source-dir %s because it overlaps bind mount(s) for unselected app(s): %s", cleaned, strings.Join(sharedWith, ", "))
 		}
 		result.SourcePaths = append(result.SourcePaths, cleanupSourcePath{Path: cleaned, Source: "explicit", AllowPlatform: filters.IncludePlatform, Action: "require_absent_before_purge_apply"})
@@ -591,6 +594,41 @@ func cleanupSelectedAppNames(apps []preparer.AppPlan) map[string]struct{} {
 	return names
 }
 
+func cleanupSelectedAppRefs(apps []preparer.AppPlan) map[string]struct{} {
+	refs := map[string]struct{}{}
+	for _, app := range apps {
+		if ref := cleanupPurgeAppRef(app); ref != "" {
+			refs[ref] = struct{}{}
+		}
+	}
+	return refs
+}
+
+func validateCleanupPurgeAppRefs(apps []preparer.AppPlan) error {
+	seen := map[string]struct{}{}
+	for index, app := range apps {
+		ref := cleanupPurgeAppRef(app)
+		if ref == "" {
+			return fmt.Errorf("refusing cleanup purge because app %d has no name or directory reference", index+1)
+		}
+		if _, exists := seen[ref]; exists {
+			return fmt.Errorf("refusing cleanup purge because app reference %q is not unique in the run", cleanupPurgeAppRefLabel(ref))
+		}
+		seen[ref] = struct{}{}
+	}
+	return nil
+}
+
+func cleanupPurgeAppRef(app preparer.AppPlan) string {
+	if directory := strings.TrimSpace(app.Directory); directory != "" {
+		return "directory:" + directory
+	}
+	if name := strings.TrimSpace(app.Name); name != "" {
+		return "name:" + name
+	}
+	return ""
+}
+
 func cleanupPurgeResourceOwners(run loadedMigrationRun) (cleanupPurgeOwners, error) {
 	owners := cleanupPurgeOwners{
 		ContainerIDs:   map[string][]string{},
@@ -600,8 +638,8 @@ func cleanupPurgeResourceOwners(run loadedMigrationRun) (cleanupPurgeOwners, err
 		Networks:       map[string][]string{},
 	}
 	for _, app := range run.Prepare.Apps {
-		appName := strings.TrimSpace(app.Name)
-		if appName == "" {
+		appRef := cleanupPurgeAppRef(app)
+		if appRef == "" {
 			continue
 		}
 		containers, err := cleanupContainersForApp(app)
@@ -610,22 +648,22 @@ func cleanupPurgeResourceOwners(run loadedMigrationRun) (cleanupPurgeOwners, err
 		}
 		for _, container := range containers {
 			if containerID := strings.TrimSpace(container.ContainerID); containerID != "" {
-				owners.ContainerIDs[containerID] = append(owners.ContainerIDs[containerID], appName)
+				owners.ContainerIDs[containerID] = append(owners.ContainerIDs[containerID], appRef)
 			}
 			if containerName := cleanupContainerName(container.ContainerName); containerName != "" {
-				owners.ContainerNames[containerName] = append(owners.ContainerNames[containerName], appName)
+				owners.ContainerNames[containerName] = append(owners.ContainerNames[containerName], appRef)
 			}
 		}
 		for _, volume := range cleanupVolumesForApp(app) {
 			switch volume.Type {
 			case "volume":
 				if strings.TrimSpace(volume.Name) != "" {
-					owners.NamedVolumes[volume.Name] = append(owners.NamedVolumes[volume.Name], appName)
+					owners.NamedVolumes[volume.Name] = append(owners.NamedVolumes[volume.Name], appRef)
 				}
 			case "bind":
 				if strings.TrimSpace(volume.Source) != "" {
 					path := filepath.Clean(volume.Source)
-					owners.BindPaths[path] = append(owners.BindPaths[path], appName)
+					owners.BindPaths[path] = append(owners.BindPaths[path], appRef)
 				}
 			}
 		}
@@ -635,7 +673,7 @@ func cleanupPurgeResourceOwners(run loadedMigrationRun) (cleanupPurgeOwners, err
 		}
 		for _, network := range networks {
 			if strings.TrimSpace(network.Name) != "" {
-				owners.Networks[network.Name] = append(owners.Networks[network.Name], appName)
+				owners.Networks[network.Name] = append(owners.Networks[network.Name], appRef)
 			}
 		}
 	}
@@ -688,10 +726,20 @@ func cleanupOwnersOutsideSelected(owners []string, selected map[string]struct{})
 			continue
 		}
 		seen[owner] = struct{}{}
-		outside = append(outside, owner)
+		outside = append(outside, cleanupPurgeAppRefLabel(owner))
 	}
 	sort.Strings(outside)
 	return outside
+}
+
+func cleanupPurgeAppRefLabel(ref string) string {
+	if strings.HasPrefix(ref, "directory:") {
+		return strings.TrimPrefix(ref, "directory:")
+	}
+	if strings.HasPrefix(ref, "name:") {
+		return strings.TrimPrefix(ref, "name:") + " (legacy name)"
+	}
+	return ref
 }
 
 func cleanupPathOwnersOutsideSelected(pathOwners map[string][]string, path string, selected map[string]struct{}) []string {
