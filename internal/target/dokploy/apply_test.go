@@ -99,6 +99,66 @@ func TestPlanBundleFilesPinComposeAndEnvContents(t *testing.T) {
 	}
 }
 
+func TestValidatePlanReadyForLiveApplyRequiresApprovedDecisionCodes(t *testing.T) {
+	app := preparer.AppPlan{
+		Name:      "api",
+		Readiness: preparer.ReadinessNeedsDecision,
+		Gates: []preparer.Gate{{
+			Code:      "prepare.review",
+			Message:   "review the prepared app",
+			Readiness: preparer.ReadinessNeedsDecision,
+		}},
+	}
+	plan := Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}
+	if err := validatePlanReadyForLiveApply(plan); err == nil || !strings.Contains(err.Error(), "unapproved prepare decisions") {
+		t.Fatalf("expected an unapproved needs_decision app to block live apply, got %v", err)
+	}
+	approved := NewPrepareDecision("api", "prepare.review", "", preparer.ReadinessNeedsDecision, "review the prepared app")
+	plan.ApprovedPrepareDecisions = map[PrepareDecision]struct{}{approved: {}}
+	if err := validatePlanReadyForLiveApply(plan); err != nil {
+		t.Fatalf("expected the explicitly approved decision code to pass validation: %v", err)
+	}
+	plan.Prepare.Apps[0].Gates[0].Code = "prepare.future_requirement"
+	if err := validatePlanReadyForLiveApply(plan); err == nil || !strings.Contains(err.Error(), "unapproved prepare decisions") {
+		t.Fatalf("expected an unknown needs_decision code to fail closed, got %v", err)
+	}
+	plan.Prepare.Apps[0].Gates[0].Code = ""
+	blank := NewPrepareDecision("api", "", "", preparer.ReadinessNeedsDecision, "review the prepared app")
+	plan.ApprovedPrepareDecisions = map[PrepareDecision]struct{}{blank: {}}
+	if err := validatePlanReadyForLiveApply(plan); err == nil || !strings.Contains(err.Error(), "unapproved prepare decisions") {
+		t.Fatalf("expected a blank needs_decision code to fail closed, got %v", err)
+	}
+}
+
+func TestValidatePlanReadyForLiveApplySeparatesDecisionIdentity(t *testing.T) {
+	gate := preparer.Gate{
+		Code:        "prepare.review",
+		ResourceRef: "service/api",
+		Message:     "review the prepared app",
+		Readiness:   preparer.ReadinessNeedsDecision,
+	}
+	plan := Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{
+		{Name: "api", Readiness: preparer.ReadinessNeedsDecision, Gates: []preparer.Gate{gate}},
+		{Name: "worker", Readiness: preparer.ReadinessNeedsDecision, Gates: []preparer.Gate{gate}},
+	}}}
+	apiApproval := NewPrepareDecision("api", gate.Code, gate.ResourceRef, gate.Readiness, gate.Message)
+	plan.ApprovedPrepareDecisions = map[PrepareDecision]struct{}{apiApproval: {}}
+	if err := validatePlanReadyForLiveApply(plan); err == nil || !strings.Contains(err.Error(), "app worker") {
+		t.Fatalf("expected api approval not to authorize worker, got %v", err)
+	}
+
+	workerApproval := NewPrepareDecision("worker", gate.Code, gate.ResourceRef, gate.Readiness, gate.Message)
+	plan.ApprovedPrepareDecisions[workerApproval] = struct{}{}
+	if err := validatePlanReadyForLiveApply(plan); err != nil {
+		t.Fatalf("expected exact approvals for both apps to pass validation: %v", err)
+	}
+
+	plan.Prepare.Apps[1].Gates[0].ResourceRef = "service/worker"
+	if err := validatePlanReadyForLiveApply(plan); err == nil || !strings.Contains(err.Error(), "app worker") {
+		t.Fatalf("expected approval for a different resource not to authorize worker, got %v", err)
+	}
+}
+
 func TestApplyDumpDataStoreNoopsForVolumeStrategyKinds(t *testing.T) {
 	// mysql has no logical-dump implementation yet, so it migrates via
 	// stopped-volume copy. the dump step in the plan must be a noop, not
