@@ -1447,6 +1447,76 @@ func TestRunStatusAndNextReadExistingRun(t *testing.T) {
 	}
 }
 
+func TestRunStatusAndNextRejectAmbiguousRunArguments(t *testing.T) {
+	tests := []struct {
+		name string
+		run  cliRunner
+		args []string
+		want string
+	}{
+		{
+			name: "status multiple positional references",
+			run:  runStatus,
+			args: []string{"intended-run", "typo"},
+			want: `status does not accept positional argument "typo" after run reference "intended-run"`,
+		},
+		{
+			name: "next multiple positional references",
+			run:  runNext,
+			args: []string{"intended-run", "typo"},
+			want: `next does not accept positional argument "typo" after run reference "intended-run"`,
+		},
+		{
+			name: "status flag and positional reference",
+			run:  runStatus,
+			args: []string{"--run", "intended-run", "typo"},
+			want: `status does not accept positional argument "typo" with --run`,
+		},
+		{
+			name: "next flag and positional reference",
+			run:  runNext,
+			args: []string{"--run", "intended-run", "typo"},
+			want: `next does not accept positional argument "typo" with --run`,
+		},
+		{
+			name: "status empty flag and positional reference",
+			run:  runStatus,
+			args: []string{"--run=", "intended-run"},
+			want: `status does not accept positional argument "intended-run" with --run`,
+		},
+		{
+			name: "next empty flag and positional reference",
+			run:  runNext,
+			args: []string{"--run=", "intended-run"},
+			want: `next does not accept positional argument "intended-run" with --run`,
+		},
+		{
+			name: "status empty flag",
+			run:  runStatus,
+			args: []string{"--run="},
+			want: "status requires a non-empty --run value",
+		},
+		{
+			name: "next empty flag",
+			run:  runNext,
+			args: []string{"--run="},
+			want: "next requires a non-empty --run value",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			err := tt.run(context.Background(), tt.args, &stdout, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected %q, got %v", tt.want, err)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("ambiguous arguments produced output before rejection: %q", stdout.String())
+			}
+		})
+	}
+}
+
 func TestRunStatusUsesCurrentRunBeforeNewerMtime(t *testing.T) {
 	workDir := t.TempDir()
 	t.Chdir(workDir)

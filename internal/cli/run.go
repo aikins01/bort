@@ -1540,7 +1540,17 @@ func loadRunFromArgs(command string, args []string, stderr io.Writer) (loadedMig
 	if err := fs.Parse(args); err != nil {
 		return loadedMigrationRun{}, err
 	}
-	if runRef == "" && fs.NArg() == 1 {
+	runFlagSet := flagSet(fs, "run")
+	if runFlagSet && fs.NArg() > 0 {
+		return loadedMigrationRun{}, fmt.Errorf("%s does not accept positional argument %q with --run", command, fs.Arg(0))
+	}
+	if runFlagSet && strings.TrimSpace(runRef) == "" {
+		return loadedMigrationRun{}, fmt.Errorf("%s requires a non-empty --run value", command)
+	}
+	if fs.NArg() > 1 {
+		return loadedMigrationRun{}, fmt.Errorf("%s does not accept positional argument %q after run reference %q", command, fs.Arg(1), fs.Arg(0))
+	}
+	if fs.NArg() == 1 {
 		runRef = fs.Arg(0)
 	}
 	resolved, err := resolveRunRef(runRef, false)
