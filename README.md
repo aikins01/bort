@@ -165,8 +165,10 @@ Bort is designed for production boxes where the safest default is “look first.
 - **Preview first:** discovery, planning, validation, rollback inspection,
   acceptance planning, cleanup, and purge planning do not change the server.
 - **Confirmed Dokploy installation:** the guided setup may offer to install
-  Dokploy in Bort's side-by-side same-VPS layout before live apply. It explains
-  the changes and asks for confirmation first.
+  Dokploy in Bort's side-by-side same-VPS layout before live apply. It warns that
+  this writes system configuration, creates Docker resources, initializes Swarm
+  when needed, and may disable Docker live-restore and reload Docker before
+  asking for confirmation.
 - **Explicit live apply:** creating target apps, copying data, and moving traffic
   only happen through `bort migrate --live` for an existing reviewed run.
 - **Known current run:** `.bort/state.json` identifies the current run. Commands

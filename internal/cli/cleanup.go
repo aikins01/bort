@@ -469,6 +469,9 @@ func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurg
 			return cleanupPurgeResult{}, err
 		}
 		for _, container := range containers {
+			if strings.TrimSpace(container.ContainerID) == "" {
+				continue
+			}
 			if sharedWith := cleanupContainerOwnersOutsideSelected(owners, container, selectedNames); len(sharedWith) > 0 {
 				result.CompletesLifecycle = false
 				result.Warnings = append(result.Warnings, fmt.Sprintf("source container %s for %s is also referenced by unselected app(s): %s", firstCleanupValue(container.ContainerName, container.ContainerID), app.Name, strings.Join(sharedWith, ", ")))

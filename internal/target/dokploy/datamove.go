@@ -1361,7 +1361,7 @@ func (c *Client) targetContainerForServiceWithRedeploy(ctx context.Context, runn
 		}
 		if allowRedeploy && len(containers) == 0 && entry.ComposeID != "" && !entry.DiscoveryRedeployAttempted {
 			entry.DiscoveryRedeployAttempted = true
-			if err := c.DeployCompose(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
+			if err := c.deployComposeWithPatchGuard(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
 				return dockerContainer{}, fmt.Errorf("redeploy dokploy compose project %q for target discovery: %w", entry.ComposeAppName, err)
 			}
 		}
