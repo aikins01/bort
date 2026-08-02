@@ -537,6 +537,7 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 		return fmt.Errorf("live migration plan has no executable steps")
 	}
 	plan.BundleFiles = bundleFiles
+	plan.ApprovedPrepareDecisions = approvedPrepareDecisions(run)
 	client, err := ensureDokployClient(ctx, run.Run.Target, os.Stdin, stderr, stderr)
 	if err != nil {
 		if err == errDokploySetupSkipped {
@@ -584,6 +585,27 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 		return fmt.Errorf("live apply completed but its successful outcome could not be persisted: %w", err)
 	}
 	return markRunLiveAppliedLocked(run.Run)
+}
+
+func approvedPrepareDecisions(run loadedMigrationRun) map[dokploy.PrepareDecision]struct{} {
+	approved := map[dokploy.PrepareDecision]struct{}{}
+	for _, decision := range run.Decisions.Decisions {
+		progress, ok := run.Progress.Decisions[decision.Kind]
+		if !ok {
+			continue
+		}
+		for _, item := range decision.Items {
+			if item.Stage != "prepare" || item.Readiness != preparer.ReadinessNeedsDecision || strings.TrimSpace(item.Code) == "" {
+				continue
+			}
+			itemProgress, ok := progress.Items[progressItemKey(item)]
+			if ok && (itemProgress.Status == progressStatusResolved || itemProgress.Status == progressStatusSkipped) {
+				decision := dokploy.NewPrepareDecision(item.App, item.Code, item.ResourceRef, item.Readiness, item.Message)
+				approved[decision] = struct{}{}
+			}
+		}
+	}
+	return approved
 }
 
 func ensureSelfContainedLiveRunLocked(run loadedMigrationRun) (loadedMigrationRun, error) {
@@ -736,7 +758,7 @@ func attachLiveMigration(ctx context.Context, run loadedMigrationRun, appliedPat
 	startedAt := time.Now().UTC()
 	var lastSeen time.Time
 	initialApplied, initialAppliedOK := readRunApplied(appliedPath, run.Run)
-	if initialAppliedOK == nil && completedApplyPrefix(plan.Steps, initialApplied) >= len(plan.Steps) && len(plan.Steps) > 0 {
+	if initialAppliedOK == nil && initialApplied.SucceededAt != nil && completedApplyPrefix(plan.Steps, initialApplied) >= len(plan.Steps) && len(plan.Steps) > 0 {
 		entries := attachProgressEntries(plan.Steps, initialApplied, time.Time{})
 		emitAttachProgress(onProgress, entries)
 		if onProgress == nil {
@@ -783,7 +805,7 @@ func attachLiveMigration(ctx context.Context, run loadedMigrationRun, appliedPat
 					writeAttachTextProgress(stderr, latest.progress, len(plan.Steps), "recorded")
 				}
 			}
-			if completedApplyPrefix(plan.Steps, applied) >= len(plan.Steps) {
+			if applied.SucceededAt != nil && completedApplyPrefix(plan.Steps, applied) >= len(plan.Steps) {
 				return nil
 			}
 			active, err := applyLockActive(lockPath)
@@ -862,7 +884,10 @@ func writeAttachTextProgress(stderr io.Writer, progress dokploy.StepProgress, to
 func attachExitResult(run loadedMigrationRun, steps []dokploy.Step, applied runApplied, attachedAt time.Time) error {
 	completed := completedApplyPrefix(steps, applied)
 	if completed >= len(steps) {
-		return nil
+		if applied.SucceededAt != nil {
+			return nil
+		}
+		return fmt.Errorf("live migration recorded all %d step(s) but no successful live-apply outcome; rerun `%s` to continue", len(steps), liveApplyCommand(run))
 	}
 	if failed, ok := latestAttachFailure(steps, applied, attachedAt); ok {
 		return fmt.Errorf("live migration exited after %d/%d recorded step(s); latest failure: %s %s/%s: %s", completed, len(steps), failed.Kind, failed.App, failed.Ref, failed.Error)

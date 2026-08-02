@@ -73,17 +73,30 @@ type StepProgress struct {
 	Err     error
 }
 
+type PrepareDecision struct {
+	app         string
+	code        string
+	resourceRef string
+	readiness   preparer.Readiness
+	message     string
+}
+
+func NewPrepareDecision(app, code, resourceRef string, readiness preparer.Readiness, message string) PrepareDecision {
+	return PrepareDecision{app: app, code: code, resourceRef: resourceRef, readiness: readiness, message: message}
+}
+
 type Plan struct {
-	Steps       []Step
-	Prepare     preparer.Result
-	Sync        syncplan.Result
-	Cutover     gateway.Result
-	BundleFiles map[string][]byte
-	RunName     string
-	RunDir      string
-	ResumeFrom  int
-	BeforeStep  *func(StepProgress) error
-	OnProgress  *func(StepProgress)
+	Steps                    []Step
+	Prepare                  preparer.Result
+	Sync                     syncplan.Result
+	Cutover                  gateway.Result
+	BundleFiles              map[string][]byte
+	ApprovedPrepareDecisions map[PrepareDecision]struct{}
+	RunName                  string
+	RunDir                   string
+	ResumeFrom               int
+	BeforeStep               *func(StepProgress) error
+	OnProgress               *func(StepProgress)
 }
 
 func PlanFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result) Plan {
@@ -268,21 +281,51 @@ func validatePlanReadyForLiveApply(plan Plan) error {
 			continue
 		}
 		switch app.Readiness {
-		// acknowledged decisions remain in the immutable plan; the CLI blocks
-		// unacknowledged decisions before it calls the target client.
-		case "", preparer.ReadinessReadyToCreate, preparer.ReadinessNeedsDecision:
+		case "", preparer.ReadinessReadyToCreate:
+		case preparer.ReadinessNeedsDecision:
+			if !appDecisionCodesApproved(plan, app) {
+				return fmt.Errorf("live apply blocked by unapproved prepare decisions for app %s", app.Name)
+			}
 		default:
 			return fmt.Errorf("live apply blocked by prepare readiness for app %s: %s", app.Name, app.Readiness)
 		}
 		for _, gate := range app.Gates {
 			switch gate.Readiness {
-			case preparer.ReadinessReadyToCreate, preparer.ReadinessNeedsDecision:
+			case preparer.ReadinessReadyToCreate:
+			case preparer.ReadinessNeedsDecision:
+				if strings.TrimSpace(gate.Code) == "" {
+					return fmt.Errorf("live apply blocked by unapproved prepare gate %s/%s: %s", app.Name, gate.Code, gate.Message)
+				}
+				if _, ok := plan.ApprovedPrepareDecisions[newPrepareDecision(app.Name, gate)]; !ok {
+					return fmt.Errorf("live apply blocked by unapproved prepare gate %s/%s: %s", app.Name, gate.Code, gate.Message)
+				}
 			default:
 				return fmt.Errorf("live apply blocked by prepare gate %s/%s: %s", app.Name, gate.Code, gate.Message)
 			}
 		}
 	}
 	return nil
+}
+
+func appDecisionCodesApproved(plan Plan, app preparer.AppPlan) bool {
+	found := false
+	for _, gate := range app.Gates {
+		if gate.Readiness != preparer.ReadinessNeedsDecision {
+			continue
+		}
+		found = true
+		if strings.TrimSpace(gate.Code) == "" {
+			return false
+		}
+		if _, ok := plan.ApprovedPrepareDecisions[newPrepareDecision(app.Name, gate)]; !ok {
+			return false
+		}
+	}
+	return found
+}
+
+func newPrepareDecision(app string, gate preparer.Gate) PrepareDecision {
+	return NewPrepareDecision(app, gate.Code, gate.ResourceRef, gate.Readiness, gate.Message)
 }
 
 type activeBortOverridePatch struct {

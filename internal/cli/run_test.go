@@ -409,6 +409,29 @@ func TestValidateLiveApplyReadyBlocksEveryPrepareRequirement(t *testing.T) {
 	}
 }
 
+func TestApprovedPrepareDecisionsRequireResolvedProgress(t *testing.T) {
+	item := runDecisionItem{
+		Stage:     "prepare",
+		App:       "api",
+		Code:      "prepare.review",
+		Message:   "review the prepared app",
+		Readiness: preparer.ReadinessNeedsDecision,
+	}
+	decision := runDecision{ID: "prepare-review", Kind: "prepare-review", Items: []runDecisionItem{item}}
+	run := loadedMigrationRun{
+		Decisions: runDecisions{APIVersion: decisionsAPIVersion, Decisions: []runDecision{decision}},
+		Progress:  runProgress{Decisions: map[string]decisionProgress{}},
+	}
+	if approved := approvedPrepareDecisions(run); len(approved) != 0 {
+		t.Fatalf("unresolved prepare decision was approved: %#v", approved)
+	}
+	run.Progress = markDecisionDone(run.Progress, decision, progressStatusResolved, "reviewed", time.Now().UTC())
+	approved := dokploy.NewPrepareDecision(item.App, item.Code, item.ResourceRef, item.Readiness, item.Message)
+	if _, ok := approvedPrepareDecisions(run)[approved]; !ok {
+		t.Fatalf("resolved prepare decision code was not approved")
+	}
+}
+
 func TestEnsureDokployClientShellQuotesRepairURL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
@@ -834,9 +857,11 @@ func TestFinalizeAttachedLiveMigrationRecordsLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := applyLiveMigrationLocked(context.Background(), run, io.Discard, nil); err == nil || !strings.Contains(err.Error(), "no successful live-apply outcome") {
+	attachCtx, cancelAttach := context.WithCancel(context.Background())
+	cancelAttach()
+	if err := applyLiveMigrationLocked(attachCtx, run, io.Discard, nil); !errors.Is(err, context.Canceled) {
 		applyLock.Release()
-		t.Fatalf("expected raced attach without a successful outcome to remain incomplete, got %v", err)
+		t.Fatalf("expected raced attach to wait for the producer's successful outcome, got %v", err)
 	}
 	applyLock.Release()
 	if err := finalizeAttachedLiveMigration(context.Background(), run.Run.RunDir); err == nil || !strings.Contains(err.Error(), "no successful live-apply outcome") {

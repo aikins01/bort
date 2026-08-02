@@ -190,6 +190,7 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 	plan := dokploy.PlanForCommit(run.Prepare, run.Cutover)
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
+	plan.ApprovedPrepareDecisions = approvedPrepareDecisions(run)
 	fmt.Fprintf(stderr, "commit apply: run %s; planned %d step(s) to retire source\n", run.Run.Name, len(plan.Steps))
 	if err := client.Apply(ctx, plan); err != nil {
 		return err
