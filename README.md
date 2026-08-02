@@ -20,8 +20,8 @@
 
 Bort is a guided migration tool for people running their own app platform on a
 VPS. It checks what is actually running, explains what needs attention, prepares
-Dokploy, copies supported data, switches web traffic, and asks before any
-destructive step.
+Dokploy, copies supported data, switches web traffic, and requires an explicit
+command before each destructive step.
 
 Bort organizes the migration by app rather than exposing a wall of Docker
 details. It shows what is ready, provides copy-paste fixes, saves your answers,

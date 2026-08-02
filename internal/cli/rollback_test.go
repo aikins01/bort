@@ -92,6 +92,13 @@ func TestRunRollbackWritesJSONPlan(t *testing.T) {
 	}
 }
 
+func TestRunRollbackRejectsPositionalArguments(t *testing.T) {
+	err := runRollback(context.Background(), []string{"typo", "--run", "recovery-run"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), `rollback does not accept positional argument "typo"`) {
+		t.Fatalf("expected positional argument rejection, got %v", err)
+	}
+}
+
 func TestRunRollbackDefaultsToCurrentRun(t *testing.T) {
 	workDir := t.TempDir()
 	t.Chdir(workDir)
