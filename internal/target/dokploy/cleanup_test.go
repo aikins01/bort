@@ -208,6 +208,9 @@ func TestPurgeSourceResourcesPreservesReplacementAfterReviewedContainerDisappear
 	if err == nil || !strings.Contains(err.Error(), "now refers to container ID") {
 		t.Fatalf("expected replacement container to block purge, got result=%#v err=%v", result, err)
 	}
+	if len(result.Containers) != 1 || !strings.Contains(result.Containers[0].Message, "now refers to container ID") {
+		t.Fatalf("expected persisted resource result to include the operation error, got %#v", result.Containers)
+	}
 	for _, args := range runner.outputArgs {
 		if strings.HasPrefix(strings.Join(args, " "), "rm -f ") {
 			t.Fatalf("replacement container was removed: %#v", runner.outputArgs)

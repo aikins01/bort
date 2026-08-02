@@ -61,12 +61,19 @@ keep. Exercise at least:
    sudo bort
    sudo bort migrate --live --run "$run"
    sudo bort status --run "$run"
+   ```
+
+4. Verify that the target serves the workload and wait through the rollback
+   window recorded in the plan. Only then accept the target and plan source
+   removal:
+
+   ```sh
    sudo bort commit --apply --run "$run"
    sudo bort cleanup --run "$run"
    sudo bort cleanup purge --run "$run" --all-apps
    ```
 
-4. Review the purge plan and verify the target still serves the disposable
+5. Review the purge plan and verify the target still serves the disposable
    workload before applying it:
 
    ```sh
@@ -74,22 +81,22 @@ keep. Exercise at least:
    sudo bort status --run "$run"
    ```
 
-5. Confirm that the target application remains healthy, `run.json` records live
+6. Confirm that the target application remains healthy, `run.json` records live
    apply and acceptance, the selected non-platform source container and network
    are absent, and target resources plus source-control credentials remain. A
    real `coolify-local` run includes internal Coolify components that `--all-apps`
    excludes unless `--include-platform` is supplied, so this purge must not
    record `PurgedAt` or claim that the whole run is complete.
-6. Restore the clean snapshot and repeat with a disposable app containing a
+7. Restore the clean snapshot and repeat with a disposable app containing a
    named volume and a bind mount under a disposable directory. After the purge
    dry run, manually remove every listed source resource. Confirm that `--apply`
    performs only absence verification, leaves the run accepted rather than
    complete, and does not delete a replacement resource introduced before
    verification.
-7. Repeat once with an interrupted live apply and once with two concurrent live
+8. Repeat once with an interrupted live apply and once with two concurrent live
    invocations. Confirm that resume, attachment, and read-only status behave as
    documented.
-8. Destroy the VM or restore its snapshot after retaining only the redacted
+9. Destroy the VM or restore its snapshot after retaining only the redacted
    evidence needed for the release.
 
 ## Evidence handling
