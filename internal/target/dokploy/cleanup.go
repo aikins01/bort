@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/aikins01/bort/internal/safepath"
 )
 
 type StalePlatformProject struct {
@@ -921,27 +923,38 @@ func backupDokployDatabase(ctx context.Context, runner dockerRunner, pg, backupD
 	if backupPrefix = strings.TrimSpace(backupPrefix); backupPrefix == "" {
 		backupPrefix = "dokploy-cleanup"
 	}
-	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+	dir, err := safepath.OpenPrivateDirNoFollow(backupDir)
+	if err != nil {
 		return "", err
 	}
-	if err := os.Chmod(backupDir, 0o700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(backupDir, fmt.Sprintf("%s-%s.sql", backupPrefix, time.Now().UTC().Format("20060102-150405.000000000")))
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	defer dir.Close()
+	name := fmt.Sprintf("%s-%s.sql", backupPrefix, time.Now().UTC().Format("20060102-150405.000000000"))
+	path := filepath.Join(backupDir, name)
+	file, err := dir.CreateFile(name, 0o600)
 	if err != nil {
 		return "", err
 	}
 	if err := runner.Run(ctx, nil, file, "exec", pg, "pg_dump", "-U", "dokploy", "-d", "dokploy"); err != nil {
 		_ = file.Close()
+		_ = dir.Remove(name)
 		return "", fmt.Errorf("backup dokploy database to %s: %w", path, err)
 	}
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
 		return "", err
 	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return "", err
+	}
 	if err := file.Close(); err != nil {
 		return "", fmt.Errorf("close dokploy database backup %s: %w", path, err)
+	}
+	if err := dir.Sync(); err != nil {
+		return "", fmt.Errorf("sync dokploy database backup directory for %s: %w", path, err)
+	}
+	if err := dir.ValidatePath(); err != nil {
+		return "", fmt.Errorf("verify dokploy database backup location %s: %w", path, err)
 	}
 	return path, nil
 }

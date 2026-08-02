@@ -7,6 +7,26 @@ import (
 	"os"
 )
 
+func openPrivateDirNoFollow(path string, _ bool) (*os.File, error) {
+	return nil, fmt.Errorf("secure private directory access for %s is unavailable on Windows", path)
+}
+
+func createPrivateFileNoFollow(*os.File, string, os.FileMode) (*os.File, error) {
+	return nil, fmt.Errorf("secure private file creation is unavailable on Windows")
+}
+
+func writePrivateFileAtomicNoFollow(*os.File, string, []byte, os.FileMode) error {
+	return fmt.Errorf("secure private file replacement is unavailable on Windows")
+}
+
+func removePrivateFileNoFollow(*os.File, string) error {
+	return fmt.Errorf("secure private file removal is unavailable on Windows")
+}
+
+func syncPrivateDir(*os.File) error {
+	return fmt.Errorf("secure private directory sync is unavailable on Windows")
+}
+
 func openNoFollowRead(path string) (*os.File, error) {
 	if err := rejectFinalSymlink(path); err != nil {
 		return nil, err

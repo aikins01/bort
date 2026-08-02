@@ -353,12 +353,12 @@ func runCleanupPurge(ctx context.Context, args []string, stdin io.Reader, stdout
 	if err := confirmCleanupPurgeApply(stdin, stderr, run.Run.Name, confirm); err != nil {
 		return err
 	}
-	backupPath, err := writeCleanupPurgeBackup(backupDir, result)
+	recorder, err := newCleanupPurgeBackupRecorder(backupDir, &result)
 	if err != nil {
 		return err
 	}
-	result.BackupPath = backupPath
-	recorder := cleanupPurgeBackupRecorder{path: backupPath, result: &result, persist: updateCleanupPurgeBackup}
+	defer recorder.Close()
+	backupPath := recorder.path
 	if err := recorder.Start(); err != nil {
 		return fmt.Errorf("record source purge execution start in private backup %s: %w", backupPath, err)
 	}
@@ -877,30 +877,49 @@ func cleanupPurgeConfirmPhrase(runName string) string {
 }
 
 func writeCleanupPurgeBackup(backupDir string, result cleanupPurgeResult) (string, error) {
+	recorder, err := newCleanupPurgeBackupRecorder(backupDir, &result)
+	if err != nil {
+		return "", err
+	}
+	defer recorder.Close()
+	return recorder.path, nil
+}
+
+func newCleanupPurgeBackupRecorder(backupDir string, result *cleanupPurgeResult) (*cleanupPurgeBackupRecorder, error) {
 	backupDir = strings.TrimSpace(backupDir)
 	if backupDir == "" {
 		backupDir = filepath.Join(".bort", "backups")
 	}
-	if err := os.MkdirAll(backupDir, 0o700); err != nil {
-		return "", err
+	dir, err := safepath.OpenPrivateDirNoFollow(backupDir)
+	if err != nil {
+		return nil, err
 	}
-	if err := os.Chmod(backupDir, 0o700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(backupDir, fmt.Sprintf("source-purge-%s-%s.json", cleanupBackupFilePart(result.RunName), time.Now().UTC().Format("20060102-150405.000000000")))
-	return path, updateCleanupPurgeBackup(path, result)
-}
-
-func updateCleanupPurgeBackup(path string, result cleanupPurgeResult) error {
+	name := fmt.Sprintf("source-purge-%s-%s.json", cleanupBackupFilePart(result.RunName), time.Now().UTC().Format("20060102-150405.000000000"))
+	path := filepath.Join(backupDir, name)
 	result.BackupPath = path
-	return writeJSONArtifact(path, result)
+	recorder := &cleanupPurgeBackupRecorder{path: path, name: name, dir: dir, result: result}
+	if err := recorder.Persist(); err != nil {
+		_ = recorder.Close()
+		return nil, err
+	}
+	return recorder, nil
 }
 
 type cleanupPurgeBackupRecorder struct {
-	path    string
-	result  *cleanupPurgeResult
-	persist func(string, cleanupPurgeResult) error
-	err     error
+	path   string
+	name   string
+	dir    *safepath.PrivateDir
+	result *cleanupPurgeResult
+	err    error
+}
+
+func (r *cleanupPurgeBackupRecorder) Close() error {
+	if r.dir == nil {
+		return nil
+	}
+	err := r.dir.Close()
+	r.dir = nil
+	return err
 }
 
 func (r *cleanupPurgeBackupRecorder) Start() error {
@@ -918,7 +937,12 @@ func (r *cleanupPurgeBackupRecorder) Persist() error {
 	if r.err != nil {
 		return r.err
 	}
-	if err := r.persist(r.path, *r.result); err != nil {
+	contents, err := json.MarshalIndent(*r.result, "", "  ")
+	if err == nil {
+		contents = append(contents, '\n')
+		err = r.dir.WriteFileAtomic(r.name, contents, 0o600)
+	}
+	if err != nil {
 		r.err = err
 		return err
 	}
