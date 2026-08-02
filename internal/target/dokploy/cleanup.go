@@ -207,6 +207,9 @@ func runSourcePurgeResource(result *SourcePurgeResult, resources *[]SourcePurgeR
 		return err
 	}
 	outcome, operationErr := operation()
+	if operationErr != nil && strings.TrimSpace(outcome.Message) == "" {
+		outcome.Message = operationErr.Error()
+	}
 	(*resources)[len(*resources)-1] = outcome
 	if err := publishSourcePurgeProgress(*result, onProgress); err != nil {
 		if operationErr != nil {

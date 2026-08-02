@@ -1243,6 +1243,44 @@ func TestTargetContainerForServiceReportsComposeDeploymentError(t *testing.T) {
 	}
 }
 
+func TestTargetContainerForServiceBlocksActivePatchBeforeDiscoveryRedeploy(t *testing.T) {
+	deploys := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "c1", AppName: "stack-1", ComposeStatus: "done"})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			deploys++
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte(""),
+			"ps --format {{.Names}}": []byte("dokploy-postgres\n"),
+		},
+		runOutputs: map[string][]byte{
+			"exec -i dokploy-postgres psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": []byte(`{"patchId":"bort-api-compose","filePath":"docker|compose.yml","composeName":"api","sourceType":"github","repository":"owner/repo","branch":"main"}` + "\n"),
+		},
+	}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}}
+	entry := actx.entry("api")
+	entry.ComposeID = "c1"
+	entry.ComposeAppName = "stack-1"
+
+	_, err := client.targetContainerForService(context.Background(), runner, actx, "api", "web")
+	if err == nil || !strings.Contains(err.Error(), "active Bort-owned Dokploy patch") {
+		t.Fatalf("expected active patch to block discovery redeploy, got %v", err)
+	}
+	if deploys != 0 {
+		t.Fatalf("active patch allowed discovery redeploy, deploys=%d", deploys)
+	}
+}
+
 func TestApplySyncVolumeRsyncsBindMount(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
 	app.Resources.Volumes = []preparer.VolumeResource{{

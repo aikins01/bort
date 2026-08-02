@@ -292,6 +292,16 @@ func TestRunCleanupPurgeInventoriesDestructiveSourceResources(t *testing.T) {
 func TestRunCleanupPurgeApplyRequiresExplicitScopeAndConfirmation(t *testing.T) {
 	workDir := t.TempDir()
 	t.Chdir(workDir)
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dockerPath := filepath.Join(binDir, "docker")
+	dockerStub := "#!/bin/sh\nif [ \"$1\" = inspect ]; then\n  echo 'Error: No such object' >&2\n  exit 1\nfi\nif [ \"$1\" = volume ] && [ \"$2\" = inspect ]; then\n  echo 'Error response from daemon: no such volume' >&2\n  exit 1\nfi\nexit 0\n"
+	if err := os.WriteFile(dockerPath, []byte(dockerStub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	bundleDir := filepath.Join(workDir, "bort-bundle")
 	writeTestBundle(t, bundleDir, manifest.Manifest{
 		Source: manifest.Source{Platform: "coolify-local"},
@@ -477,12 +487,15 @@ func TestCleanupPurgeFailsClosedWhenTopologyIsUnavailable(t *testing.T) {
 	if err := os.WriteFile(topologyPath, topology, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	run.Prepare.Apps[0].Resources.SourceServices = []preparer.SourceServiceRef{{ServiceName: "api"}}
+	run.Prepare.Apps[0].Resources.SourceServices = []preparer.SourceServiceRef{
+		{ServiceName: "api", ContainerName: "api"},
+		{ServiceName: "worker", ContainerID: "worker-id", ContainerName: "worker"},
+	}
 	incomplete, err := planCleanupPurge(run, "dokploy", cleanupPurgeFilters{AllApps: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if incomplete.CompletesLifecycle || !strings.Contains(strings.Join(incomplete.Warnings, "\n"), "has no stable container ID") {
+	if incomplete.CompletesLifecycle || !strings.Contains(strings.Join(incomplete.Warnings, "\n"), "has no stable container ID") || len(incomplete.SourceContainers) != 1 || incomplete.SourceContainers[0].ContainerID != "worker-id" {
 		t.Fatalf("expected unresolved source coordinates to keep lifecycle incomplete, got %#v", incomplete)
 	}
 }

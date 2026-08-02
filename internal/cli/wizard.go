@@ -224,7 +224,7 @@ func promptInstallAndBootstrapDokploy(ctx context.Context, stdin io.Reader, stdo
 	if strings.TrimSpace(defaultURL) == "" {
 		defaultURL = "http://127.0.0.1:3030"
 	}
-	description := fmt.Sprintf("Bort will set up Dokploy in same-VPS shadow mode at %s and keep Coolify on :80/:443 until cutover. You may be asked to choose a Coolify admin and enter its password.", defaultURL)
+	description := fmt.Sprintf("Bort will set up Dokploy in same-VPS shadow mode at %s. This writes system configuration, creates Docker resources, initializes Swarm when needed, and may disable Docker live-restore and reload Docker. Coolify keeps :80/:443 until Bort switches traffic. You may be asked to choose a Coolify admin and enter its password.", defaultURL)
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().
 			Title("Install Dokploy now?").

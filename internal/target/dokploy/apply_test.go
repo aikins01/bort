@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -250,6 +251,90 @@ func TestActivePatchGuardBlocksGitBackedCompose(t *testing.T) {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("expected patch guard sql to contain %q, got:\n%s", want, sql)
 		}
+	}
+	if strings.Contains(sql, `coalesce(c."sourceType"::text, '') not in`) {
+		t.Fatalf("expected active Bort patches to block mutations regardless of current compose source type, got:\n%s", sql)
+	}
+}
+
+type stagedBortPatchRunner struct {
+	fakeDockerRunner
+	checks int
+}
+
+func (r *stagedBortPatchRunner) Run(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {
+	key := strings.Join(args, " ")
+	if strings.Contains(key, " psql ") {
+		r.checks++
+		if r.checks == 2 {
+			r.runOutputs[key] = []byte(`{"patchId":"bort-api-compose","filePath":"docker|compose.yml","composeName":"api","sourceType":"github","repository":"owner/repo","branch":"main"}` + "\n")
+		} else {
+			r.runOutputs[key] = nil
+		}
+	}
+	return r.fakeDockerRunner.Run(ctx, stdin, stdout, args...)
+}
+
+func TestComposeMutationPatchGuardsDetectConcurrentPatch(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		path   string
+		mutate func(*Client) error
+	}{
+		{name: "update", path: "/api/compose.update", mutate: func(client *Client) error {
+			return client.updateComposeWithPatchGuard(context.Background(), "compose-api", "services: {}\n", "")
+		}},
+		{name: "deploy", path: "/api/compose.deploy", mutate: func(client *Client) error {
+			return client.deployComposeWithPatchGuard(context.Background(), "compose-api", "bort-migrate")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mutations := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != test.path {
+					http.NotFound(w, r)
+					return
+				}
+				mutations++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+			runner := &stagedBortPatchRunner{fakeDockerRunner: fakeDockerRunner{
+				outputs:    map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
+				runOutputs: map[string][]byte{},
+			}}
+			client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+			err := test.mutate(client)
+			if err == nil || !strings.Contains(err.Error(), "appeared while Bort was changing compose") {
+				t.Fatalf("expected post-mutation patch detection, got %v", err)
+			}
+			if mutations != 1 || runner.checks != 2 {
+				t.Fatalf("expected one mutation between two patch checks, mutations=%d checks=%d", mutations, runner.checks)
+			}
+		})
+	}
+}
+
+func TestComposeMutationPatchGuardRechecksAfterHTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/compose.update" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "mutation failed", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	runner := &stagedBortPatchRunner{fakeDockerRunner: fakeDockerRunner{
+		outputs:    map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
+		runOutputs: map[string][]byte{},
+	}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	err := client.updateComposeWithPatchGuard(context.Background(), "compose-api", "services: {}\n", "")
+	if err == nil || !strings.Contains(err.Error(), "mutation failed") || !strings.Contains(err.Error(), "appeared while Bort was changing compose") {
+		t.Fatalf("expected HTTP and post-mutation patch errors, got %v", err)
+	}
+	if runner.checks != 2 {
+		t.Fatalf("expected the failed HTTP mutation to remain bracketed by patch checks, got %d", runner.checks)
 	}
 }
 

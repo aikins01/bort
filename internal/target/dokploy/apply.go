@@ -267,6 +267,8 @@ func validatePlanReadyForLiveApply(plan Plan) error {
 			continue
 		}
 		switch app.Readiness {
+		// acknowledged decisions remain in the immutable plan; the CLI blocks
+		// unacknowledged decisions before it calls the target client.
 		case "", preparer.ReadinessReadyToCreate, preparer.ReadinessNeedsDecision:
 		default:
 			return fmt.Errorf("live apply blocked by prepare readiness for app %s: %s", app.Name, app.Readiness)
@@ -303,6 +305,23 @@ func (c *Client) validateNoActiveBortOverrides(ctx context.Context, composeID st
 	if len(patches) == 0 {
 		return nil
 	}
+	details := activeBortOverridePatchDetails(patches)
+	return fmt.Errorf("active Bort-owned Dokploy patch(es) override compose app(s): %s; merge the patch contents into the repo or disable the patch before live apply so the reviewed compose file remains the source of truth", strings.Join(details, "; "))
+}
+
+func (c *Client) validateNoActiveBortOverridesAfterMutation(ctx context.Context, composeID string) error {
+	patches, err := c.activeBortOverridePatches(ctx, composeID)
+	if err != nil {
+		return fmt.Errorf("recheck active Dokploy patches after changing compose %s; the compose was already changed and must be verified manually: %w", composeID, err)
+	}
+	if len(patches) == 0 {
+		return nil
+	}
+	details := activeBortOverridePatchDetails(patches)
+	return fmt.Errorf("active Bort-owned Dokploy patch(es) appeared while Bort was changing compose %s: %s; stop and reconcile the compose file and patch before resuming", composeID, strings.Join(details, "; "))
+}
+
+func activeBortOverridePatchDetails(patches []activeBortOverridePatch) []string {
 	details := make([]string, 0, len(patches))
 	for _, patch := range patches {
 		repo := strings.Trim(strings.TrimSpace(patch.Repository)+"@"+strings.TrimSpace(patch.Branch), "@")
@@ -312,7 +331,7 @@ func (c *Client) validateNoActiveBortOverrides(ctx context.Context, composeID st
 		details = append(details, fmt.Sprintf("%s on %s (%s, %s)", patch.PatchID, patch.ComposeName, patch.FilePath, repo))
 	}
 	sort.Strings(details)
-	return fmt.Errorf("active Bort-owned Dokploy patch(es) override Git-backed compose app(s): %s; merge the patch contents into the repo or disable the patch before live apply so Git remains the source of truth", strings.Join(details, "; "))
+	return details
 }
 
 func (c *Client) activeBortOverridePatches(ctx context.Context, composeID string) ([]activeBortOverridePatch, error) {
@@ -343,7 +362,6 @@ join compose c on c."composeId" = p."composeId"
 where p.enabled = true
   and p."patchId" like 'bort-%%'
   and c."composeId" = %s
-  and coalesce(c."sourceType"::text, '') not in ('', 'raw')
 order by c.name, p."patchId";
 `, sqlStringLiteral(composeID))
 }
@@ -698,10 +716,7 @@ func (c *Client) applyUploadEnv(ctx context.Context, actx *applyContext, step St
 	if err != nil {
 		return err
 	}
-	if err := c.validateNoActiveBortOverrides(ctx, entry.ComposeID); err != nil {
-		return err
-	}
-	return c.UpdateCompose(ctx, entry.ComposeID, composeFile, envContent)
+	return c.updateComposeWithPatchGuard(ctx, entry.ComposeID, composeFile, envContent)
 }
 
 func (c *Client) applyPushImage(ctx context.Context, actx *applyContext, step Step) error {
@@ -716,10 +731,7 @@ func (c *Client) applyPushImage(ctx context.Context, actx *applyContext, step St
 	if err := ensureComposeImagesAvailable(ctx, c.dockerRunner(), actx.plan, step.App, composeFile); err != nil {
 		return err
 	}
-	if err := c.validateNoActiveBortOverrides(ctx, entry.ComposeID); err != nil {
-		return err
-	}
-	if err := c.DeployCompose(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
+	if err := c.deployComposeWithPatchGuard(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
 		if safetyErr := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, step.App); safetyErr != nil && isUnsafeTargetResumeError(safetyErr) {
 			return fmt.Errorf("deploy dokploy compose: %w; post-deploy safety check: %v", err, safetyErr)
 		}
@@ -729,6 +741,24 @@ func (c *Client) applyPushImage(ctx context.Context, actx *applyContext, step St
 		return err
 	}
 	return c.pauseTargetWritersForState(ctx, c.dockerRunner(), actx, step.App)
+}
+
+func (c *Client) updateComposeWithPatchGuard(ctx context.Context, composeID, composeFile, envContent string) error {
+	if err := c.validateNoActiveBortOverrides(ctx, composeID); err != nil {
+		return err
+	}
+	mutationErr := c.UpdateCompose(ctx, composeID, composeFile, envContent)
+	patchErr := c.validateNoActiveBortOverridesAfterMutation(ctx, composeID)
+	return errors.Join(mutationErr, patchErr)
+}
+
+func (c *Client) deployComposeWithPatchGuard(ctx context.Context, composeID, title string) error {
+	if err := c.validateNoActiveBortOverrides(ctx, composeID); err != nil {
+		return err
+	}
+	mutationErr := c.DeployCompose(ctx, composeID, title)
+	patchErr := c.validateNoActiveBortOverridesAfterMutation(ctx, composeID)
+	return errors.Join(mutationErr, patchErr)
 }
 
 func deployComposeTitle(plan Plan) string {
@@ -913,10 +943,7 @@ func (c *Client) applyActivateRoutes(ctx context.Context, actx *applyContext, st
 	if err != nil {
 		return err
 	}
-	if err := c.validateNoActiveBortOverrides(ctx, entry.ComposeID); err != nil {
-		return err
-	}
-	if err := c.UpdateCompose(ctx, entry.ComposeID, composeFile, envContent); err != nil {
+	if err := c.updateComposeWithPatchGuard(ctx, entry.ComposeID, composeFile, envContent); err != nil {
 		return err
 	}
 	for _, route := range cutoverRoutesForApp(actx.plan.Cutover, step.App) {
@@ -928,7 +955,7 @@ func (c *Client) applyActivateRoutes(ctx context.Context, actx *applyContext, st
 			return err
 		}
 	}
-	if err := c.DeployCompose(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
+	if err := c.deployComposeWithPatchGuard(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
 		if safetyErr := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, step.App); safetyErr != nil && isUnsafeTargetResumeError(safetyErr) {
 			return fmt.Errorf("deploy dokploy compose: %w; post-deploy safety check: %v", err, safetyErr)
 		}
