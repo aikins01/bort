@@ -1,16 +1,17 @@
-# Lifecycle acceptance
+# End-to-end acceptance testing
 
-This guide is for maintainers validating Bort releases. It includes an automated
-trace with fakes and a destructive disposable-host checklist. The fake trace is
-not evidence that real Docker, proxy, volume, or filesystem behavior passed.
+This guide is for maintainers testing Bort releases. It includes an automated
+test with fake services and a destructive checklist for a disposable host. The
+automated test does not prove that real Docker, proxy, volume, or filesystem
+behavior works.
 
-No production-host acceptance should be inferred until a redacted result from
-the disposable-host checklist has been recorded for the release candidate.
+Do not claim production-host support until a redacted result from the
+disposable-host checklist has been recorded for the version being released.
 
-## Automated lifecycle trace
+## Automated end-to-end test
 
-The automated trace uses a disposable workspace, fake Dokploy HTTP API, and fake
-Docker executable. It creates a self-contained run, performs live apply, verifies
+The automated test uses a temporary workspace, fake Dokploy HTTP API, and fake
+Docker command. It creates a self-contained run, performs live apply, verifies
 `TARGET LIVE`, commits, verifies `COMMITTED`, inventories cleanup, applies a
 confirmed all-app purge, and verifies `COMPLETE`:
 
@@ -26,7 +27,7 @@ make vet
 make build
 ```
 
-## Disposable-host matrix
+## Disposable-host test cases
 
 Use a fresh Linux VM or a restorable snapshot containing no data you intend to
 keep. Exercise at least:
@@ -36,23 +37,23 @@ keep. Exercise at least:
 | Stateless app | Domain remains healthy after live apply, acceptance, and source purge. |
 | Database | Representative data survives the selected migration strategy and remains readable and writable on the target. |
 | Named volume | Dry run requires manual completion; apply verifies absence without deleting resources automatically or recording completion. |
-| Bind mount | Host path receives the same absence-only treatment and protected paths are refused. |
-| Interrupted live apply | Rerun resumes from the apply ledger without replaying completed work blindly. |
-| Concurrent live invocation | The second process attaches to progress while status remains readable. |
-| Automatic purge | Exact source container and network identities are removed while target resources and credentials remain. |
-| Replacement identity | A resource recreated under a reused name is not mistaken for the originally reviewed object. |
+| Bind mount | Bort requires manual removal of the host path and refuses protected paths. |
+| Interrupted live apply | Rerunning the command continues from saved progress without repeating completed work. |
+| Two live commands | The second process shows the active progress while `status` remains readable. |
+| Automatic purge | Bort removes the exact source containers and networks while keeping target resources and credentials. |
+| Same-name replacement | Bort does not mistake a newly created resource for the one that was reviewed. |
 
 ## Disposable-host procedure
 
 1. Install Coolify, then deploy one stateless disposable Coolify app with a
    route, source network, and non-secret test environment value. Do not perform a
-   normal Dokploy installation alongside the active Coolify proxy. During Bort's
-   guided setup, use its same-VPS shadow installation so Dokploy's edge proxy is
-   prepared without taking ports 80/443 before cutover.
+   normal Dokploy installation alongside the active Coolify proxy. Use Bort's
+   guided `same-VPS shadow mode`, its side-by-side Dokploy layout, so Dokploy's
+   proxy is prepared without taking ports 80/443 before Bort switches web
+   traffic.
 2. Record the source container, network, and target project names before
    migration.
-3. In a dedicated working directory, run the complete lifecycle under one
-   identity:
+3. In a dedicated working directory, run the complete migration as one OS user:
 
    ```sh
    run="bort-acceptance-$(date +%Y%m%d-%H%M%S)"
@@ -76,9 +77,9 @@ keep. Exercise at least:
 5. Confirm that the target application remains healthy, `run.json` records live
    apply and acceptance, the selected non-platform source container and network
    are absent, and target resources plus source-control credentials remain. A
-   real `coolify-local` run includes platform-role applications that `--all-apps`
-   excludes unless `--include-platform` is supplied, so this scoped purge must
-   not record `PurgedAt` or claim whole-run completion.
+   real `coolify-local` run includes internal Coolify components that `--all-apps`
+   excludes unless `--include-platform` is supplied, so this purge must not
+   record `PurgedAt` or claim that the whole run is complete.
 6. Restore the clean snapshot and repeat with a disposable app containing a
    named volume and a bind mount under a disposable directory. After the purge
    dry run, manually remove every listed source resource. Confirm that `--apply`
@@ -97,8 +98,8 @@ Retain:
 
 - Bort version and release candidate commit;
 - host OS, architecture, Docker version, Coolify version, and Dokploy version;
-- redacted command output and lifecycle status;
-- the scenario matrix result;
+- redacted command output and migration status;
+- the test-case results;
 - confirmation that the VM was destroyed or restored.
 
 Do not retain or publish:
