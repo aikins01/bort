@@ -117,10 +117,26 @@ func TestBackupDokployDatabaseRejectsSymlinkDirectory(t *testing.T) {
 
 func dokployBackupTestDir(t *testing.T) string {
 	t.Helper()
-	dir, err := filepath.EvalSymlinks(t.TempDir())
+	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cacheDir, err = filepath.EvalSymlinks(cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(cacheDir, "bort-dokploy-cleanup-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove Dokploy backup test directory: %v", err)
+		}
+	})
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}

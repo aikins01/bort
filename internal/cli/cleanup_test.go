@@ -51,7 +51,7 @@ func TestLifecycleAcceptanceTraceWithFakeDokploy(t *testing.T) {
 	t.Setenv(dokploy.EnvBaseURL, server.URL)
 	t.Setenv(dokploy.EnvToken, "test-token")
 
-	workDir := t.TempDir()
+	workDir := cleanupBackupTestDir(t)
 	t.Chdir(workDir)
 	binDir := filepath.Join(workDir, "bin")
 	if err := os.MkdirAll(binDir, 0o700); err != nil {
@@ -966,10 +966,26 @@ func TestCleanupPurgeBackupRecorderRetainsDirectoryIdentity(t *testing.T) {
 
 func cleanupBackupTestDir(t *testing.T) string {
 	t.Helper()
-	dir, err := filepath.EvalSymlinks(t.TempDir())
+	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cacheDir, err = filepath.EvalSymlinks(cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(cacheDir, "bort-cleanup-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove cleanup backup test directory: %v", err)
+		}
+	})
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
