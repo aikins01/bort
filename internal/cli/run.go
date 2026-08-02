@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -45,6 +46,7 @@ type migrationRun struct {
 	ApplyOutcomeRequired     bool         `json:"applyOutcomeRequired,omitempty"`
 	Source                   string       `json:"source,omitempty"`
 	BundleDir                string       `json:"bundleDir"`
+	BundleDigest             string       `json:"bundleDigest,omitempty"`
 	SourceBundleDir          string       `json:"sourceBundleDir,omitempty"`
 	ManifestPath             string       `json:"manifest,omitempty"`
 	Target                   string       `json:"target"`
@@ -405,13 +407,21 @@ func liveApplyBlockingDecisions(run loadedMigrationRun) []runDecision {
 		if item.Readiness != preparer.ReadinessNeedsDecision {
 			return false
 		}
-		switch item.Stage {
-		case "cutover", "rollback", "commit":
-			return false
-		default:
-			return true
-		}
+		return !liveApplyReviewOnlyDecision(item)
 	})
+}
+
+func liveApplyReviewOnlyDecision(item runDecisionItem) bool {
+	switch item.Stage {
+	case "cutover":
+		return item.Code == "cutover.sync_verification_required" || item.Code == "cutover.health_check_required"
+	case "rollback":
+		return item.Code == "rollback.trigger_required" || item.Code == "rollback.source_health_required"
+	case "commit":
+		return item.Code == "commit.target_acceptance_required" || item.Code == "commit.target_route_acceptance_required" || item.Code == "commit.rollback_window_closed"
+	default:
+		return false
+	}
 }
 
 func applyRunActive(runRef string) (bool, error) {
@@ -515,6 +525,10 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 		return fmt.Errorf("lock live migration run: %w", err)
 	}
 	defer lock.Release()
+	bundleFiles, err := captureReviewedMigrationBundle(run)
+	if err != nil {
+		return err
+	}
 	if err := validateLiveApplyReady(run); err != nil {
 		return err
 	}
@@ -522,6 +536,7 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 	if len(plan.Steps) == 0 {
 		return fmt.Errorf("live migration plan has no executable steps")
 	}
+	plan.BundleFiles = bundleFiles
 	client, err := ensureDokployClient(ctx, run.Run.Target, os.Stdin, stderr, stderr)
 	if err != nil {
 		if err == errDokploySetupSkipped {
@@ -583,6 +598,10 @@ func ensureSelfContainedLiveRunLocked(run loadedMigrationRun) (loadedMigrationRu
 	if err != nil {
 		return loadedMigrationRun{}, fmt.Errorf("snapshot legacy run bundle: %w", err)
 	}
+	bundleDigest, err := digestMigrationBundle(bundleDir)
+	if err != nil {
+		return loadedMigrationRun{}, fmt.Errorf("digest legacy run bundle: %w", err)
+	}
 	removeBundle := true
 	defer func() {
 		if removeBundle {
@@ -605,6 +624,7 @@ func ensureSelfContainedLiveRunLocked(run loadedMigrationRun) (loadedMigrationRu
 		run.Run.SourceBundleDir = run.Run.BundleDir
 	}
 	run.Run.BundleDir = bundleDir
+	run.Run.BundleDigest = hex.EncodeToString(bundleDigest[:])
 	run.Run.ApplyOutcomeRequired = true
 	run.Run.UpdatedAt = now
 	run.Run.Artifacts = artifacts
@@ -1134,7 +1154,20 @@ func validateMigrationBundleSnapshot(sourceDir, snapshotDir string, sourceDigest
 }
 
 func digestMigrationBundle(root string) ([sha256.Size]byte, error) {
+	digest, _, err := readMigrationBundle(root, false)
+	return digest, err
+}
+
+func captureMigrationBundle(root string) ([sha256.Size]byte, map[string][]byte, error) {
+	return readMigrationBundle(root, true)
+}
+
+func readMigrationBundle(root string, capture bool) ([sha256.Size]byte, map[string][]byte, error) {
 	digest := sha256.New()
+	var files map[string][]byte
+	if capture {
+		files = map[string][]byte{}
+	}
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -1169,6 +1202,9 @@ func digestMigrationBundle(root string) ([sha256.Size]byte, error) {
 		if err != nil {
 			return err
 		}
+		if capture {
+			files[filepath.Clean(path)] = contents
+		}
 		if err := writeMigrationBundleDigestField(digest, []byte("file")); err != nil {
 			return err
 		}
@@ -1176,10 +1212,43 @@ func digestMigrationBundle(root string) ([sha256.Size]byte, error) {
 	})
 	var result [sha256.Size]byte
 	if err != nil {
-		return result, err
+		return result, nil, err
 	}
 	copy(result[:], digest.Sum(nil))
-	return result, nil
+	return result, files, nil
+}
+
+func verifyReviewedMigrationBundle(run loadedMigrationRun) error {
+	_, err := captureReviewedMigrationBundle(run)
+	return err
+}
+
+func captureReviewedMigrationBundle(run loadedMigrationRun) (map[string][]byte, error) {
+	recovery := reviewedMigrationBundleRecovery(run)
+	var expected [sha256.Size]byte
+	if strings.TrimSpace(run.Run.BundleDigest) == "" {
+		return nil, fmt.Errorf("run %q predates reviewed bundle digests; %s", run.Run.Name, recovery)
+	}
+	expectedBytes, err := hex.DecodeString(run.Run.BundleDigest)
+	if err != nil || len(expectedBytes) != sha256.Size {
+		return nil, fmt.Errorf("reviewed migration bundle digest for run %q is invalid; %s", run.Run.Name, recovery)
+	}
+	copy(expected[:], expectedBytes)
+	actual, files, err := captureMigrationBundle(run.Run.BundleDir)
+	if err != nil {
+		return nil, fmt.Errorf("capture reviewed migration bundle for run %q: %w; %s", run.Run.Name, err, recovery)
+	}
+	if actual != expected {
+		return nil, fmt.Errorf("reviewed migration bundle for run %q changed after planning; %s", run.Run.Name, recovery)
+	}
+	return files, nil
+}
+
+func reviewedMigrationBundleRecovery(run loadedMigrationRun) string {
+	if len(run.Applied.Steps) > 0 || run.Run.LiveAppliedAt != nil {
+		return "this run has started live execution and cannot be re-planned; reconcile any applied target changes, then create a new run"
+	}
+	return fmt.Sprintf("run `%s` to re-plan before live apply", runScopedCommand(run, "migrate"))
 }
 
 func writeMigrationBundleDigestField(w io.Writer, value []byte) error {
@@ -1247,6 +1316,10 @@ func createMigrationRunLocked(opts migrationRunOptions, runDir, runName string, 
 	if _, err := applyStateEnvToBundle(state, bundleDir); err != nil {
 		return loadedMigrationRun{}, err
 	}
+	bundleDigest, err := digestMigrationBundle(bundleDir)
+	if err != nil {
+		return loadedMigrationRun{}, err
+	}
 
 	preparePlan, err := preparer.Plan(preparer.Options{BundleDir: bundleDir, Target: opts.Target, AppName: opts.AppName})
 	if err != nil {
@@ -1289,6 +1362,7 @@ func createMigrationRunLocked(opts migrationRunOptions, runDir, runName string, 
 		ApplyOutcomeRequired:     true,
 		Source:                   opts.Source,
 		BundleDir:                bundleDir,
+		BundleDigest:             hex.EncodeToString(bundleDigest[:]),
 		SourceBundleDir:          sourceBundleDir,
 		ManifestPath:             opts.ManifestPath,
 		Target:                   opts.Target,
@@ -1681,21 +1755,16 @@ func openSetupDecisions(run loadedMigrationRun) []runDecision {
 
 func openReviewDecisions(run loadedMigrationRun) []runDecision {
 	return openFilteredDecisions(run, func(item runDecisionItem) bool {
-		if item.Readiness != preparer.ReadinessNeedsDecision {
-			return false
-		}
-		switch item.Stage {
-		case "cutover", "rollback", "commit":
-			return true
-		default:
-			return false
-		}
+		return item.Readiness == preparer.ReadinessNeedsDecision && liveApplyReviewOnlyDecision(item)
 	})
 }
 
 func openDownstreamBlockingDecisions(run loadedMigrationRun) []runDecision {
 	return openFilteredDecisions(run, func(item runDecisionItem) bool {
-		return item.Stage != "prepare" && (item.Readiness == preparer.ReadinessBlocked || item.Readiness == preparer.ReadinessNeedsInput)
+		if item.Stage == "prepare" {
+			return false
+		}
+		return item.Readiness == preparer.ReadinessBlocked || item.Readiness == preparer.ReadinessNeedsInput || (item.Readiness == preparer.ReadinessNeedsDecision && !liveApplyReviewOnlyDecision(item))
 	})
 }
 
