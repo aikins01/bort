@@ -122,7 +122,7 @@ func openPrivateFileNoFollow(dir *os.File, name string) (*os.File, error) {
 }
 
 func readPrivateFile(path, name string) ([]byte, error) {
-	dir, err := OpenPrivateDirNoFollow(path)
+	dir, err := openPrivateDirPathNoFollow(path, false)
 	if err != nil {
 		return nil, err
 	}
