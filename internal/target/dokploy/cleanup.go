@@ -9,6 +9,7 @@ import (
 	"os"
 	pathpkg "path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -87,6 +88,13 @@ type SourcePurgeResourceResult struct {
 }
 
 func (c *Client) CleanupStalePlatformProjects(ctx context.Context, opts StalePlatformCleanupOptions) (StalePlatformCleanupResult, error) {
+	if runtime.GOOS != "linux" {
+		return StalePlatformCleanupResult{}, fmt.Errorf("Dokploy metadata cleanup is unavailable on %s; run cleanup --apply on the Linux Dokploy host", runtime.GOOS)
+	}
+	return c.cleanupStalePlatformProjects(ctx, opts)
+}
+
+func (c *Client) cleanupStalePlatformProjects(ctx context.Context, opts StalePlatformCleanupOptions) (StalePlatformCleanupResult, error) {
 	names := cleanupProjectNames(opts.ProjectNames)
 	if len(names) == 0 {
 		return StalePlatformCleanupResult{}, fmt.Errorf("at least one project name is required")
@@ -96,18 +104,29 @@ func (c *Client) CleanupStalePlatformProjects(ctx context.Context, opts StalePla
 	if err != nil {
 		return StalePlatformCleanupResult{}, err
 	}
-	backupPath, err := backupDokployDatabase(ctx, runner, pg, opts.BackupDir, opts.BackupPrefix)
+	backup, err := backupDokployDatabase(ctx, runner, pg, opts.BackupDir, opts.BackupPrefix)
 	if err != nil {
 		return StalePlatformCleanupResult{}, err
 	}
+	defer backup.dir.Close()
+	if err := backup.dir.ValidatePath(); err != nil {
+		return StalePlatformCleanupResult{}, fmt.Errorf("verify Dokploy database backup location %s before deleting metadata: %w", backup.path, err)
+	}
 	deleted, err := deleteStalePlatformProjects(ctx, runner, pg, names, opts.ProjectIDs)
 	if err != nil {
-		return StalePlatformCleanupResult{}, fmt.Errorf("delete stale Dokploy platform metadata after backup %s: %w", backupPath, err)
+		return StalePlatformCleanupResult{}, fmt.Errorf("delete stale Dokploy platform metadata after backup %s: %w", backup.path, err)
 	}
-	return StalePlatformCleanupResult{BackupPath: backupPath, Deleted: deleted}, nil
+	return StalePlatformCleanupResult{BackupPath: backup.path, Deleted: deleted}, nil
 }
 
 func (c *Client) PurgeSourceResources(ctx context.Context, opts SourcePurgeOptions) (SourcePurgeResult, error) {
+	if runtime.GOOS != "linux" {
+		return SourcePurgeResult{}, fmt.Errorf("source resource purge is unavailable on %s; rerun this purge on the Linux source host", runtime.GOOS)
+	}
+	return c.purgeSourceResources(ctx, opts)
+}
+
+func (c *Client) purgeSourceResources(ctx context.Context, opts SourcePurgeOptions) (SourcePurgeResult, error) {
 	runner := c.dockerRunner()
 	result := SourcePurgeResult{}
 
@@ -1052,7 +1071,12 @@ func findDokployPostgresContainer(ctx context.Context, runner dockerRunner) (str
 	return "", fmt.Errorf("dokploy postgres container was not found; cleanup must run on the Dokploy host")
 }
 
-func backupDokployDatabase(ctx context.Context, runner dockerRunner, pg, backupDir, backupPrefix string) (_ string, resultErr error) {
+type dokployDatabaseBackup struct {
+	path string
+	dir  *safepath.PrivateDir
+}
+
+func backupDokployDatabase(ctx context.Context, runner dockerRunner, pg, backupDir, backupPrefix string) (_ *dokployDatabaseBackup, resultErr error) {
 	backupDir = strings.TrimSpace(backupDir)
 	if backupDir == "" {
 		backupDir = filepath.Join(".bort", "backups")
@@ -1062,14 +1086,18 @@ func backupDokployDatabase(ctx context.Context, runner dockerRunner, pg, backupD
 	}
 	dir, err := safepath.OpenPrivateDirNoFollow(backupDir)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	defer dir.Close()
+	defer func() {
+		if resultErr != nil {
+			_ = dir.Close()
+		}
+	}()
 	name := fmt.Sprintf("%s-%s.sql", backupPrefix, time.Now().UTC().Format("20060102-150405.000000000"))
 	path := filepath.Join(backupDir, name)
 	file, err := dir.CreateFile(name, 0o600)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	removeBackup := true
 	defer func() {
@@ -1081,25 +1109,22 @@ func backupDokployDatabase(ctx context.Context, runner dockerRunner, pg, backupD
 		}
 	}()
 	if err := runner.Run(ctx, nil, file, "exec", pg, "pg_dump", "-U", "dokploy", "-d", "dokploy"); err != nil {
-		return "", fmt.Errorf("backup dokploy database to %s: %w", path, err)
+		return nil, fmt.Errorf("backup dokploy database to %s: %w", path, err)
 	}
 	if err := file.Chmod(0o600); err != nil {
-		return "", err
+		return nil, err
 	}
 	if err := file.Sync(); err != nil {
-		return "", err
+		return nil, err
 	}
 	if err := file.Close(); err != nil {
-		return "", fmt.Errorf("close dokploy database backup %s: %w", path, err)
+		return nil, fmt.Errorf("close dokploy database backup %s: %w", path, err)
 	}
 	if err := dir.Sync(); err != nil {
-		return "", fmt.Errorf("sync dokploy database backup directory for %s: %w", path, err)
-	}
-	if err := dir.ValidatePath(); err != nil {
-		return "", fmt.Errorf("verify dokploy database backup location %s: %w", path, err)
+		return nil, fmt.Errorf("sync dokploy database backup directory for %s: %w", path, err)
 	}
 	removeBackup = false
-	return path, nil
+	return &dokployDatabaseBackup{path: path, dir: dir}, nil
 }
 
 func deleteStalePlatformProjects(ctx context.Context, runner dockerRunner, pg string, names []string, projectIDs map[string]string) ([]StalePlatformProject, error) {
