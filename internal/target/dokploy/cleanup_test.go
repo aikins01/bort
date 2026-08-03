@@ -780,7 +780,7 @@ func TestDockerMissingResourceClassifierRejectsInfrastructureErrors(t *testing.T
 }
 
 func TestProtectedSourcePurgeNetworkNamesAreCaseSensitive(t *testing.T) {
-	for _, name := range []string{"bridge", "host", "none", "ingress"} {
+	for _, name := range []string{"bridge", "host", "none", "ingress", "docker_gwbridge"} {
 		if !IsProtectedSourcePurgeNetwork(name) {
 			t.Fatalf("expected %q to be protected", name)
 		}
