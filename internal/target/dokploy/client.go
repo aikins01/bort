@@ -108,23 +108,35 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-api-key", c.Token)
 
-	resp, err := c.HTTPClient.Do(req)
+	httpClient := *c.httpClient()
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("dokploy %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read %s response: %w", path, err)
-	}
-	if resp.StatusCode >= 400 {
+	data, readErr := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		apiErr := &APIError{Status: resp.StatusCode}
 		_ = json.Unmarshal(data, apiErr)
 		if apiErr.Message == "" {
 			apiErr.Message = strings.TrimSpace(string(data))
 		}
+		if readErr != nil {
+			readFailure := fmt.Sprintf("read response: %v", readErr)
+			if apiErr.Message == "" {
+				apiErr.Message = readFailure
+			} else {
+				apiErr.Message += " (" + readFailure + ")"
+			}
+		}
 		return apiErr
+	}
+	if readErr != nil && out != nil {
+		return fmt.Errorf("read %s response: %w", path, readErr)
 	}
 	if out != nil && len(data) > 0 {
 		if err := json.Unmarshal(data, out); err != nil {

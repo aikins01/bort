@@ -352,6 +352,42 @@ func (e deployedComposeGuardError) Unwrap() error {
 	return e.err
 }
 
+type deployedComposeTerminalError struct {
+	err error
+}
+
+func (e deployedComposeTerminalError) Error() string {
+	return e.err.Error()
+}
+
+func (e deployedComposeTerminalError) Unwrap() error {
+	return e.err
+}
+
+type deployedComposeMonitorError struct {
+	err error
+}
+
+func (e deployedComposeMonitorError) Error() string {
+	return e.err.Error()
+}
+
+func (e deployedComposeMonitorError) Unwrap() error {
+	return e.err
+}
+
+type ambiguousDeployResponseError struct {
+	err error
+}
+
+func (e ambiguousDeployResponseError) Error() string {
+	return e.err.Error()
+}
+
+func (e ambiguousDeployResponseError) Unwrap() error {
+	return e.err
+}
+
 type unsafeSourceResumeError struct {
 	err error
 }
@@ -416,7 +452,18 @@ func (c *Client) activeBortOverridePatches(ctx context.Context, composeID string
 		"exec", "-i", pg, "psql", "-U", "dokploy", "-d", "dokploy", "-v", "ON_ERROR_STOP=1", "-At"); err != nil {
 		return nil, fmt.Errorf("inspect active Dokploy patches: %w", err)
 	}
-	return parseActiveBortOverridePatches(out.String())
+	patches, err := parseActiveBortOverridePatches(out.String())
+	if err != nil {
+		return nil, err
+	}
+	active := make([]activeBortOverridePatch, 0, len(patches))
+	for _, patch := range patches {
+		if strings.EqualFold(strings.TrimSpace(patch.SourceType), "raw") {
+			continue
+		}
+		active = append(active, patch)
+	}
+	return active, nil
 }
 
 func activeBortOverridePatchesSQL(composeID string) string {
@@ -811,7 +858,11 @@ func (c *Client) applyPushImage(ctx context.Context, actx *applyContext, step St
 	if err := ensureComposeImagesAvailable(ctx, c.dockerRunner(), actx.plan, step.App, composeFile); err != nil {
 		return err
 	}
-	if err := c.deployComposeForApply(ctx, actx, step.App); err != nil {
+	envContent, err := readEnvContent(actx.plan, step.App)
+	if err != nil {
+		return err
+	}
+	if err := c.deployComposeForApply(ctx, actx, step.App, composeFile, envContent); err != nil {
 		return err
 	}
 	return c.pauseTargetWritersForState(ctx, c.dockerRunner(), actx, step.App)
@@ -830,41 +881,107 @@ func (c *Client) deployComposeWithPatchGuard(ctx context.Context, composeID, tit
 	if err := c.validateNoActiveBortOverrides(ctx, composeID); err != nil {
 		return err
 	}
-	mutationErr := c.DeployCompose(ctx, composeID, title)
-	patchErr := c.validateNoActiveBortOverridesAfterMutation(ctx, composeID)
-	if mutationErr == nil && patchErr != nil {
-		return deployedComposeGuardError{err: patchErr}
+	err := c.DeployCompose(ctx, composeID, title)
+	if err == nil {
+		return nil
 	}
-	return errors.Join(mutationErr, patchErr)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return err
+	}
+	return ambiguousDeployResponseError{err: err}
 }
 
-func (c *Client) deployComposeForApply(ctx context.Context, actx *applyContext, appName string) error {
+const guardedDeploymentTimeout = 30 * time.Minute
+
+func (c *Client) deployComposeForApply(ctx context.Context, actx *applyContext, appName, composeFile, envContent string) error {
 	entry := actx.entry(appName)
+	if err := c.updateComposeWithPatchGuard(ctx, entry.ComposeID, composeFile, envContent); err != nil {
+		return err
+	}
 	title, err := deployComposeAttemptTitle(actx.plan)
 	if err != nil {
 		return err
 	}
 	err = c.deployComposeWithPatchGuard(ctx, entry.ComposeID, title)
-	if err == nil {
-		return c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, appName)
+	var ambiguousErr ambiguousDeployResponseError
+	if err == nil || errors.As(err, &ambiguousErr) {
+		responseErr := err
+		deployment, guardErr := c.waitForGuardedDeployment(ctx, entry.ComposeID, title)
+		status := strings.ToLower(strings.TrimSpace(deployment.Status))
+		if status != "" && status != "done" {
+			err = deployedComposeTerminalError{err: errors.Join(responseErr, fmt.Errorf("dokploy compose project %q deployment finished with status %q%s", entry.ComposeAppName, status, composeDeploymentDetails(&Compose{Deployments: []Deployment{deployment}})), guardErr)}
+		} else if guardErr != nil {
+			var monitorErr deployedComposeMonitorError
+			if errors.As(guardErr, &monitorErr) {
+				err = deployedComposeMonitorError{err: errors.Join(responseErr, guardErr)}
+			} else {
+				err = deployedComposeGuardError{err: errors.Join(responseErr, guardErr)}
+			}
+		} else {
+			return c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, appName)
+		}
 	}
 	var deployedGuardErr deployedComposeGuardError
-	if errors.As(err, &deployedGuardErr) {
-		stopCtx, cancelStop := context.WithTimeout(context.Background(), targetDiscoveryTimeout)
+	var deployedTerminalErr deployedComposeTerminalError
+	var deployedMonitorErr deployedComposeMonitorError
+	if errors.As(err, &deployedGuardErr) || errors.As(err, &deployedTerminalErr) || errors.As(err, &deployedMonitorErr) {
+		failure := "Dokploy accepted the deploy request, but its post-deploy safety guard failed"
+		if errors.As(err, &deployedTerminalErr) {
+			failure = "Dokploy compose deployment did not complete successfully"
+		} else if errors.As(err, &deployedMonitorErr) {
+			failure = "Dokploy accepted the deploy request, but deployment monitoring could not prove safety"
+			if errors.As(err, &ambiguousErr) {
+				failure = "Dokploy deploy response was ambiguous and deployment monitoring could not prove safety"
+			}
+		}
+		quiescenceDeadline := time.Now().Add(targetDiscoveryTimeout)
+		if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(quiescenceDeadline) {
+			quiescenceDeadline = callerDeadline
+		}
+		stopCtx, cancelStop := context.WithDeadline(context.Background(), quiescenceDeadline)
 		defer cancelStop()
 		stopErr := c.quiesceGuardedDeployment(stopCtx, actx, appName, title)
 		if stopErr != nil {
-			return unsafeSourceResumeError{err: unsafeTargetResumeError{err: fmt.Errorf("successful Dokploy deploy failed its post-deploy patch guard: %w; quiescence could not be proved, so Bort will leave any paused source applications stopped and skip target recovery: %v", err, stopErr)}}
+			return unsafeSourceResumeError{err: unsafeTargetResumeError{err: fmt.Errorf("%s: %w; quiescence could not be proved, so Bort will leave any paused source applications stopped and skip target recovery: %v", failure, err, stopErr)}}
 		}
 		safetyErr := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, appName)
 		combined := errors.Join(err, safetyErr)
-		return unsafeTargetResumeError{err: fmt.Errorf("successful Dokploy deploy failed its post-deploy patch guard; deployment quiesced and target compose containers were stopped: %w", combined)}
+		return unsafeTargetResumeError{err: fmt.Errorf("%s; deployment quiesced and target compose containers were stopped: %w", failure, combined)}
 	}
 	safetyErr := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, appName)
 	if safetyErr != nil && isUnsafeTargetResumeError(safetyErr) {
 		return fmt.Errorf("deploy dokploy compose: %w; post-deploy safety check: %v", err, safetyErr)
 	}
 	return err
+}
+
+func (c *Client) waitForGuardedDeployment(ctx context.Context, composeID, title string) (Deployment, error) {
+	monitorCtx, cancel := context.WithTimeout(ctx, guardedDeploymentTimeout)
+	defer cancel()
+	for {
+		compose, err := c.GetCompose(monitorCtx, composeID)
+		if err != nil {
+			return Deployment{}, deployedComposeMonitorError{err: fmt.Errorf("monitor accepted Dokploy deployment %q: %w", title, err)}
+		}
+		for _, deployment := range compose.Deployments {
+			if deployment.Title != title {
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(deployment.Status)) {
+			case "done", "error", "cancelled":
+				if err := c.validateNoActiveBortOverridesAfterMutation(monitorCtx, composeID); err != nil {
+					return deployment, err
+				}
+				return deployment, nil
+			}
+		}
+		select {
+		case <-monitorCtx.Done():
+			return Deployment{}, deployedComposeMonitorError{err: fmt.Errorf("monitor accepted Dokploy deployment %q: %w", title, monitorCtx.Err())}
+		case <-time.After(targetDiscoveryDelay):
+		}
+	}
 }
 
 func deployComposeAttemptTitle(plan Plan) (string, error) {
@@ -1059,6 +1176,9 @@ func (c *Client) applyInstallGateway(ctx context.Context, actx *applyContext, st
 	if entry.ComposeID == "" {
 		return fmt.Errorf("missing composeId for app %s; create_service must run first", step.App)
 	}
+	if err := c.validateNoActiveBortOverrides(ctx, entry.ComposeID); err != nil {
+		return err
+	}
 	route, ok := findCutoverRoute(actx.plan.Cutover, step.App, step.Ref)
 	if !ok {
 		return fmt.Errorf("route %s for app %s not found in cutover artifact", step.Ref, step.App)
@@ -1090,7 +1210,7 @@ func (c *Client) applyActivateRoutes(ctx context.Context, actx *applyContext, st
 	if err != nil {
 		return err
 	}
-	if err := c.updateComposeWithPatchGuard(ctx, entry.ComposeID, composeFile, envContent); err != nil {
+	if err := c.validateNoActiveBortOverrides(ctx, entry.ComposeID); err != nil {
 		return err
 	}
 	for _, route := range cutoverRoutesForApp(actx.plan.Cutover, step.App) {
@@ -1102,7 +1222,7 @@ func (c *Client) applyActivateRoutes(ctx context.Context, actx *applyContext, st
 			return err
 		}
 	}
-	return c.deployComposeForApply(ctx, actx, step.App)
+	return c.deployComposeForApply(ctx, actx, step.App, composeFile, envContent)
 }
 
 func (c *Client) ensureRouteDomain(ctx context.Context, composeID string, route gateway.Route) error {

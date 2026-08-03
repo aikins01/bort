@@ -1356,8 +1356,19 @@ func (c *Client) targetContainerForServiceWithRedeploy(ctx context.Context, runn
 		}
 		if allowRedeploy && len(containers) == 0 && entry.ComposeID != "" && !entry.DiscoveryRedeployAttempted {
 			entry.DiscoveryRedeployAttempted = true
-			if err := c.deployComposeForApply(ctx, actx, appName); err != nil {
-				return dockerContainer{}, fmt.Errorf("redeploy dokploy compose project %q for target discovery: %w", entry.ComposeAppName, err)
+			composeFile, err := c.composeFileForApply(ctx, actx, appName)
+			if err != nil {
+				return dockerContainer{}, err
+			}
+			envContent, err := readEnvContent(actx.plan, appName)
+			if err != nil {
+				return dockerContainer{}, err
+			}
+			redeployCtx, cancelRedeploy := context.WithDeadline(ctx, deadline)
+			redeployErr := c.deployComposeForApply(redeployCtx, actx, appName, composeFile, envContent)
+			cancelRedeploy()
+			if redeployErr != nil {
+				return dockerContainer{}, fmt.Errorf("redeploy dokploy compose project %q for target discovery: %w", entry.ComposeAppName, redeployErr)
 			}
 		}
 		if time.Now().After(deadline) {

@@ -351,12 +351,14 @@ func TestActivePatchGuardBlocksGitBackedCompose(t *testing.T) {
 			"ps --format {{.Names}}": []byte("dokploy-postgres.1.task\n"),
 		},
 		runOutputs: map[string][]byte{
-			"exec -i dokploy-postgres.1.task psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": []byte(`{"patchId":"bort-api-compose","filePath":"docker|compose.yml","composeName":"api","sourceType":"github","repository":"owner/repo","branch":"main"}` + "\n"),
+			"exec -i dokploy-postgres.1.task psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": []byte(
+				`{"patchId":"bort-api-compose","filePath":"docker|compose.yml","composeName":"api","sourceType":"github","repository":"owner/repo","branch":"main"}` + "\n" +
+					`{"patchId":"bort-raw-compose","filePath":"docker|compose.yml","composeName":"raw-api","sourceType":"raw","repository":"owner/repo","branch":"main"}` + "\n"),
 		},
 	}
 	client := &Client{Docker: runner}
 	err := client.validateNoActiveBortOverrides(context.Background(), "compose-api")
-	if err == nil || !strings.Contains(err.Error(), "active Bort-owned Dokploy patch") || !strings.Contains(err.Error(), "bort-api-compose") || !strings.Contains(err.Error(), "docker|compose.yml") {
+	if err == nil || !strings.Contains(err.Error(), "active Bort-owned Dokploy patch") || !strings.Contains(err.Error(), "bort-api-compose") || !strings.Contains(err.Error(), "docker|compose.yml") || strings.Contains(err.Error(), "bort-raw-compose") {
 		t.Fatalf("expected active patch guard, got %v", err)
 	}
 	if len(runner.runs) != 1 {
@@ -367,9 +369,6 @@ func TestActivePatchGuardBlocksGitBackedCompose(t *testing.T) {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("expected patch guard sql to contain %q, got:\n%s", want, sql)
 		}
-	}
-	if strings.Contains(sql, `coalesce(c."sourceType"::text, '') not in`) {
-		t.Fatalf("expected active Bort patches to block mutations regardless of current compose source type, got:\n%s", sql)
 	}
 }
 
@@ -438,48 +437,28 @@ func (r *restartingTargetRunner) Run(context.Context, io.Reader, io.Writer, ...s
 	return nil
 }
 
-func TestComposeMutationPatchGuardsDetectConcurrentPatch(t *testing.T) {
-	for _, test := range []struct {
-		name           string
-		path           string
-		deployedBefore bool
-		mutate         func(*Client) error
-	}{
-		{name: "update", path: "/api/compose.update", mutate: func(client *Client) error {
-			return client.updateComposeWithPatchGuard(context.Background(), "compose-api", "services: {}\n", "")
-		}},
-		{name: "deploy", path: "/api/compose.deploy", deployedBefore: true, mutate: func(client *Client) error {
-			return client.deployComposeWithPatchGuard(context.Background(), "compose-api", "bort-migrate")
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			mutations := 0
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodPost || r.URL.Path != test.path {
-					http.NotFound(w, r)
-					return
-				}
-				mutations++
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer server.Close()
-			runner := &stagedBortPatchRunner{fakeDockerRunner: fakeDockerRunner{
-				outputs:    map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
-				runOutputs: map[string][]byte{},
-			}}
-			client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
-			err := test.mutate(client)
-			if err == nil || !strings.Contains(err.Error(), "appeared while Bort was changing compose") {
-				t.Fatalf("expected post-mutation patch detection, got %v", err)
-			}
-			var deployedGuardErr deployedComposeGuardError
-			if got := errors.As(err, &deployedGuardErr); got != test.deployedBefore {
-				t.Fatalf("deployed guard error = %t, want %t", got, test.deployedBefore)
-			}
-			if mutations != 1 || runner.checks != 2 {
-				t.Fatalf("expected one mutation between two patch checks, mutations=%d checks=%d", mutations, runner.checks)
-			}
-		})
+func TestUpdateComposePatchGuardDetectsConcurrentPatch(t *testing.T) {
+	updates := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/compose.update" {
+			http.NotFound(w, r)
+			return
+		}
+		updates++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	runner := &stagedBortPatchRunner{fakeDockerRunner: fakeDockerRunner{
+		outputs:    map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
+		runOutputs: map[string][]byte{},
+	}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	err := client.updateComposeWithPatchGuard(context.Background(), "compose-api", "services: {}\n", "")
+	if err == nil || !strings.Contains(err.Error(), "appeared while Bort was changing compose") {
+		t.Fatalf("expected post-update patch detection, got %v", err)
+	}
+	if updates != 1 || runner.checks != 2 {
+		t.Fatalf("expected one update between two patch checks, updates=%d checks=%d", updates, runner.checks)
 	}
 }
 
@@ -488,6 +467,8 @@ func TestPostDeployPatchGuardStopsTargetCompose(t *testing.T) {
 	var composeReads int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
 			var request deployComposeRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -514,7 +495,7 @@ func TestPostDeployPatchGuardStopsTargetCompose(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	runner := &stagedBortPatchRunner{fakeDockerRunner: fakeDockerRunner{
+	runner := &stagedBortPatchRunner{patchAt: 4, fakeDockerRunner: fakeDockerRunner{
 		outputs: map[string][]byte{
 			"ps --format {{.Names}}": []byte("dokploy-postgres\n"),
 			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("target-id\n"),
@@ -529,7 +510,7 @@ func TestPostDeployPatchGuardStopsTargetCompose(t *testing.T) {
 	entry.ComposeID = "compose-api"
 	entry.ComposeAppName = "stack-1"
 
-	err := client.deployComposeForApply(context.Background(), actx, "api")
+	err := client.deployComposeForApply(context.Background(), actx, "api", "services: {}\n", "")
 	if err == nil || !strings.Contains(err.Error(), "deployment quiesced and target compose containers were stopped") || !isUnsafeTargetResumeError(err) {
 		t.Fatalf("expected guarded deploy failure to stop the target and prevent target recovery, got %v", err)
 	}
@@ -557,6 +538,280 @@ func TestPostDeployPatchGuardStopsTargetCompose(t *testing.T) {
 	}
 }
 
+func TestDeployComposeForApplyResolvesAmbiguousResponseByTitle(t *testing.T) {
+	var deploymentTitle string
+	deploys := 0
+	composeReads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			deploys++
+			var request deployComposeRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			deploymentTitle = request.Title
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.Close()
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			composeReads++
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "compose-api", Deployments: []Deployment{{Title: deploymentTitle, Status: "done"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	runner := &stagedBortPatchRunner{patchAt: 100, fakeDockerRunner: fakeDockerRunner{
+		outputs:    map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
+		runOutputs: map[string][]byte{},
+	}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	actx := &applyContext{plan: Plan{}, cache: map[string]*appCache{"api": {ComposeID: "compose-api", ComposeAppName: "stack-1"}}}
+
+	if err := client.deployComposeForApply(context.Background(), actx, "api", "services: {}\n", ""); err != nil {
+		t.Fatalf("expected titled terminal deployment to resolve ambiguous response, got %v", err)
+	}
+	if deploys != 1 || composeReads != 1 || deploymentTitle == "" {
+		t.Fatalf("expected one deploy resolved by one titled status read, deploys=%d reads=%d title=%q", deploys, composeReads, deploymentTitle)
+	}
+}
+
+func TestDeployComposeForApplyFailsClosedWhenAmbiguousResponseCannotBeResolved(t *testing.T) {
+	var deploymentTitle string
+	composeReads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			var request deployComposeRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			deploymentTitle = request.Title
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.Close()
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			composeReads++
+			http.Error(w, "deployment status unavailable", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	runner := &stagedBortPatchRunner{patchAt: 100, fakeDockerRunner: fakeDockerRunner{
+		outputs: map[string][]byte{
+			"ps --format {{.Names}}": []byte("dokploy-postgres\n"),
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": {},
+		},
+		runOutputs: map[string][]byte{},
+	}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	actx := &applyContext{plan: Plan{}, cache: map[string]*appCache{"api": {ComposeID: "compose-api", ComposeAppName: "stack-1"}}}
+
+	err := client.deployComposeForApply(context.Background(), actx, "api", "services: {}\n", "")
+	if err == nil || !strings.Contains(err.Error(), "response was ambiguous") || !strings.Contains(err.Error(), "deployment status unavailable") || !strings.Contains(err.Error(), "quiescence could not be proved") {
+		t.Fatalf("expected unresolved ambiguous response evidence, got %v", err)
+	}
+	if !isUnsafeSourceResumeError(err) || !isUnsafeTargetResumeError(err) {
+		t.Fatalf("unresolved ambiguous response must prevent source and target recovery, got %v", err)
+	}
+	if composeReads != 2 || deploymentTitle == "" {
+		t.Fatalf("expected monitoring and quiescence to inspect the titled attempt, reads=%d title=%q", composeReads, deploymentTitle)
+	}
+	if !fakeOutputCalled(&runner.fakeDockerRunner, "ps", "-a", "--filter", "label=com.docker.compose.project=stack-1", "--format", "{{.ID}}") {
+		t.Fatalf("unresolved ambiguous response did not attempt target quiescence, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestDeployComposeForApplyDoesNotMonitorAuthoritativeAPIRejection(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status int
+		body   bool
+	}{
+		{name: "redirect", status: http.StatusFound},
+		{name: "replay redirect", status: http.StatusTemporaryRedirect},
+		{name: "truncated error", status: http.StatusConflict, body: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			composeReads := 0
+			redirects := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+					if test.status >= 300 && test.status < 400 {
+						w.Header().Set("Location", "/login")
+					}
+					if test.body {
+						w.Header().Set("Content-Length", "100")
+					}
+					w.WriteHeader(test.status)
+					if test.body {
+						_, _ = w.Write([]byte("deploy rejected"))
+					}
+				case r.URL.Path == "/login":
+					redirects++
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+					composeReads++
+					http.NotFound(w, r)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			runner := &stagedBortPatchRunner{patchAt: 100, fakeDockerRunner: fakeDockerRunner{
+				outputs:    map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
+				runOutputs: map[string][]byte{},
+			}}
+			client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+			actx := &applyContext{plan: Plan{}, cache: map[string]*appCache{"api": {ComposeID: "compose-api", ComposeAppName: "stack-1"}}}
+
+			err := client.deployComposeForApply(context.Background(), actx, "api", "services: {}\n", "")
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Status != test.status {
+				t.Fatalf("expected authoritative API rejection %d, got %v", test.status, err)
+			}
+			if composeReads != 0 || redirects != 0 || isUnsafeSourceResumeError(err) || isUnsafeTargetResumeError(err) {
+				t.Fatalf("authoritative rejection followed redirect or entered deployment recovery, redirects=%d reads=%d err=%v", redirects, composeReads, err)
+			}
+		})
+	}
+}
+
+func TestDeployComposeAcceptsCompletedSuccessWithTruncatedBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/compose.deploy" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("queued"))
+	}))
+	defer server.Close()
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+
+	if err := client.DeployCompose(context.Background(), "compose-api", "unique-title"); err != nil {
+		t.Fatalf("completed 2xx deploy response was not accepted: %v", err)
+	}
+}
+
+func TestWaitForGuardedDeploymentRechecksPatchAfterTerminalStatus(t *testing.T) {
+	composeReads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/compose.one" {
+			http.NotFound(w, r)
+			return
+		}
+		composeReads++
+		_ = json.NewEncoder(w).Encode(Compose{ComposeID: "compose-api", Deployments: []Deployment{{Title: "unique-title", Status: "done"}}})
+	}))
+	defer server.Close()
+	runner := &stagedBortPatchRunner{
+		patchAt: 1,
+		fakeDockerRunner: fakeDockerRunner{
+			outputs:    map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
+			runOutputs: map[string][]byte{},
+		},
+	}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+
+	deployment, err := client.waitForGuardedDeployment(context.Background(), "compose-api", "unique-title")
+	if err == nil || !strings.Contains(err.Error(), "appeared while Bort was changing compose") {
+		t.Fatalf("expected final patch check after terminal status, got %v", err)
+	}
+	if deployment.Title != "unique-title" || deployment.Status != "done" {
+		t.Fatalf("final patch check discarded terminal deployment: %+v", deployment)
+	}
+	if composeReads != 1 || runner.checks != 1 {
+		t.Fatalf("expected one terminal status read followed by a final patch check, reads=%d checks=%d", composeReads, runner.checks)
+	}
+}
+
+func TestDeployComposeForApplyRejectsTerminalFailureStatuses(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		status    string
+		patchAt   int
+		wantPatch bool
+	}{
+		{name: "error", status: "error", patchAt: 100},
+		{name: "cancelled", status: "cancelled", patchAt: 100},
+		{name: "error with final patch conflict", status: "error", patchAt: 4, wantPatch: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var deploymentTitle string
+			rawUpdated := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+					var request updateComposeRequest
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Fatal(err)
+					}
+					rawUpdated = request.SourceType == "raw"
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+					if !rawUpdated {
+						t.Fatal("compose deploy was not preceded by a raw compose update")
+					}
+					var request deployComposeRequest
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Fatal(err)
+					}
+					deploymentTitle = request.Title
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+					_ = json.NewEncoder(w).Encode(Compose{ComposeID: "compose-api", Deployments: []Deployment{{Title: deploymentTitle, Status: test.status, ErrorMessage: "deploy failed", LogPath: "/tmp/deploy.log"}}})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			runner := &stagedBortPatchRunner{
+				patchAt: test.patchAt,
+				fakeDockerRunner: fakeDockerRunner{
+					outputs: map[string][]byte{
+						"ps --format {{.Names}}": []byte("dokploy-postgres\n"),
+						"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("target-id\n"),
+						"inspect --type container target-id":                                       []byte(`[{"Id":"target-id","Name":"/target","State":{"Running":true,"Status":"running"}}]`),
+						"stop target-id":                                                           []byte("target-id\n"),
+					},
+					runOutputs: map[string][]byte{},
+				},
+			}
+			client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+			actx := &applyContext{plan: Plan{}, cache: map[string]*appCache{"api": {ComposeID: "compose-api", ComposeAppName: "stack-1"}}}
+
+			err := client.deployComposeForApply(context.Background(), actx, "api", "services: {}\n", "")
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("status %q", test.status)) || !strings.Contains(err.Error(), "deploy failed") || !strings.Contains(err.Error(), "/tmp/deploy.log") || !strings.Contains(err.Error(), "Dokploy compose deployment did not complete successfully") || strings.Contains(err.Error(), "post-deploy safety guard failed") || !strings.Contains(err.Error(), "deployment quiesced and target compose containers were stopped") || !isUnsafeTargetResumeError(err) {
+				t.Fatalf("expected terminal %s deployment to fail, got %v", test.status, err)
+			}
+			if got := strings.Contains(err.Error(), "appeared while Bort was changing compose"); got != test.wantPatch {
+				t.Fatalf("final patch conflict = %t, want %t: %v", got, test.wantPatch, err)
+			}
+			if isUnsafeSourceResumeError(err) {
+				t.Fatalf("terminal %s deployment should permit source recovery after quiescence, got %v", test.status, err)
+			}
+			if !fakeOutputCalled(&runner.fakeDockerRunner, "stop", "target-id") {
+				t.Fatalf("terminal %s deployment did not stop target compose, calls=%#v", test.status, runner.outputArgs)
+			}
+		})
+	}
+}
+
 func TestStopTargetComposeContainersRestopsRestartedTarget(t *testing.T) {
 	runner := &restartingTargetRunner{}
 	client := &Client{Docker: runner}
@@ -571,9 +826,11 @@ func TestStopTargetComposeContainersRestopsRestartedTarget(t *testing.T) {
 	}
 }
 
-func TestPostDeployPatchGuardQuiescenceFailurePreventsSourceRecovery(t *testing.T) {
+func TestDeploymentMonitoringQuiescenceFailurePreventsSourceRecovery(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
@@ -583,7 +840,7 @@ func TestPostDeployPatchGuardQuiescenceFailurePreventsSourceRecovery(t *testing.
 		}
 	}))
 	defer server.Close()
-	runner := &stagedBortPatchRunner{fakeDockerRunner: fakeDockerRunner{
+	runner := &stagedBortPatchRunner{patchAt: 100, fakeDockerRunner: fakeDockerRunner{
 		outputs: map[string][]byte{
 			"ps --format {{.Names}}": []byte("dokploy-postgres\n"),
 			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": {},
@@ -596,12 +853,56 @@ func TestPostDeployPatchGuardQuiescenceFailurePreventsSourceRecovery(t *testing.
 	entry.ComposeID = "compose-api"
 	entry.ComposeAppName = "stack-1"
 
-	err := client.deployComposeForApply(context.Background(), actx, "api")
-	if err == nil || !strings.Contains(err.Error(), "deployment status unavailable") {
+	err := client.deployComposeForApply(context.Background(), actx, "api", "services: {}\n", "")
+	if err == nil || !strings.Contains(err.Error(), "deployment status unavailable") || !strings.Contains(err.Error(), "deployment monitoring could not prove safety") || strings.Contains(err.Error(), "post-deploy safety guard failed") {
 		t.Fatalf("expected deployment polling failure, got %v", err)
 	}
 	if !isUnsafeSourceResumeError(err) || !isUnsafeTargetResumeError(err) {
 		t.Fatalf("unproved deployment quiescence must prevent source and target recovery, got %v", err)
+	}
+}
+
+func TestDeploymentQuiescenceRespectsCallerDeadline(t *testing.T) {
+	composeReads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			composeReads++
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "compose-api"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	runner := &stagedBortPatchRunner{patchAt: 100, fakeDockerRunner: fakeDockerRunner{
+		outputs: map[string][]byte{
+			"ps --format {{.Names}}": []byte("dokploy-postgres\n"),
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": {},
+		},
+		runOutputs: map[string][]byte{},
+	}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	actx := &applyContext{plan: Plan{}, cache: map[string]*appCache{"api": {ComposeID: "compose-api", ComposeAppName: "stack-1"}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+
+	err := client.deployComposeForApply(ctx, actx, "api", "services: {}\n", "")
+	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") || !strings.Contains(err.Error(), "quiescence could not be proved") {
+		t.Fatalf("expected deadline-bounded quiescence failure, got %v", err)
+	}
+	if !isUnsafeSourceResumeError(err) || !isUnsafeTargetResumeError(err) {
+		t.Fatalf("expired quiescence deadline must prevent source and target recovery, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("quiescence exceeded caller deadline: %s", elapsed)
+	}
+	if composeReads == 0 {
+		t.Fatal("deployment monitor did not inspect the accepted attempt")
 	}
 }
 
@@ -679,7 +980,7 @@ func TestApplyLeavesPausedSourceStoppedWhenGuardedDeploymentCannotBeQuiesced(t *
 	}))
 	defer server.Close()
 	runner := &stagedBortPatchRunner{
-		patchAt: 4,
+		patchAt: 100,
 		fakeDockerRunner: fakeDockerRunner{
 			outputs: map[string][]byte{
 				"ps --format {{.Names}}":           []byte("dokploy-postgres\n"),
@@ -715,14 +1016,16 @@ func TestApplyLeavesPausedSourceStoppedWhenGuardedDeploymentCannotBeQuiesced(t *
 
 func TestComposeMutationPatchGuardRechecksAfterHTTPError(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		path   string
-		mutate func(*Client) error
+		name       string
+		path       string
+		wantPatch  bool
+		wantChecks int
+		mutate     func(*Client) error
 	}{
-		{name: "update", path: "/api/compose.update", mutate: func(client *Client) error {
+		{name: "update", path: "/api/compose.update", wantPatch: true, wantChecks: 2, mutate: func(client *Client) error {
 			return client.updateComposeWithPatchGuard(context.Background(), "compose-api", "services: {}\n", "")
 		}},
-		{name: "deploy", path: "/api/compose.deploy", mutate: func(client *Client) error {
+		{name: "deploy", path: "/api/compose.deploy", wantChecks: 1, mutate: func(client *Client) error {
 			return client.deployComposeWithPatchGuard(context.Background(), "compose-api", "bort-migrate")
 		}},
 	} {
@@ -741,15 +1044,18 @@ func TestComposeMutationPatchGuardRechecksAfterHTTPError(t *testing.T) {
 			}}
 			client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
 			err := test.mutate(client)
-			if err == nil || !strings.Contains(err.Error(), "mutation failed") || !strings.Contains(err.Error(), "appeared while Bort was changing compose") {
-				t.Fatalf("expected HTTP and post-mutation patch errors, got %v", err)
+			if err == nil || !strings.Contains(err.Error(), "mutation failed") {
+				t.Fatalf("expected HTTP mutation error, got %v", err)
+			}
+			if got := strings.Contains(err.Error(), "appeared while Bort was changing compose"); got != test.wantPatch {
+				t.Fatalf("post-mutation patch error = %t, want %t: %v", got, test.wantPatch, err)
 			}
 			var deployedGuardErr deployedComposeGuardError
 			if errors.As(err, &deployedGuardErr) {
 				t.Fatalf("failed HTTP mutation was classified as a successful deploy: %v", err)
 			}
-			if runner.checks != 2 {
-				t.Fatalf("expected the failed HTTP mutation to remain bracketed by patch checks, got %d", runner.checks)
+			if runner.checks != test.wantChecks {
+				t.Fatalf("patch checks = %d, want %d", runner.checks, test.wantChecks)
 			}
 		})
 	}
@@ -779,6 +1085,99 @@ func TestApplyPushImageChecksActivePatchWithoutEnvOrRoutes(t *testing.T) {
 	err := client.applyPushImage(context.Background(), actx, Step{Kind: StepPushImage, App: "api", Ref: "api"})
 	if err == nil || !strings.Contains(err.Error(), "active Bort-owned Dokploy patch") {
 		t.Fatalf("expected unconditional deployment path to block active patch, got %v", err)
+	}
+}
+
+func TestApplyActivateRoutesChecksPatchBeforeDomainMutation(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte("services:\n  web:\n    image: example/web\n    expose:\n      - \"8080\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	domainRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/domain.") {
+			domainRequests++
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"image inspect example/web": []byte(`[{}]`),
+			"ps --format {{.Names}}":    []byte("dokploy-postgres\n"),
+		},
+		runOutputs: map[string][]byte{
+			"exec -i dokploy-postgres psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": []byte(`{"patchId":"bort-api-compose","filePath":"docker|compose.yml","composeName":"api","sourceType":"github","repository":"owner/repo","branch":"main"}` + "\n"),
+		},
+	}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	app := preparer.AppPlan{Name: "api", Directory: "api", TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}}
+	actx := &applyContext{
+		plan: Plan{
+			Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}},
+			Cutover: gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com", ServiceName: "web", Port: "8080"}}}}},
+		},
+		cache: map[string]*appCache{"api": {ComposeID: "compose-api"}},
+	}
+
+	err := client.applyActivateRoutes(context.Background(), actx, Step{Kind: StepActivateRoutes, App: "api", Ref: "routes"})
+	if err == nil || !strings.Contains(err.Error(), "active Bort-owned Dokploy patch") {
+		t.Fatalf("expected active patch to block route activation, got %v", err)
+	}
+	if domainRequests != 0 {
+		t.Fatalf("active patch allowed %d domain request(s) before rejection", domainRequests)
+	}
+}
+
+func TestPlannedInstallGatewayChecksPatchBeforeDomainMutation(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte("services:\n  web:\n    image: example/web\n    expose:\n      - \"8080\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := preparer.AppPlan{Name: "api", Directory: "api", TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "api", ComposePath: "compose.yaml"}}}}
+	cutover := gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com", ServiceName: "web", Port: "8080"}}}}}
+	plan := PlanFromArtifacts(preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}, syncplan.Result{}, cutover)
+	var firstRouteMutation Step
+	for _, step := range plan.Steps {
+		if step.Kind == StepInstallGateway || step.Kind == StepActivateRoutes {
+			firstRouteMutation = step
+			break
+		}
+	}
+	if firstRouteMutation.Kind != StepInstallGateway {
+		t.Fatalf("first planned route mutation = %s, want %s", firstRouteMutation.Kind, StepInstallGateway)
+	}
+	domainRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/domain.") {
+			domainRequests++
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
+		runOutputs: map[string][]byte{
+			"exec -i dokploy-postgres psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": []byte(`{"patchId":"bort-api-compose","filePath":"docker|compose.yml","composeName":"api","sourceType":"github","repository":"owner/repo","branch":"main"}` + "\n"),
+		},
+	}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{"api": {ComposeID: "compose-api"}}}
+
+	err := client.applyStep(context.Background(), actx, firstRouteMutation)
+	if err == nil || !strings.Contains(err.Error(), "active Bort-owned Dokploy patch") {
+		t.Fatalf("expected planned install_gateway patch rejection, got %v", err)
+	}
+	if domainRequests != 0 {
+		t.Fatalf("planned install_gateway made %d domain request(s) before rejection", domainRequests)
 	}
 }
 
@@ -1279,6 +1678,7 @@ func TestApplyActivateRoutesUpdatesDomainsAndRedeploys(t *testing.T) {
 	}
 	var updatedDomain UpdateDomainRequest
 	var updatedCompose updateComposeRequest
+	var deploymentTitle string
 	deploys := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -1296,7 +1696,14 @@ func TestApplyActivateRoutesUpdatesDomainsAndRedeploys(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(Domain{DomainID: updatedDomain.DomainID, Host: updatedDomain.Host, DomainType: updatedDomain.DomainType, ComposeID: "c1", ServiceName: updatedDomain.ServiceName, Port: updatedDomain.Port})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
 			deploys++
+			var request deployComposeRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode compose.deploy: %v", err)
+			}
+			deploymentTitle = request.Title
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "c1", AppName: "stack-1", Deployments: []Deployment{{Title: deploymentTitle, Status: "done"}}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -1361,6 +1768,7 @@ func TestApplyActivateRoutesDetectsMigratedVolumeDriftAfterDeploy(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte("services:\n  web:\n    image: example/web\n"), 0o600); err != nil {
 		t.Fatalf("write compose: %v", err)
 	}
+	var deploymentTitle string
 	deploys := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -1368,7 +1776,14 @@ func TestApplyActivateRoutesDetectsMigratedVolumeDriftAfterDeploy(t *testing.T) 
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
 			deploys++
+			var request deployComposeRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode compose.deploy: %v", err)
+			}
+			deploymentTitle = request.Title
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "c1", AppName: "stack-1", Deployments: []Deployment{{Title: deploymentTitle, Status: "done"}}})
 		default:
 			http.NotFound(w, r)
 		}
