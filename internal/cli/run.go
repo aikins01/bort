@@ -612,27 +612,34 @@ func approvedPrepareDecisions(run loadedMigrationRun) map[dokploy.PrepareDecisio
 }
 
 func ensureSelfContainedLiveRunLocked(run loadedMigrationRun) (loadedMigrationRun, error) {
-	if err := containedPath(run.Run.RunDir, run.Prepare.BundleDir); err == nil {
+	containedErr := containedPath(run.Run.RunDir, run.Prepare.BundleDir)
+	if containedErr == nil && strings.TrimSpace(run.Run.BundleDigest) != "" {
 		return run, nil
-	} else if run.Run.ApplyOutcomeRequired {
-		return loadedMigrationRun{}, fmt.Errorf("run %q does not have a self-contained reviewed bundle; run `%s` to refresh it before live apply: %w", run.Run.Name, runScopedCommand(run, "migrate"), err)
+	}
+	if containedErr != nil && run.Run.ApplyOutcomeRequired {
+		return loadedMigrationRun{}, fmt.Errorf("run %q does not have a self-contained reviewed bundle; run `%s` to refresh it before live apply: %w", run.Run.Name, runScopedCommand(run, "migrate"), containedErr)
 	}
 
 	runDir := filepath.FromSlash(run.Run.RunDir)
-	bundleDir, err := snapshotMigrationBundle(run.Prepare.BundleDir, runDir)
-	if err != nil {
-		return loadedMigrationRun{}, fmt.Errorf("snapshot legacy run bundle: %w", err)
-	}
-	bundleDigest, err := digestMigrationBundle(bundleDir)
-	if err != nil {
-		return loadedMigrationRun{}, fmt.Errorf("digest legacy run bundle: %w", err)
-	}
-	removeBundle := true
+	bundleDir := run.Prepare.BundleDir
+	removeBundle := false
 	defer func() {
 		if removeBundle {
 			_ = os.RemoveAll(bundleDir)
 		}
 	}()
+	if containedErr != nil {
+		var err error
+		bundleDir, err = snapshotMigrationBundle(run.Prepare.BundleDir, runDir)
+		if err != nil {
+			return loadedMigrationRun{}, fmt.Errorf("snapshot legacy run bundle: %w", err)
+		}
+		removeBundle = true
+	}
+	bundleDigest, err := digestMigrationBundle(bundleDir)
+	if err != nil {
+		return loadedMigrationRun{}, fmt.Errorf("digest legacy run bundle: %w", err)
+	}
 	artifacts, artifactDir, err := nextRunArtifacts(runDir, run.Run)
 	if err != nil {
 		return loadedMigrationRun{}, err

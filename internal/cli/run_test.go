@@ -273,7 +273,7 @@ func TestApplyLiveMigrationRejectsChangedReviewedBundle(t *testing.T) {
 	}
 }
 
-func TestLegacySelfContainedRunWithoutBundleDigestRemainsLoadable(t *testing.T) {
+func TestLegacySelfContainedRunWithoutBundleDigestIsUpgradedBeforeLiveApply(t *testing.T) {
 	workDir := t.TempDir()
 	t.Chdir(workDir)
 	bundleDir := filepath.Join(workDir, "bort-bundle")
@@ -299,6 +299,95 @@ func TestLegacySelfContainedRunWithoutBundleDigestRemainsLoadable(t *testing.T) 
 	}
 	if err := verifyReviewedMigrationBundle(loaded); err == nil || !strings.Contains(err.Error(), "predates reviewed bundle digests") || !strings.Contains(err.Error(), "to re-plan before live apply") {
 		t.Fatalf("legacy run without a bundle digest did not require a safe re-plan before live apply: %v", err)
+	}
+	originalBundleDir := loaded.Run.BundleDir
+	originalArtifacts := loaded.Run.Artifacts
+	operationLock, err := acquireRunOperationLock(loaded.Run.RunDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgraded, upgradeErr := ensureSelfContainedLiveRunLocked(loaded)
+	operationLock.Release()
+	if upgradeErr != nil {
+		t.Fatal(upgradeErr)
+	}
+	if upgraded.Run.BundleDigest == "" {
+		t.Fatal("legacy self-contained run did not acquire a reviewed bundle digest")
+	}
+	if upgraded.Run.BundleDir != originalBundleDir {
+		t.Fatalf("legacy self-contained bundle was replaced: before=%q after=%q", originalBundleDir, upgraded.Run.BundleDir)
+	}
+	if upgraded.Run.Artifacts.Prepare == originalArtifacts.Prepare {
+		t.Fatalf("legacy digest upgrade did not publish a new artifact generation: %#v", upgraded.Run.Artifacts)
+	}
+	if err := verifyReviewedMigrationBundle(upgraded); err != nil {
+		t.Fatalf("upgraded reviewed bundle did not verify: %v", err)
+	}
+	reloaded, err := loadMigrationRun("legacy-contained")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Run.BundleDigest != upgraded.Run.BundleDigest || reloaded.Run.Artifacts != upgraded.Run.Artifacts {
+		t.Fatalf("legacy digest upgrade was not persisted: upgraded=%#v reloaded=%#v", upgraded.Run, reloaded.Run)
+	}
+}
+
+func TestLegacySelfContainedAppliedRunRetainsResumeStateDuringDigestUpgrade(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	bundleDir := filepath.Join(workDir, "bort-bundle")
+	writeTestBundle(t, bundleDir, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "api", Services: []manifest.Service{{Name: "api", Image: "example/api:v1"}}}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "legacy-applied"})
+	run, err := loadMigrationRun("legacy-applied")
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps
+	if len(steps) == 0 {
+		t.Fatal("expected legacy live steps")
+	}
+	run.Run.BundleDigest = ""
+	run.Applied.Steps = []appliedStep{{
+		Index:  0,
+		Kind:   string(steps[0].Kind),
+		App:    steps[0].App,
+		Ref:    steps[0].Ref,
+		Status: string(dokploy.StepStatusOK),
+	}}
+	if err := writeRunApplied(runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied), run.Applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONArtifact(filepath.Join(run.Run.RunDir, "run.json"), run.Run); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadMigrationRun("legacy-applied")
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationLock, err := acquireRunOperationLock(loaded.Run.RunDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgraded, upgradeErr := ensureSelfContainedLiveRunLocked(loaded)
+	operationLock.Release()
+	if upgradeErr != nil {
+		t.Fatal(upgradeErr)
+	}
+	if upgraded.Run.BundleDigest == "" || len(upgraded.Applied.Steps) != 1 || upgraded.Applied.Steps[0] != run.Applied.Steps[0] {
+		t.Fatalf("legacy digest upgrade lost applied resume state: run=%#v applied=%#v", upgraded.Run, upgraded.Applied)
+	}
+	if err := verifyReviewedMigrationBundle(upgraded); err != nil {
+		t.Fatalf("upgraded applied run bundle did not verify: %v", err)
+	}
+	reloaded, err := loadMigrationRun("legacy-applied")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Run.BundleDigest != upgraded.Run.BundleDigest || len(reloaded.Applied.Steps) != 1 || reloaded.Applied.Steps[0] != run.Applied.Steps[0] {
+		t.Fatalf("persisted legacy digest upgrade lost applied resume state: run=%#v applied=%#v", reloaded.Run, reloaded.Applied)
 	}
 }
 
