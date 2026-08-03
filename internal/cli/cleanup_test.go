@@ -22,6 +22,7 @@ import (
 
 func TestLifecycleAcceptanceTraceWithFakeDokploy(t *testing.T) {
 	composeCreated := false
+	deploymentTitle := ""
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/project.all":
@@ -42,8 +43,19 @@ func TestLifecycleAcceptanceTraceWithFakeDokploy(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.create":
 			composeCreated = true
 			_ = json.NewEncoder(w).Encode(dokploy.Compose{ComposeID: "compose-api", Name: "api", AppName: "compose-api", EnvironmentID: "environment-production"})
-		case r.Method == http.MethodPost && (r.URL.Path == "/api/compose.update" || r.URL.Path == "/api/compose.deploy"):
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			var request struct {
+				Title string `json:"title"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode compose.deploy: %v", err)
+			}
+			deploymentTitle = request.Title
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(dokploy.Compose{ComposeID: "compose-api", Name: "api", AppName: "compose-api", EnvironmentID: "environment-production", Deployments: []dokploy.Deployment{{Title: deploymentTitle, Status: "done"}}})
 		default:
 			http.NotFound(w, r)
 		}

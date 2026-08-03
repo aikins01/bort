@@ -525,12 +525,23 @@ func TestApplyPushImageTagsMissingComposeImageFromSourceContainer(t *testing.T) 
 		t.Fatalf("write compose: %v", err)
 	}
 
+	var deploymentTitle string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/compose.deploy" {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			var request deployComposeRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode compose.deploy: %v", err)
+			}
+			deploymentTitle = request.Title
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "compose-1", AppName: "stack-1", Deployments: []Deployment{{Title: deploymentTitle, Status: "done"}}})
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 	runner := &fakeDockerRunner{outputs: map[string][]byte{
@@ -565,14 +576,25 @@ func TestApplyPushImageDetectsMigratedVolumeDriftAfterDeploy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte("services:\n  web:\n    image: example/web\n"), 0o600); err != nil {
 		t.Fatalf("write compose: %v", err)
 	}
+	var deploymentTitle string
 	deploys := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy" {
-			deploys++
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
 			w.WriteHeader(http.StatusOK)
-			return
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			deploys++
+			var request deployComposeRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode compose.deploy: %v", err)
+			}
+			deploymentTitle = request.Title
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "c1", AppName: "stack-1", Deployments: []Deployment{{Title: deploymentTitle, Status: "done"}}})
+		default:
+			http.NotFound(w, r)
 		}
-		http.NotFound(w, r)
 	}))
 	defer server.Close()
 	runner := &latePostDeployTargetRunner{}
@@ -1273,6 +1295,14 @@ func TestTargetContainerForServiceReportsComposeDeploymentError(t *testing.T) {
 }
 
 func TestTargetContainerForServiceBlocksActivePatchBeforeDiscoveryRedeploy(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte("services:\n  web:\n    image: example/web\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	deploys := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -1296,7 +1326,8 @@ func TestTargetContainerForServiceBlocksActivePatchBeforeDiscoveryRedeploy(t *te
 		},
 	}
 	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
-	actx := &applyContext{cache: map[string]*appCache{}}
+	app := preparer.AppPlan{Name: "api", Directory: "api", TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}}}
 	entry := actx.entry("api")
 	entry.ComposeID = "c1"
 	entry.ComposeAppName = "stack-1"
