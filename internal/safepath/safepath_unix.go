@@ -137,7 +137,7 @@ func readPrivateFile(path, name string) ([]byte, error) {
 	return contents, nil
 }
 
-func writePrivateFileAtomicNoFollow(dir *os.File, name string, data []byte, mode os.FileMode) error {
+func writePrivateFileAtomicNoFollow(dir *os.File, name string, data []byte, mode os.FileMode) (resultErr error) {
 	tmpName, err := privateTempName()
 	if err != nil {
 		return err
@@ -150,7 +150,9 @@ func writePrivateFileAtomicNoFollow(dir *os.File, name string, data []byte, mode
 	defer func() {
 		_ = tmp.Close()
 		if removeTmp {
-			_ = removePrivateFileNoFollow(dir, tmpName)
+			if err := removePrivateFileNoFollow(dir, tmpName); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("remove incomplete private file %s: %w", filepath.Join(dir.Name(), tmpName), err))
+			}
 		}
 	}()
 	if _, err := tmp.Write(data); err != nil {
