@@ -38,6 +38,9 @@ func runRollback(_ context.Context, args []string, stdout, stderr io.Writer) err
 	if fs.NArg() > 0 {
 		return fmt.Errorf("rollback does not accept positional argument %q", fs.Arg(0))
 	}
+	if flagSet(fs, "run") && strings.TrimSpace(runRef) == "" {
+		return fmt.Errorf("rollback requires a non-empty --run value")
+	}
 	if err := checkOutputFormat("rollback", format); err != nil {
 		return err
 	}

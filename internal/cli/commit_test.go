@@ -117,6 +117,26 @@ func TestRunCommitApplyRejectsPositionalArguments(t *testing.T) {
 	}
 }
 
+func TestRunCommitRejectsEmptyExplicitRun(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := mutateBortState(defaultStatePath(), func(state *bortState) bool {
+		state.CurrentRun = ".bort/runs/current"
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"--run="}, {"--apply", "--run="}} {
+		var stdout bytes.Buffer
+		err := runCommit(context.Background(), args, &stdout, io.Discard)
+		if err == nil || err.Error() != "commit requires a non-empty --run value" {
+			t.Fatalf("args=%v: expected empty run rejection, got %v", args, err)
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("args=%v: empty run produced output before rejection: %q", args, stdout.String())
+		}
+	}
+}
+
 func TestRunCommitDefaultsToCurrentRun(t *testing.T) {
 	workDir := t.TempDir()
 	t.Chdir(workDir)

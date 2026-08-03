@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aikins01/bort/internal/manifest"
 )
@@ -163,6 +164,115 @@ func TestRunWithoutArgsDoesNotPromoteOrRefreshMtimeFallback(t *testing.T) {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("expected fallback output to contain %q, got:\n%s", want, stdout.String())
 		}
+	}
+}
+
+func TestRunWithoutArgsDoesNotRestoreStaleCurrentRunAfterRefresh(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	oldBundle := filepath.Join(workDir, "old-bundle")
+	writeTestBundle(t, oldBundle, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "old", Services: []manifest.Service{{Name: "old", Image: "example/old:v1"}}}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", oldBundle, "--run", "old-current"})
+	oldRun, err := loadMigrationRun("old-current")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath, err := writeRunSourceManifest(oldRun.Run.RunDir, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "old", Services: []manifest.Service{{Name: "old", Image: "example/old:v1"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRun.Run.Source = "docker"
+	oldRun.Run.ManifestPath = manifestPath
+	if err := writeJSONArtifact(filepath.Join(oldRun.Run.RunDir, "run.json"), oldRun.Run); err != nil {
+		t.Fatal(err)
+	}
+	runRef, currentSelected, found, err := guideRunRef()
+	if err != nil || !found || !currentSelected || runRef != oldRun.Run.RunDir {
+		t.Fatalf("unexpected initial guide selection: ref=%q current=%t found=%t err=%v", runRef, currentSelected, found, err)
+	}
+	applyActive, err := applyRunActive(runRef)
+	if err != nil || applyActive {
+		t.Fatalf("unexpected initial apply state: active=%t err=%v", applyActive, err)
+	}
+	if !shouldAutoRescanRun(oldRun.Run) {
+		t.Fatal("old current run is not eligible for source refresh")
+	}
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	enteredPath := filepath.Join(workDir, "guide-entered")
+	releasePath := filepath.Join(workDir, "guide-release")
+	dockerScript := `#!/bin/sh
+if [ "$1" = "ps" ]; then
+  touch "$BORT_GUIDE_ENTERED"
+  while [ ! -f "$BORT_GUIDE_RELEASE" ]; do sleep 0.01; done
+  printf 'reviewed-container\n'
+elif [ "$1" = "inspect" ]; then
+  printf '%s\n' '[{"Id":"reviewed-container","Name":"/reviewed","Image":"sha256:reviewed","Config":{"Image":"example/reviewed:v2","Labels":{}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}}]'
+elif [ "$1" = "image" ]; then
+  printf '%s\n' '[{"Id":"sha256:reviewed","RepoDigests":[]}]'
+fi
+`
+	if err := os.WriteFile(dockerPath, []byte(dockerScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BORT_GUIDE_ENTERED", enteredPath)
+	t.Setenv("BORT_GUIDE_RELEASE", releasePath)
+	t.Cleanup(func() { _ = os.WriteFile(releasePath, nil, 0o600) })
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runGuide(context.Background(), strings.NewReader(""), io.Discard, io.Discard)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case err := <-errCh:
+			t.Fatalf("guide exited before source refresh: %v", err)
+		default:
+		}
+		if _, err := os.Stat(enteredPath); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("guide refresh did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	newBundle := filepath.Join(workDir, "new-bundle")
+	writeTestBundle(t, newBundle, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "new", Services: []manifest.Service{{Name: "new", Image: "example/new:v1"}}}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", newBundle, "--run", "new-current"})
+	newRun, err := loadMigrationRun("new-current")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("stale guide refresh failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale guide refresh did not finish")
+	}
+	current, ok, err := currentRunRef()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || current != filepath.ToSlash(filepath.Clean(newRun.Run.RunDir)) {
+		t.Fatalf("stale guide for %q replaced newer current run %q with %q", oldRun.Run.RunDir, newRun.Run.RunDir, current)
 	}
 }
 

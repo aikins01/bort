@@ -57,17 +57,11 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 			if err != nil {
 				return err
 			}
-			if err := rememberCurrentRun(run.Run); err != nil {
-				return err
-			}
 			writeAppFirstCockpit(stdout, run)
 			return nil
 		}
 		run, err := refreshGuideRun(ctx, runRef, stdin, stdout)
 		if err != nil {
-			return err
-		}
-		if err := rememberCurrentRun(run.Run); err != nil {
 			return err
 		}
 		if isRealTTY(stdin, stdout) {

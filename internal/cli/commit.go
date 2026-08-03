@@ -43,6 +43,9 @@ func runCommit(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if fs.NArg() > 0 {
 		return fmt.Errorf("commit does not accept positional argument %q", fs.Arg(0))
 	}
+	if flagSet(fs, "run") && strings.TrimSpace(runRef) == "" {
+		return fmt.Errorf("commit requires a non-empty --run value")
+	}
 	if apply {
 		for _, name := range []string{"app", "bundle", "format", "from-cutover", "output", "rollback-window", "target"} {
 			if flagSet(fs, name) {
