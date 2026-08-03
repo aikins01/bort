@@ -108,9 +108,14 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-api-key", c.Token)
 
-	httpClient := *c.httpClient()
-	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
+	configuredClient := c.httpClient()
+	httpClient := &http.Client{
+		Transport: configuredClient.Transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Jar:     configuredClient.Jar,
+		Timeout: configuredClient.Timeout,
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
