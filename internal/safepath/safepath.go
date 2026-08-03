@@ -37,6 +37,10 @@ type PrivateDir struct {
 }
 
 func OpenPrivateDirNoFollow(path string) (*PrivateDir, error) {
+	return openPrivateDirPathNoFollow(path, true)
+}
+
+func openPrivateDirPathNoFollow(path string, create bool) (*PrivateDir, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("private directory path is empty")
 	}
@@ -53,7 +57,7 @@ func OpenPrivateDirNoFollow(path string) (*PrivateDir, error) {
 		abs = filepath.Join(cwd, path)
 	}
 	abs = filepath.Clean(abs)
-	dir, err := openPrivateDirNoFollow(abs, true)
+	dir, err := openPrivateDirNoFollow(abs, create)
 	if err != nil {
 		return nil, err
 	}
