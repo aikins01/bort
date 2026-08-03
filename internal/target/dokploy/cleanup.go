@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	pathpkg "path"
@@ -1027,7 +1028,7 @@ func findDokployPostgresContainer(ctx context.Context, runner dockerRunner) (str
 	return "", fmt.Errorf("dokploy postgres container was not found; cleanup must run on the Dokploy host")
 }
 
-func backupDokployDatabase(ctx context.Context, runner dockerRunner, pg, backupDir, backupPrefix string) (string, error) {
+func backupDokployDatabase(ctx context.Context, runner dockerRunner, pg, backupDir, backupPrefix string) (_ string, resultErr error) {
 	backupDir = strings.TrimSpace(backupDir)
 	if backupDir == "" {
 		backupDir = filepath.Join(".bort", "backups")
@@ -1046,17 +1047,22 @@ func backupDokployDatabase(ctx context.Context, runner dockerRunner, pg, backupD
 	if err != nil {
 		return "", err
 	}
+	removeBackup := true
+	defer func() {
+		if removeBackup {
+			_ = file.Close()
+			if err := dir.Remove(name); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("remove incomplete Dokploy database backup %s: %w", path, err))
+			}
+		}
+	}()
 	if err := runner.Run(ctx, nil, file, "exec", pg, "pg_dump", "-U", "dokploy", "-d", "dokploy"); err != nil {
-		_ = file.Close()
-		_ = dir.Remove(name)
 		return "", fmt.Errorf("backup dokploy database to %s: %w", path, err)
 	}
 	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
 		return "", err
 	}
 	if err := file.Sync(); err != nil {
-		_ = file.Close()
 		return "", err
 	}
 	if err := file.Close(); err != nil {
@@ -1068,6 +1074,7 @@ func backupDokployDatabase(ctx context.Context, runner dockerRunner, pg, backupD
 	if err := dir.ValidatePath(); err != nil {
 		return "", fmt.Errorf("verify dokploy database backup location %s: %w", path, err)
 	}
+	removeBackup = false
 	return path, nil
 }
 

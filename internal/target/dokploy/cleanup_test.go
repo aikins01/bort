@@ -3,6 +3,7 @@ package dokploy
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -112,6 +113,37 @@ func TestBackupDokployDatabaseRejectsSymlinkDirectory(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("symlink target was modified: %#v", entries)
+	}
+}
+
+type closingBackupRunner struct{}
+
+func (closingBackupRunner) Output(context.Context, ...string) ([]byte, error) {
+	return nil, errors.New("unexpected output call")
+}
+
+func (closingBackupRunner) Run(_ context.Context, _ io.Reader, stdout io.Writer, _ ...string) error {
+	file, ok := stdout.(*os.File)
+	if !ok {
+		return errors.New("backup output is not a file")
+	}
+	if _, err := file.WriteString("incomplete"); err != nil {
+		return err
+	}
+	return file.Close()
+}
+
+func TestBackupDokployDatabaseRemovesFileAfterFinalizationFailure(t *testing.T) {
+	backupDir := dokployBackupTestDir(t)
+	if _, err := backupDokployDatabase(context.Background(), closingBackupRunner{}, "dokploy-postgres", backupDir, "cleanup"); err == nil {
+		t.Fatal("expected backup finalization to fail")
+	}
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("incomplete backup remained visible: %#v", entries)
 	}
 }
 
