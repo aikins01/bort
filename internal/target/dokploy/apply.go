@@ -3,6 +3,8 @@ package dokploy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/preparer"
@@ -337,6 +340,30 @@ type activeBortOverridePatch struct {
 	Branch      string `json:"branch"`
 }
 
+type deployedComposeGuardError struct {
+	err error
+}
+
+func (e deployedComposeGuardError) Error() string {
+	return e.err.Error()
+}
+
+func (e deployedComposeGuardError) Unwrap() error {
+	return e.err
+}
+
+type unsafeSourceResumeError struct {
+	err error
+}
+
+func (e unsafeSourceResumeError) Error() string {
+	return e.err.Error()
+}
+
+func (e unsafeSourceResumeError) Unwrap() error {
+	return e.err
+}
+
 func (c *Client) validateNoActiveBortOverrides(ctx context.Context, composeID string) error {
 	composeID = strings.TrimSpace(composeID)
 	if composeID == "" {
@@ -476,7 +503,11 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 		err := c.applyStep(ctx, actx, step)
 		if err != nil {
 			emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusError, Err: err})
-			c.bestEffortResume(ctx, actx, plan, total, pausedApps, coolifyProxyStopped, isUnsafeTargetResumeError(err))
+			resumePausedApps := pausedApps
+			if isUnsafeSourceResumeError(err) {
+				resumePausedApps = nil
+			}
+			c.bestEffortResume(ctx, actx, plan, total, resumePausedApps, coolifyProxyStopped, isUnsafeTargetResumeError(err))
 			return fmt.Errorf("dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
 		}
 		emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusOK})
@@ -645,6 +676,11 @@ func isUnsafeTargetResumeError(err error) bool {
 	return errors.As(err, &unsafe)
 }
 
+func isUnsafeSourceResumeError(err error) bool {
+	var unsafe unsafeSourceResumeError
+	return errors.As(err, &unsafe)
+}
+
 func (c *Client) applyStep(ctx context.Context, actx *applyContext, step Step) error {
 	switch step.Kind {
 	case StepCreateProject:
@@ -775,13 +811,7 @@ func (c *Client) applyPushImage(ctx context.Context, actx *applyContext, step St
 	if err := ensureComposeImagesAvailable(ctx, c.dockerRunner(), actx.plan, step.App, composeFile); err != nil {
 		return err
 	}
-	if err := c.deployComposeWithPatchGuard(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
-		if safetyErr := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, step.App); safetyErr != nil && isUnsafeTargetResumeError(safetyErr) {
-			return fmt.Errorf("deploy dokploy compose: %w; post-deploy safety check: %v", err, safetyErr)
-		}
-		return err
-	}
-	if err := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, step.App); err != nil {
+	if err := c.deployComposeForApply(ctx, actx, step.App); err != nil {
 		return err
 	}
 	return c.pauseTargetWritersForState(ctx, c.dockerRunner(), actx, step.App)
@@ -802,7 +832,80 @@ func (c *Client) deployComposeWithPatchGuard(ctx context.Context, composeID, tit
 	}
 	mutationErr := c.DeployCompose(ctx, composeID, title)
 	patchErr := c.validateNoActiveBortOverridesAfterMutation(ctx, composeID)
+	if mutationErr == nil && patchErr != nil {
+		return deployedComposeGuardError{err: patchErr}
+	}
 	return errors.Join(mutationErr, patchErr)
+}
+
+func (c *Client) deployComposeForApply(ctx context.Context, actx *applyContext, appName string) error {
+	entry := actx.entry(appName)
+	title, err := deployComposeAttemptTitle(actx.plan)
+	if err != nil {
+		return err
+	}
+	err = c.deployComposeWithPatchGuard(ctx, entry.ComposeID, title)
+	if err == nil {
+		return c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, appName)
+	}
+	var deployedGuardErr deployedComposeGuardError
+	if errors.As(err, &deployedGuardErr) {
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), targetDiscoveryTimeout)
+		defer cancelStop()
+		stopErr := c.quiesceGuardedDeployment(stopCtx, actx, appName, title)
+		if stopErr != nil {
+			return unsafeSourceResumeError{err: unsafeTargetResumeError{err: fmt.Errorf("successful Dokploy deploy failed its post-deploy patch guard: %w; quiescence could not be proved, so Bort will leave any paused source applications stopped and skip target recovery: %v", err, stopErr)}}
+		}
+		safetyErr := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, appName)
+		combined := errors.Join(err, safetyErr)
+		return unsafeTargetResumeError{err: fmt.Errorf("successful Dokploy deploy failed its post-deploy patch guard; deployment quiesced and target compose containers were stopped: %w", combined)}
+	}
+	safetyErr := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, appName)
+	if safetyErr != nil && isUnsafeTargetResumeError(safetyErr) {
+		return fmt.Errorf("deploy dokploy compose: %w; post-deploy safety check: %v", err, safetyErr)
+	}
+	return err
+}
+
+func deployComposeAttemptTitle(plan Plan) (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("generate Dokploy deployment identity: %w", err)
+	}
+	return deployComposeTitle(plan) + "-" + hex.EncodeToString(nonce[:]), nil
+}
+
+func (c *Client) quiesceGuardedDeployment(ctx context.Context, actx *applyContext, appName, title string) error {
+	entry := actx.entry(appName)
+	for {
+		if err := c.stopTargetComposeContainers(ctx, actx, appName); err != nil {
+			return err
+		}
+		compose, err := c.GetCompose(ctx, entry.ComposeID)
+		if err != nil {
+			return err
+		}
+		attemptTerminal := false
+		allDeploymentsTerminal := true
+		for _, deployment := range compose.Deployments {
+			switch strings.ToLower(strings.TrimSpace(deployment.Status)) {
+			case "done", "error", "cancelled":
+				if deployment.Title == title {
+					attemptTerminal = true
+				}
+			default:
+				allDeploymentsTerminal = false
+			}
+		}
+		if attemptTerminal && allDeploymentsTerminal {
+			return c.stopTargetComposeContainers(ctx, actx, appName)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(targetWriterDiscoveryDelay):
+		}
+	}
 }
 
 func deployComposeTitle(plan Plan) string {
@@ -999,13 +1102,7 @@ func (c *Client) applyActivateRoutes(ctx context.Context, actx *applyContext, st
 			return err
 		}
 	}
-	if err := c.deployComposeWithPatchGuard(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
-		if safetyErr := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, step.App); safetyErr != nil && isUnsafeTargetResumeError(safetyErr) {
-			return fmt.Errorf("deploy dokploy compose: %w; post-deploy safety check: %v", err, safetyErr)
-		}
-		return err
-	}
-	return c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, step.App)
+	return c.deployComposeForApply(ctx, actx, step.App)
 }
 
 func (c *Client) ensureRouteDomain(ctx context.Context, composeID string, route gateway.Route) error {

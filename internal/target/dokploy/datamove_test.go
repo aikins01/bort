@@ -1,6 +1,7 @@
 package dokploy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -81,6 +82,34 @@ func (f *fakeDockerRunner) Run(_ context.Context, stdin io.Reader, stdout io.Wri
 	}
 	f.runs = append(f.runs, run)
 	return f.runErr
+}
+
+type statefulTargetRunner struct {
+	fakeDockerRunner
+	stopped map[string]bool
+}
+
+func (r *statefulTargetRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	if len(args) == 4 && args[0] == "inspect" && args[1] == "--type" && args[2] == "container" && r.stopped[args[3]] {
+		output, err := r.fakeDockerRunner.Output(ctx, args...)
+		if err != nil {
+			return nil, err
+		}
+		output = bytes.ReplaceAll(output, []byte(`"Running":true`), []byte(`"Running":false`))
+		output = bytes.ReplaceAll(output, []byte(`"Status":"running"`), []byte(`"Status":"exited"`))
+		return output, nil
+	}
+	output, err := r.fakeDockerRunner.Output(ctx, args...)
+	if err != nil || len(args) != 2 {
+		return output, err
+	}
+	switch args[0] {
+	case "stop":
+		r.stopped[args[1]] = true
+	case "start":
+		r.stopped[args[1]] = false
+	}
+	return output, nil
 }
 
 type stagedTargetWriterRunner struct {
@@ -1365,15 +1394,16 @@ func TestApplyResumeTargetDetectsMigratedVolumeDrift(t *testing.T) {
 		Name:    "src-vol",
 		Target:  "/data",
 	}}
-	runner := &fakeDockerRunner{
-		outputs: map[string][]byte{
+	runner := &statefulTargetRunner{
+		stopped: map[string]bool{},
+		fakeDockerRunner: fakeDockerRunner{outputs: map[string][]byte{
 			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("dst-id\n"),
 			"inspect --type container dst-id":                                          []byte(`[{"Id":"dst-id","Name":"/dokploy-redis","Config":{"Labels":{"com.docker.compose.service":"redis","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"migrated-vol","Destination":"/data","RW":true}]}]`),
 			"volume inspect src-vol":                                                   []byte(`[{"Name":"src-vol"}]`),
 			"volume inspect migrated-vol":                                              []byte(`[{"Name":"migrated-vol"}]`),
 			"stop dst-id":                                                              []byte("dst-id\n"),
 			"start dst-id":                                                             []byte("dst-id\n"),
-		},
+		}},
 	}
 	client := &Client{Docker: runner}
 	actx := &applyContext{cache: map[string]*appCache{}}
@@ -1392,10 +1422,10 @@ func TestApplyResumeTargetDetectsMigratedVolumeDrift(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "changed from migrated volume migrated-vol to fresh-vol") {
 		t.Fatalf("expected migrated volume drift error, got %v", err)
 	}
-	if !fakeOutputCalled(runner, "stop", "dst-id") {
+	if !fakeOutputCalled(&runner.fakeDockerRunner, "stop", "dst-id") {
 		t.Fatalf("expected unsafe target container to stop, calls=%#v", runner.outputArgs)
 	}
-	if fakeOutputCalled(runner, "start", "writer-id") {
+	if fakeOutputCalled(&runner.fakeDockerRunner, "start", "writer-id") {
 		t.Fatalf("target writer started before volume drift validation, calls=%#v", runner.outputArgs)
 	}
 }
@@ -1409,15 +1439,16 @@ func TestApplyResumeTargetLoadsPersistedMigratedVolumeState(t *testing.T) {
 		Name:    "src-vol",
 		Target:  "/data",
 	}}
-	runner := &fakeDockerRunner{
-		outputs: map[string][]byte{
+	runner := &statefulTargetRunner{
+		stopped: map[string]bool{},
+		fakeDockerRunner: fakeDockerRunner{outputs: map[string][]byte{
 			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("dst-id\n"),
 			"inspect --type container dst-id":                                          []byte(`[{"Id":"dst-id","Name":"/dokploy-redis","Config":{"Labels":{"com.docker.compose.service":"redis","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"migrated-vol","Destination":"/data","RW":true}]}]`),
 			"volume inspect src-vol":                                                   []byte(`[{"Name":"src-vol"}]`),
 			"volume inspect migrated-vol":                                              []byte(`[{"Name":"migrated-vol"}]`),
 			"stop dst-id":                                                              []byte("dst-id\n"),
 			"start dst-id":                                                             []byte("dst-id\n"),
-		},
+		}},
 	}
 	client := &Client{Docker: runner}
 	plan := Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}, RunDir: runDir}
