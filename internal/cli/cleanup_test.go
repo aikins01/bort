@@ -147,6 +147,20 @@ func TestLifecycleAcceptanceTraceWithFakeDokploy(t *testing.T) {
 	if !strings.Contains(purgeOut.String(), "Source containers scheduled for purge") {
 		t.Fatalf("expected purge inventory, got:\n%s", purgeOut.String())
 	}
+	if runtime.GOOS != "linux" {
+		err := runCleanup(context.Background(), []string{"purge", "--run", "acceptance", "--apply", "--all-apps", "--confirm", "purge acceptance"}, io.Discard, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "Linux source host") {
+			t.Fatalf("expected destructive purge to require Linux, got %v", err)
+		}
+		backups, err := filepath.Glob(filepath.Join(".bort", "backups", "source-purge-*"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(backups) != 0 {
+			t.Fatalf("platform rejection created purge backups: %#v", backups)
+		}
+		return
+	}
 	if err := runCleanup(context.Background(), []string{"purge", "--run", "acceptance", "--apply", "--all-apps", "--confirm", "purge acceptance"}, io.Discard, io.Discard); err != nil {
 		t.Fatal(err)
 	}
