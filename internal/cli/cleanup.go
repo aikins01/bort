@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -354,6 +355,9 @@ func runCleanupPurge(ctx context.Context, args []string, stdin io.Reader, stdout
 	applyCleanupPurgeIdentities(&result, identified)
 	if err := confirmCleanupPurgeApply(stdin, stderr, run.Run.Name, confirm); err != nil {
 		return err
+	}
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("cleanup purge --apply is unavailable on %s; rerun the same scoped and confirmed command on the Linux source host", runtime.GOOS)
 	}
 	recorder, err := newCleanupPurgeBackupRecorder(backupDir, &result)
 	if err != nil {

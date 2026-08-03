@@ -6,9 +6,33 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestDestructiveCleanupPlatformBoundary(t *testing.T) {
+	runner := &fakeDockerRunner{}
+	client := &Client{Docker: runner}
+	if runtime.GOOS == "linux" {
+		if _, err := client.CleanupStalePlatformProjects(context.Background(), StalePlatformCleanupOptions{}); err == nil || !strings.Contains(err.Error(), "at least one project name") {
+			t.Fatalf("expected metadata cleanup to reach input validation on Linux, got %v", err)
+		}
+		if _, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{}); err != nil {
+			t.Fatalf("expected source purge to reach execution on Linux, got %v", err)
+		}
+		return
+	}
+	if _, err := client.CleanupStalePlatformProjects(context.Background(), StalePlatformCleanupOptions{}); err == nil || !strings.Contains(err.Error(), "Linux Dokploy host") {
+		t.Fatalf("expected metadata cleanup to require Linux, got %v", err)
+	}
+	if _, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{}); err == nil || !strings.Contains(err.Error(), "Linux source host") {
+		t.Fatalf("expected source purge to require Linux, got %v", err)
+	}
+	if len(runner.outputArgs) != 0 || len(runner.runs) != 0 {
+		t.Fatalf("unsupported cleanup reached Docker: output=%#v runs=%#v", runner.outputArgs, runner.runs)
+	}
+}
 
 func TestCleanupStalePlatformProjectsBacksUpThenDeletesMetadata(t *testing.T) {
 	backupDir := dokployBackupTestDir(t)
@@ -25,7 +49,7 @@ func TestCleanupStalePlatformProjectsBacksUpThenDeletesMetadata(t *testing.T) {
 	}
 	client := &Client{Docker: runner}
 
-	result, err := client.CleanupStalePlatformProjects(context.Background(), StalePlatformCleanupOptions{
+	result, err := client.cleanupStalePlatformProjects(context.Background(), StalePlatformCleanupOptions{
 		ProjectNames: []string{"proxy", "source", "proxy"},
 		BackupDir:    backupDir,
 		BackupPrefix: "cleanup-test",
@@ -67,6 +91,54 @@ func TestCleanupStalePlatformProjectsBacksUpThenDeletesMetadata(t *testing.T) {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("expected cleanup sql to contain %q, got:\n%s", want, sql)
 		}
+	}
+}
+
+type replacingBackupDirRunner struct {
+	fakeDockerRunner
+	backupDir   string
+	deleteCalls int
+}
+
+func (r *replacingBackupDirRunner) Run(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {
+	if len(args) > 2 && args[2] == "pg_dump" {
+		if _, err := io.WriteString(stdout, "dump-bytes"); err != nil {
+			return err
+		}
+		if err := os.Rename(r.backupDir, r.backupDir+"-held"); err != nil {
+			return err
+		}
+		return os.Mkdir(r.backupDir, 0o700)
+	}
+	r.deleteCalls++
+	return r.fakeDockerRunner.Run(ctx, stdin, stdout, args...)
+}
+
+func TestCleanupStalePlatformProjectsRejectsReplacedBackupDirectoryBeforeDelete(t *testing.T) {
+	backupDir := dokployBackupTestDir(t)
+	runner := &replacingBackupDirRunner{
+		fakeDockerRunner: fakeDockerRunner{outputs: map[string][]byte{
+			"ps --format {{.Names}}": []byte("dokploy-postgres.1.task\n"),
+		}},
+		backupDir: backupDir,
+	}
+	client := &Client{Docker: runner}
+	_, err := client.cleanupStalePlatformProjects(context.Background(), StalePlatformCleanupOptions{
+		ProjectNames: []string{"proxy"},
+		BackupDir:    backupDir,
+	})
+	if err == nil || !strings.Contains(err.Error(), "private directory path changed") {
+		t.Fatalf("expected replaced backup directory to block metadata deletion, got %v", err)
+	}
+	if runner.deleteCalls != 0 {
+		t.Fatalf("metadata deletion ran after backup directory replacement: %d", runner.deleteCalls)
+	}
+	entries, err := os.ReadDir(backupDir + "-held")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected completed backup in retained directory, got %#v", entries)
 	}
 }
 
@@ -192,7 +264,7 @@ func TestPurgeSourceResourcesRemovesDockerResources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IdentifySourcePurgeResources: %v", err)
 	}
-	result, err := client.PurgeSourceResources(context.Background(), options)
+	result, err := client.purgeSourceResources(context.Background(), options)
 	if err != nil {
 		t.Fatalf("PurgeSourceResources: %v", err)
 	}
@@ -336,7 +408,7 @@ func TestSourcePurgeRejectsConflictingVolumeAbsenceState(t *testing.T) {
 		if _, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{Volumes: ordered}); err == nil || !strings.Contains(err.Error(), "conflicting") {
 			t.Fatalf("expected identification to reject conflicting duplicate volumes, got %v", err)
 		}
-		if _, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{Volumes: ordered}); err == nil || !strings.Contains(err.Error(), "conflicting") {
+		if _, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{Volumes: ordered}); err == nil || !strings.Contains(err.Error(), "conflicting") {
 			t.Fatalf("expected apply to reject conflicting duplicate volumes, got %v", err)
 		}
 	}
@@ -369,7 +441,7 @@ func TestPurgeSourceResourcesSkipsAbsentAllowedPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IdentifySourcePurgeResources: %v", err)
 	}
-	result, err := client.PurgeSourceResources(context.Background(), options)
+	result, err := client.purgeSourceResources(context.Background(), options)
 	if err != nil {
 		t.Fatalf("PurgeSourceResources: %v", err)
 	}
@@ -385,7 +457,7 @@ func TestPurgeSourceResourcesDoesNotFallbackFromStaleIDToName(t *testing.T) {
 	}}
 	client := &Client{Docker: runner}
 
-	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{Containers: []SourcePurgeContainer{{App: "api", ContainerID: "missing-id", ContainerName: "web"}}})
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{Containers: []SourcePurgeContainer{{App: "api", ContainerID: "missing-id", ContainerName: "web"}}})
 	if err == nil || !strings.Contains(err.Error(), "docker inspect missing-id") {
 		t.Fatalf("expected stale ID inspect error, got err=%v result=%#v", err, result)
 	}
@@ -406,7 +478,7 @@ func TestPurgeSourceResourcesPreservesReplacementAfterReviewedContainerDisappear
 		},
 	}
 	client := &Client{Docker: runner}
-	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{Containers: []SourcePurgeContainer{{ContainerID: "reviewed-id", ContainerName: "web"}}})
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{Containers: []SourcePurgeContainer{{ContainerID: "reviewed-id", ContainerName: "web"}}})
 	if err == nil || !strings.Contains(err.Error(), "now refers to container ID") {
 		t.Fatalf("expected replacement container to block purge, got result=%#v err=%v", result, err)
 	}
@@ -426,7 +498,7 @@ func TestPurgeSourceResourcesRejectsMismatchedInspectedContainerID(t *testing.T)
 		"rm -f replacement-id":                 []byte("replacement-id\n"),
 	}}
 	client := &Client{Docker: runner}
-	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{Containers: []SourcePurgeContainer{{ContainerID: "reviewed-id", ContainerName: "web"}}})
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{Containers: []SourcePurgeContainer{{ContainerID: "reviewed-id", ContainerName: "web"}}})
 	if err == nil || !strings.Contains(err.Error(), "not the reviewed ID") {
 		t.Fatalf("expected mismatched inspected ID to block purge, got result=%#v err=%v", result, err)
 	}
@@ -449,7 +521,7 @@ func TestPurgeSourceNetworkPreservesReplacementAfterReviewedIDDisappears(t *test
 		},
 	}
 	client := &Client{Docker: runner}
-	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{
 		Networks: []SourcePurgeNetwork{{Name: "api-net", DiscoveredIdentity: reviewedID, ExpectedIdentity: reviewedID}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "appeared after confirmation") {
@@ -511,7 +583,7 @@ func TestIdentifySourcePurgeResourcesRequiresDiscoveredNetworkIdentity(t *testin
 func TestPurgeSourceNetworkRejectsShortConfirmedIdentity(t *testing.T) {
 	client := &Client{Docker: &fakeDockerRunner{}}
 	progressCalls := 0
-	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{
 		Networks: []SourcePurgeNetwork{{Name: "api-net", DiscoveredIdentity: "123456789abc", ExpectedIdentity: "123456789abc"}},
 		OnProgress: func(SourcePurgeResult) error {
 			progressCalls++
@@ -538,7 +610,7 @@ func TestPurgeSourceNetworkRejectsInvalidIdentityTupleBeforeProgress(t *testing.
 		t.Run(name, func(t *testing.T) {
 			runner := &fakeDockerRunner{}
 			progressCalls := 0
-			result, err := (&Client{Docker: runner}).PurgeSourceResources(context.Background(), SourcePurgeOptions{
+			result, err := (&Client{Docker: runner}).purgeSourceResources(context.Background(), SourcePurgeOptions{
 				Networks: []SourcePurgeNetwork{network},
 				OnProgress: func(SourcePurgeResult) error {
 					progressCalls++
@@ -570,7 +642,7 @@ func TestPurgeSourceResourcesReturnsPartialResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IdentifySourcePurgeResources: %v", err)
 	}
-	result, err := client.PurgeSourceResources(context.Background(), options)
+	result, err := client.purgeSourceResources(context.Background(), options)
 	if err == nil {
 		t.Fatal("expected purge to stop on the network failure")
 	}
@@ -587,7 +659,7 @@ func TestSourcePurgeRequiresNamedVolumeToRemainAbsent(t *testing.T) {
 	if _, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{Volumes: []SourcePurgeVolume{{Name: "api-data"}}}); err == nil || !strings.Contains(err.Error(), "remove it manually") {
 		t.Fatalf("expected existing named volume to block before confirmation, got %v", err)
 	}
-	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{
 		Volumes: []SourcePurgeVolume{{Name: "api-data", ExpectedAbsent: true}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "appeared after confirmation") {
@@ -607,7 +679,7 @@ func TestSourcePurgeRechecksAbsenceBeforeRemovingContainers(t *testing.T) {
 		"rm -f cid123":                    []byte("cid123\n"),
 	}}
 	client := &Client{Docker: runner}
-	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{
 		Containers: []SourcePurgeContainer{{ContainerID: "cid123", ContainerName: "web"}},
 		Volumes:    []SourcePurgeVolume{{Name: "api-data", ExpectedAbsent: true}},
 	})
@@ -627,7 +699,7 @@ func TestSourcePurgeWithAbsencePrerequisitesRequiresManualContainerRemoval(t *te
 		"rm -f cid123":                    []byte("cid123\n"),
 	}}}
 	client := &Client{Docker: runner}
-	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{
 		Containers: []SourcePurgeContainer{{ContainerID: "cid123", ContainerName: "web"}},
 		Volumes:    []SourcePurgeVolume{{Name: "api-data", ExpectedAbsent: true}},
 	})
@@ -681,7 +753,7 @@ func TestSourcePurgeManualCompletionPreservesReplacementContainerByName(t *testi
 		},
 	}
 	client := &Client{Docker: runner}
-	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{
 		Containers: []SourcePurgeContainer{{ContainerID: "reviewed", ContainerName: "web"}},
 		Volumes:    []SourcePurgeVolume{{Name: "api-data", ExpectedAbsent: true}},
 	})
@@ -704,7 +776,7 @@ func TestPurgeSourceResourcesStopsBeforeNextMutationWhenProgressPersistenceFails
 	}}
 	var durable SourcePurgeResult
 	client := &Client{Docker: runner}
-	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{
 		Containers: []SourcePurgeContainer{{ContainerID: "cid1", ContainerName: "one"}, {ContainerID: "cid2", ContainerName: "two"}},
 		OnProgress: func(progress SourcePurgeResult) error {
 			latest := progress.Containers[len(progress.Containers)-1]
@@ -759,7 +831,7 @@ func TestSourcePurgeAcceptsNamedVolumeThatRemainsAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IdentifySourcePurgeResources: %v", err)
 	}
-	result, err := client.PurgeSourceResources(context.Background(), options)
+	result, err := client.purgeSourceResources(context.Background(), options)
 	if err != nil {
 		t.Fatalf("PurgeSourceResources: %v", err)
 	}
@@ -778,7 +850,7 @@ func TestSourcePurgeManualNetworkResultRetainsConfirmedIdentity(t *testing.T) {
 		},
 	}
 	client := &Client{Docker: runner}
-	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{
 		Volumes:  []SourcePurgeVolume{{Name: "api-data", ExpectedAbsent: true}},
 		Networks: []SourcePurgeNetwork{{Name: "api-net", DiscoveredIdentity: canonicalID, ExpectedIdentity: canonicalID}},
 	})
@@ -831,7 +903,7 @@ func TestProtectedSourcePurgeNetworkNamesAreCaseSensitive(t *testing.T) {
 
 func TestPurgeSourceResourcesRejectsProtectedHostPath(t *testing.T) {
 	client := &Client{Docker: &fakeDockerRunner{}}
-	_, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{Paths: []SourcePurgePath{{Path: "/data"}}})
+	_, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{Paths: []SourcePurgePath{{Path: "/data"}}})
 	if err == nil || !strings.Contains(err.Error(), "protected host path") {
 		t.Fatalf("expected protected path error, got %v", err)
 	}
