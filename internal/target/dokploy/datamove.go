@@ -565,7 +565,6 @@ func (c *Client) stopTargetComposeContainers(ctx context.Context, actx *applyCon
 	runner := c.dockerRunner()
 	var result error
 	var quietSince time.Time
-	stoppedIDs := map[string]struct{}{}
 	for {
 		containers, err := listContainersByLabel(ctx, runner, "com.docker.compose.project="+entry.ComposeAppName)
 		if err != nil {
@@ -580,9 +579,6 @@ func (c *Client) stopTargetComposeContainers(ctx context.Context, actx *applyCon
 			if !container.State.Running {
 				continue
 			}
-			if _, stopped := stoppedIDs[container.ID]; stopped {
-				continue
-			}
 			sawRunning = true
 			quietSince = time.Time{}
 			if err := stopContainer(ctx, runner, container.ID); err != nil {
@@ -594,7 +590,6 @@ func (c *Client) stopTargetComposeContainers(ctx context.Context, actx *applyCon
 				result = fmt.Errorf("stop target container %s: %w", container.ID, err)
 				continue
 			}
-			stoppedIDs[container.ID] = struct{}{}
 		}
 		if hadStopError {
 			return result
@@ -1361,7 +1356,7 @@ func (c *Client) targetContainerForServiceWithRedeploy(ctx context.Context, runn
 		}
 		if allowRedeploy && len(containers) == 0 && entry.ComposeID != "" && !entry.DiscoveryRedeployAttempted {
 			entry.DiscoveryRedeployAttempted = true
-			if err := c.deployComposeWithPatchGuard(ctx, entry.ComposeID, deployComposeTitle(actx.plan)); err != nil {
+			if err := c.deployComposeForApply(ctx, actx, appName); err != nil {
 				return dockerContainer{}, fmt.Errorf("redeploy dokploy compose project %q for target discovery: %w", entry.ComposeAppName, err)
 			}
 		}
