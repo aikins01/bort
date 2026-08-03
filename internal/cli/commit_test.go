@@ -137,6 +137,22 @@ func TestRunCommitRejectsEmptyExplicitRun(t *testing.T) {
 	}
 }
 
+func TestRunCommitRejectsEmptyCutoverArtifact(t *testing.T) {
+	var stdout bytes.Buffer
+	err := runCommit(context.Background(), []string{"--from-cutover="}, &stdout, io.Discard)
+	if err == nil || err.Error() != "commit requires a non-empty --from-cutover value" {
+		t.Fatalf("expected empty cutover artifact rejection, got %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("empty cutover artifact produced output before rejection: %q", stdout.String())
+	}
+
+	err = runCommit(context.Background(), []string{"--apply", "--from-cutover="}, io.Discard, io.Discard)
+	if err == nil || err.Error() != "commit --apply does not accept --from-cutover; select the run with --run" {
+		t.Fatalf("expected apply mode to reject the cutover artifact flag, got %v", err)
+	}
+}
+
 func TestRunCommitDefaultsToCurrentRun(t *testing.T) {
 	workDir := t.TempDir()
 	t.Chdir(workDir)

@@ -46,6 +46,9 @@ func runCommit(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if flagSet(fs, "run") && strings.TrimSpace(runRef) == "" {
 		return fmt.Errorf("commit requires a non-empty --run value")
 	}
+	if !apply && flagSet(fs, "from-cutover") && strings.TrimSpace(cutoverPlanPath) == "" {
+		return fmt.Errorf("commit requires a non-empty --from-cutover value")
+	}
 	if apply {
 		for _, name := range []string{"app", "bundle", "format", "from-cutover", "output", "rollback-window", "target"} {
 			if flagSet(fs, name) {
