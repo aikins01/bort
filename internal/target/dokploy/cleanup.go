@@ -47,10 +47,11 @@ type SourcePurgeVolume struct {
 }
 
 type SourcePurgeNetwork struct {
-	App              string `json:"app,omitempty"`
-	Name             string `json:"name"`
-	ExpectedIdentity string `json:"expectedIdentity,omitempty"`
-	ExpectedAbsent   bool   `json:"expectedAbsent,omitempty"`
+	App                string `json:"app,omitempty"`
+	Name               string `json:"name"`
+	DiscoveredIdentity string `json:"discoveredIdentity,omitempty"`
+	ExpectedIdentity   string `json:"expectedIdentity,omitempty"`
+	ExpectedAbsent     bool   `json:"expectedAbsent,omitempty"`
 }
 
 type SourcePurgePath struct {
@@ -77,10 +78,11 @@ type SourcePurgeResult struct {
 }
 
 type SourcePurgeResourceResult struct {
-	App     string `json:"app,omitempty"`
-	Ref     string `json:"ref"`
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
+	App      string `json:"app,omitempty"`
+	Ref      string `json:"ref"`
+	Identity string `json:"identity,omitempty"`
+	Status   string `json:"status"`
+	Message  string `json:"message,omitempty"`
 }
 
 func (c *Client) CleanupStalePlatformProjects(ctx context.Context, opts StalePlatformCleanupOptions) (StalePlatformCleanupResult, error) {
@@ -114,7 +116,13 @@ func (c *Client) PurgeSourceResources(ctx context.Context, opts SourcePurgeOptio
 	}
 	volumes := cleanupSourcePurgeVolumes(opts.Volumes)
 	paths := cleanupSourcePurgePaths(opts.Paths)
-	networks := cleanupSourcePurgeNetworks(opts.Networks)
+	networks, err := cleanupSourcePurgeNetworks(opts.Networks)
+	if err != nil {
+		return result, err
+	}
+	if err := validateSourcePurgeNetworksForExecution(networks); err != nil {
+		return result, err
+	}
 	if sourcePurgeRequiresManualCompletion(volumes, paths, networks) {
 		for _, volume := range volumes {
 			if err := runSourcePurgeResource(&result, &result.Volumes, opts.OnProgress, SourcePurgeResourceResult{App: volume.App, Ref: volume.Name}, func() (SourcePurgeResourceResult, error) {
@@ -138,7 +146,7 @@ func (c *Client) PurgeSourceResources(ctx context.Context, opts SourcePurgeOptio
 			}
 		}
 		for _, network := range networks {
-			if err := runSourcePurgeResource(&result, &result.Networks, opts.OnProgress, SourcePurgeResourceResult{App: network.App, Ref: network.Name}, func() (SourcePurgeResourceResult, error) {
+			if err := runSourcePurgeResource(&result, &result.Networks, opts.OnProgress, SourcePurgeResourceResult{App: network.App, Ref: network.Name, Identity: network.ExpectedIdentity}, func() (SourcePurgeResourceResult, error) {
 				return verifySourcePurgeNetworkAbsent(ctx, runner, network)
 			}); err != nil {
 				return result, err
@@ -164,7 +172,7 @@ func (c *Client) PurgeSourceResources(ctx context.Context, opts SourcePurgeOptio
 		if !network.ExpectedAbsent {
 			continue
 		}
-		if err := runSourcePurgeResource(&result, &result.Networks, opts.OnProgress, SourcePurgeResourceResult{App: network.App, Ref: network.Name}, func() (SourcePurgeResourceResult, error) {
+		if err := runSourcePurgeResource(&result, &result.Networks, opts.OnProgress, SourcePurgeResourceResult{App: network.App, Ref: network.Name, Identity: network.ExpectedIdentity}, func() (SourcePurgeResourceResult, error) {
 			return purgeSourceNetwork(ctx, runner, network)
 		}); err != nil {
 			return result, err
@@ -181,7 +189,7 @@ func (c *Client) PurgeSourceResources(ctx context.Context, opts SourcePurgeOptio
 		if network.ExpectedAbsent {
 			continue
 		}
-		if err := runSourcePurgeResource(&result, &result.Networks, opts.OnProgress, SourcePurgeResourceResult{App: network.App, Ref: network.Name}, func() (SourcePurgeResourceResult, error) {
+		if err := runSourcePurgeResource(&result, &result.Networks, opts.OnProgress, SourcePurgeResourceResult{App: network.App, Ref: network.Name, Identity: network.ExpectedIdentity}, func() (SourcePurgeResourceResult, error) {
 			return purgeSourceNetwork(ctx, runner, network)
 		}); err != nil {
 			return result, err
@@ -264,10 +272,27 @@ func (c *Client) IdentifySourcePurgeResources(ctx context.Context, opts SourcePu
 		identified.Volumes = append(identified.Volumes, volume)
 	}
 	identified.Networks = nil
-	for _, network := range cleanupSourcePurgeNetworks(opts.Networks) {
+	networks, err := cleanupSourcePurgeNetworks(opts.Networks)
+	if err != nil {
+		return SourcePurgeOptions{}, err
+	}
+	for _, network := range networks {
 		identity, absent, err := inspectSourcePurgeNetworkIdentity(ctx, runner, network.Name)
 		if err != nil {
 			return SourcePurgeOptions{}, err
+		}
+		discoveredIdentity := strings.TrimSpace(network.DiscoveredIdentity)
+		if !absent && discoveredIdentity == "" {
+			return SourcePurgeOptions{}, fmt.Errorf("source network %q has no stable ID from discovery; remove it manually before cleanup purge --apply", network.Name)
+		}
+		if !absent && !sourcePurgeCanonicalNetworkID(discoveredIdentity) {
+			return SourcePurgeOptions{}, fmt.Errorf("source network %q has non-canonical discovered ID %q; remove it manually before cleanup purge --apply", network.Name, discoveredIdentity)
+		}
+		if !absent && !sourcePurgeCanonicalNetworkID(identity) {
+			return SourcePurgeOptions{}, fmt.Errorf("docker returned non-canonical ID %q for source network %q", identity, network.Name)
+		}
+		if !absent && !SourcePurgeNetworkIDsEquivalent(identity, discoveredIdentity) {
+			return SourcePurgeOptions{}, fmt.Errorf("refusing source network %q because current ID %s does not match discovered ID %s", network.Name, identity, discoveredIdentity)
 		}
 		network.ExpectedIdentity = identity
 		network.ExpectedAbsent = absent
@@ -347,6 +372,31 @@ func sourcePurgeContainerIDsEquivalent(a, b string) bool {
 		a, b = b, a
 	}
 	return len(a) >= 12 && strings.HasPrefix(b, a)
+}
+
+func ValidSourcePurgeNetworkID(identity string) bool {
+	identity = strings.TrimSpace(identity)
+	if len(identity) < 12 || len(identity) > 64 {
+		return false
+	}
+	for _, r := range identity {
+		if r < '0' || r > '9' {
+			if r < 'a' || r > 'f' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sourcePurgeCanonicalNetworkID(identity string) bool {
+	return len(strings.TrimSpace(identity)) == 64 && ValidSourcePurgeNetworkID(identity)
+}
+
+func SourcePurgeNetworkIDsEquivalent(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	return sourcePurgeCanonicalNetworkID(a) && sourcePurgeCanonicalNetworkID(b) && a == b
 }
 
 func cleanupSourcePurgeContainers(containers []SourcePurgeContainer) ([]SourcePurgeContainer, error) {
@@ -434,22 +484,66 @@ func cleanupSourcePurgeVolumes(volumes []SourcePurgeVolume) []SourcePurgeVolume 
 	return cleaned
 }
 
-func cleanupSourcePurgeNetworks(networks []SourcePurgeNetwork) []SourcePurgeNetwork {
-	seen := map[string]struct{}{}
+func cleanupSourcePurgeNetworks(networks []SourcePurgeNetwork) ([]SourcePurgeNetwork, error) {
+	seen := map[string]int{}
 	cleaned := []SourcePurgeNetwork{}
 	for _, network := range networks {
 		network.Name = strings.TrimSpace(network.Name)
+		network.DiscoveredIdentity = strings.TrimSpace(network.DiscoveredIdentity)
+		network.ExpectedIdentity = strings.TrimSpace(network.ExpectedIdentity)
 		if network.Name == "" {
 			continue
 		}
-		if _, ok := seen[network.Name]; ok {
+		if network.ExpectedAbsent && network.ExpectedIdentity != "" {
+			return nil, fmt.Errorf("source network %q has conflicting expected identity and absence state", network.Name)
+		}
+		if index, ok := seen[network.Name]; ok {
+			current := &cleaned[index]
+			if current.DiscoveredIdentity != "" && network.DiscoveredIdentity != "" && current.DiscoveredIdentity != network.DiscoveredIdentity {
+				return nil, fmt.Errorf("source network %q has conflicting discovered identities", network.Name)
+			}
+			if current.ExpectedIdentity != "" && network.ExpectedIdentity != "" && current.ExpectedIdentity != network.ExpectedIdentity {
+				return nil, fmt.Errorf("source network %q has conflicting expected identities", network.Name)
+			}
+			if current.ExpectedAbsent != network.ExpectedAbsent {
+				return nil, fmt.Errorf("source network %q has conflicting expected absence state", network.Name)
+			}
+			if current.DiscoveredIdentity == "" {
+				current.DiscoveredIdentity = network.DiscoveredIdentity
+			}
+			if current.ExpectedIdentity == "" {
+				current.ExpectedIdentity = network.ExpectedIdentity
+			}
 			continue
 		}
-		seen[network.Name] = struct{}{}
+		seen[network.Name] = len(cleaned)
 		cleaned = append(cleaned, network)
 	}
+	for _, network := range cleaned {
+		if network.ExpectedIdentity != "" && !sourcePurgeCanonicalNetworkID(network.ExpectedIdentity) {
+			return nil, fmt.Errorf("source network %q has non-canonical confirmed ID %q", network.Name, network.ExpectedIdentity)
+		}
+	}
 	sort.Slice(cleaned, func(i, j int) bool { return cleaned[i].Name < cleaned[j].Name })
-	return cleaned
+	return cleaned, nil
+}
+
+func validateSourcePurgeNetworksForExecution(networks []SourcePurgeNetwork) error {
+	for _, network := range networks {
+		if network.ExpectedAbsent {
+			continue
+		}
+		if !sourcePurgeCanonicalNetworkID(network.ExpectedIdentity) {
+			return fmt.Errorf("source network %q has no canonical confirmed ID", network.Name)
+		}
+		if !sourcePurgeCanonicalNetworkID(network.DiscoveredIdentity) {
+			return fmt.Errorf("source network %q has non-canonical discovered ID %q", network.Name, network.DiscoveredIdentity)
+		}
+		if !SourcePurgeNetworkIDsEquivalent(network.ExpectedIdentity, network.DiscoveredIdentity) {
+			return fmt.Errorf("source network %q has conflicting discovered and confirmed IDs", network.Name)
+		}
+	}
+	return nil
 }
 
 func cleanupSourcePurgePaths(paths []SourcePurgePath) []SourcePurgePath {
@@ -614,6 +708,24 @@ func purgeSourceNetwork(ctx context.Context, runner dockerRunner, item SourcePur
 		result.Status = "blocked"
 		return result, fmt.Errorf("refusing to remove docker network %q without a pre-confirmation identity", name)
 	}
+	if !sourcePurgeCanonicalNetworkID(identity) {
+		result.Status = "blocked"
+		return result, fmt.Errorf("refusing to remove docker network %q with non-canonical confirmed ID %q", name, identity)
+	}
+	discoveredIdentity := strings.TrimSpace(item.DiscoveredIdentity)
+	if discoveredIdentity == "" {
+		result.Status = "blocked"
+		return result, fmt.Errorf("refusing to remove docker network %q without a stable ID from discovery", name)
+	}
+	if !sourcePurgeCanonicalNetworkID(discoveredIdentity) {
+		result.Status = "blocked"
+		return result, fmt.Errorf("refusing to remove docker network %q with non-canonical discovered ID %q", name, discoveredIdentity)
+	}
+	if !SourcePurgeNetworkIDsEquivalent(identity, discoveredIdentity) {
+		result.Status = "blocked"
+		return result, fmt.Errorf("refusing to remove docker network %q because confirmed ID %s does not match discovered ID %s", name, identity, discoveredIdentity)
+	}
+	result.Identity = identity
 	if _, err := runner.Output(ctx, "network", "rm", identity); err != nil {
 		if isDockerVolumeOrNetworkMissingErr(err) {
 			_, absent, inspectErr := inspectSourcePurgeNetworkIdentity(ctx, runner, name)
@@ -638,7 +750,7 @@ func purgeSourceNetwork(ctx context.Context, runner dockerRunner, item SourcePur
 
 func verifySourcePurgeNetworkAbsent(ctx context.Context, runner dockerRunner, item SourcePurgeNetwork) (SourcePurgeResourceResult, error) {
 	name := strings.TrimSpace(item.Name)
-	result := SourcePurgeResourceResult{App: item.App, Ref: name}
+	result := SourcePurgeResourceResult{App: item.App, Ref: name, Identity: strings.TrimSpace(item.ExpectedIdentity)}
 	if err := validateDockerPurgeName("network", name); err != nil {
 		result.Status = "blocked"
 		return result, err

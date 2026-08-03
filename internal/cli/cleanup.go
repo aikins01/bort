@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aikins01/bort/internal/analyzer"
+	"github.com/aikins01/bort/internal/manifest"
 	"github.com/aikins01/bort/internal/planutil"
 	"github.com/aikins01/bort/internal/preparer"
 	"github.com/aikins01/bort/internal/safepath"
@@ -86,11 +87,12 @@ type cleanupSourceVolume struct {
 }
 
 type cleanupSourceNetwork struct {
-	App              string `json:"app"`
-	Name             string `json:"name"`
-	ExpectedIdentity string `json:"expectedIdentity,omitempty"`
-	ExpectedAbsent   bool   `json:"expectedAbsent,omitempty"`
-	Action           string `json:"action"`
+	App                string `json:"app"`
+	Name               string `json:"name"`
+	DiscoveredIdentity string `json:"discoveredIdentity,omitempty"`
+	ExpectedIdentity   string `json:"expectedIdentity,omitempty"`
+	ExpectedAbsent     bool   `json:"expectedAbsent,omitempty"`
+	Action             string `json:"action"`
 }
 
 type cleanupTargetArtifact struct {
@@ -444,7 +446,11 @@ func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurg
 		return cleanupPurgeResult{}, err
 	}
 	selectedRefs := cleanupSelectedAppRefs(selected)
-	owners, err := cleanupPurgeResourceOwners(run)
+	networkIdentities, err := cleanupManifestNetworkIdentities(run)
+	if err != nil {
+		return cleanupPurgeResult{}, err
+	}
+	owners, err := cleanupPurgeResourceOwners(run, networkIdentities)
 	if err != nil {
 		return cleanupPurgeResult{}, err
 	}
@@ -457,6 +463,7 @@ func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurg
 		CompletesLifecycle: cleanupPurgeCoversAllRunApps(run, filters),
 		Filters:            filters,
 	}
+	manualNetworkCompletion := false
 
 	for _, app := range selected {
 		if control := cleanupSourceControlForApp(app); control != nil {
@@ -522,7 +529,7 @@ func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurg
 			}
 			result.SourceVolumes = append(result.SourceVolumes, volume)
 		}
-		networks, err := cleanupNetworksForApp(run, app)
+		networks, err := cleanupNetworksForApp(run, app, networkIdentities)
 		if err != nil {
 			return cleanupPurgeResult{}, fmt.Errorf("inspect source networks for %s before purge: %w", app.Name, err)
 		}
@@ -541,7 +548,13 @@ func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurg
 				result.Warnings = append(result.Warnings, fmt.Sprintf("source network %s for %s is also referenced by unselected app(s): %s", network.Name, app.Name, strings.Join(sharedWith, ", ")))
 				continue
 			}
-			network.Action = "remove_on_purge_apply"
+			if identity := strings.TrimSpace(network.DiscoveredIdentity); len(identity) != 64 || !dokploy.ValidSourcePurgeNetworkID(identity) {
+				manualNetworkCompletion = true
+				network.Action = "require_absent_before_purge_apply"
+				result.Warnings = append(result.Warnings, fmt.Sprintf("source network %s for %s has no canonical recorded ID and must be removed manually before cleanup purge --apply; Bort will verify it remains absent", network.Name, app.Name))
+			} else {
+				network.Action = "remove_on_purge_apply"
+			}
 			result.SourceNetworks = append(result.SourceNetworks, network)
 		}
 	}
@@ -563,7 +576,7 @@ func planCleanupPurge(run loadedMigrationRun, target string, filters cleanupPurg
 	if filters.AllApps && !cleanupPurgeCoversAllRunApps(run, filters) {
 		result.Warnings = append(result.Warnings, "--all-apps excludes platform-role apps unless --include-platform is set; this purge will not complete the migration lifecycle")
 	}
-	if len(cleanupPurgeVolumeChecks(result.SourceVolumes)) > 0 || len(result.SourcePaths) > 0 {
+	if len(cleanupPurgeVolumeChecks(result.SourceVolumes)) > 0 || len(result.SourcePaths) > 0 || manualNetworkCompletion {
 		setCleanupPurgeManualCompletion(&result)
 	}
 	if filters.AllApps && !result.CompletesLifecycle {
@@ -629,7 +642,7 @@ func cleanupPurgeAppRef(app preparer.AppPlan) string {
 	return ""
 }
 
-func cleanupPurgeResourceOwners(run loadedMigrationRun) (cleanupPurgeOwners, error) {
+func cleanupPurgeResourceOwners(run loadedMigrationRun, networkIdentities map[string]string) (cleanupPurgeOwners, error) {
 	owners := cleanupPurgeOwners{
 		ContainerIDs:   map[string][]string{},
 		ContainerNames: map[string][]string{},
@@ -667,7 +680,7 @@ func cleanupPurgeResourceOwners(run loadedMigrationRun) (cleanupPurgeOwners, err
 				}
 			}
 		}
-		networks, err := cleanupNetworksForApp(run, app)
+		networks, err := cleanupNetworksForApp(run, app, networkIdentities)
 		if err != nil {
 			return cleanupPurgeOwners{}, fmt.Errorf("inspect source networks for %s before purge: %w", app.Name, err)
 		}
@@ -1032,7 +1045,7 @@ func cleanupPurgeOptions(result cleanupPurgeResult) dokploy.SourcePurgeOptions {
 		opts.Volumes = append(opts.Volumes, dokploy.SourcePurgeVolume{App: volume.App, Service: volume.Service, Name: volume.Name, ExpectedAbsent: volume.ExpectedAbsent})
 	}
 	for _, network := range result.SourceNetworks {
-		opts.Networks = append(opts.Networks, dokploy.SourcePurgeNetwork{App: network.App, Name: network.Name, ExpectedIdentity: network.ExpectedIdentity, ExpectedAbsent: network.ExpectedAbsent})
+		opts.Networks = append(opts.Networks, dokploy.SourcePurgeNetwork{App: network.App, Name: network.Name, DiscoveredIdentity: network.DiscoveredIdentity, ExpectedIdentity: network.ExpectedIdentity, ExpectedAbsent: network.ExpectedAbsent})
 	}
 	for _, path := range result.SourcePaths {
 		opts.Paths = append(opts.Paths, dokploy.SourcePurgePath{App: path.App, Source: path.Source, Path: path.Path, AllowPlatform: path.AllowPlatform, ExpectedAbsent: path.ExpectedAbsent})
@@ -1300,6 +1313,10 @@ func planCleanup(ctx context.Context, run loadedMigrationRun, target string) cle
 		DryRun:     true,
 	}
 	result.StalePlatformRecords, result.Warnings = inspectStalePlatformRecords(ctx, target)
+	networkIdentities, networkIdentityErr := cleanupManifestNetworkIdentities(run)
+	if networkIdentityErr != nil {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("inspect source network identities: %v", networkIdentityErr))
+	}
 	for _, record := range result.StalePlatformRecords {
 		status := "planned"
 		message := "remove Dokploy metadata only if the project still exists and has zero domains"
@@ -1327,10 +1344,13 @@ func planCleanup(ctx context.Context, run loadedMigrationRun, target string) cle
 			result.SourceContainers = append(result.SourceContainers, containers...)
 		}
 		result.SourceVolumes = append(result.SourceVolumes, cleanupVolumesForApp(app)...)
-		networks, err := cleanupNetworksForApp(run, app)
+		networks, err := cleanupNetworksForApp(run, app, networkIdentities)
 		if err != nil {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("inspect source networks for %s: %v", app.Name, err))
 		} else {
+			for i := range networks {
+				networks[i].Action = "preserve_until_manual_purge_after_acceptance"
+			}
 			result.SourceNetworks = append(result.SourceNetworks, networks...)
 		}
 		result.TargetArtifacts = append(result.TargetArtifacts, cleanupTargetArtifactsForApp(app)...)
@@ -1570,7 +1590,7 @@ func cleanupVolumesForApp(app preparer.AppPlan) []cleanupSourceVolume {
 	return volumes
 }
 
-func cleanupNetworksForApp(run loadedMigrationRun, app preparer.AppPlan) ([]cleanupSourceNetwork, error) {
+func cleanupNetworksForApp(run loadedMigrationRun, app preparer.AppPlan, identities map[string]string) ([]cleanupSourceNetwork, error) {
 	topology, err := cleanupReadTopology(run, app)
 	if err != nil {
 		return nil, err
@@ -1580,12 +1600,84 @@ func cleanupNetworksForApp(run loadedMigrationRun, app preparer.AppPlan) ([]clea
 	}
 	networks := make([]cleanupSourceNetwork, 0, len(topology.Networks))
 	for _, network := range topology.Networks {
-		if strings.TrimSpace(network) == "" {
+		network = strings.TrimSpace(network)
+		if network == "" {
 			continue
 		}
-		networks = append(networks, cleanupSourceNetwork{App: app.Name, Name: network, Action: "preserve_until_manual_purge_after_acceptance"})
+		networks = append(networks, cleanupSourceNetwork{App: app.Name, Name: network, DiscoveredIdentity: identities[network]})
 	}
 	return networks, nil
+}
+
+func cleanupManifestNetworkIdentities(run loadedMigrationRun) (map[string]string, error) {
+	identities := map[string]string{}
+	manifestPath := strings.TrimSpace(run.Run.ManifestPath)
+	if manifestPath == "" {
+		return identities, nil
+	}
+	runDir := filepath.FromSlash(run.Run.RunDir)
+	path := filepath.FromSlash(manifestPath)
+	name := filepath.Base(path)
+	if path != name {
+		manifestAbsolute, err := filepath.Abs(path)
+		if err != nil {
+			return nil, err
+		}
+		expectedAbsolute, err := filepath.Abs(filepath.Join(runDir, name))
+		if err != nil {
+			return nil, err
+		}
+		if manifestAbsolute != expectedAbsolute {
+			return nil, fmt.Errorf("source manifest path %s is outside migration run %s", manifestPath, run.Run.RunDir)
+		}
+	}
+	contents, err := safepath.ReadPrivateFile(runDir, name)
+	if err != nil {
+		return nil, fmt.Errorf("read source manifest network identities: %w", err)
+	}
+	var sourceManifest manifest.Manifest
+	if err := json.Unmarshal(contents, &sourceManifest); err != nil {
+		return nil, fmt.Errorf("decode source manifest network identities: %w", err)
+	}
+	conflicts := map[string]struct{}{}
+	record := func(name, identity string) {
+		name = strings.TrimSpace(name)
+		identity = strings.TrimSpace(identity)
+		if name == "" || identity == "" {
+			return
+		}
+		if !dokploy.ValidSourcePurgeNetworkID(identity) {
+			delete(identities, name)
+			conflicts[name] = struct{}{}
+			return
+		}
+		if _, conflict := conflicts[name]; conflict {
+			return
+		}
+		if current, ok := identities[name]; ok {
+			if current != identity && !dokploy.SourcePurgeNetworkIDsEquivalent(current, identity) {
+				delete(identities, name)
+				conflicts[name] = struct{}{}
+				return
+			}
+			if len(identity) > len(current) {
+				identities[name] = identity
+			}
+			return
+		}
+		identities[name] = identity
+	}
+	for _, network := range sourceManifest.Networks {
+		record(network.Name, network.ID)
+	}
+	for _, app := range sourceManifest.Apps {
+		for _, service := range app.Services {
+			for _, network := range service.Networks {
+				record(network.Name, network.NetworkID)
+			}
+		}
+	}
+	return identities, nil
 }
 
 func cleanupReadTopology(run loadedMigrationRun, app preparer.AppPlan) (analyzer.Topology, error) {
@@ -1812,11 +1904,15 @@ func writeCleanupPurgeResourceResults(w io.Writer, label string, items []dokploy
 	}
 	fmt.Fprintf(w, "  %s:\n", label)
 	for _, item := range items {
+		identity := ""
+		if strings.TrimSpace(item.Identity) != "" {
+			identity = " [id: " + strings.TrimSpace(item.Identity) + "]"
+		}
 		message := item.Message
 		if message != "" {
 			message = ": " + message
 		}
-		fmt.Fprintf(w, "    [%s] %s%s\n", item.Status, item.Ref, message)
+		fmt.Fprintf(w, "    [%s] %s%s%s\n", item.Status, item.Ref, identity, message)
 	}
 }
 

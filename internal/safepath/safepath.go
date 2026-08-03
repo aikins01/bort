@@ -1,6 +1,7 @@
 package safepath
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -86,6 +87,77 @@ func (d *PrivateDir) CreateFile(name string, mode os.FileMode) (*os.File, error)
 		return nil, err
 	}
 	return createPrivateFileNoFollow(dir, name, mode)
+}
+
+func (d *PrivateDir) ReadFile(name string) ([]byte, error) {
+	if err := validatePrivateFileName(name); err != nil {
+		return nil, err
+	}
+	dir, err := d.openFile()
+	if err != nil {
+		return nil, err
+	}
+	file, err := openPrivateFileNoFollow(dir, name)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("private file %s is not regular", name)
+	}
+	contents, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+	afterRead, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !samePrivateFileState(info, afterRead) {
+		return nil, fmt.Errorf("private file %s changed during read", name)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	verification, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+	afterVerification, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !samePrivateFileState(afterRead, afterVerification) || !bytes.Equal(contents, verification) {
+		return nil, fmt.Errorf("private file %s changed during read", name)
+	}
+	current, err := openPrivateFileNoFollow(dir, name)
+	if err != nil {
+		return nil, err
+	}
+	defer current.Close()
+	currentInfo, err := current.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !currentInfo.Mode().IsRegular() || !samePrivateFileState(afterVerification, currentInfo) {
+		return nil, fmt.Errorf("private file %s changed during read", name)
+	}
+	return contents, nil
+}
+
+func samePrivateFileState(a, b os.FileInfo) bool {
+	return os.SameFile(a, b) && a.Size() == b.Size() && a.Mode() == b.Mode() && a.ModTime().Equal(b.ModTime())
+}
+
+func ReadPrivateFile(path, name string) ([]byte, error) {
+	if err := validatePrivateFileName(name); err != nil {
+		return nil, err
+	}
+	return readPrivateFile(path, name)
 }
 
 func (d *PrivateDir) WriteFileAtomic(name string, data []byte, mode os.FileMode) error {

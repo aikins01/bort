@@ -231,6 +231,7 @@ func TestParseDuBytesAndInt64(t *testing.T) {
 }
 
 func TestScanPopulatesNewServiceFields(t *testing.T) {
+	networkID := strings.Repeat("a", 64)
 	scanner := &Scanner{
 		Now: func() time.Time { return time.Unix(0, 0).UTC() },
 		runCommand: func(_ context.Context, args ...string) ([]byte, error) {
@@ -243,7 +244,7 @@ func TestScanPopulatesNewServiceFields(t *testing.T) {
 					"Config":{"Image":"app:1","Env":["PORT=80"],"Labels":{},"Healthcheck":{"Test":["CMD","ok"],"Interval":1000000000,"Retries":2}},
 					"State":{"Status":"running"},
 					"Mounts":[{"Type":"volume","Name":"data","Source":"/var/lib/docker/volumes/data/_data","Destination":"/data","RW":true}],
-					"NetworkSettings":{"Ports":{},"Networks":{}}
+					"NetworkSettings":{"Ports":{},"Networks":{"net":{"NetworkID":"` + networkID + `","IPAddress":"172.18.0.2"}}}
 				}]`), nil
 			case len(args) >= 2 && args[0] == "image" && args[1] == "inspect":
 				return []byte(`[{"Id":"sha256:abc","RepoDigests":["registry/app@sha256:dead"]}]`), nil
@@ -254,7 +255,7 @@ func TestScanPopulatesNewServiceFields(t *testing.T) {
 			case len(args) == 3 && args[0] == "network" && args[1] == "ls" && args[2] == "-q":
 				return []byte("n1\n"), nil
 			case len(args) >= 2 && args[0] == "network" && args[1] == "inspect":
-				return []byte(`[{"Id":"n1","Name":"net","Driver":"bridge","Scope":"local"}]`), nil
+				return []byte(`[{"Id":"` + networkID + `","Name":"net","Driver":"bridge","Scope":"local"}]`), nil
 			}
 			return nil, fmt.Errorf("unexpected docker args: %v", args)
 		},
@@ -282,6 +283,12 @@ func TestScanPopulatesNewServiceFields(t *testing.T) {
 	}
 	if svc.Healthcheck == nil || svc.Healthcheck.Interval != "1s" || svc.Healthcheck.Retries != 2 {
 		t.Fatalf("unexpected healthcheck: %+v", svc.Healthcheck)
+	}
+	if len(svc.Networks) != 1 || svc.Networks[0].NetworkID != networkID {
+		t.Fatalf("expected full service network id %q, got %+v", networkID, svc.Networks)
+	}
+	if len(m.Networks) != 1 || m.Networks[0].ID != networkID {
+		t.Fatalf("expected full top-level network id %q, got %+v", networkID, m.Networks)
 	}
 	if len(m.Volumes) != 1 {
 		t.Fatalf("expected 1 volume, got %d", len(m.Volumes))

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -286,6 +287,127 @@ func TestRunCleanupPurgeInventoriesDestructiveSourceResources(t *testing.T) {
 	}
 	if strings.Contains(output, "Applied destructive source purge") {
 		t.Fatalf("cleanup purge dry run claimed destructive removal:\n%s", output)
+	}
+}
+
+func TestPlanCleanupPurgePinsDiscoveredSourceNetworkIdentity(t *testing.T) {
+	workDir := cleanupBackupTestDir(t)
+	t.Chdir(workDir)
+	fullID := "123456789abc" + strings.Repeat("d", 52)
+	manifestPath := filepath.Join(workDir, "manifest.json")
+	if err := writeJSONArtifact(manifestPath, manifest.Manifest{
+		Source:   manifest.Source{Platform: "coolify-local"},
+		Networks: []manifest.Network{{ID: fullID, Name: "api-net"}, {ID: "abcdef123456", Name: "legacy-net"}},
+		Apps: []manifest.App{{
+			Name: "api",
+			Services: []manifest.Service{{
+				ID:       "cid123",
+				Name:     "web",
+				Image:    "example/api:latest",
+				Networks: []manifest.ServiceNetwork{{Name: " api-net ", NetworkID: fullID}, {Name: "legacy-net", NetworkID: "abcdef123456"}},
+			}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, runMigrate, []string{"--manifest", manifestPath, "--run", "network-identity"})
+	run, err := loadMigrationRun("network-identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := planCleanupPurge(run, "dokploy", cleanupPurgeFilters{AllApps: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.SourceNetworks) != 2 {
+		t.Fatalf("expected immutable source network identity in purge plan, got %#v", result.SourceNetworks)
+	}
+	networks := map[string]cleanupSourceNetwork{}
+	for _, network := range result.SourceNetworks {
+		networks[network.Name] = network
+	}
+	if networks["api-net"].DiscoveredIdentity != fullID || networks["api-net"].Action != "require_absent_before_purge_apply" {
+		t.Fatalf("expected manual completion to require canonical network absence too, got %#v", networks["api-net"])
+	}
+	if networks["legacy-net"].DiscoveredIdentity != "abcdef123456" || networks["legacy-net"].Action != "require_absent_before_purge_apply" {
+		t.Fatalf("expected legacy network identity to require manual removal, got %#v", networks["legacy-net"])
+	}
+	if !result.ManualCompletion || result.CompletesLifecycle {
+		t.Fatalf("expected legacy network identity to force manual completion, got %#v", result)
+	}
+}
+
+func TestCleanupManifestNetworkIdentitiesRejectsPersistentConflict(t *testing.T) {
+	workDir := cleanupBackupTestDir(t)
+	t.Chdir(workDir)
+	runDir := filepath.Join(".bort", "runs", "network-conflict")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(runDir, "manifest.json")
+	if err := writeJSONArtifact(manifestPath, manifest.Manifest{
+		Networks: []manifest.Network{
+			{ID: strings.Repeat("a", 64), Name: "api-net"},
+			{ID: strings.Repeat("b", 64), Name: "api-net"},
+			{ID: strings.Repeat("a", 64), Name: "api-net"},
+			{ID: strings.Repeat("c", 64), Name: "stable-net"},
+			{ID: strings.Repeat("d", 65), Name: "invalid-net"},
+			{ID: strings.Repeat("d", 64), Name: "invalid-net"},
+			{ID: "eeeeeeeeeeee", Name: "legacy-net"},
+			{ID: strings.Repeat("e", 64), Name: "legacy-net"},
+			{ID: "ffffffffffff", Name: "legacy-only-net"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	identities, err := cleanupManifestNetworkIdentities(loadedMigrationRun{Run: migrationRun{
+		RunDir:       filepath.ToSlash(runDir),
+		ManifestPath: filepath.ToSlash(manifestPath),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := identities["api-net"]; ok {
+		t.Fatalf("conflicting network identity was restored by a later duplicate: %#v", identities)
+	}
+	if identities["stable-net"] != strings.Repeat("c", 64) {
+		t.Fatalf("stable network identity was lost: %#v", identities)
+	}
+	if _, ok := identities["invalid-net"]; ok {
+		t.Fatalf("invalid network identity was restored by a later valid record: %#v", identities)
+	}
+	if _, ok := identities["legacy-net"]; ok {
+		t.Fatalf("legacy short network identity was restored by a later full record: %#v", identities)
+	}
+	if identities["legacy-only-net"] != "ffffffffffff" {
+		t.Fatalf("legacy short network identity was not preserved for manual cleanup: %#v", identities)
+	}
+}
+
+func TestCleanupManifestNetworkIdentitiesRejectsManifestSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink test")
+	}
+	workDir := cleanupBackupTestDir(t)
+	t.Chdir(workDir)
+	runDir := filepath.Join(".bort", "runs", "manifest-link")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outsidePath := filepath.Join(workDir, "outside-manifest.json")
+	if err := writeJSONArtifact(outsidePath, manifest.Manifest{Networks: []manifest.Network{{ID: "aaaaaaaaaaaa", Name: "api-net"}}}); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(runDir, "manifest.json")
+	if err := os.Symlink(outsidePath, manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	_, err := cleanupManifestNetworkIdentities(loadedMigrationRun{Run: migrationRun{
+		RunDir:       filepath.ToSlash(runDir),
+		ManifestPath: filepath.ToSlash(manifestPath),
+	}})
+	if err == nil {
+		t.Fatal("expected source manifest symlink to be rejected")
 	}
 }
 
@@ -704,8 +826,8 @@ func TestCleanupPurgePlatformNetworkRequiresExplicitInclusion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !withPlatform.CompletesLifecycle || len(withPlatform.SourceNetworks) != 1 || withPlatform.SourceNetworks[0].Name != "coolify" {
-		t.Fatalf("expected included platform network to be scheduled, got %#v", withPlatform)
+	if withPlatform.CompletesLifecycle || !withPlatform.ManualCompletion || len(withPlatform.SourceNetworks) != 1 || withPlatform.SourceNetworks[0].Name != "coolify" || withPlatform.SourceNetworks[0].Action != "require_absent_before_purge_apply" {
+		t.Fatalf("expected included platform network without a recorded identity to require manual absence, got %#v", withPlatform)
 	}
 }
 
@@ -891,6 +1013,7 @@ func TestCleanupRecoveryCommandsPreserveExternalRunAndPurgeScope(t *testing.T) {
 }
 
 func TestWriteCleanupPurgeTextWarnsAfterPartialApply(t *testing.T) {
+	networkID := strings.Repeat("a", 64)
 	result := cleanupPurgeResult{
 		RunName: "partial",
 		RunDir:  filepath.Join(".bort", "runs", "partial"),
@@ -898,11 +1021,11 @@ func TestWriteCleanupPurgeTextWarnsAfterPartialApply(t *testing.T) {
 		PurgeResult: &dokploy.SourcePurgeResult{Containers: []dokploy.SourcePurgeResourceResult{
 			{Ref: "web", Status: "removed"},
 			{Ref: "worker", Status: "error"},
-		}},
+		}, Networks: []dokploy.SourcePurgeResourceResult{{Ref: "api-net", Identity: networkID, Status: "removed"}}},
 	}
 	var output strings.Builder
 	writeCleanupPurgeText(&output, result)
-	for _, want := range []string{"Mode: incomplete", "[removed] web", "[error] worker", "Earlier resources may already have been removed"} {
+	for _, want := range []string{"Mode: incomplete", "[removed] web", "[error] worker", "[removed] api-net [id: " + networkID + "]", "Earlier resources may already have been removed"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("expected partial purge output to contain %q, got:\n%s", want, output.String())
 		}

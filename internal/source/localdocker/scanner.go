@@ -234,7 +234,7 @@ func (s *Scanner) inspectNetworks(ctx context.Context) ([]manifest.Network, erro
 	networks := make([]manifest.Network, 0, len(inspected))
 	for _, network := range inspected {
 		networks = append(networks, manifest.Network{
-			ID:       shortID(network.ID),
+			ID:       network.ID,
 			Name:     network.Name,
 			Driver:   network.Driver,
 			Scope:    network.Scope,
@@ -602,7 +602,7 @@ func ports(raw map[string][]portBinding) []manifest.Port {
 func networks(raw map[string]networkAttachInspect) []manifest.ServiceNetwork {
 	networks := make([]manifest.ServiceNetwork, 0, len(raw))
 	for name, network := range raw {
-		networks = append(networks, manifest.ServiceNetwork{Name: name, NetworkID: shortID(network.NetworkID), IPAddress: network.IPAddress})
+		networks = append(networks, manifest.ServiceNetwork{Name: name, NetworkID: network.NetworkID, IPAddress: network.IPAddress})
 	}
 	sort.Slice(networks, func(i, j int) bool { return networks[i].Name < networks[j].Name })
 	return networks
