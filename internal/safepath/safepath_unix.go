@@ -108,6 +108,35 @@ func createPrivateFileNoFollow(dir *os.File, name string, mode os.FileMode) (*os
 	return file, nil
 }
 
+func openPrivateFileNoFollow(dir *os.File, name string) (*os.File, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name))
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("open private file %s", name)
+	}
+	return file, nil
+}
+
+func readPrivateFile(path, name string) ([]byte, error) {
+	dir, err := OpenPrivateDirNoFollow(path)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	contents, err := dir.ReadFile(name)
+	if err != nil {
+		return nil, err
+	}
+	if err := dir.ValidatePath(); err != nil {
+		return nil, err
+	}
+	return contents, nil
+}
+
 func writePrivateFileAtomicNoFollow(dir *os.File, name string, data []byte, mode os.FileMode) error {
 	tmpName, err := privateTempName()
 	if err != nil {

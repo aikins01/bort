@@ -144,17 +144,18 @@ func dokployBackupTestDir(t *testing.T) string {
 }
 
 func TestPurgeSourceResourcesRemovesDockerResources(t *testing.T) {
+	fullNetworkID := "123456789abc" + strings.Repeat("d", 52)
 	runner := &fakeDockerRunner{outputs: map[string][]byte{
 		"inspect --type container cid123": []byte(`[{"Id":"cid123","Name":"/web","Config":{"Labels":{"coolify.managed":"true"}},"State":{"Running":false,"Status":"exited"}}]`),
 		"rm -f cid123":                    []byte("cid123\n"),
-		"network inspect api-net":         []byte(`[{"Id":"network-id","Name":"api-net"}]`),
-		"network rm network-id":           []byte("network-id\n"),
+		"network inspect api-net":         []byte(`[{"Id":"` + fullNetworkID + `","Name":"api-net"}]`),
+		"network rm " + fullNetworkID:     []byte(fullNetworkID + "\n"),
 	}}
 	client := &Client{Docker: runner}
 
 	options, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{
 		Containers: []SourcePurgeContainer{{App: "api", Service: "web", ContainerID: "cid123", ContainerName: "web"}},
-		Networks:   []SourcePurgeNetwork{{App: "api", Name: "api-net"}},
+		Networks:   []SourcePurgeNetwork{{App: "api", Name: "api-net", DiscoveredIdentity: fullNetworkID}},
 	})
 	if err != nil {
 		t.Fatalf("IdentifySourcePurgeResources: %v", err)
@@ -169,11 +170,14 @@ func TestPurgeSourceResourcesRemovesDockerResources(t *testing.T) {
 	if len(result.Networks) != 1 || result.Networks[0].Status != "removed" {
 		t.Fatalf("unexpected network result: %#v", result.Networks)
 	}
+	if result.Networks[0].Identity != fullNetworkID {
+		t.Fatalf("expected canonical network identity in result, got %#v", result.Networks[0])
+	}
 	gotArgs := []string{}
 	for _, args := range runner.outputArgs {
 		gotArgs = append(gotArgs, strings.Join(args, " "))
 	}
-	for _, want := range []string{"inspect --type container cid123", "rm -f cid123", "network inspect api-net", "network rm network-id"} {
+	for _, want := range []string{"inspect --type container cid123", "rm -f cid123", "network inspect api-net", "network rm " + fullNetworkID} {
 		found := false
 		for _, got := range gotArgs {
 			if got == want {
@@ -242,6 +246,51 @@ func TestCleanupSourcePurgeContainersDeduplicatesShortAndCanonicalIDs(t *testing
 		if len(containers) != 1 || containers[0].ContainerID != fullID {
 			t.Fatalf("expected one canonical container coordinate for order %#v, got %#v", ids, containers)
 		}
+	}
+}
+
+func TestCleanupSourcePurgeNetworksRejectsConflictingIdentityState(t *testing.T) {
+	for name, networks := range map[string][]SourcePurgeNetwork{
+		"discovered identity": {
+			{Name: "api-net", DiscoveredIdentity: strings.Repeat("a", 64)},
+			{Name: "api-net", DiscoveredIdentity: strings.Repeat("b", 64)},
+		},
+		"expected identity": {
+			{Name: "api-net", ExpectedIdentity: strings.Repeat("a", 64)},
+			{Name: "api-net", ExpectedIdentity: strings.Repeat("b", 64)},
+		},
+		"expected absence": {
+			{Name: "api-net", ExpectedAbsent: true},
+			{Name: "api-net"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := cleanupSourcePurgeNetworks(networks); err == nil || !strings.Contains(err.Error(), "conflicting") {
+				t.Fatalf("expected conflicting duplicate networks to fail closed, got %v", err)
+			}
+		})
+	}
+	legacyID := "123456789abc"
+	networks, err := cleanupSourcePurgeNetworks([]SourcePurgeNetwork{
+		{App: "api", Name: "api-net", DiscoveredIdentity: legacyID},
+		{App: "worker", Name: "api-net", DiscoveredIdentity: legacyID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(networks) != 1 || networks[0].DiscoveredIdentity != legacyID {
+		t.Fatalf("identical legacy network IDs were not deduplicated: %#v", networks)
+	}
+	fullID := "123456789abc" + strings.Repeat("d", 52)
+	networks, err = cleanupSourcePurgeNetworks([]SourcePurgeNetwork{
+		{App: "api", Name: "api-net", DiscoveredIdentity: fullID, ExpectedIdentity: fullID},
+		{App: "worker", Name: "api-net", DiscoveredIdentity: fullID, ExpectedIdentity: fullID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(networks) != 1 || networks[0].DiscoveredIdentity != fullID || networks[0].ExpectedIdentity != fullID {
+		t.Fatalf("equivalent duplicate network IDs were not canonicalized: %#v", networks)
 	}
 }
 
@@ -320,38 +369,134 @@ func TestPurgeSourceResourcesRejectsMismatchedInspectedContainerID(t *testing.T)
 }
 
 func TestPurgeSourceNetworkPreservesReplacementAfterReviewedIDDisappears(t *testing.T) {
+	reviewedID := "aaaaaaaaaaaa" + strings.Repeat("a", 52)
+	replacementID := strings.Repeat("b", 64)
 	runner := &cleanupDockerRunner{
 		fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
-			"network inspect api-net": []byte(`[{"Id":"replacement-id","Name":"api-net"}]`),
+			"network inspect api-net": []byte(`[{"Id":"` + replacementID + `","Name":"api-net"}]`),
 		}},
 		outputErrors: map[string]error{
-			"network rm reviewed-id": errors.New("Error response from daemon: network reviewed-id not found"),
+			"network rm " + reviewedID: errors.New("Error response from daemon: network not found"),
 		},
 	}
 	client := &Client{Docker: runner}
 	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
-		Networks: []SourcePurgeNetwork{{Name: "api-net", ExpectedIdentity: "reviewed-id"}},
+		Networks: []SourcePurgeNetwork{{Name: "api-net", DiscoveredIdentity: reviewedID, ExpectedIdentity: reviewedID}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "appeared after confirmation") {
 		t.Fatalf("expected replacement network to be preserved, got result=%#v err=%v", result, err)
 	}
 	for _, args := range runner.outputArgs {
-		if strings.Join(args, " ") == "network rm replacement-id" {
+		if strings.Join(args, " ") == "network rm "+replacementID {
 			t.Fatalf("replacement network was removed: %#v", runner.outputArgs)
 		}
 	}
 }
 
+func TestIdentifySourcePurgeResourcesRejectsNetworkReplacementSinceDiscovery(t *testing.T) {
+	discoveredID := "aaaaaaaaaaaa" + strings.Repeat("a", 52)
+	replacementID := "aaaaaaaaaaaa" + strings.Repeat("b", 52)
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"network inspect api-net": []byte(`[{"Id":"` + replacementID + `","Name":"api-net"}]`),
+	}}
+	client := &Client{Docker: runner}
+	_, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{
+		Networks: []SourcePurgeNetwork{{Name: "api-net", DiscoveredIdentity: discoveredID}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not match discovered ID") {
+		t.Fatalf("expected replacement network to be rejected, got %v", err)
+	}
+	for _, args := range runner.outputArgs {
+		if len(args) > 1 && args[0] == "network" && args[1] == "rm" {
+			t.Fatalf("replacement network was removed: %#v", runner.outputArgs)
+		}
+	}
+}
+
+func TestIdentifySourcePurgeResourcesRequiresDiscoveredNetworkIdentity(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"network inspect api-net": []byte(`[{"Id":"` + strings.Repeat("a", 64) + `","Name":"api-net"}]`),
+	}}
+	client := &Client{Docker: runner}
+	for name, test := range map[string]struct {
+		identity string
+		want     string
+	}{
+		"missing": {want: "has no stable ID from discovery"},
+		"legacy short": {
+			identity: "aaaaaaaaaaaa",
+			want:     "has non-canonical discovered ID",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{
+				Networks: []SourcePurgeNetwork{{Name: "api-net", DiscoveredIdentity: test.identity}},
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "remove it manually") {
+				t.Fatalf("expected discovered identity to require manual removal, got %v", err)
+			}
+		})
+	}
+}
+
+func TestPurgeSourceNetworkRejectsShortConfirmedIdentity(t *testing.T) {
+	client := &Client{Docker: &fakeDockerRunner{}}
+	progressCalls := 0
+	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+		Networks: []SourcePurgeNetwork{{Name: "api-net", DiscoveredIdentity: "123456789abc", ExpectedIdentity: "123456789abc"}},
+		OnProgress: func(SourcePurgeResult) error {
+			progressCalls++
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "non-canonical confirmed ID") {
+		t.Fatalf("expected short confirmed identity to block mutation, got result=%#v err=%v", result, err)
+	}
+	if progressCalls != 0 {
+		t.Fatalf("invalid confirmed identity was published before rejection: %d progress calls", progressCalls)
+	}
+}
+
+func TestPurgeSourceNetworkRejectsInvalidIdentityTupleBeforeProgress(t *testing.T) {
+	confirmedID := strings.Repeat("a", 64)
+	for name, network := range map[string]SourcePurgeNetwork{
+		"missing confirmed":  {Name: "api-net", DiscoveredIdentity: confirmedID},
+		"missing discovered": {Name: "api-net", ExpectedIdentity: confirmedID},
+		"invalid discovered": {Name: "api-net", DiscoveredIdentity: "abcdef", ExpectedIdentity: confirmedID},
+		"short discovered":   {Name: "api-net", DiscoveredIdentity: confirmedID[:12], ExpectedIdentity: confirmedID},
+		"mismatched IDs":     {Name: "api-net", DiscoveredIdentity: strings.Repeat("b", 64), ExpectedIdentity: confirmedID},
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := &fakeDockerRunner{}
+			progressCalls := 0
+			result, err := (&Client{Docker: runner}).PurgeSourceResources(context.Background(), SourcePurgeOptions{
+				Networks: []SourcePurgeNetwork{network},
+				OnProgress: func(SourcePurgeResult) error {
+					progressCalls++
+					return nil
+				},
+			})
+			if err == nil {
+				t.Fatalf("expected invalid identity tuple to fail, got %#v", result)
+			}
+			if progressCalls != 0 || len(runner.outputArgs) != 0 {
+				t.Fatalf("invalid identity tuple reached progress or Docker: progress=%d args=%#v", progressCalls, runner.outputArgs)
+			}
+		})
+	}
+}
+
 func TestPurgeSourceResourcesReturnsPartialResults(t *testing.T) {
+	canonicalID := "aaaaaaaaaaaa" + strings.Repeat("a", 52)
 	runner := &fakeDockerRunner{outputs: map[string][]byte{
 		"inspect --type container cid123": []byte(`[{"Id":"cid123","Name":"/web","State":{"Running":false,"Status":"exited"}}]`),
 		"rm -f cid123":                    []byte("cid123\n"),
-		"network inspect api-net":         []byte(`[{"Id":"network-id","Name":"api-net"}]`),
+		"network inspect api-net":         []byte(`[{"Id":"` + canonicalID + `","Name":"api-net"}]`),
 	}}
 	client := &Client{Docker: runner}
 	options, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{
 		Containers: []SourcePurgeContainer{{App: "api", ContainerID: "cid123", ContainerName: "web"}},
-		Networks:   []SourcePurgeNetwork{{App: "api", Name: "api-net"}},
+		Networks:   []SourcePurgeNetwork{{App: "api", Name: "api-net", DiscoveredIdentity: canonicalID}},
 	})
 	if err != nil {
 		t.Fatalf("IdentifySourcePurgeResources: %v", err)
@@ -551,6 +696,28 @@ func TestSourcePurgeAcceptsNamedVolumeThatRemainsAbsent(t *testing.T) {
 	}
 	if len(result.Volumes) != 1 || result.Volumes[0].Status != "skipped" || !strings.Contains(result.Volumes[0].Message, "remains absent") {
 		t.Fatalf("unexpected volume result: %#v", result.Volumes)
+	}
+}
+
+func TestSourcePurgeManualNetworkResultRetainsConfirmedIdentity(t *testing.T) {
+	canonicalID := strings.Repeat("a", 64)
+	runner := &cleanupDockerRunner{
+		fakeDockerRunner: &fakeDockerRunner{},
+		outputErrors: map[string]error{
+			"volume inspect api-data": errors.New("Error response from daemon: get api-data: no such volume"),
+			"network inspect api-net": errors.New("Error response from daemon: network api-net not found"),
+		},
+	}
+	client := &Client{Docker: runner}
+	result, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{
+		Volumes:  []SourcePurgeVolume{{Name: "api-data", ExpectedAbsent: true}},
+		Networks: []SourcePurgeNetwork{{Name: "api-net", DiscoveredIdentity: canonicalID, ExpectedIdentity: canonicalID}},
+	})
+	if err != nil {
+		t.Fatalf("PurgeSourceResources: %v", err)
+	}
+	if len(result.Networks) != 1 || result.Networks[0].Status != "skipped" || result.Networks[0].Identity != canonicalID {
+		t.Fatalf("confirmed network identity was lost from manual result: %#v", result.Networks)
 	}
 }
 
