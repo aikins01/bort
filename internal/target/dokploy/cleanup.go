@@ -115,7 +115,10 @@ func (c *Client) PurgeSourceResources(ctx context.Context, opts SourcePurgeOptio
 	if err != nil {
 		return result, err
 	}
-	volumes := cleanupSourcePurgeVolumes(opts.Volumes)
+	volumes, err := cleanupSourcePurgeVolumes(opts.Volumes)
+	if err != nil {
+		return result, err
+	}
 	paths, err := cleanupSourcePurgePaths(opts.Paths)
 	if err != nil {
 		return result, err
@@ -264,7 +267,11 @@ func (c *Client) IdentifySourcePurgeResources(ctx context.Context, opts SourcePu
 	}
 	identified.Containers = containers
 	identified.Volumes = nil
-	for _, volume := range cleanupSourcePurgeVolumes(opts.Volumes) {
+	volumes, err := cleanupSourcePurgeVolumes(opts.Volumes)
+	if err != nil {
+		return SourcePurgeOptions{}, err
+	}
+	for _, volume := range volumes {
 		absent, err := inspectSourcePurgeVolumeAbsent(ctx, runner, volume.Name)
 		if err != nil {
 			return SourcePurgeOptions{}, err
@@ -474,22 +481,25 @@ func cleanupSourcePurgeContainers(containers []SourcePurgeContainer) ([]SourcePu
 	return cleaned, nil
 }
 
-func cleanupSourcePurgeVolumes(volumes []SourcePurgeVolume) []SourcePurgeVolume {
-	seen := map[string]struct{}{}
+func cleanupSourcePurgeVolumes(volumes []SourcePurgeVolume) ([]SourcePurgeVolume, error) {
+	seen := map[string]int{}
 	cleaned := []SourcePurgeVolume{}
 	for _, volume := range volumes {
 		volume.Name = strings.TrimSpace(volume.Name)
 		if volume.Name == "" {
 			continue
 		}
-		if _, ok := seen[volume.Name]; ok {
+		if index, ok := seen[volume.Name]; ok {
+			if cleaned[index].ExpectedAbsent != volume.ExpectedAbsent {
+				return nil, fmt.Errorf("source volume %q has conflicting expected absence state", volume.Name)
+			}
 			continue
 		}
-		seen[volume.Name] = struct{}{}
+		seen[volume.Name] = len(cleaned)
 		cleaned = append(cleaned, volume)
 	}
 	sort.Slice(cleaned, func(i, j int) bool { return cleaned[i].Name < cleaned[j].Name })
-	return cleaned
+	return cleaned, nil
 }
 
 func cleanupSourcePurgeNetworks(networks []SourcePurgeNetwork) ([]SourcePurgeNetwork, error) {
