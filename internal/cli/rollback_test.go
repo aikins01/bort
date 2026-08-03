@@ -99,6 +99,24 @@ func TestRunRollbackRejectsPositionalArguments(t *testing.T) {
 	}
 }
 
+func TestRunRollbackRejectsEmptyExplicitRun(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := mutateBortState(defaultStatePath(), func(state *bortState) bool {
+		state.CurrentRun = ".bort/runs/current"
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	err := runRollback(context.Background(), []string{"--run="}, &stdout, io.Discard)
+	if err == nil || err.Error() != "rollback requires a non-empty --run value" {
+		t.Fatalf("expected empty run rejection, got %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("empty run produced output before rejection: %q", stdout.String())
+	}
+}
+
 func TestRunRollbackDefaultsToCurrentRun(t *testing.T) {
 	workDir := t.TempDir()
 	t.Chdir(workDir)
