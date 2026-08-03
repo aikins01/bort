@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -221,6 +223,20 @@ func TestStopContainerKillsAfterStopTimeout(t *testing.T) {
 	want := []string{"stop c1", "stop -t 2 c1", "inspect --type container c1", "kill c1"}
 	if strings.Join(runner.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("expected calls %v, got %v", want, runner.calls)
+	}
+}
+
+func TestStopPhaseContextPreservesDefaultDockerGrace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerStopTimeout)
+	defer cancel()
+	phaseCtx, cancelPhase := stopPhaseContext(ctx, dockerStopTimeout, 2)
+	defer cancelPhase()
+	deadline, ok := phaseCtx.Deadline()
+	if !ok {
+		t.Fatal("stop phase has no deadline")
+	}
+	if remaining := time.Until(deadline); remaining < 10*time.Second || remaining >= dockerStopTimeout {
+		t.Fatalf("initial stop phase = %s, want at least Docker's default grace within the total stop budget", remaining)
 	}
 }
 
@@ -1641,6 +1657,103 @@ func TestPostDeployValidationIgnoresCanceledApplyContextAndStopsLateTarget(t *te
 	}
 	if !fakeOutputCalled(&fakeDockerRunner{outputArgs: runner.outputArgs}, "stop", "web-id") {
 		t.Fatalf("expected late post-deploy target to stop, calls=%#v", runner.outputArgs)
+	}
+}
+
+type deadlineBoundStopRunner struct {
+	calls        []string
+	deadlines    []time.Time
+	activeAtCall []bool
+	psCalls      int
+}
+
+func (r *deadlineBoundStopRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	r.calls = append(r.calls, strings.Join(args, " "))
+	r.activeAtCall = append(r.activeAtCall, ctx.Err() == nil)
+	if deadline, ok := ctx.Deadline(); ok {
+		r.deadlines = append(r.deadlines, deadline)
+	}
+	key := strings.Join(args, " ")
+	if key == "ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}" {
+		r.psCalls++
+		if r.psCalls == 1 {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return []byte("web-id\n"), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	switch key {
+	case "inspect --type container web-id":
+		return []byte(`[{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`), nil
+	case "stop web-id", "stop -t 2 web-id", "kill web-id":
+		<-ctx.Done()
+		return nil, ctx.Err()
+	default:
+		return nil, fmt.Errorf("docker output not stubbed: %s", key)
+	}
+}
+
+func (r *deadlineBoundStopRunner) Run(context.Context, io.Reader, io.Writer, ...string) error {
+	return nil
+}
+
+func TestPostDeployValidationRespectsCallerDeadline(t *testing.T) {
+	runner := &deadlineBoundStopRunner{}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{}}
+	entry := actx.entry("api")
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	callerDeadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("test context has no deadline")
+	}
+	started := time.Now()
+
+	err := client.validateMigratedVolumeMountsAfterDeploy(ctx, actx, "api")
+	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") || !isUnsafeTargetResumeError(err) {
+		t.Fatalf("expected caller deadline to bound post-deploy validation, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("post-deploy validation exceeded caller deadline: %s", elapsed)
+	}
+	wantCalls := []string{
+		"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}",
+		"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}",
+		"inspect --type container web-id",
+		"stop web-id",
+		"stop -t 2 web-id",
+		"inspect --type container web-id",
+		"kill web-id",
+		"inspect --type container web-id",
+	}
+	if !slices.Equal(runner.calls, wantCalls) {
+		t.Fatalf("emergency stop calls = %v, want %v", runner.calls, wantCalls)
+	}
+	if len(runner.deadlines) != len(runner.calls) {
+		t.Fatalf("some validation or stop commands had no deadline: calls=%v deadlines=%v", runner.calls, runner.deadlines)
+	}
+	for _, deadline := range runner.deadlines {
+		if deadline.After(callerDeadline) {
+			t.Fatalf("validation or stop deadline %s exceeded caller deadline %s", deadline, callerDeadline)
+		}
+	}
+	for i := 3; i < len(runner.activeAtCall); i++ {
+		if !runner.activeAtCall[i] {
+			t.Fatalf("emergency stop phase %q started with an expired context", runner.calls[i])
+		}
+	}
+	for i := 4; i < len(runner.deadlines); i++ {
+		if !runner.deadlines[i].After(runner.deadlines[i-1]) {
+			t.Fatalf("emergency stop phase deadlines did not increase: %v", runner.deadlines[3:])
+		}
 	}
 }
 
