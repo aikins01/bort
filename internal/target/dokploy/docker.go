@@ -77,29 +77,37 @@ const (
 	dockerStopTimeout        = 30 * time.Second
 	dockerStopFallbackGrace  = "2"
 	dockerStopFallbackWindow = 30 * time.Second
+	dockerStopInspectWindow  = 10 * time.Second
+	dockerKillWindow         = 15 * time.Second
 	dockerStartTimeout       = 3 * time.Minute
 )
 
 func stopContainer(ctx context.Context, runner dockerRunner, id string) error {
-	stopCtx, cancel := context.WithTimeout(ctx, dockerStopTimeout)
+	stopCtx, cancel := stopPhaseContext(ctx, dockerStopTimeout, 2)
 	defer cancel()
 	if _, err := runner.Output(stopCtx, "stop", id); err != nil {
 		if !errors.Is(stopCtx.Err(), context.DeadlineExceeded) {
 			return err
 		}
-		shortStopCtx, cancelShortStop := context.WithTimeout(context.Background(), dockerStopFallbackWindow)
+		var fallbackCtx context.Context = context.Background()
+		cancelFallback := func() {}
+		if deadline, ok := ctx.Deadline(); ok {
+			fallbackCtx, cancelFallback = context.WithDeadline(fallbackCtx, deadline)
+		}
+		defer cancelFallback()
+		shortStopCtx, cancelShortStop := stopPhaseContext(fallbackCtx, dockerStopFallbackWindow, 4)
 		shortStopErr := func() error {
 			defer cancelShortStop()
 			_, shortStopErr := runner.Output(shortStopCtx, "stop", "-t", dockerStopFallbackGrace, id)
 			return shortStopErr
 		}()
-		if shortStopErr == nil || containerStoppedAfterStopFailure(runner, id) {
+		if shortStopErr == nil || containerStoppedAfterStopFailure(fallbackCtx, runner, id, 3) {
 			return nil
 		}
-		killCtx, cancelKill := context.WithTimeout(context.Background(), 15*time.Second)
+		killCtx, cancelKill := stopPhaseContext(fallbackCtx, dockerKillWindow, 2)
 		defer cancelKill()
 		if _, killErr := runner.Output(killCtx, "kill", id); killErr != nil {
-			if containerStoppedAfterStopFailure(runner, id) {
+			if containerStoppedAfterStopFailure(fallbackCtx, runner, id, 1) {
 				return nil
 			}
 			return fmt.Errorf("docker stop %s timed out and kill failed: %w", id, killErr)
@@ -108,8 +116,23 @@ func stopContainer(ctx context.Context, runner dockerRunner, id string) error {
 	return nil
 }
 
-func containerStoppedAfterStopFailure(runner dockerRunner, id string) bool {
-	inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func stopPhaseContext(ctx context.Context, maximum time.Duration, remainingPhases int) (context.Context, context.CancelFunc) {
+	timeout := maximum
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		share := remaining / time.Duration(remainingPhases)
+		if share < timeout {
+			timeout = share
+		}
+	}
+	if timeout < 0 {
+		timeout = 0
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func containerStoppedAfterStopFailure(ctx context.Context, runner dockerRunner, id string, remainingPhases int) bool {
+	inspectCtx, cancel := stopPhaseContext(ctx, dockerStopInspectWindow, remainingPhases)
 	defer cancel()
 	container, err := inspectContainer(inspectCtx, runner, id)
 	return err == nil && !container.State.Running
