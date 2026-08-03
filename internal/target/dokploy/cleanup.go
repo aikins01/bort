@@ -116,7 +116,10 @@ func (c *Client) PurgeSourceResources(ctx context.Context, opts SourcePurgeOptio
 		return result, err
 	}
 	volumes := cleanupSourcePurgeVolumes(opts.Volumes)
-	paths := cleanupSourcePurgePaths(opts.Paths)
+	paths, err := cleanupSourcePurgePaths(opts.Paths)
+	if err != nil {
+		return result, err
+	}
 	networks, err := cleanupSourcePurgeNetworks(opts.Networks)
 	if err != nil {
 		return result, err
@@ -300,7 +303,11 @@ func (c *Client) IdentifySourcePurgeResources(ctx context.Context, opts SourcePu
 		identified.Networks = append(identified.Networks, network)
 	}
 	identified.Paths = nil
-	for _, path := range cleanupSourcePurgePaths(opts.Paths) {
+	paths, err := cleanupSourcePurgePaths(opts.Paths)
+	if err != nil {
+		return SourcePurgeOptions{}, err
+	}
+	for _, path := range paths {
 		absent, err := sourcePurgePathAbsentNoFollow(path.Path, path.AllowPlatform)
 		if err != nil {
 			return SourcePurgeOptions{}, err
@@ -547,22 +554,29 @@ func validateSourcePurgeNetworksForExecution(networks []SourcePurgeNetwork) erro
 	return nil
 }
 
-func cleanupSourcePurgePaths(paths []SourcePurgePath) []SourcePurgePath {
-	seen := map[string]struct{}{}
+func cleanupSourcePurgePaths(paths []SourcePurgePath) ([]SourcePurgePath, error) {
+	seen := map[string]int{}
 	cleaned := []SourcePurgePath{}
 	for _, path := range paths {
 		path.Path = pathpkg.Clean(strings.TrimSpace(path.Path))
 		if path.Path == "." || path.Path == "" {
 			continue
 		}
-		if _, ok := seen[path.Path]; ok {
+		if index, ok := seen[path.Path]; ok {
+			current := cleaned[index]
+			if current.AllowPlatform != path.AllowPlatform {
+				return nil, fmt.Errorf("source path %q has conflicting platform authorization", path.Path)
+			}
+			if current.ExpectedAbsent != path.ExpectedAbsent {
+				return nil, fmt.Errorf("source path %q has conflicting expected absence state", path.Path)
+			}
 			continue
 		}
-		seen[path.Path] = struct{}{}
+		seen[path.Path] = len(cleaned)
 		cleaned = append(cleaned, path)
 	}
 	sort.Slice(cleaned, func(i, j int) bool { return cleaned[i].Path < cleaned[j].Path })
-	return cleaned
+	return cleaned, nil
 }
 
 func purgeSourceContainer(ctx context.Context, runner dockerRunner, item SourcePurgeContainer) (SourcePurgeResourceResult, error) {
