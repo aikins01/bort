@@ -326,6 +326,27 @@ func TestCleanupSourcePurgeNetworksRejectsConflictingIdentityState(t *testing.T)
 	}
 }
 
+func TestCleanupSourcePurgePathsRejectsConflictingState(t *testing.T) {
+	for name, paths := range map[string][]SourcePurgePath{
+		"platform authorization": {
+			{Path: "/data/coolify", AllowPlatform: true},
+			{Path: "/data/coolify"},
+		},
+		"expected absence": {
+			{Path: "/data/app", ExpectedAbsent: true},
+			{Path: "/data/app"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, ordered := range [][]SourcePurgePath{paths, {paths[1], paths[0]}} {
+				if _, err := cleanupSourcePurgePaths(ordered); err == nil || !strings.Contains(err.Error(), "conflicting") {
+					t.Fatalf("expected conflicting duplicate paths to fail closed, got %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestPurgeSourceResourcesSkipsAbsentAllowedPath(t *testing.T) {
 	client := &Client{Docker: &fakeDockerRunner{}}
 	options, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{Paths: []SourcePurgePath{{Path: "/data/coolify/applications/app-1"}}})
