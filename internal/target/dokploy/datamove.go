@@ -467,12 +467,20 @@ func (c *Client) applyResumeTarget(ctx context.Context, actx *applyContext, step
 	return nil
 }
 
-func (c *Client) validateMigratedVolumeMountsAfterDeploy(_ context.Context, actx *applyContext, appName string) error {
-	validationCtx, cancelValidation := context.WithTimeout(context.Background(), targetDiscoveryTimeout)
+func (c *Client) validateMigratedVolumeMountsAfterDeploy(ctx context.Context, actx *applyContext, appName string) error {
+	operationDeadline := time.Now().Add(targetDiscoveryTimeout)
+	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(operationDeadline) {
+		operationDeadline = callerDeadline
+	}
+	validationDeadline := operationDeadline.Add(-dockerStopTimeout)
+	if validationDeadline.Before(time.Now()) {
+		validationDeadline = time.Now()
+	}
+	validationCtx, cancelValidation := context.WithDeadline(context.Background(), validationDeadline)
 	defer cancelValidation()
 	if err := c.validateMigratedVolumeMountsStable(validationCtx, actx, appName); err != nil {
 		if isUnsafeTargetResumeError(err) {
-			stopCtx, cancelStop := context.WithTimeout(context.Background(), targetDiscoveryTimeout)
+			stopCtx, cancelStop := context.WithDeadline(context.Background(), operationDeadline)
 			defer cancelStop()
 			if stopErr := c.stopTargetComposeContainers(stopCtx, actx, appName); stopErr != nil {
 				return fmt.Errorf("%w (also failed to stop unsafe target containers: %v)", err, stopErr)
