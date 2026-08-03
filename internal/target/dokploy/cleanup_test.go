@@ -326,6 +326,22 @@ func TestCleanupSourcePurgeNetworksRejectsConflictingIdentityState(t *testing.T)
 	}
 }
 
+func TestSourcePurgeRejectsConflictingVolumeAbsenceState(t *testing.T) {
+	client := &Client{Docker: &fakeDockerRunner{}}
+	volumes := []SourcePurgeVolume{
+		{Name: "api-data", ExpectedAbsent: true},
+		{Name: "api-data"},
+	}
+	for _, ordered := range [][]SourcePurgeVolume{volumes, {volumes[1], volumes[0]}} {
+		if _, err := client.IdentifySourcePurgeResources(context.Background(), SourcePurgeOptions{Volumes: ordered}); err == nil || !strings.Contains(err.Error(), "conflicting") {
+			t.Fatalf("expected identification to reject conflicting duplicate volumes, got %v", err)
+		}
+		if _, err := client.PurgeSourceResources(context.Background(), SourcePurgeOptions{Volumes: ordered}); err == nil || !strings.Contains(err.Error(), "conflicting") {
+			t.Fatalf("expected apply to reject conflicting duplicate volumes, got %v", err)
+		}
+	}
+}
+
 func TestCleanupSourcePurgePathsRejectsConflictingState(t *testing.T) {
 	for name, paths := range map[string][]SourcePurgePath{
 		"platform authorization": {
