@@ -856,7 +856,7 @@ func validateDockerPurgeName(kind, name string) error {
 
 func IsProtectedSourcePurgeNetwork(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "bridge", "host", "none", "ingress":
+	case "bridge", "host", "none", "ingress", "docker_gwbridge":
 		return true
 	default:
 		return false
