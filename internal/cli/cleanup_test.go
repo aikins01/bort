@@ -291,7 +291,7 @@ func TestRunCleanupPurgeInventoriesDestructiveSourceResources(t *testing.T) {
 }
 
 func TestPlanCleanupPurgePinsDiscoveredSourceNetworkIdentity(t *testing.T) {
-	workDir := t.TempDir()
+	workDir := cleanupBackupTestDir(t)
 	t.Chdir(workDir)
 	fullID := "123456789abc" + strings.Repeat("d", 52)
 	manifestPath := filepath.Join(workDir, "manifest.json")
@@ -338,7 +338,7 @@ func TestPlanCleanupPurgePinsDiscoveredSourceNetworkIdentity(t *testing.T) {
 }
 
 func TestCleanupManifestNetworkIdentitiesRejectsPersistentConflict(t *testing.T) {
-	workDir := t.TempDir()
+	workDir := cleanupBackupTestDir(t)
 	t.Chdir(workDir)
 	runDir := filepath.Join(".bort", "runs", "network-conflict")
 	if err := os.MkdirAll(runDir, 0o700); err != nil {
@@ -388,7 +388,7 @@ func TestCleanupManifestNetworkIdentitiesRejectsManifestSymlink(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink test")
 	}
-	workDir := t.TempDir()
+	workDir := cleanupBackupTestDir(t)
 	t.Chdir(workDir)
 	runDir := filepath.Join(".bort", "runs", "manifest-link")
 	if err := os.MkdirAll(runDir, 0o700); err != nil {
