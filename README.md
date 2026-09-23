@@ -210,11 +210,9 @@ Bort's safety model defaults to “look first.”
 Near-term work remains focused on making the same-VPS Coolify → Dokploy path
 boring and safe before adding more platforms:
 
-1. make workspace selection, requirement checks, and failure recovery clearer
-   in the guided screen;
-2. decide how automated rollback should work;
-3. add Dokploy source scanning and Coolify target creation;
-4. add cross-server transfers after the same-VPS steps are proven.
+1. decide how automated rollback should work;
+2. add Dokploy source scanning and Coolify target creation;
+3. add cross-server transfers after the same-VPS steps are proven.
 
 Other Docker-, Compose-, and Swarm-based platforms remain possible future
 targets. Bort should only support one when it can clearly say which resources
