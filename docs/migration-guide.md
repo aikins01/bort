@@ -156,9 +156,32 @@ You can inspect the stored rollback plan with:
 sudo bort rollback
 ```
 
-Bort does not currently execute rollback. The command prints the stored plan;
-any recovery action remains manual. Do not accept the target unless that manual
-recovery limitation is understood.
+After a successful live apply, if the target does not check out, return traffic
+to the source:
+
+```sh
+sudo bort rollback --live
+```
+
+The command restarts the source containers that live apply stopped, verifies
+they are running (and healthy, when Docker tracks a healthcheck) before
+touching any traffic, returns web traffic to the source by stopping the Dokploy
+proxy and starting the source proxy, and re-checks the result after a five-second
+settle per observed app. This does not enforce the observation window displayed
+by `bort rollback`; continue monitoring the source for that reviewed period.
+Every step inspects current state first, so an interrupted rollback can be
+re-run. Once rollback starts, commit and live apply remain blocked, even if
+rollback fails. Use `bort rollback --live` again to finish recovery.
+
+Rollback requires confirming the recorded rollback trigger first. If you skipped
+that guided review before applying, inspect `bort rollback --run <run-name>`, then
+use `bort rollback --live --run <run-name> --confirm 'rollback <run-name>'` with the
+actual run name. The command records that confirmation before starting recovery.
+
+Rollback never deletes resources: the Dokploy target resources remain on the
+server for later cleanup, and data written to the target after cutover is not
+copied back to the source. To migrate again, create a new named run with
+`bort migrate --run <new-name>` and current `--source` or `--bundle` inputs.
 
 Accepting the target retires source application containers:
 
@@ -167,7 +190,9 @@ sudo bort commit --apply
 ```
 
 This command stops the source application containers. Run it only after checking
-the target and waiting through the planned rollback window.
+the target and waiting through the planned rollback window. Once source
+retirement starts, automated rollback is no longer available, even if commit is
+interrupted; rerun `commit --apply` to finish acceptance.
 
 ## Audit and clean up
 
@@ -188,7 +213,8 @@ Ordinary cleanup and destructive source purge are separate operations. See the
 | Live apply was interrupted | Run `sudo bort status`, then rerun `sudo bort migrate --live` to resume from the saved progress. |
 | Another change is running | Keep `status` open if useful and wait. A second live command joins an active live apply; other commands that make changes must wait. |
 | The plan needs to change after live execution began | Keep the existing run as a record and create a new named run. A plan cannot change after live work starts. |
-| Target validation fails before acceptance | Keep source resources available, inspect `sudo bort rollback`, and perform the required recovery manually. Automated rollback is not implemented. |
+| Target validation fails after successful live apply, before acceptance | Run `sudo bort rollback --live` to restart and verify source containers and return traffic to the source. Target resources remain for cleanup; data written to the target after cutover is not copied back. |
+| Rollback stops partway through | Inspect `sudo bort status`, then rerun `sudo bort rollback --live`. Commit and live apply are blocked because traffic may already have returned to the source. |
 | Cleanup or purge stops partway through | Stop and inspect the command output and private backup before retrying. Follow the recovery guidance in the cleanup and purge guide. |
 | `.bort` cannot be read | Do not change ownership or permissions blindly. Confirm the original working directory and OS user first, then restore the workspace from backup if necessary. |
 

@@ -21,9 +21,11 @@ sudo bort commit --apply
 ```
 
 This confirms that Dokploy is now the active platform and stops the source
-application containers. Bort does not currently provide automatic rollback, so
-do not run it until you have independently checked the target. Bort does not
-measure the rollback window or block this command when the window has not passed.
+application containers. Automated rollback is refused once source retirement
+starts, even if commit is interrupted. Rerun `commit --apply` to finish an
+interrupted acceptance. Do not start it until you have independently checked the
+target. Bort does not measure the rollback window or block this command when the
+window has not passed.
 
 ## Ordinary cleanup
 

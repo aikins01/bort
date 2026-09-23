@@ -16,7 +16,7 @@ import (
 
 func runWizard(ctx context.Context, run loadedMigrationRun, stdin io.Reader, stdout, stderr io.Writer) error {
 	current := run
-	if len(current.Applied.Steps) > 0 {
+	if len(current.Applied.Steps) > 0 || current.Run.LiveAppliedAt != nil || current.Run.CommitStartedAt != nil || current.Run.CommittedAt != nil || current.Run.RollbackStartedAt != nil || current.Run.RolledBackAt != nil || current.Run.PurgedAt != nil {
 		writeAppFirstCockpit(stdout, current)
 		return nil
 	}
@@ -151,7 +151,7 @@ func promptReviewDecision(run loadedMigrationRun, decision runDecision, stdout i
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().
 			Title(decisionAction(decision)).
-			Description(decisionAction(decision) + "\n" + decisionReason(decision)).
+			Description(decisionReason(decision)).
 			Affirmative("Reviewed").
 			Negative("Not yet").
 			Value(&confirm),
