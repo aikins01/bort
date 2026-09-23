@@ -365,12 +365,13 @@ func parseEnvBlock(input string) map[string]string {
 func runWizardScan(ctx context.Context, setup guidedSetup, stdout io.Writer) (loadedMigrationRun, error) {
 	if !canAnimateStatus(stdout) {
 		fmt.Fprintln(stdout, "~ Scanning source...")
-		return createGuidedMigrationRun(ctx, setup)
+		run, err := createGuidedMigrationRun(ctx, setup)
+		return run, wrapGuideScanFailure(err, "")
 	}
 	stopStatus := startScanStatus(stdout)
 	run, err := createGuidedMigrationRun(ctx, setup)
 	stopStatus(err)
-	return run, err
+	return run, wrapGuideScanFailure(err, "")
 }
 
 const scanStatusFrameCount = 3

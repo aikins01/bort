@@ -218,6 +218,9 @@ func rememberCurrentRun(run migrationRun) error {
 func currentRunRef() (string, bool, error) {
 	state, err := readBortState(defaultStatePath())
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return "", false, fmt.Errorf("%w; this user cannot read the .bort workspace — re-run as the OS user that owns it, or fix its permissions", err)
+		}
 		return "", false, err
 	}
 	ref := strings.TrimSpace(state.CurrentRun)

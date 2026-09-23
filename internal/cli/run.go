@@ -244,7 +244,11 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 			ManifestPath: manifestPath,
 		}, observationWindowSeconds, rollbackWindowSeconds)
 		if err != nil {
-			return err
+			rerunArgs := []string{"migrate"}
+			for _, arg := range args {
+				rerunArgs = append(rerunArgs, shellQuote(arg))
+			}
+			return wrapGuideScanFailure(err, strings.Join(rerunArgs, " "))
 		}
 		if err := rememberCurrentRun(loadedRun.Run); err != nil {
 			return err

@@ -30,7 +30,7 @@ func TestRunWithoutArgsShowsGuidedStartWhenNoBundleOrRunExists(t *testing.T) {
 	}
 
 	output := stdout.String()
-	for _, want := range []string{"No migration run was found.", "bort migrate --source coolify-local", "bort migrate --manifest manifest.json"} {
+	for _, want := range []string{"No migration run was found.", "bort migrate --source coolify-local", "bort migrate --manifest manifest.json", "Working directory:", "different directory"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected guide output to contain %q, got:\n%s", want, output)
 		}
@@ -80,7 +80,7 @@ func TestRunWithoutArgsCreatesRunFromDefaultBundle(t *testing.T) {
 	}
 
 	output := stdout.String()
-	for _, want := range []string{"local bundle → dokploy", "api", "READY"} {
+	for _, want := range []string{"local bundle → dokploy", "api", "READY", "workspace:"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected guide output to contain %q, got:\n%s", want, output)
 		}
@@ -591,4 +591,95 @@ fi
 		t.Fatal(err)
 	}
 	return run
+}
+
+func TestCheckSourceRequirementsReportsMissingDockerCLI(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+
+	err := checkSourceRequirements(context.Background(), "coolify-local")
+	if err == nil || !strings.Contains(err.Error(), "docker CLI not found") {
+		t.Fatalf("expected docker CLI requirement error, got %v", err)
+	}
+	if err := checkSourceRequirements(context.Background(), "manifest"); err != nil {
+		t.Fatalf("manifest source must not require docker: %v", err)
+	}
+	if err := checkSourceRequirements(context.Background(), "local-docker"); err == nil {
+		t.Fatal("local-docker alias must require docker like the docker source")
+	}
+}
+
+func TestCheckSourceRequirementsSkipsDockerWarnings(t *testing.T) {
+	binDir := t.TempDir()
+	dockerStub := "#!/bin/sh\n" +
+		"echo 'WARNING: Error loading config file: open /root/.docker/config.json: permission denied'\n" +
+		"echo 'docker: Got permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock'\n" +
+		"exit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "docker"), []byte(dockerStub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	err := checkSourceRequirements(context.Background(), "docker")
+	if err == nil || !strings.Contains(err.Error(), "docker is not usable by this user: docker: Got permission denied") {
+		t.Fatalf("expected docker usability error with the real cause, got %v", err)
+	}
+	if strings.Contains(err.Error(), "WARNING") {
+		t.Fatalf("expected warning lines to be skipped, got %v", err)
+	}
+}
+
+func TestGuidedSetupScanFailureIncludesRecoveryHint(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+
+	input := testGuideInput{Reader: strings.NewReader("4\nmissing-manifest.json\n")}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := RunWithInput(context.Background(), nil, input, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected guided setup to fail on a missing manifest, got:\n%s", stdout.String())
+	}
+	if !strings.Contains(err.Error(), "discovery made no changes on the server") {
+		t.Fatalf("expected scan failure to include a recovery hint, got %v", err)
+	}
+}
+
+func TestCurrentRunRefReportsWrongUserPermission(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("permission bits are not enforced for root")
+	}
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	if err := os.MkdirAll(".bort", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(".bort", "state.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(".bort", "state.json"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := currentRunRef()
+	if err == nil || !strings.Contains(err.Error(), "re-run as the OS user that owns it") {
+		t.Fatalf("expected wrong-user recovery hint, got %v", err)
+	}
+}
+
+func TestMigrateSourceScanFailureIncludesRecoveryHint(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	t.Setenv("PATH", t.TempDir())
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := runMigrate(context.Background(), []string{"--source", "coolify-local", "--run", "prod run"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected migrate --source to fail without docker, got:\n%s", stdout.String())
+	}
+	if !strings.Contains(err.Error(), "discovery made no changes on the server") {
+		t.Fatalf("expected scan failure to include a recovery hint, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "re-run `bort migrate --source coolify-local --run 'prod run'`") {
+		t.Fatalf("expected recovery hint to echo the invocation with quoted args, got %v", err)
+	}
 }
