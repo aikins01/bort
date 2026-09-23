@@ -41,7 +41,7 @@ The current product path is **Coolify → Dokploy on the same Linux VPS**.
 | Explicit live apply and resume | Implemented |
 | Accepting Dokploy and stopping source containers | Implemented |
 | Safe Dokploy database cleanup and separately confirmed source removal | Implemented |
-| Executable rollback | Not implemented; Bort only prints the stored rollback plan |
+| Executable rollback | Implemented (`bort rollback --live`) |
 | Dokploy → Coolify or cross-server migration | Not implemented |
 
 Bort publishes macOS, Linux, and Windows binaries, but a complete same-VPS move
@@ -63,6 +63,8 @@ Today Bort can:
   while a service is stopped;
 - switch web traffic during explicit live apply, save progress for retries, and
   store rollback instructions;
+- execute the reviewed rollback (`bort rollback --live`) to restart source
+  containers and return traffic to the source;
 - accept the target only after successful live apply;
 - list leftovers, remove only eligible unused records from Dokploy, and
   separately remove eligible source containers and networks after confirmation.
@@ -87,7 +89,8 @@ Bort keeps workspace directories and files private, but `.bort` contains target
 credentials and application configuration. Do not commit or publish it.
 
 Read the [prerequisites and recovery guidance](docs/migration-guide.md) before a
-live migration. In particular, Bort does not yet execute rollback.
+live migration. In particular, review how `bort rollback --live` works before you
+need it.
 
 ## Install
 
@@ -136,7 +139,8 @@ The migration uses separate commands for each important step:
 ```text
 sudo bort                 # start or resume, then review and fix
 sudo bort migrate --live  # apply only the selected planned run
-sudo bort rollback        # inspect the stored manual rollback plan
+sudo bort rollback        # inspect the stored rollback plan
+sudo bort rollback --live # restart source containers and return traffic
 sudo bort commit --apply  # accept the target and retire source containers
 sudo bort cleanup         # audit leftovers without deleting source resources
 ```
@@ -182,8 +186,13 @@ Bort's safety model defaults to “look first.”
 - **Separate destructive purge:** purge requires selected apps or projects, a
   successful live apply, an accepted target, the exact confirmation phrase, a
   recheck of Docker IDs, and a private backup.
-- **Manual rollback only:** `bort rollback` prints the stored plan. Bort does not
-  currently execute recovery actions.
+- **Health-gated rollback:** `bort rollback --live` restarts the quiesced source
+  containers, verifies they are running and healthy before touching any traffic,
+  swaps the proxies back, and observes the result. It never deletes data; the
+  Dokploy target resources remain on the server for cleanup, and an interrupted
+  rollback can be re-run. Commit and live apply stay blocked once rollback starts.
+  Live rollback uses a five-second settling check per observed app, not the
+  stored observation window; continue monitoring for the reviewed period.
 
 ## Documentation
 
@@ -196,7 +205,8 @@ Bort's safety model defaults to “look first.”
 
 ## Current limitations
 
-- Bort shows rollback instructions but does not run them.
+- Rollback returns traffic to the source but does not copy back data written to
+  the target after cutover.
 - Bort does not keep copying new volume changes while applications remain live.
 - Database moves currently use local export/import or copy data while the
   database is stopped.
@@ -210,9 +220,8 @@ Bort's safety model defaults to “look first.”
 Near-term work remains focused on making the same-VPS Coolify → Dokploy path
 boring and safe before adding more platforms:
 
-1. decide how automated rollback should work;
-2. add Dokploy source scanning and Coolify target creation;
-3. add cross-server transfers after the same-VPS steps are proven.
+1. add Dokploy source scanning and Coolify target creation;
+2. add cross-server transfers after the same-VPS steps are proven.
 
 Other Docker-, Compose-, and Swarm-based platforms remain possible future
 targets. Bort should only support one when it can clearly say which resources

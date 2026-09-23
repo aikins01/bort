@@ -86,7 +86,8 @@ func writePrimaryHelp(w io.Writer, st *styler) {
 	writeHelpSection(w, st, "Usage:", []helpLine{
 		{verb: bortCommand(""), desc: "start or resume the current migration"},
 		{verb: bortCommand("migrate --live"), desc: "apply the selected planned run to its target"},
-		{verb: bortCommand("rollback"), desc: "inspect the source rollback plan"},
+		{verb: bortCommand("rollback"), desc: "inspect the stored rollback plan"},
+		{verb: bortCommand("rollback --live"), desc: "restart source containers and return traffic to the source"},
 		{verb: bortCommand("commit --apply"), desc: "accept the target and retire source containers"},
 		{verb: bortCommand("cleanup"), desc: "audit leftovers; --apply removes safe metadata only"},
 		{verb: bortCommand("cleanup purge"), desc: "purge eligible source leftovers with confirmation"},

@@ -157,6 +157,20 @@ func containerRunningAfterStartFailure(runner dockerRunner, id string) bool {
 	return err == nil && container.State.Running
 }
 
+func waitContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 type dockerContainer struct {
 	ID     string
 	Name   string
@@ -167,10 +181,15 @@ type dockerContainer struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	State struct {
-		Status  string `json:"Status"`
-		Running bool   `json:"Running"`
+		Status  string             `json:"Status"`
+		Running bool               `json:"Running"`
+		Health  *dockerHealthState `json:"Health"`
 	} `json:"State"`
 	Mounts []dockerMount `json:"Mounts"`
+}
+
+type dockerHealthState struct {
+	Status string `json:"Status"`
 }
 
 type dockerMount struct {
@@ -191,8 +210,9 @@ type dockerInspectRaw struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	State struct {
-		Status  string `json:"Status"`
-		Running bool   `json:"Running"`
+		Status  string             `json:"Status"`
+		Running bool               `json:"Running"`
+		Health  *dockerHealthState `json:"Health"`
 	} `json:"State"`
 	Mounts []dockerMount `json:"Mounts"`
 }

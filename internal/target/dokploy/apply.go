@@ -25,22 +25,26 @@ import (
 type StepKind string
 
 const (
-	StepCreateProject     StepKind = "create_project"
-	StepCreateService     StepKind = "create_service"
-	StepPushImage         StepKind = "push_image"
-	StepUploadEnv         StepKind = "upload_env"
-	StepCreateVolume      StepKind = "create_volume"
-	StepPauseSource       StepKind = "pause_source"
-	StepResumeSource      StepKind = "resume_source"
-	StepResumeTarget      StepKind = "resume_target"
-	StepSyncVolume        StepKind = "sync_volume"
-	StepDumpDataStore     StepKind = "dump_data_store"
-	StepRestoreDataStore  StepKind = "restore_data_store"
-	StepInstallGateway    StepKind = "install_gateway"
-	StepActivateRoutes    StepKind = "activate_routes"
-	StepStopCoolifyProxy  StepKind = "stop_coolify_proxy"
-	StepStartDokployProxy StepKind = "start_dokploy_proxy"
-	StepStopSourceApp     StepKind = "stop_source_app"
+	StepCreateProject      StepKind = "create_project"
+	StepCreateService      StepKind = "create_service"
+	StepPushImage          StepKind = "push_image"
+	StepUploadEnv          StepKind = "upload_env"
+	StepCreateVolume       StepKind = "create_volume"
+	StepPauseSource        StepKind = "pause_source"
+	StepResumeSource       StepKind = "resume_source"
+	StepResumeTarget       StepKind = "resume_target"
+	StepSyncVolume         StepKind = "sync_volume"
+	StepDumpDataStore      StepKind = "dump_data_store"
+	StepRestoreDataStore   StepKind = "restore_data_store"
+	StepInstallGateway     StepKind = "install_gateway"
+	StepActivateRoutes     StepKind = "activate_routes"
+	StepStopCoolifyProxy   StepKind = "stop_coolify_proxy"
+	StepStartDokployProxy  StepKind = "start_dokploy_proxy"
+	StepVerifySourceHealth StepKind = "verify_source_health"
+	StepStopDokployProxy   StepKind = "stop_dokploy_proxy"
+	StepStartCoolifyProxy  StepKind = "start_coolify_proxy"
+	StepObserveRollback    StepKind = "observe_rollback"
+	StepStopSourceApp      StepKind = "stop_source_app"
 )
 
 // proxy container names assumed by the cutover swap. coolify-proxy is
@@ -100,6 +104,7 @@ type Plan struct {
 	ResumeFrom               int
 	BeforeStep               *func(StepProgress) error
 	OnProgress               *func(StepProgress)
+	stepTimeout              time.Duration
 }
 
 func PlanFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result) Plan {
@@ -547,7 +552,15 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 		if step.Kind == StepStopCoolifyProxy {
 			coolifyProxyStopped = true
 		}
-		err := c.applyStep(ctx, actx, step)
+		stepCtx := ctx
+		var cancel context.CancelFunc
+		if plan.stepTimeout > 0 {
+			stepCtx, cancel = context.WithTimeout(ctx, plan.stepTimeout)
+		}
+		err := c.applyStep(stepCtx, actx, step)
+		if cancel != nil {
+			cancel()
+		}
 		if err != nil {
 			emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusError, Err: err})
 			resumePausedApps := pausedApps
@@ -760,6 +773,14 @@ func (c *Client) applyStep(ctx context.Context, actx *applyContext, step Step) e
 		return c.applyStopCoolifyProxy(ctx, actx, step)
 	case StepStartDokployProxy:
 		return c.applyStartDokployProxy(ctx, actx, step)
+	case StepVerifySourceHealth:
+		return c.applyVerifySourceHealth(ctx, actx, step)
+	case StepStopDokployProxy:
+		return c.applyStopDokployProxy(ctx, actx, step)
+	case StepStartCoolifyProxy:
+		return c.applyStartCoolifyProxy(ctx, actx, step)
+	case StepObserveRollback:
+		return c.applyObserveRollback(ctx, actx, step)
 	case StepStopSourceApp:
 		return c.applyStopSourceApp(ctx, actx, step)
 	default:

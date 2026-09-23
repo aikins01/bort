@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	rollbackplan "github.com/aikins01/bort/internal/rollback"
+	"github.com/aikins01/bort/internal/target/dokploy"
 )
 
-func runRollback(_ context.Context, args []string, stdout, stderr io.Writer) error {
+func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("rollback", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -21,6 +23,8 @@ func runRollback(_ context.Context, args []string, stdout, stderr io.Writer) err
 	var outputPath string
 	var cutoverPlanPath string
 	var runRef string
+	var live bool
+	var confirm string
 	observationWindowSeconds := rollbackplan.DefaultObservationWindowSeconds
 
 	fs.StringVar(&bundleDir, "bundle", "bort-bundle", "migration bundle directory")
@@ -30,6 +34,8 @@ func runRollback(_ context.Context, args []string, stdout, stderr io.Writer) err
 	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
 	fs.StringVar(&cutoverPlanPath, "from-cutover", "", "read a prior cutover JSON plan artifact")
 	fs.StringVar(&runRef, "run", "", "run name under .bort/runs, or a run directory path")
+	fs.BoolVar(&live, "live", false, "restart source containers and return traffic; performs a short settling check, not the stored observation window")
+	fs.StringVar(&confirm, "confirm", "", "confirm open rollback triggers with the exact phrase: rollback <run-name> (requires --live)")
 	fs.IntVar(&observationWindowSeconds, "observation-window", rollbackplan.DefaultObservationWindowSeconds, "observation window in seconds")
 
 	if err := fs.Parse(args); err != nil {
@@ -40,6 +46,17 @@ func runRollback(_ context.Context, args []string, stdout, stderr io.Writer) err
 	}
 	if flagSet(fs, "run") && strings.TrimSpace(runRef) == "" {
 		return fmt.Errorf("rollback requires a non-empty --run value")
+	}
+	if flagSet(fs, "confirm") && !live {
+		return fmt.Errorf("rollback --confirm requires --live")
+	}
+	if live {
+		for _, name := range []string{"app", "bundle", "format", "from-cutover", "observation-window", "output", "target"} {
+			if flagSet(fs, name) {
+				return fmt.Errorf("rollback --live does not accept --%s; select the run with --run", name)
+			}
+		}
+		return applyRollbackFromArgs(ctx, runRef, confirm, stderr)
 	}
 	if err := checkOutputFormat("rollback", format); err != nil {
 		return err
@@ -145,4 +162,120 @@ func writeRollbackText(w io.Writer, result rollbackplan.Result) {
 		fmt.Fprintln(w)
 	}
 	fmt.Fprintln(w, "Dry run only: no routes were changed and no rollback actions were executed.")
+}
+
+func applyRollbackFromArgs(ctx context.Context, runRef, confirm string, stderr io.Writer) error {
+	var err error
+	runRef, err = resolveRunRef(runRef, false)
+	if err != nil {
+		return err
+	}
+	operationLock, err := acquireRunOperationLock(runRef)
+	if err != nil {
+		return fmt.Errorf("rollback run %q: %w", runRef, err)
+	}
+	defer operationLock.Release()
+	run, err := loadMigrationRun(runRef)
+	if err != nil {
+		return err
+	}
+	if err := validateRollbackApplyReady(run); err != nil {
+		return err
+	}
+	phrase := "rollback " + run.Run.Name
+	if confirm != "" && confirm != phrase {
+		return fmt.Errorf("rollback confirmation must be exactly %q", phrase)
+	}
+	if decisions := rollbackTriggerDecisions(run); len(decisions) > 0 {
+		for _, decision := range decisions {
+			fmt.Fprintf(stderr, "%s\n%s\n", decisionAction(decision), decisionReason(decision))
+		}
+		if confirm != phrase {
+			return fmt.Errorf("rollback is blocked by %d unconfirmed rollback trigger(s); review `%s`, then confirm with `%s --confirm %s`", len(decisions), runScopedCommand(run, "rollback"), runScopedCommand(run, "rollback --live"), shellQuote(phrase))
+		}
+		for _, decision := range decisions {
+			run.Progress = markReviewDecisionDone(run, decision, time.Now().UTC())
+		}
+		path, err := safeRunArtifactPath(run.Run.RunDir, run.Run.Artifacts.Progress)
+		if err != nil {
+			return err
+		}
+		if err := writeRunProgress(path, run.Progress); err != nil {
+			return err
+		}
+	}
+	plan := dokploy.PlanForRollback(run.Prepare, run.Cutover)
+	plan.RunName = run.Run.Name
+	plan.RunDir = run.Run.RunDir
+	plan.ApprovedPrepareDecisions = approvedPrepareDecisions(run)
+	onProgress := func(p dokploy.StepProgress) {
+		target := p.Step.App
+		if target == "" {
+			target = p.Step.Ref
+		}
+		line := fmt.Sprintf("rollback [%d/%d] %s %s: %s", p.Index+1, p.Total, p.Step.Kind, target, p.Status)
+		if p.Err != nil {
+			line += ": " + p.Err.Error()
+		}
+		fmt.Fprintln(stderr, line)
+	}
+	plan.OnProgress = &onProgress
+	if err := markRunRollbackStartedLocked(run.Run); err != nil {
+		return fmt.Errorf("record rollback start: %w", err)
+	}
+	fmt.Fprintf(stderr, "rollback live: run %s; planned %d step(s) to return traffic to the source\n", run.Run.Name, len(plan.Steps))
+	client := &dokploy.Client{}
+	if err := client.Apply(ctx, plan); err != nil {
+		return err
+	}
+	if err := markRunRolledBackLocked(run.Run); err != nil {
+		return fmt.Errorf("rollback completed, but its outcome could not be recorded: %w", err)
+	}
+	writeRollbackAppliedSummary(stderr, run, plan)
+	return nil
+}
+
+func validateRollbackApplyReady(run loadedMigrationRun) error {
+	if run.Run.Target != "dokploy" {
+		return fmt.Errorf("rollback --live is only supported for target dokploy, got %q", run.Run.Target)
+	}
+	if run.Run.PurgedAt != nil {
+		return fmt.Errorf("rollback refused: run %q was already purged", run.Run.Name)
+	}
+	if run.Run.CommittedAt != nil {
+		return fmt.Errorf("rollback refused: run %q was already committed; its source containers were retired", run.Run.Name)
+	}
+	if run.Run.CommitStartedAt != nil {
+		return fmt.Errorf("rollback refused: source retirement started for run %q; run `%s` to finish acceptance", run.Run.Name, runScopedCommand(run, "commit --apply"))
+	}
+	if run.Run.RolledBackAt != nil {
+		return fmt.Errorf("rollback refused: run %q was already rolled back; start a fresh run to migrate again", run.Run.Name)
+	}
+	if err := requireLiveApplySucceeded(run); err != nil {
+		return fmt.Errorf("rollback requires a successful live apply: %w", err)
+	}
+	active, err := applyRunActive(run.Run.RunDir)
+	if err != nil {
+		return fmt.Errorf("check live-apply lock: %w", err)
+	}
+	if active {
+		return fmt.Errorf("rollback refused: live apply is running for run %q; wait for it to finish before rolling back", run.Run.Name)
+	}
+	return nil
+}
+
+func rollbackTriggerDecisions(run loadedMigrationRun) []runDecision {
+	return openFilteredDecisions(run, func(item runDecisionItem) bool {
+		return item.Stage == "rollback" && item.Code == "rollback.trigger_required"
+	})
+}
+
+func writeRollbackAppliedSummary(w io.Writer, run loadedMigrationRun, plan dokploy.Plan) {
+	fmt.Fprintln(w, "rollback complete: traffic is back on the source")
+	if len(plan.Steps) == 0 {
+		fmt.Fprintln(w, "this run stopped no source containers and changed no routes; the source was serving all along")
+	}
+	fmt.Fprintln(w, "the Dokploy target resources remain on the server; data written to the target after cutover was not copied back to the source")
+	fmt.Fprintln(w, "live rollback does not enforce the stored observation window; continue monitoring the source for the reviewed period")
+	fmt.Fprintln(w, "to migrate again, create a new named run with `bort migrate --run <new-name>` and current `--source` or `--bundle` inputs")
 }

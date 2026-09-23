@@ -186,6 +186,12 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 	if run.Run.Target != "dokploy" {
 		return fmt.Errorf("commit --apply is only supported for target dokploy, got %q", run.Run.Target)
 	}
+	if run.Run.RolledBackAt != nil {
+		return fmt.Errorf("commit refused: run %q was rolled back; the source is serving traffic again", run.Run.Name)
+	}
+	if run.Run.RollbackStartedAt != nil {
+		return fmt.Errorf("commit refused: rollback started for run %q; run `%s` to finish recovery", run.Run.Name, runScopedCommand(run, "rollback --live"))
+	}
 	if err := requireLiveApplySucceeded(run); err != nil {
 		return err
 	}
@@ -197,6 +203,9 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
 	plan.ApprovedPrepareDecisions = approvedPrepareDecisions(run)
+	if err := markRunCommitStartedLocked(run.Run); err != nil {
+		return fmt.Errorf("record source retirement start: %w", err)
+	}
 	fmt.Fprintf(stderr, "commit apply: run %s; planned %d step(s) to retire source\n", run.Run.Name, len(plan.Steps))
 	if err := client.Apply(ctx, plan); err != nil {
 		return err

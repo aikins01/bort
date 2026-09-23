@@ -41,7 +41,10 @@ type migrationRun struct {
 	CreatedAt                time.Time    `json:"createdAt"`
 	UpdatedAt                time.Time    `json:"updatedAt"`
 	LiveAppliedAt            *time.Time   `json:"liveAppliedAt,omitempty"`
+	CommitStartedAt          *time.Time   `json:"commitStartedAt,omitempty"`
 	CommittedAt              *time.Time   `json:"committedAt,omitempty"`
+	RollbackStartedAt        *time.Time   `json:"rollbackStartedAt,omitempty"`
+	RolledBackAt             *time.Time   `json:"rolledBackAt,omitempty"`
 	PurgedAt                 *time.Time   `json:"purgedAt,omitempty"`
 	ApplyOutcomeRequired     bool         `json:"applyOutcomeRequired,omitempty"`
 	Source                   string       `json:"source,omitempty"`
@@ -395,6 +398,15 @@ func refreshMigrationRunSafelyLocked(runRef string) (loadedMigrationRun, error) 
 }
 
 func validateLiveApplyReady(run loadedMigrationRun) error {
+	if run.Run.RolledBackAt != nil {
+		return fmt.Errorf("live apply refused: run %q was rolled back; start a fresh migration run to migrate again", run.Run.Name)
+	}
+	if run.Run.RollbackStartedAt != nil {
+		return fmt.Errorf("live apply refused: rollback started for run %q; run `%s` to finish recovery", run.Run.Name, runScopedCommand(run, "rollback --live"))
+	}
+	if run.Run.CommitStartedAt != nil {
+		return fmt.Errorf("live apply refused: source retirement started for run %q; run `%s` to finish acceptance", run.Run.Name, runScopedCommand(run, "commit --apply"))
+	}
 	if decisions := liveApplyBlockingDecisions(run); len(decisions) > 0 {
 		decision := decisions[0]
 		action := strings.TrimSpace(decision.Action)
@@ -1055,7 +1067,7 @@ func existingMutableMigrationRun(runDir, runName string) (migrationRun, error) {
 	}
 	existing.RunDir = filepath.ToSlash(filepath.Clean(runDir))
 	existing.Artifacts = existing.Artifacts.withDefaults()
-	if existing.LiveAppliedAt != nil || existing.CommittedAt != nil || existing.PurgedAt != nil {
+	if existing.LiveAppliedAt != nil || existing.CommitStartedAt != nil || existing.CommittedAt != nil || existing.RollbackStartedAt != nil || existing.RolledBackAt != nil || existing.PurgedAt != nil {
 		return migrationRun{}, immutableError()
 	}
 	appliedPath, err := safeRunArtifactPath(runDir, existing.Artifacts.Applied)
@@ -1396,7 +1408,10 @@ func createMigrationRunLocked(opts migrationRunOptions, runDir, runName string, 
 		CreatedAt:                createdAt,
 		UpdatedAt:                now,
 		LiveAppliedAt:            existingRun.LiveAppliedAt,
+		CommitStartedAt:          existingRun.CommitStartedAt,
 		CommittedAt:              existingRun.CommittedAt,
+		RollbackStartedAt:        existingRun.RollbackStartedAt,
+		RolledBackAt:             existingRun.RolledBackAt,
 		PurgedAt:                 existingRun.PurgedAt,
 		ApplyOutcomeRequired:     true,
 		Source:                   opts.Source,
@@ -1722,6 +1737,15 @@ func nextSafeStep(run loadedMigrationRun, decisions []runDecision) runNextStep {
 	}
 	if run.Run.CommittedAt != nil {
 		return runNextStep{Action: fmt.Sprintf("run `%s` to audit remaining metadata and source leftovers", runScopedCommand(run, "cleanup")), Reason: "the target is accepted and source app containers are retired"}
+	}
+	if run.Run.RolledBackAt != nil {
+		return runNextStep{Action: "create a new named migration run with `bort migrate --run <new-name>` and current `--source` or `--bundle` inputs", Reason: "the rollback returned traffic to the source; the Dokploy target resources remain on the server"}
+	}
+	if run.Run.RollbackStartedAt != nil {
+		return runNextStep{Action: fmt.Sprintf("run `%s` to finish recovery", runScopedCommand(run, "rollback --live")), Reason: "rollback started but has not completed; traffic may already be on the source"}
+	}
+	if run.Run.CommitStartedAt != nil {
+		return runNextStep{Action: fmt.Sprintf("run `%s` to finish acceptance", runScopedCommand(run, "commit --apply")), Reason: "source retirement started; rollback is no longer available"}
 	}
 	if run.Run.LiveAppliedAt != nil || liveApplySucceeded(run) {
 		return runNextStep{Action: fmt.Sprintf("verify the target, then run `%s` after the rollback window", runScopedCommand(run, "commit --apply")), Reason: "the live apply completed and the source remains available for rollback"}
@@ -2482,10 +2506,34 @@ func markRunLiveAppliedLocked(run migrationRun) error {
 	})
 }
 
+func markRunCommitStartedLocked(run migrationRun) error {
+	return updateRunLifecycleLocked(run, func(current *migrationRun, now time.Time) {
+		if current.CommitStartedAt == nil {
+			current.CommitStartedAt = &now
+		}
+	})
+}
+
 func markRunCommittedLocked(run migrationRun) error {
 	return updateRunLifecycleLocked(run, func(current *migrationRun, now time.Time) {
 		if current.CommittedAt == nil {
 			current.CommittedAt = &now
+		}
+	})
+}
+
+func markRunRollbackStartedLocked(run migrationRun) error {
+	return updateRunLifecycleLocked(run, func(current *migrationRun, now time.Time) {
+		if current.RollbackStartedAt == nil {
+			current.RollbackStartedAt = &now
+		}
+	})
+}
+
+func markRunRolledBackLocked(run migrationRun) error {
+	return updateRunLifecycleLocked(run, func(current *migrationRun, now time.Time) {
+		if current.RolledBackAt == nil {
+			current.RolledBackAt = &now
 		}
 	})
 }

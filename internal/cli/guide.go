@@ -141,7 +141,7 @@ func refreshGuideRun(ctx context.Context, runRef string, stdin io.Reader, stdout
 	if err != nil {
 		return loadedMigrationRun{}, fmt.Errorf("read applied migration progress: %w", err)
 	}
-	if existing.LiveAppliedAt != nil || existing.CommittedAt != nil || existing.PurgedAt != nil || hasAppliedSteps {
+	if existing.LiveAppliedAt != nil || existing.CommitStartedAt != nil || existing.CommittedAt != nil || existing.RollbackStartedAt != nil || existing.RolledBackAt != nil || existing.PurgedAt != nil || hasAppliedSteps {
 		return loadMigrationRun(runRef)
 	}
 	if shouldAutoRescanRun(existing) {
