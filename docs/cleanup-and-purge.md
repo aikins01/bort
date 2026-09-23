@@ -86,7 +86,10 @@ Purge apply refuses to run unless:
 - the exact `purge <run-name>` confirmation is supplied.
 
 Bort writes a private purge-plan backup under `.bort/backups` before destructive
-work begins.
+work begins. It records each resource before and after removal and stops as soon
+as recording fails. Printed results only show progress Bort confirmed was
+recorded, so a resource reported as `started` may already have been removed:
+compare the actual source state with both records before retrying.
 
 ## Automatic removal and manual-removal checks
 
