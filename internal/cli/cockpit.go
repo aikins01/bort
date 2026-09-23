@@ -38,6 +38,9 @@ func writeAppFirstCockpit(w io.Writer, run loadedMigrationRun) {
 	}
 	header += " " + st.pill(migrationRunPhaseLabel(phase), severityForMigrationRunPhase(phase))
 	fmt.Fprintln(w, header)
+	if workspace := workspaceDir(); workspace != "" {
+		fmt.Fprintln(w, st.muted("workspace: "+workspace))
+	}
 	fmt.Fprintln(w)
 
 	if len(apps) == 0 {

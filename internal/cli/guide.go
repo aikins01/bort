@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -105,6 +106,9 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 			run, err = runWizardScan(ctx, setup, stdout)
 		} else {
 			run, err = createGuidedMigrationRun(ctx, setup)
+			if err != nil {
+				return wrapGuideScanFailure(err, "")
+			}
 		}
 		if err != nil {
 			return err
@@ -150,13 +154,13 @@ func refreshGuideRun(ctx context.Context, runRef string, stdin io.Reader, stdout
 			refreshedBundle, refreshedManifest, err = refreshRunSourceBundle(ctx, existing)
 		}
 		if err != nil {
-			return loadedMigrationRun{}, err
+			return loadedMigrationRun{}, wrapGuideRescanFailure(err)
 		}
 		defer os.RemoveAll(refreshedBundle)
 		refreshed, err := refreshMigrationRunLockedWithInputs(runRef, refreshedBundle, refreshedManifest)
 		if err != nil {
 			_ = os.Remove(refreshedManifest)
-			return loadedMigrationRun{}, err
+			return loadedMigrationRun{}, wrapGuideRescanFailure(err)
 		}
 		return refreshed, nil
 	}
@@ -223,15 +227,28 @@ func isRealTTY(stdin io.Reader, stdout io.Writer) bool {
 	return isInteractiveTerminal(inFile) && isInteractiveTerminal(outFile)
 }
 
+func workspaceDir() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return wd
+}
+
 func promptGuidedSetupHuh(now time.Time) (guidedSetup, error) {
 	source := "coolify-local"
-	manifestPath := "manifest.json"
+	manifestPath := ""
+
+	description := "All actions are local dry-runs. bort runs on the same server as the source PaaS."
+	if workspace := workspaceDir(); workspace != "" {
+		description += "\nWorkspace: " + workspace + " — run every command from this directory with the same OS user."
+	}
 
 	form := huh.NewForm(
 		huh.NewGroup(
 			huh.NewSelect[string]().
 				Title("Where are your apps?").
-				Description("All actions are local dry-runs. bort runs on the same server as the source PaaS.").
+				Description(description).
 				Options(
 					huh.NewOption("Coolify on this server (reads local Docker labels)", "coolify-local"),
 					huh.NewOption("Coolify API (uses BORT_COOLIFY_URL/TOKEN)", "coolify"),
@@ -270,6 +287,9 @@ func promptGuidedSetupWithReader(reader *bufio.Reader, stdout io.Writer, now tim
 	st := newStyler(stdout)
 	fmt.Fprintln(stdout, st.emph("Migration setup"))
 	fmt.Fprintln(stdout, st.muted("All actions are local dry-runs. bort runs on the same server as the source PaaS."))
+	if workspace := workspaceDir(); workspace != "" {
+		fmt.Fprintln(stdout, st.muted("Workspace: "+workspace+" — run every command from this directory with the same OS user."))
+	}
 	fmt.Fprintln(stdout)
 
 	sourceName, err := promptChoice(reader, stdout, "Where are your apps?", []guideChoice{
@@ -365,7 +385,55 @@ func exportRunSourceBundle(runDir string, m manifest.Manifest, appName string) (
 	return bundleDir, nil
 }
 
+func checkSourceRequirements(ctx context.Context, sourceName string) error {
+	switch sourceName {
+	case "docker", "local-docker", "coolify-local":
+	default:
+		return nil
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		return fmt.Errorf("docker CLI not found: %w; install Docker on the source server first", err)
+	}
+	out, err := exec.CommandContext(ctx, "docker", "ps", "-q").CombinedOutput()
+	if err != nil {
+		detail := firstOutputLine(out)
+		if detail == "" {
+			detail = err.Error()
+		}
+		return fmt.Errorf("docker is not usable by this user: %s; Docker sources need Docker access, usually by running with sudo — if you switch to sudo, re-run with sudo and keep using sudo for every later command", detail)
+	}
+	return nil
+}
+
+func firstOutputLine(out []byte) string {
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "WARNING:") {
+			continue
+		}
+		return trimmed
+	}
+	return ""
+}
+
+func wrapGuideScanFailure(err error, rerunArgs string) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w; discovery made no changes on the server — fix the issue and re-run `%s`", err, bortCommand(rerunArgs))
+}
+
+func wrapGuideRescanFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w; the existing run and its plan were not changed — fix the issue and re-run `%s`", err, bortCommand(""))
+}
+
 func guidedManifest(ctx context.Context, setup guidedSetup, runDir string) (manifest.Manifest, string, error) {
+	if err := checkSourceRequirements(ctx, setup.Source); err != nil {
+		return manifest.Manifest{}, "", err
+	}
 	if setup.Source == "manifest" {
 		m, err := readManifestFile(setup.ManifestPath)
 		if err != nil {
@@ -557,7 +625,7 @@ func guideRunRef() (string, bool, bool, error) {
 	}
 	if ok {
 		if !migrationRunMetadataExists(current) {
-			return "", false, false, fmt.Errorf("current migration run %q no longer exists; run `%s` to select another run", current, bortCommand("migrate --run <name>"))
+			return "", false, false, fmt.Errorf("current migration run %q no longer exists in this workspace; if you moved directories, exit and run bort from the original migration directory — otherwise run `%s` with a run name from `.bort/runs`", current, bortCommand("migrate --run <name>"))
 		}
 		return current, true, true, nil
 	}
@@ -612,11 +680,15 @@ func writeGuideStart(w io.Writer) error {
 	fmt.Fprintln(w, st.emph("bort")+" "+st.muted("— migrate self-hosted apps between PaaS platforms"))
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("No migration run was found. Run `%s` in a terminal for guided setup.", bortCommand(""))))
+	if workspace := workspaceDir(); workspace != "" {
+		fmt.Fprintf(w, "%s\n", st.muted("Working directory: "+workspace))
+	}
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, st.emph("For non-interactive setup:"))
 	fmt.Fprintf(w, "  %s\n", st.emph(bortCommand("migrate --source coolify-local")))
 	fmt.Fprintf(w, "  %s\n", st.muted("or: "+bortCommand("migrate --manifest manifest.json")))
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, st.muted("This single command scans, exports a private bundle, and creates the current run."))
+	fmt.Fprintln(w, st.muted("If you started this migration in a different directory, exit and run bort from there; each directory keeps its own .bort workspace."))
 	return nil
 }

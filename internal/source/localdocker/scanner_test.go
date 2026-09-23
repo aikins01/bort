@@ -42,13 +42,13 @@ func TestRoutesFromLabelsExtractsHostsAndServicePort(t *testing.T) {
 
 func TestCaddyRoutesFromLabelsExtractsHostsAndPort(t *testing.T) {
 	labels := map[string]string{
-		"caddy_ingress_network":               "coolify",
-		"caddy_0":                             "https://app.example.com",
-		"caddy_0.handle_path.0_reverse_proxy": "{{upstreams 3000}}",
-		"caddy_1":                             "https://api.example.com/v1",
-		"caddy_1.handle_path.1_reverse_proxy": "{{upstreams}}",
-		"traefik.http.routers.web.rule":       "Host(`legacy.example.com`)",
-		"traefik.http.routers.web.service":    "app-svc",
+		"caddy_ingress_network":                                  "coolify",
+		"caddy_0":                                                "https://app.example.com",
+		"caddy_0.handle_path.0_reverse_proxy":                    "{{upstreams 3000}}",
+		"caddy_1":                                                "https://api.example.com/v1",
+		"caddy_1.handle_path.1_reverse_proxy":                    "{{upstreams}}",
+		"traefik.http.routers.web.rule":                          "Host(`legacy.example.com`)",
+		"traefik.http.routers.web.service":                       "app-svc",
 		"traefik.http.services.app-svc.loadbalancer.server.port": "8080",
 	}
 
