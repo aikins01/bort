@@ -120,9 +120,15 @@ func writeAppFirstCockpit(w io.Writer, run loadedMigrationRun) {
 	case "partial":
 		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Live apply is incomplete. Run `%s` to resume safely.", liveApplyCommand(run))))
 	case "applied":
-		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Target is live. Verify it through the rollback window, then run `%s` to retire the source.", runScopedCommand(run, "commit --apply"))))
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Target is live. Verify it through the rollback window, then run `%s` to retire the source; if validation fails, run `%s` to roll back.", runScopedCommand(run, "commit --apply"), runScopedCommand(run, "rollback --live"))))
 	case "committed":
 		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Target accepted and source containers retired. Run `%s` to audit leftovers.", runScopedCommand(run, "cleanup"))))
+	case "committing":
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Source retirement started; rollback is no longer available. Run `%s` to finish acceptance.", runScopedCommand(run, "commit --apply"))))
+	case "rolled back":
+		fmt.Fprintf(w, "%s\n", st.muted("Rollback returned traffic to the source; the Dokploy target resources remain on the server. To migrate again, "+summary.Next.Action+"."))
+	case "rolling back":
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Rollback has not completed; traffic may already be on the source. Run `%s` to finish recovery.", runScopedCommand(run, "rollback --live"))))
 	case "purged":
 		fmt.Fprintln(w, st.muted("Migration complete. Target resources and source-control credentials were preserved."))
 	case "planning":
@@ -149,6 +155,12 @@ func migrationRunPhase(run loadedMigrationRun) string {
 		return "purged"
 	case run.Run.CommittedAt != nil:
 		return "committed"
+	case run.Run.RolledBackAt != nil:
+		return "rolled back"
+	case run.Run.RollbackStartedAt != nil:
+		return "rolling back"
+	case run.Run.CommitStartedAt != nil:
+		return "committing"
 	case run.Run.LiveAppliedAt != nil || liveApplySucceeded(run):
 		return "applied"
 	case applyActiveErr != nil:
