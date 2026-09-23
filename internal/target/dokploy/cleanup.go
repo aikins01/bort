@@ -240,6 +240,7 @@ func runSourcePurgeResource(result *SourcePurgeResult, resources *[]SourcePurgeR
 	started.Status = "started"
 	*resources = append(*resources, started)
 	if err := publishSourcePurgeProgress(*result, onProgress); err != nil {
+		*resources = (*resources)[:len(*resources)-1]
 		return err
 	}
 	outcome, operationErr := operation()
@@ -248,6 +249,7 @@ func runSourcePurgeResource(result *SourcePurgeResult, resources *[]SourcePurgeR
 	}
 	(*resources)[len(*resources)-1] = outcome
 	if err := publishSourcePurgeProgress(*result, onProgress); err != nil {
+		(*resources)[len(*resources)-1] = started
 		if operationErr != nil {
 			return fmt.Errorf("%v; %w", operationErr, err)
 		}

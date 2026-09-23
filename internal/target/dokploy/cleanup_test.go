@@ -793,10 +793,102 @@ func TestPurgeSourceResourcesStopsBeforeNextMutationWhenProgressPersistenceFails
 	if len(durable.Containers) != 1 || durable.Containers[0].Status != "removed" {
 		t.Fatalf("expected first outcome to remain durable, got %#v", durable)
 	}
+	if len(result.Containers) != 1 || result.Containers[0].Status != "removed" {
+		t.Fatalf("expected returned progress to match the durable snapshot without the unpersisted entry, got %#v", result.Containers)
+	}
 	for _, args := range runner.outputArgs {
 		if strings.Join(args, " ") == "inspect --type container cid2" || strings.Join(args, " ") == "rm -f cid2" {
 			t.Fatalf("second resource mutated after persistence failure: %#v", runner.outputArgs)
 		}
+	}
+}
+
+func TestPurgeSourceResourcesDiscardsStartedProgressWhenFirstPersistenceFails(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container cid1": []byte(`[{"Id":"cid1","Name":"/one","State":{"Running":false,"Status":"exited"}}]`),
+		"rm -f cid1":                    []byte("cid1\n"),
+	}}
+	client := &Client{Docker: runner}
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{
+		Containers: []SourcePurgeContainer{{ContainerID: "cid1", ContainerName: "one"}},
+		OnProgress: func(SourcePurgeResult) error {
+			return errors.New("backup unavailable")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "persist source purge progress") {
+		t.Fatalf("expected progress persistence failure, got result=%#v err=%v", result, err)
+	}
+	if len(result.Containers) != 0 {
+		t.Fatalf("expected returned progress to drop the unpersisted started entry, got %#v", result.Containers)
+	}
+	if len(runner.outputArgs) != 0 {
+		t.Fatalf("expected no purge mutation after persistence failure, got %#v", runner.outputArgs)
+	}
+}
+
+func TestPurgeSourceResourcesDiscardsUnpersistedOutcomeWhenProgressPersistenceFails(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container cid1": []byte(`[{"Id":"cid1","Name":"/one","State":{"Running":false,"Status":"exited"}}]`),
+		"rm -f cid1":                    []byte("cid1\n"),
+	}}
+	var durable SourcePurgeResult
+	client := &Client{Docker: runner}
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{
+		Containers: []SourcePurgeContainer{{ContainerID: "cid1", ContainerName: "one"}},
+		OnProgress: func(progress SourcePurgeResult) error {
+			latest := progress.Containers[len(progress.Containers)-1]
+			if latest.Status != "started" {
+				return errors.New("backup unavailable")
+			}
+			durable = progress
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "persist source purge progress") {
+		t.Fatalf("expected progress persistence failure, got result=%#v err=%v", result, err)
+	}
+	removed := false
+	for _, args := range runner.outputArgs {
+		if strings.Join(args, " ") == "rm -f cid1" {
+			removed = true
+		}
+	}
+	if !removed {
+		t.Fatalf("expected the container removal to run before the failing progress publish, got %#v", runner.outputArgs)
+	}
+	if len(durable.Containers) != 1 || durable.Containers[0].Status != "started" {
+		t.Fatalf("expected the durable snapshot to keep the started entry, got %#v", durable)
+	}
+	if len(result.Containers) != 1 || result.Containers[0].Status != "started" {
+		t.Fatalf("expected returned progress to match the durable started entry instead of the unpersisted outcome, got %#v", result.Containers)
+	}
+}
+
+func TestPurgeSourceResourcesReportsOperationErrorWhenOutcomePersistenceFails(t *testing.T) {
+	runner := &cleanupDockerRunner{
+		fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+			"inspect --type container cid1": []byte(`[{"Id":"cid1","Name":"/one","State":{"Running":false,"Status":"exited"}}]`),
+		}},
+		outputErrors: map[string]error{
+			"rm -f cid1": errors.New("docker daemon unreachable"),
+		},
+	}
+	client := &Client{Docker: runner}
+	result, err := client.purgeSourceResources(context.Background(), SourcePurgeOptions{
+		Containers: []SourcePurgeContainer{{ContainerID: "cid1", ContainerName: "one"}},
+		OnProgress: func(progress SourcePurgeResult) error {
+			latest := progress.Containers[len(progress.Containers)-1]
+			if latest.Status != "started" {
+				return errors.New("backup unavailable")
+			}
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "docker daemon unreachable") || !strings.Contains(err.Error(), "persist source purge progress") {
+		t.Fatalf("expected operation and persistence errors, got result=%#v err=%v", result, err)
+	}
+	if len(result.Containers) != 1 || result.Containers[0].Status != "started" {
+		t.Fatalf("expected returned progress to match the durable started entry, got %#v", result.Containers)
 	}
 }
 
