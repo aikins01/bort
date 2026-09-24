@@ -32,6 +32,22 @@ move depends on Linux, Docker, and access to protected host files. Use the macOS
 and Windows builds to inspect migration files and help develop Bort, not to run a
 production migration.
 
+### Kernels without IPVS
+
+Dokploy's control-plane services use Docker Swarm VIP networking by default.
+If the kernel explicitly reports that IPVS is disabled, Bort stops before
+installing anything. On these hosts, use Dokploy's documented DNS round-robin
+mode when starting Bort, for example `sudo ENDPOINT_MODE=dnsrr bort migrate --live`
+or `sudo ENDPOINT_MODE=dnsrr bort init-target --install`.
+
+This option applies to the three control-plane services that Bort creates, not
+to existing services. Bort refuses a conflicting existing endpoint mode; review
+and update those services before retrying. DNSRR requires host-mode published
+ports, which Bort's shadow installer already uses. Bort migrates workloads as
+Docker Compose containers, not Swarm services. Other applications deployed as
+Swarm services can still require IPVS or direct task addressing; see
+[Dokploy's networking guide](https://docs.dokploy.com/docs/core/troubleshooting/networking).
+
 ## Keep one workspace and one identity
 
 Bort stores the current run, Dokploy credentials, your answers, plans, and live
