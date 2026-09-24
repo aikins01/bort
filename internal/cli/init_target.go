@@ -685,6 +685,28 @@ ADDR_POOL="${ADDR_POOL:-auto}"
 VERSION_TAG="${DOKPLOY_VERSION:-latest}"
 ACME_EMAIL="${ACME_EMAIL:-admin@dokploy.local}"
 TRAEFIK_IMAGE="${DOKPLOY_TRAEFIK_IMAGE:-traefik:v3.6.7}"
+ENDPOINT_MODE="${ENDPOINT_MODE:-vip}"
+
+validate_endpoint_mode() {
+    case "$1" in
+        vip)
+            if grep -Eq '^(# CONFIG_IP_VS is not set|CONFIG_IP_VS=n)$' <<<"$2"; then
+                echo "Docker Swarm VIP mode requires kernel IPVS support; use ENDPOINT_MODE=dnsrr for Dokploy's control-plane services or a kernel with IPVS support" >&2
+                return 1
+            fi
+            ;;
+        dnsrr) ;;
+        *) echo "ENDPOINT_MODE must be vip or dnsrr" >&2; return 1 ;;
+    esac
+}
+
+kernel_config=""
+if [ -r /proc/config.gz ]; then
+    kernel_config="$(gzip -dc /proc/config.gz 2>/dev/null || true)"
+elif [ -r "/boot/config-$(uname -r)" ]; then
+    kernel_config="$(cat "/boot/config-$(uname -r)")"
+fi
+validate_endpoint_mode "$ENDPOINT_MODE" "$kernel_config"
 
 if ! [[ "$ACME_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
     echo "invalid ACME_EMAIL \"$ACME_EMAIL\"" >&2
@@ -713,6 +735,15 @@ if ! command -v python3 >/dev/null 2>&1; then
     echo "python3 is required before installing Dokploy" >&2
     exit 1
 fi
+
+for service in dokploy-postgres dokploy-redis dokploy; do
+    if mode="$(docker service inspect "$service" --format '{{.Spec.EndpointSpec.Mode}}' 2>/dev/null)"; then
+        if [ "$mode" != "$ENDPOINT_MODE" ]; then
+            echo "existing service $service uses endpoint mode $mode, not $ENDPOINT_MODE; review and update its endpoint mode before rerunning (existing services are not changed automatically)" >&2
+            exit 1
+        fi
+    fi
+done
 
 private_ip() {
     ip -o -4 addr show scope global 2>/dev/null | awk 'first == "" { split($4, a, "/"); first = a[1] } END { print first }'
@@ -900,6 +931,7 @@ log "Starting Dokploy Postgres"
 if ! docker service inspect dokploy-postgres >/dev/null 2>&1; then
     docker service create \
         --name dokploy-postgres \
+        --endpoint-mode "$ENDPOINT_MODE" \
         --detach=true \
         --constraint 'node.role==manager' \
         --network dokploy-network \
@@ -915,6 +947,7 @@ log "Starting Dokploy Redis"
 if ! docker service inspect dokploy-redis >/dev/null 2>&1; then
 	docker service create \
         --name dokploy-redis \
+        --endpoint-mode "$ENDPOINT_MODE" \
         --detach=true \
         --constraint 'node.role==manager' \
         --network dokploy-network \
@@ -932,6 +965,7 @@ log "Starting Dokploy UI/API on port ${HOST_PORT}"
 if ! docker service inspect dokploy >/dev/null 2>&1; then
     docker service create \
         --name dokploy \
+        --endpoint-mode "$ENDPOINT_MODE" \
         --detach=true \
         --replicas 1 \
         --network dokploy-network \
