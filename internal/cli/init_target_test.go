@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -660,6 +661,110 @@ func TestDokployShadowInstallScriptIsHardened(t *testing.T) {
 		if !strings.Contains(dokployShadowInstallScript, want) {
 			t.Fatalf("install script missing hardened fragment %q", want)
 		}
+	}
+}
+
+func TestDokployShadowEndpointMode(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is unavailable")
+	}
+	start := strings.Index(dokployShadowInstallScript, "validate_endpoint_mode() {")
+	end := strings.Index(dokployShadowInstallScript, "\nkernel_config=")
+	if start < 0 || end < start {
+		t.Fatal("missing endpoint validation function")
+	}
+	for _, tc := range []struct {
+		mode, config, wantError string
+	}{
+		{"vip", "CONFIG_IP_VS=y", ""},
+		{"vip", "CONFIG_IP_VS=m", ""},
+		{"vip", "", ""},
+		{"vip", "# CONFIG_IP_VS is not set", "requires kernel IPVS"},
+		{"vip", "CONFIG_IP_VS=n", "requires kernel IPVS"},
+		{"dnsrr", "# CONFIG_IP_VS is not set", ""},
+		{"dnsrr", "CONFIG_IP_VS=y", ""},
+		{"invalid", "CONFIG_IP_VS=y", "must be vip or dnsrr"},
+	} {
+		t.Run(tc.mode+"/"+tc.config, func(t *testing.T) {
+			cmd := exec.Command(bash, "-c", dokployShadowInstallScript[start:end]+"\nvalidate_endpoint_mode \"$1\" \"$2\"", "test", tc.mode, tc.config)
+			out, err := cmd.CombinedOutput()
+			if tc.wantError == "" {
+				if err != nil {
+					t.Fatalf("validation failed: %v: %s", err, out)
+				}
+			} else if err == nil || !strings.Contains(string(out), tc.wantError) {
+				t.Fatalf("wanted %q, got %v: %s", tc.wantError, err, out)
+			}
+		})
+	}
+	for _, service := range []string{"dokploy-postgres", "dokploy-redis", "dokploy"} {
+		want := "--name " + service + " \\\n        --endpoint-mode \"$ENDPOINT_MODE\""
+		if !strings.Contains(dokployShadowInstallScript, want) {
+			t.Errorf("%s must use the selected endpoint mode", service)
+		}
+	}
+	if !strings.Contains(dokployShadowInstallScript, `--publish published="$HOST_PORT",target=3000,mode=host`) {
+		t.Fatal("DNSRR requires host-mode publication")
+	}
+}
+
+func TestDokployShadowEndpointPreflight(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is unavailable")
+	}
+	configStart := strings.Index(dokployShadowInstallScript, "\nkernel_config=")
+	configEnd := strings.Index(dokployShadowInstallScript, "\nvalidate_endpoint_mode \"")
+	end := strings.Index(dokployShadowInstallScript, "\nprivate_ip() {")
+	if configStart < 0 || configEnd < configStart || end < configEnd {
+		t.Fatal("missing endpoint preflight boundaries")
+	}
+	preflight := dokployShadowInstallScript[:configStart] + "\nkernel_config=\"$2\"" + dokployShadowInstallScript[configEnd:end]
+	stub := `
+ENDPOINT_MODE="$1"
+ACME_EMAIL=admin@dokploy.local
+id() { echo 0; }
+python3() { return 0; }
+docker() {
+    if [ "$1 $2" != "service inspect" ]; then
+        echo unexpected-docker-command
+        return 1
+    fi
+    case "$3" in
+        dokploy-postgres) mode="$POSTGRES_MODE" ;;
+        dokploy-redis) mode="$REDIS_MODE" ;;
+        dokploy) mode="$DOKPLOY_MODE" ;;
+        *) return 1 ;;
+    esac
+    [ "$mode" != absent ] || return 1
+    printf '%s\n' "$mode"
+}
+POSTGRES_MODE="$3"
+REDIS_MODE="$4"
+DOKPLOY_MODE="$5"
+`
+	for _, tc := range []struct {
+		name, mode, config, postgres, redis, dokploy, wantError string
+	}{
+		{"matching", "dnsrr", "", "dnsrr", "dnsrr", "dnsrr", ""},
+		{"absent", "dnsrr", "", "absent", "absent", "absent", ""},
+		{"first conflict", "dnsrr", "", "vip", "dnsrr", "dnsrr", "existing service dokploy-postgres uses endpoint mode vip"},
+		{"later conflict", "dnsrr", "", "dnsrr", "vip", "dnsrr", "existing service dokploy-redis uses endpoint mode vip"},
+		{"last conflict", "dnsrr", "", "dnsrr", "dnsrr", "vip", "existing service dokploy uses endpoint mode vip"},
+		{"disabled VIP", "vip", "# CONFIG_IP_VS is not set", "absent", "absent", "absent", "requires kernel IPVS"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(bash, "-c", stub+preflight+"\necho preflight-complete", "test", tc.mode, tc.config, tc.postgres, tc.redis, tc.dokploy)
+			out, err := cmd.CombinedOutput()
+			if tc.wantError == "" {
+				if err != nil || !strings.Contains(string(out), "preflight-complete") {
+					t.Fatalf("preflight did not continue: %v: %s", err, out)
+				}
+			} else if err == nil || !strings.Contains(string(out), tc.wantError) || strings.Contains(string(out), "preflight-complete") {
+				t.Fatalf("wanted refusal %q before continuation, got %v: %s", tc.wantError, err, out)
+			}
+		})
 	}
 }
 
