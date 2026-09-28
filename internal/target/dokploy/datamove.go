@@ -804,7 +804,7 @@ func (c *Client) applyRestoreDataStore(ctx context.Context, actx *applyContext, 
 
 	runner := c.dockerRunner()
 	if appStateIsStaged(actx.plan, step.App) {
-		return c.restoreDataStoreToStaging(ctx, runner, actx, step, store)
+		return c.restoreDataStoreToStaging(ctx, runner, actx, app, step, store)
 	}
 	dst, err := c.targetContainerForService(ctx, runner, actx, step.App, store.Service)
 	if err != nil {
@@ -818,46 +818,155 @@ func (c *Client) applyRestoreDataStore(ctx context.Context, actx *applyContext, 
 	return recordMigratedStoreMounts(actx, step.App, app, store.Service, dst)
 }
 
+// requireStagedRestoreLayout refuses layouts the reviewed plan itself
+// rules out; callers run it before stagingRestoreProject so those
+// refusals stay distinguishable from the repairable Dokploy settings
+// that stagingRestoreProject also reports as ErrNotImplemented.
+func requireStagedRestoreLayout(plan Plan, step Step, store preparer.DataStoreResource) ([]stagedVolume, error) {
+	staged := stagedVolumesForService(plan, step.App, store.Service)
+	if len(staged) == 0 {
+		return nil, fmt.Errorf("%w: data store %s for app %s has no named volume to stage", ErrNotImplemented, step.Ref, step.App)
+	}
+	composeFile, err := readComposeFile(plan, step.App)
+	if err != nil {
+		return nil, err
+	}
+	return staged, requireLiteralMountTargets(composeFile, step.App, store.Service)
+}
+
+func (c *Client) stagingRestoreProject(ctx context.Context, actx *applyContext, step Step, store preparer.DataStoreResource, staged []stagedVolume) (stagingProject, error) {
+	entry := actx.entry(step.App)
+	if strings.TrimSpace(entry.ComposeAppName) == "" {
+		return stagingProject{}, fmt.Errorf("missing compose app name for app %s; create_service must run first", step.App)
+	}
+	if actx.stagingEnvFormat == stagingEnvFormatUnresolved {
+		return stagingProject{}, fmt.Errorf("Dokploy .env format was not resolved before staging %s for app %s", store.Service, step.App)
+	}
+	if err := c.requireStagingCompatibleCompose(ctx, entry.ComposeID, step.App); err != nil {
+		return stagingProject{}, err
+	}
+	composeFile, err := c.composeFileForApply(ctx, actx, step.App)
+	if err != nil {
+		return stagingProject{}, err
+	}
+	stagingCompose, err := stagingComposeFile(composeFile, store.Service, staged)
+	if err != nil {
+		return stagingProject{}, err
+	}
+	envContent, err := readEnvContent(actx.plan, step.App)
+	if err != nil {
+		return stagingProject{}, err
+	}
+	return writeStagingProject(actx.plan, step.App, store.Service, stagingCompose, stagingEnvFileContent(entry.ComposeAppName, envContent, actx.stagingEnvFormat))
+}
+
+// preflightStagedRestores creates (without starting) each staged data
+// store container while the source still runs, so a PGDATA or mount
+// layout that only compose interpolation or the image decides is refused
+// before pause_source stops the source.
+func (c *Client) preflightStagedRestores(ctx context.Context, actx *applyContext, appName string) error {
+	if !appStateIsStaged(actx.plan, appName) {
+		return nil
+	}
+	app, ok := findPrepareApp(actx.plan.Prepare, appName)
+	if !ok {
+		return nil
+	}
+	runner := c.dockerRunner()
+	for _, step := range actx.plan.Steps {
+		if step.Kind != StepRestoreDataStore || step.App != appName || shouldSkipApplyStep(actx.plan, step) {
+			continue
+		}
+		store, ok := findPrepareDataStore(app, step.Ref)
+		if !ok || dataStoreMigrationKind(store) != dataStoreMigrationLogical {
+			continue
+		}
+		if err := c.preflightStagedRestore(ctx, runner, actx, app, step, store); err != nil {
+			return fmt.Errorf("staged restore preflight of %s for app %s failed, so pause_source did not stop the source: %w", store.Service, appName, err)
+		}
+	}
+	return nil
+}
+
+// stagedRestorePreflightError marks a refusal whose layout comes from the
+// plan itself, so no retry of this run can pass pause_source.
+type stagedRestorePreflightError struct {
+	err            error
+	requiresNewRun bool
+}
+
+func (e stagedRestorePreflightError) Error() string { return e.err.Error() }
+
+func (e stagedRestorePreflightError) Unwrap() error { return e.err }
+
+func stagedRestoreLayoutRefusal(err error, app string) error {
+	if !errors.Is(err, ErrNotImplemented) {
+		return err
+	}
+	return stagedRestorePreflightError{
+		err:            fmt.Errorf("%w; no retry of this run can pass pause_source for app %s because its reviewed plan is immutable: follow the recovery `bort status` shows to release this run, then choose a recreate or managed data store strategy or change the source compose and create a new run", err, app),
+		requiresNewRun: true,
+	}
+}
+
+func (c *Client) preflightStagedRestore(ctx context.Context, runner dockerRunner, actx *applyContext, app preparer.AppPlan, step Step, store preparer.DataStoreResource) error {
+	staged, err := requireStagedRestoreLayout(actx.plan, step, store)
+	if err != nil {
+		return stagedRestoreLayoutRefusal(err, step.App)
+	}
+	project, err := c.stagingRestoreProject(ctx, actx, step, store, staged)
+	if err != nil {
+		return err
+	}
+	if err := project.down(runner); err != nil {
+		return err
+	}
+	for _, volume := range staged {
+		if err := ensureStagingVolume(ctx, runner, actx.plan, step.App, volume); err != nil {
+			return err
+		}
+	}
+	checkErr := func() error {
+		if err := runner.Run(ctx, nil, nil, project.args("create", "--no-build", store.Service)...); err != nil {
+			return fmt.Errorf("create staging data store %s: %w", store.Service, err)
+		}
+		dst, err := project.serviceContainer(ctx, runner, store.Service)
+		if err != nil {
+			return err
+		}
+		if err := requireStagedPostgresDataDir(dst, staged); err != nil {
+			return fmt.Errorf("%w: %v", ErrNotImplemented, err)
+		}
+		return requireSourceMountsStageDataDir(app, store.Service, postgresDataDir(dst), staged)
+	}()
+	checkErr = stagedRestoreLayoutRefusal(checkErr, step.App)
+	if downErr := project.down(runner); downErr != nil {
+		if checkErr != nil {
+			return fmt.Errorf("%w (also failed to stop staging project: %v)", checkErr, downErr)
+		}
+		return downErr
+	}
+	return checkErr
+}
+
 // restoreDataStoreToStaging runs the data store service alone under a
 // Bort-owned compose project with only its staging volumes and read-only
 // init-script mounts, restores the dump into it, and stops it again. the
 // volumes are recreated first so a retry never restores on top of a
 // partial earlier attempt.
-func (c *Client) restoreDataStoreToStaging(ctx context.Context, runner dockerRunner, actx *applyContext, step Step, store preparer.DataStoreResource) error {
-	staged := stagedVolumesForService(actx.plan, step.App, store.Service)
-	if len(staged) == 0 {
-		return fmt.Errorf("data store %s for app %s has no named volume to stage", step.Ref, step.App)
+func (c *Client) restoreDataStoreToStaging(ctx context.Context, runner dockerRunner, actx *applyContext, app preparer.AppPlan, step Step, store preparer.DataStoreResource) error {
+	staged, err := requireStagedRestoreLayout(actx.plan, step, store)
+	if err != nil {
+		return err
 	}
-	entry := actx.entry(step.App)
-	if strings.TrimSpace(entry.ComposeAppName) == "" {
-		return fmt.Errorf("missing compose app name for app %s; create_service must run first", step.App)
-	}
-	if actx.stagingEnvFormat == stagingEnvFormatUnresolved {
-		return fmt.Errorf("Dokploy .env format was not resolved before staging %s for app %s", store.Service, step.App)
-	}
-	if err := c.requireStagingCompatibleCompose(ctx, entry.ComposeID, step.App); err != nil {
+	project, err := c.stagingRestoreProject(ctx, actx, step, store, staged)
+	if err != nil {
 		return err
 	}
 	for _, volume := range staged {
 		if err := actx.forgetMigratedVolumeMount(step.App, volume.Service, volume.Target); err != nil {
 			return err
 		}
-	}
-	composeFile, err := c.composeFileForApply(ctx, actx, step.App)
-	if err != nil {
-		return err
-	}
-	stagingCompose, err := stagingComposeFile(composeFile, store.Service, staged)
-	if err != nil {
-		return err
-	}
-	envContent, err := readEnvContent(actx.plan, step.App)
-	if err != nil {
-		return err
-	}
-	project, err := writeStagingProject(actx.plan, step.App, store.Service, stagingCompose, stagingEnvFileContent(entry.ComposeAppName, envContent, actx.stagingEnvFormat))
-	if err != nil {
-		return err
 	}
 	if err := project.down(runner); err != nil {
 		return err
@@ -879,6 +988,9 @@ func (c *Client) restoreDataStoreToStaging(ctx context.Context, runner dockerRun
 			return err
 		}
 		if err := requireStagedPostgresDataDir(dst, staged); err != nil {
+			return err
+		}
+		if err := requireSourceMountsStageDataDir(app, store.Service, postgresDataDir(dst), staged); err != nil {
 			return err
 		}
 		return pgRestoreIntoContainer(ctx, runner, actx.plan, step, dst)

@@ -414,7 +414,7 @@ func copyNamedVolume(ctx context.Context, runner dockerRunner, src, dst string) 
 		"-v", dst + ":/to",
 		volumeCopyImage,
 		"sh", "-c",
-		"set -o pipefail; rm -rf /to/* /to/.[!.]* /to/..?* 2>/dev/null; cd /from && tar cpf - . | tar xpf - -C /to && find /to \\( -type f -o -type d \\) -print0 | xargs -0 fsync",
+		"set -o pipefail; find /to -mindepth 1 -delete && cd /from && tar cpf - . | tar xpf - -C /to && find /to \\( -type f -o -type d \\) -print0 | xargs -0 fsync",
 	}
 	return runner.Run(ctx, nil, nil, args...)
 }

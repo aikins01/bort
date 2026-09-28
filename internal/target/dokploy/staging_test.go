@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -571,8 +573,8 @@ func TestSyncVolumeToStagingRefusesCopyWhoseFlushFails(t *testing.T) {
 		t.Fatalf("expected one copy attempt, got %#v", runner.runs)
 	}
 	script := runner.runs[0].Args[len(runner.runs[0].Args)-1]
-	if !strings.HasPrefix(script, "set -o pipefail;") || !strings.Contains(script, "tar xpf - -C /to && find /to") || !strings.HasSuffix(script, "-print0 | xargs -0 fsync") {
-		t.Fatalf("copy must fsync every file and directory under /to and propagate any batch failure before succeeding, got %q", script)
+	if !strings.HasPrefix(script, "set -o pipefail; find /to -mindepth 1 -delete && ") || !strings.Contains(script, "tar xpf - -C /to && find /to") || !strings.HasSuffix(script, "-print0 | xargs -0 fsync") {
+		t.Fatalf("copy must clear /to without shell globbing, fsync every file and directory under /to, and propagate any batch failure before succeeding, got %q", script)
 	}
 	if _, ok := actx.entry("api").MigratedVolumeMounts[migratedMountKey("web", "/data")]; ok {
 		t.Fatalf("an unflushed copy must not be recorded as transferred: %#v", actx.entry("api").MigratedVolumeMounts)
@@ -1032,11 +1034,30 @@ func TestStagingOwnershipUsesRunIDOverRunName(t *testing.T) {
 func TestRestoreDataStoreToStagingRefusesUnstagedDataDir(t *testing.T) {
 	plan, step, staged := stagedRestoreFixture(t)
 	project := stagingProjectName(plan, "api", "db")
-	for name, inspect := range map[string]string{
-		"bind at PGDATA":    `"Config":{"Env":["POSTGRES_USER=bob","POSTGRES_DB=app","PGDATA=/srv/pg"]},"Mounts":[{"Type":"bind","Source":"/host/pg","Destination":"/srv/pg","RW":true},{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/var/lib/postgresql/data","RW":true}]`,
-		"nothing at PGDATA": `"Config":{"Env":["POSTGRES_USER=bob","POSTGRES_DB=app"]},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/backups","RW":true}]`,
+	for name, tc := range map[string]struct {
+		inspect string
+		volumes []preparer.VolumeResource
+		want    string
+	}{
+		"bind at PGDATA": {
+			inspect: `"Config":{"Env":["POSTGRES_USER=bob","POSTGRES_DB=app","PGDATA=/srv/pg"]},"Mounts":[{"Type":"bind","Source":"/host/pg","Destination":"/srv/pg","RW":true},{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/var/lib/postgresql/data","RW":true}]`,
+			want:    "not a staged volume",
+		},
+		"nothing at PGDATA": {
+			inspect: `"Config":{"Env":["POSTGRES_USER=bob","POSTGRES_DB=app"]},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/backups","RW":true}]`,
+			want:    "not mounted from a staged volume",
+		},
+		"source bind inside image PGDATA": {
+			inspect: `"Config":{"Env":["POSTGRES_USER=bob","POSTGRES_DB=app"]},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/var/lib/postgresql/data","RW":true}]`,
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "bind", Source: "/srv/wal", Target: "/var/lib/postgresql/data/pg_wal", ReadWrite: true}},
+			want:    "sits inside postgres data directory",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
+			plan := plan
+			plan.Prepare.Apps = []preparer.AppPlan{plan.Prepare.Apps[0]}
+			plan.Prepare.Apps[0].Resources.Volumes = append(append([]preparer.VolumeResource{}, plan.Prepare.Apps[0].Resources.Volumes...), tc.volumes...)
+			inspect := tc.inspect
 			runner := &fakeDockerRunner{
 				outputs: map[string][]byte{
 					"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
@@ -1050,8 +1071,8 @@ func TestRestoreDataStoreToStagingRefusesUnstagedDataDir(t *testing.T) {
 			actx := &applyContext{cache: map[string]*appCache{}, plan: plan, stagingEnvFormat: stagingEnvFormatKeepInterpolation}
 			actx.entry("api").ComposeAppName = "stack-1"
 			err := client.applyRestoreDataStore(context.Background(), actx, step)
-			if err == nil || !strings.Contains(err.Error(), "not a staged volume") && !strings.Contains(err.Error(), "not mounted from a staged volume") {
-				t.Fatalf("expected data dir refusal, got %v", err)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected data dir refusal mentioning %q, got %v", tc.want, err)
 			}
 			for _, run := range runner.runs {
 				if strings.Contains(strings.Join(run.Args, " "), "pg_restore") {
@@ -1170,5 +1191,434 @@ func TestValidatePlanReadyForLiveApplyRefusesSourceVolumeSharedAcrossApps(t *tes
 	plan.Prepare.Apps[1].Resources.Volumes[0].Name = "src-worker"
 	if err := validatePlanReadyForLiveApply(plan); err != nil {
 		t.Fatalf("distinct source volumes were refused: %v", err)
+	}
+}
+
+func TestValidatePlannedPostgresDataDirsRefusesUnstagedLayoutsBeforeLiveApply(t *testing.T) {
+	for name, tc := range map[string]struct {
+		compose string
+		volumes []preparer.VolumeResource
+		env     string
+		want    string
+	}{
+		"bind mount data dir": {
+			compose: "services:\n  db:\n    image: postgres:16\n    volumes:\n      - ./pg:/var/lib/postgresql/data\nvolumes: {}\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "bind", Source: "/srv/pg", Target: "/var/lib/postgresql/data"}},
+			want:    "mounts no named volume",
+		},
+		"no data dir mount": {
+			compose: "services:\n  db:\n    image: postgres:16\n",
+			want:    "mounts no named volume",
+		},
+		"bind data dir beside unrelated named volume": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /pg/data\n    volumes:\n      - backups:/backups\n      - ./pg:/pg/data\nvolumes:\n  backups:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-backups", Target: "/backups"}, {Service: "db", Type: "bind", Source: "/srv/pg", Target: "/pg/data"}},
+			want:    "bind \"/srv/pg\" at /pg/data",
+		},
+		"null PGDATA defers to preflight": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: null\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}},
+		},
+		"list-form PGDATA beside named volume": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      - PGDATA=/pg/data\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}},
+			want:    "/pg/data",
+		},
+		"bind inside PGDATA": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /var/lib/postgresql/data\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ./wal:/var/lib/postgresql/data/pg_wal\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}, {Service: "db", Type: "bind", Source: "/srv/wal", Target: "/var/lib/postgresql/data/pg_wal", ReadWrite: true}},
+			want:    "bind \"/srv/wal\" at /var/lib/postgresql/data/pg_wal",
+		},
+		"read-only config file inside PGDATA": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /var/lib/postgresql/data\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ./pg_hba.conf:/var/lib/postgresql/data/pg_hba.conf:ro\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}, {Service: "db", Type: "bind", Source: "/srv/pg_hba.conf", Target: "/var/lib/postgresql/data/pg_hba.conf"}},
+		},
+		"writable config file inside PGDATA": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /var/lib/postgresql/data\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ./postgresql.conf:/var/lib/postgresql/data/postgresql.conf\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}, {Service: "db", Type: "bind", Source: "/srv/postgresql.conf", Target: "/var/lib/postgresql/data/postgresql.conf", ReadWrite: true}},
+			want:    "bind \"/srv/postgresql.conf\" at /var/lib/postgresql/data/postgresql.conf",
+		},
+		"named volume inside PGDATA": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /var/lib/postgresql/data\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - wal:/var/lib/postgresql/data/pg_wal\nvolumes:\n  pgdata:\n  wal:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}, {Service: "db", Type: "volume", Name: "src-wal", Target: "/var/lib/postgresql/data/pg_wal"}},
+		},
+		"named volume beside custom PGDATA": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /pg/data\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}},
+			want:    "/pg/data",
+		},
+		"custom PGDATA from env file": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      - PGDATA=${PG_DIR}\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}},
+			env:     "PG_DIR=/pg/data\n",
+		},
+		"interpolated PGDATA that cleans to a literal": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: ${PGROOT}/../data\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}},
+			env:     "PGROOT=/var/lib/postgresql/child\n",
+		},
+		"interpolated bind target": {
+			compose: "services:\n  db:\n    image: postgres:16\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ./other:${BIND_TARGET}\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}, {Service: "db", Type: "bind", Source: "/srv/other", Target: "/backups"}},
+			env:     "BIND_TARGET=/backups\n",
+			want:    "\"${BIND_TARGET}\" at an interpolated path",
+		},
+		"interpolated long-form bind target": {
+			compose: "services:\n  db:\n    image: postgres:16\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - type: bind\n        source: ./other\n        target: $BIND_TARGET\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}, {Service: "db", Type: "bind", Source: "/srv/other", Target: "/backups"}},
+			env:     "BIND_TARGET=/backups\n",
+			want:    "\"$BIND_TARGET\" at an interpolated path",
+		},
+		"interpolated bind source with literal target": {
+			compose: "services:\n  db:\n    image: postgres:16\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ${BACKUP_DIR}:/backups\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}, {Service: "db", Type: "bind", Source: "/srv/other", Target: "/backups"}},
+			env:     "BACKUP_DIR=/srv/other\n",
+		},
+		"defaulted bind source with interpolated target": {
+			compose: "services:\n  db:\n    image: postgres:16\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ${BACKUP_DIR:-./backups}:${BACKUP_TARGET}\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}, {Service: "db", Type: "bind", Source: "/srv/other", Target: "/backups"}},
+			env:     "BACKUP_TARGET=/backups\n",
+			want:    "at an interpolated path",
+		},
+		"defaulted bind source with literal target": {
+			compose: "services:\n  db:\n    image: postgres:16\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ${BACKUP_DIR:-$PWD/backups}:/backups\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}, {Service: "db", Type: "bind", Source: "/srv/other", Target: "/backups"}},
+		},
+		"custom PGDATA under named volume": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /var/lib/postgresql/data/pgdata\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}},
+		},
+		"bind mount shadows named volume": {
+			compose: "services:\n  db:\n    image: postgres:16\n    volumes:\n      - pgdata:/var/lib/postgresql\n      - ./pg:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pg", Target: "/var/lib/postgresql"}, {Service: "db", Type: "bind", Source: "/srv/pg", Target: "/var/lib/postgresql/data"}},
+		},
+		"custom PGDATA through merge key": {
+			compose: "x-pg: &pg\n  image: postgres:16\n  environment:\n    PGDATA: /pg/data\nservices:\n  db:\n    <<: *pg\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}},
+			want:    "/pg/data",
+		},
+		"custom PGDATA through aliased environment": {
+			compose: "x-env: &env\n  PGDATA: /pg/data\nservices:\n  db:\n    image: postgres:16\n    environment: *env\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}},
+			want:    "/pg/data",
+		},
+		"custom PGDATA through default env_file": {
+			compose: "services:\n  db:\n    image: postgres:16\n    env_file: .env\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}},
+			env:     "PGDATA=/pg/data\n",
+		},
+		"environment wins over env_file": {
+			compose: "services:\n  db:\n    image: postgres:16\n    env_file: .env\n    environment:\n      PGDATA: /var/lib/postgresql/data/pgdata\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}},
+			env:     "PGDATA=/pg/data\n",
+		},
+		"trailing slash on named volume target": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /var/lib/postgresql/data\n    volumes:\n      - pgdata:/var/lib/postgresql/data/\nvolumes:\n  pgdata:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data/"}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			plan, _, _ := stagedRestoreFixture(t)
+			composePath := filepath.Clean(filepath.Join(plan.Prepare.BundleDir, "api", "compose.yaml"))
+			plan.BundleFiles[composePath] = []byte(tc.compose)
+			if tc.env != "" {
+				plan.BundleFiles[filepath.Clean(filepath.Join(plan.Prepare.BundleDir, "api", ".env"))] = []byte(tc.env)
+			}
+			plan.Prepare.Apps[0].Resources.Volumes = tc.volumes
+			if err := validatePlanReadyForLiveApply(plan); err != nil {
+				t.Fatalf("the planned data dir gate must not block Apply of a started run: %v", err)
+			}
+			err := ValidatePlannedPostgresDataDirs(plan)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("unexpected refusal: %v", err)
+				}
+				return
+			}
+			if err == nil || !errors.Is(err, ErrNotImplemented) || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "before live apply") {
+				t.Fatalf("expected data dir refusal mentioning %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestPauseSourcePreflightsStagedRestoreOnCreatedContainer(t *testing.T) {
+	for name, tc := range map[string]struct {
+		env     string
+		volumes []preparer.VolumeResource
+		want    string
+	}{
+		"image PGDATA outside staged volume": {env: `"PGDATA=/pg/data"`, want: "/pg/data"},
+		"source bind nested under staged volume": {
+			env:     `"PGDATA=/var/lib/postgresql/data/pgdata"`,
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "bind", Source: "/srv/pg", Target: "/var/lib/postgresql/data/pgdata", ReadWrite: true}},
+			want:    "bind \"/srv/pg\" at /var/lib/postgresql/data/pgdata",
+		},
+		"data dir on staged volume": {env: `"POSTGRES_USER=bob"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			plan, _, staged := stagedRestoreFixture(t)
+			plan.Prepare.Apps[0].Resources.Volumes = append(append(plan.Prepare.Apps[0].Resources.Volumes, tc.volumes...), preparer.VolumeResource{Service: "web", Type: "volume", SourceContainerID: "web-id"})
+			project := stagingProjectName(plan, "api", "db")
+			runner := &fakeDockerRunner{
+				outputs: map[string][]byte{
+					"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
+					"compose -p " + project:           []byte("stg-id\n"),
+					"inspect --type container stg-id": []byte(`[{"Id":"stg-id","Name":"/` + project + `-db-1","Config":{"Env":[` + tc.env + `]},"State":{"Running":false,"Status":"created"},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/var/lib/postgresql/data","RW":true}]}]`),
+					"inspect --type container web-id": []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+					"stop web-id":                     []byte("web-id\n"),
+				},
+			}
+			client := stagingCompatibleClient(t, runner, true, "")
+			actx := &applyContext{cache: map[string]*appCache{}, plan: plan, stagingEnvFormat: stagingEnvFormatKeepInterpolation}
+			actx.entry("api").ComposeAppName = "stack-1"
+
+			err := client.preflightStagedRestores(context.Background(), actx, "api")
+			if err == nil {
+				err = client.applyStep(context.Background(), actx, Step{Kind: StepPauseSource, App: "api"})
+			}
+
+			stageDir := filepath.Join(plan.RunDir, "stage", "api", "db")
+			prefix := "compose -p " + project + " --env-file " + filepath.Join(stageDir, ".env") + " -f " + filepath.Join(stageDir, "compose.yaml") + " "
+			var composeRuns []string
+			for _, run := range runner.runs {
+				joined := strings.Join(run.Args, " ")
+				if run.Args[0] != "compose" {
+					continue
+				}
+				if !strings.HasPrefix(joined, prefix) {
+					t.Fatalf("compose must target the Bort staging project with its env file, got %v", run.Args)
+				}
+				composeRuns = append(composeRuns, strings.TrimPrefix(joined, prefix))
+			}
+			wantCompose := []string{"down --remove-orphans", "create --no-build db", "down --remove-orphans"}
+			if strings.Join(composeRuns, "|") != strings.Join(wantCompose, "|") {
+				t.Fatalf("compose lifecycle mismatch\n got: %v\nwant: %v", composeRuns, wantCompose)
+			}
+			if fakeOutputCalled(runner, "volume", "rm", "-f", staged.VolumeName) {
+				t.Fatalf("preflight must not recreate the staging volume, calls=%v", runner.outputArgs)
+			}
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("applyStep(pause_source): %v", err)
+				}
+				if !fakeOutputCalled(runner, "stop", "web-id") {
+					t.Fatalf("pause must stop the source after a clean preflight, calls=%v", runner.outputArgs)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "did not stop the source") || !strings.Contains(err.Error(), "create a new run") {
+				t.Fatalf("expected preflight refusal mentioning %q, got %v", tc.want, err)
+			}
+			var refusal stagedRestorePreflightError
+			if !errors.As(err, &refusal) || !refusal.requiresNewRun {
+				t.Fatalf("a layout refusal must require a new run, got %v", err)
+			}
+			if fakeOutputCalled(runner, "stop", "web-id") {
+				t.Fatalf("preflight refusal must not stop the source, calls=%v", runner.outputArgs)
+			}
+			if actx.entry("api").SourcePauseRecorded {
+				t.Fatalf("preflight refusal must not record a source pause: %#v", actx.entry("api"))
+			}
+		})
+	}
+}
+
+type failingCreateRunner struct {
+	*fakeDockerRunner
+}
+
+func (r *failingCreateRunner) Run(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {
+	if err := r.fakeDockerRunner.Run(ctx, stdin, stdout, args...); err != nil {
+		return err
+	}
+	if slices.Contains(args, "create") {
+		return errors.New("image pull failed")
+	}
+	return nil
+}
+
+func TestPauseSourcePreflightStopsStagingProjectAfterFailedCreate(t *testing.T) {
+	plan, _, staged := stagedRestoreFixture(t)
+	plan.Prepare.Apps[0].Resources.Volumes = append(plan.Prepare.Apps[0].Resources.Volumes, preparer.VolumeResource{Service: "web", Type: "volume", SourceContainerID: "web-id"})
+	runner := &failingCreateRunner{fakeDockerRunner: &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
+		},
+	}}
+	client := stagingCompatibleClient(t, runner, true, "")
+	actx := &applyContext{cache: map[string]*appCache{}, plan: plan, stagingEnvFormat: stagingEnvFormatKeepInterpolation}
+	actx.entry("api").ComposeAppName = "stack-1"
+
+	err := client.preflightStagedRestores(context.Background(), actx, "api")
+	if err == nil || !strings.Contains(err.Error(), "image pull failed") || !strings.Contains(err.Error(), "did not stop the source") {
+		t.Fatalf("expected create failure to abort the pause, got %v", err)
+	}
+	var refusal stagedRestorePreflightError
+	if errors.As(err, &refusal) {
+		t.Fatalf("a transient create failure must stay retryable, got %v", err)
+	}
+	var composeRuns []string
+	for _, run := range runner.runs {
+		if run.Args[0] == "compose" {
+			composeRuns = append(composeRuns, strings.Join(run.Args[len(run.Args)-2:], " "))
+		}
+	}
+	if last := composeRuns[len(composeRuns)-1]; last != "down --remove-orphans" || len(composeRuns) != 3 {
+		t.Fatalf("a failed create must still stop the staging project, got %v", composeRuns)
+	}
+	if fakeOutputCalled(runner.fakeDockerRunner, "stop", "web-id") {
+		t.Fatalf("create failure must not stop the source, calls=%v", runner.outputArgs)
+	}
+}
+
+func TestApplyPreflightRefusalSkipsSourceResumeWhenNothingWasPaused(t *testing.T) {
+	for name, tc := range map[string]applyPreflightRefusalCase{
+		"layout refusal":             {want: "/pg/data", requiresNewRun: true},
+		"transient create failure":   {transient: true, want: "image pull failed"},
+		"repairable Dokploy setting": {composeCommand: "docker compose up -d", want: "clear it in Dokploy and resume"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			testApplyPreflightRefusal(t, tc)
+		})
+	}
+}
+
+func TestApplyPreflightRefusalResumesEarlierPartialPause(t *testing.T) {
+	for name, tc := range map[string]applyPreflightRefusalCase{
+		"resume succeeds": {want: "/pg/data", requiresNewRun: true, earlierPartialPause: true},
+		"resume fails":    {want: "/pg/data", requiresNewRun: true, earlierPartialPause: true, resumeFails: true},
+		"no named volume": {want: "has no named volume to stage", requiresNewRun: true, earlierPartialPause: true, plan: func(plan *Plan) {
+			plan.Prepare.Apps[0].Resources.Volumes[0].Type = "bind"
+		}},
+		"interpolated mount target outside the data dir": {want: "\"${WAL_TARGET:-/backups}\" at an interpolated path", requiresNewRun: true, earlierPartialPause: true, plan: func(plan *Plan) {
+			app := &plan.Prepare.Apps[0]
+			app.Resources.Volumes = append(app.Resources.Volumes, preparer.VolumeResource{Service: "db", Type: "bind", Source: "/srv/wal", Target: "/backups", ReadWrite: true})
+			for path, contents := range plan.BundleFiles {
+				if filepath.Base(path) == "compose.yaml" {
+					plan.BundleFiles[path] = []byte(strings.Replace(string(contents), "      - pgdata:/var/lib/postgresql/data\n", "      - pgdata:/var/lib/postgresql/data\n      - /srv/wal:${WAL_TARGET:-/backups}\n", 1))
+				}
+			}
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			testApplyPreflightRefusal(t, tc)
+		})
+	}
+}
+
+type applyPreflightRefusalCase struct {
+	transient           bool
+	want                string
+	requiresNewRun      bool
+	earlierPartialPause bool
+	resumeFails         bool
+	composeCommand      string
+	plan                func(*Plan)
+}
+
+func testApplyPreflightRefusal(t *testing.T, tc applyPreflightRefusalCase) {
+	t.Helper()
+	transient, want, requiresNewRun := tc.transient, tc.want, tc.requiresNewRun
+	plan, _, staged := stagedRestoreFixture(t)
+	plan.Steps = append([]Step{{Kind: StepCreateProject, App: "api"}, {Kind: StepCreateService, App: "api"}}, plan.Steps...)
+	plan.ResumeFrom = 2
+	plan.TargetIdentities = map[string]TargetIdentity{"api": {ProjectID: "proj-1", EnvironmentID: "env-1", ComposeID: "comp-1", ComposeAppName: "stack-1"}}
+	plan.Prepare.Apps[0].Resources.Volumes = append(plan.Prepare.Apps[0].Resources.Volumes, preparer.VolumeResource{Service: "web", Type: "volume", SourceContainerID: "web-id"})
+	if tc.plan != nil {
+		tc.plan(&plan)
+	}
+	project := stagingProjectName(plan, "api", "db")
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
+			"compose -p " + project:           []byte("stg-id\n"),
+			"inspect --type container stg-id": []byte(`[{"Id":"stg-id","Name":"/` + project + `-db-1","Config":{"Env":["PGDATA=/pg/data"]},"State":{"Running":false,"Status":"created"},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/var/lib/postgresql/data","RW":true}]}]`),
+			"inspect --type container web-id": []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+		},
+	}
+	if tc.earlierPartialPause {
+		runner.outputs["inspect --type container web-id"] = []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":false,"Status":"exited"}}]`)
+		runner.outputs["start web-id"] = []byte("web-id\n")
+		if tc.resumeFails {
+			runner.outputErrs = map[string]error{"start web-id": errors.New("daemon unreachable")}
+		}
+		paused := &applyContext{plan: plan, cache: map[string]*appCache{}}
+		paused.entry("api").SourcePauseRecorded = true
+		paused.entry("api").SourcePausedContainers = []sourcePausedContainer{{ID: "web-id", Stopped: true}}
+		if err := paused.persistSourcePauseState(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	createEnvFile := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-api-key") != "secret" {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/settings.getDokployVersion":
+			_, _ = w.Write([]byte(`"v0.31.0"`))
+		case "/api/project.one":
+			_ = json.NewEncoder(w).Encode(Project{ProjectID: "proj-1", Environments: []ProjectEnvironment{{EnvironmentID: "env-1", Name: "production"}}})
+		case "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: r.URL.Query().Get("composeId"), AppName: "stack-1", EnvironmentID: "env-1", CreateEnvFile: &createEnvFile, Command: tc.composeCommand})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	var progress []StepProgress
+	onProgress := func(p StepProgress) { progress = append(progress, p) }
+	plan.OnProgress = &onProgress
+	var docker dockerRunner = runner
+	if transient {
+		docker = &failingCreateRunner{fakeDockerRunner: runner}
+	}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: docker}
+
+	err := client.Apply(context.Background(), plan)
+	if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "did not stop the source") {
+		t.Fatalf("expected preflight refusal, got %v", err)
+	}
+	if errors.As(err, new(stagedRestorePreflightError)) != requiresNewRun {
+		t.Fatalf("preflight error classified as layout refusal = %v, want %v: %v", !requiresNewRun, requiresNewRun, err)
+	}
+	if strings.Contains(err.Error(), "resume source app") != tc.resumeFails || strings.Contains(err.Error(), "was not durably recorded") {
+		t.Fatalf("resume failure reported = %v, want %v: %v", strings.Contains(err.Error(), "resume source app"), tc.resumeFails, err)
+	}
+	var first, last *StepProgress
+	resumed := false
+	for i, p := range progress {
+		if p.Step.Kind == StepResumeSource {
+			if !tc.earlierPartialPause {
+				t.Fatalf("unexpected resume progress after a preflight refusal: %#v", progress)
+			}
+			resumed = resumed || p.Status == StepStatusOK
+		}
+		if p.Index != 2 || p.Status == StepStatusStarted {
+			continue
+		}
+		if first == nil {
+			first = &progress[i]
+		}
+		last = &progress[i]
+	}
+	if first == nil || first.Step.Kind != StepPauseSource || first.Status != StepStatusError || first.RequiresNewRun != (requiresNewRun && !tc.earlierPartialPause) {
+		t.Fatalf("the refusal must not claim a new run while owned source containers may still be stopped, got %#v", first)
+	}
+	if tc.resumeFails {
+		if last == nil || last.Step.Kind != StepResumeSource || last.Status != StepStatusError || last.RequiresNewRun {
+			t.Fatalf("a failed cleanup resume must stay the last record at the pause index so status keeps retrying the resume, got %#v", last)
+		}
+	} else if last == nil || last.Step.Kind != StepPauseSource || last.Status != StepStatusError || last.RequiresNewRun != requiresNewRun {
+		t.Fatalf("the last record at the pause index must be the refusal (ledgers keep one record per index), got %#v", last)
+	}
+	if fakeOutputCalled(runner, "stop", "web-id") {
+		t.Fatalf("preflight refusal must not stop the source, calls=%v", runner.outputArgs)
+	}
+	wantResumed := tc.earlierPartialPause && !tc.resumeFails
+	if fakeOutputCalled(runner, "start", "web-id") != tc.earlierPartialPause || resumed != wantResumed {
+		t.Fatalf("source restart after refusal = %v (resume progress %v), want %v/%v: calls=%v", fakeOutputCalled(runner, "start", "web-id"), resumed, tc.earlierPartialPause, wantResumed, runner.outputArgs)
 	}
 }

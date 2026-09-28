@@ -246,14 +246,11 @@ const defaultPostgresDataDir = "/var/lib/postgresql/data"
 // directory is not backed by one of the staged volumes: the restore
 // would land in the container layer and vanish with it.
 func requireStagedPostgresDataDir(container dockerContainer, staged []stagedVolume) error {
-	dataDir := strings.TrimSpace(envMap(container.Config.Env)["PGDATA"])
-	if dataDir == "" {
-		dataDir = defaultPostgresDataDir
-	}
+	dataDir := postgresDataDir(container)
 	var mount dockerMount
 	found := false
 	for _, candidate := range container.Mounts {
-		if candidate.Destination != dataDir && !strings.HasPrefix(dataDir, strings.TrimSuffix(candidate.Destination, "/")+"/") {
+		if !mountCoversPath(candidate.Destination, dataDir) {
 			continue
 		}
 		if !found || len(candidate.Destination) > len(mount.Destination) {
@@ -269,6 +266,182 @@ func requireStagedPostgresDataDir(container dockerContainer, staged []stagedVolu
 		}
 	}
 	return fmt.Errorf("postgres data directory %s is mounted from %s %q, not a staged volume; the restore would be lost when the staging container stops", dataDir, mount.Type, firstNonEmpty(mount.Name, mount.Source))
+}
+
+// requirePlannedPostgresDataDirStaged refuses at plan time only the
+// layouts requireStagedPostgresDataDir is certain to refuse after
+// pause_source: a service with nothing to stage, or a literal PGDATA that
+// no scanned named volume covers. Interpolated or image-provided PGDATA
+// and image VOLUMEs are only known to the created staging container, so
+// preflightStagedRestores checks those before the source is paused.
+// The mount check reads the source container's mount list, so a mount
+// target that compose interpolates could land elsewhere on the target and
+// is refused outright.
+func requirePlannedPostgresDataDirStaged(composeFile, stagingCompose string, app preparer.AppPlan, service string, staged []stagedVolume) error {
+	if len(staged) == 0 {
+		return fmt.Errorf("%w: data store service %s for app %s mounts no named volume, so its restore would be lost when the staging container stops; choose a recreate or managed data store strategy or change the source compose before live apply", ErrNotImplemented, service, app.Name)
+	}
+	if err := requireLiteralMountTargets(composeFile, app.Name, service); err != nil {
+		return fmt.Errorf("%w; choose a recreate or managed data store strategy or change the source compose before live apply", err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(stagingCompose), &doc); err != nil {
+		return err
+	}
+	root, err := composeRoot(&doc)
+	if err != nil {
+		return err
+	}
+	raw := strings.TrimSpace(composeServiceEnvValue(mappingValue(mappingValue(root, "services"), service), "PGDATA"))
+	if raw == "" || strings.Contains(raw, "$") {
+		return nil
+	}
+	if err := requireSourceMountsStageDataDir(app, service, path.Clean(raw), staged); err != nil {
+		return fmt.Errorf("%w; choose a recreate or managed data store strategy or change the source compose before live apply", err)
+	}
+	return nil
+}
+
+func requireLiteralMountTargets(composeFile, appName, service string) error {
+	if target, ok := composeServiceInterpolatedMountTarget(composeFile, service); ok {
+		return fmt.Errorf("%w: data store service %s for app %s mounts %q at an interpolated path, so the postgres data directory cannot be checked", ErrNotImplemented, service, appName, target)
+	}
+	return nil
+}
+
+func composeServiceInterpolatedMountTarget(composeFile, service string) (string, bool) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(composeFile), &doc); err != nil {
+		return "", false
+	}
+	root, err := composeRoot(&doc)
+	if err != nil {
+		return "", false
+	}
+	entry := mappingValue(mappingValue(root, "services"), service)
+	if entry == nil {
+		return "", false
+	}
+	if entry, err = selfContainedNode(entry, map[*yaml.Node]bool{}); err != nil {
+		return "", false
+	}
+	volumes := mappingValue(entry, "volumes")
+	if volumes == nil || volumes.Kind != yaml.SequenceNode {
+		return "", false
+	}
+	for _, item := range volumes.Content {
+		var target string
+		switch item.Kind {
+		case yaml.ScalarNode:
+			fields := splitComposeVolumeShortSyntax(item.Value)
+			target = fields[0]
+			if len(fields) > 1 {
+				target = fields[1]
+			}
+		case yaml.MappingNode:
+			if dest := mappingValue(item, "target"); dest != nil {
+				target = dest.Value
+			}
+		}
+		if strings.Contains(target, "$") {
+			return strings.TrimSpace(target), true
+		}
+	}
+	return "", false
+}
+
+// splitComposeVolumeShortSyntax splits SOURCE:TARGET[:MODE] on colons that
+// are not inside a ${...} reference, where ${VAR:-default} keeps its colon.
+func splitComposeVolumeShortSyntax(value string) []string {
+	fields := []string{}
+	depth, start := 0, 0
+	for i := 0; i < len(value); i++ {
+		switch {
+		case value[i] == '$' && i+1 < len(value) && value[i+1] == '{':
+			depth++
+			i++
+		case value[i] == '}' && depth > 0:
+			depth--
+		case value[i] == ':' && depth == 0:
+			fields = append(fields, value[start:i])
+			start = i + 1
+		}
+	}
+	return append(fields, value[start:])
+}
+
+// requireSourceMountsStageDataDir checks the source service's own mount
+// list, which the deployed compose keeps verbatim: a bind at, above, or
+// inside the data directory would shadow the restored data once Dokploy
+// starts the service, even though the staging container never mounts it.
+func requireSourceMountsStageDataDir(app preparer.AppPlan, service, dataDir string, staged []stagedVolume) error {
+	var mount preparer.VolumeResource
+	found := false
+	for _, candidate := range app.Resources.Volumes {
+		if candidate.Service != service {
+			continue
+		}
+		if mountCoversPath(candidate.Target, dataDir) {
+			if !found || len(path.Clean(candidate.Target)) > len(path.Clean(mount.Target)) {
+				mount, found = candidate, true
+			}
+			continue
+		}
+		if mountCoversPath(dataDir, candidate.Target) && candidate.ReadWrite && !stagedVolumeMount(candidate, staged) {
+			return fmt.Errorf("%w: %s %q at %s for service %s in app %s sits inside postgres data directory %s and would shadow the restored data once Dokploy starts the service", ErrNotImplemented, candidate.Type, firstNonEmpty(candidate.Name, candidate.Source), candidate.Target, service, app.Name, dataDir)
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: postgres data directory %s for service %s in app %s is not mounted from a named volume, so the restore would be lost when the staging container stops", ErrNotImplemented, dataDir, service, app.Name)
+	}
+	if stagedVolumeMount(mount, staged) {
+		return nil
+	}
+	return fmt.Errorf("%w: postgres data directory %s for service %s in app %s is mounted from %s %q at %s, not a named volume, so the restore would be lost when the staging container stops", ErrNotImplemented, dataDir, service, app.Name, mount.Type, firstNonEmpty(mount.Name, mount.Source), mount.Target)
+}
+
+func stagedVolumeMount(mount preparer.VolumeResource, staged []stagedVolume) bool {
+	if mount.Type != "volume" {
+		return false
+	}
+	for _, volume := range staged {
+		if path.Clean(volume.Target) == path.Clean(mount.Target) {
+			return true
+		}
+	}
+	return false
+}
+
+func postgresDataDir(container dockerContainer) string {
+	if dataDir := strings.TrimSpace(envMap(container.Config.Env)["PGDATA"]); dataDir != "" {
+		return path.Clean(dataDir)
+	}
+	return defaultPostgresDataDir
+}
+
+func mountCoversPath(destination, target string) bool {
+	destination, target = path.Clean(destination), path.Clean(target)
+	return destination == target || strings.HasPrefix(target, strings.TrimSuffix(destination, "/")+"/")
+}
+
+func composeServiceEnvValue(service *yaml.Node, key string) string {
+	environment := mappingValue(service, "environment")
+	if environment == nil {
+		return ""
+	}
+	switch environment.Kind {
+	case yaml.MappingNode:
+		if value := mappingValue(environment, key); value != nil && value.Kind == yaml.ScalarNode && value.Tag != "!!null" {
+			return value.Value
+		}
+	case yaml.SequenceNode:
+		for _, item := range environment.Content {
+			if name, value, ok := strings.Cut(item.Value, "="); ok && item.Kind == yaml.ScalarNode && strings.TrimSpace(name) == key {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func requireSourceQuiescent(containers []dockerContainer) error {

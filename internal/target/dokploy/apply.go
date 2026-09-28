@@ -80,6 +80,7 @@ type StepProgress struct {
 	Message           string
 	Err               error
 	MutationAmbiguous bool
+	RequiresNewRun    bool
 	Target            *TargetIdentity
 }
 
@@ -449,6 +450,39 @@ func ValidateStagedTransfer(plan Plan) error {
 			bySourceName[name] = stagedSourceVolume{app: app.Name, volume: volume}
 		}
 	}
+	return eachPlannedStagedRestore(plan, func(restore plannedStagedRestore) error {
+		envContent, err := readEnvContent(plan, restore.app.Name)
+		if err != nil {
+			return err
+		}
+		if stagingComposeProjectNamePattern.MatchString(restore.stagingCompose) || stagingComposeProjectNamePattern.MatchString(envContent) {
+			return fmt.Errorf("%w: data store service %s for app %s interpolates COMPOSE_PROJECT_NAME, which resolves to the Bort staging project instead of the Dokploy app; choose a recreate or managed data store strategy or change the source compose before live apply", ErrNotImplemented, restore.store.Service, restore.app.Name)
+		}
+		return nil
+	})
+}
+
+// ValidatePlannedPostgresDataDirs refuses, before a run starts live
+// execution, staged Postgres restores whose planned layout cannot keep the
+// data directory on a staged volume. A run that already has apply history
+// must not be gated here: its pause_source preflight checks the created
+// staging container and can restart any source it owns, whereas a
+// refusal before Apply would leave that source stopped.
+func ValidatePlannedPostgresDataDirs(plan Plan) error {
+	return eachPlannedStagedRestore(plan, func(restore plannedStagedRestore) error {
+		return requirePlannedPostgresDataDirStaged(restore.composeFile, restore.stagingCompose, restore.app, restore.store.Service, restore.stagedVolumes)
+	})
+}
+
+type plannedStagedRestore struct {
+	app            preparer.AppPlan
+	store          preparer.DataStoreResource
+	composeFile    string
+	stagingCompose string
+	stagedVolumes  []stagedVolume
+}
+
+func eachPlannedStagedRestore(plan Plan, visit func(plannedStagedRestore) error) error {
 	for _, step := range plan.Steps {
 		if step.Kind != StepRestoreDataStore || shouldSkipApplyStep(plan, step) || !appStateIsStaged(plan, step.App) {
 			continue
@@ -465,16 +499,13 @@ func ValidateStagedTransfer(plan Plan) error {
 		if err != nil {
 			return err
 		}
-		staged, err := stagingComposeFile(composeFile, store.Service, stagedVolumesForService(plan, step.App, store.Service))
+		stagedVolumes := stagedVolumesForService(plan, step.App, store.Service)
+		staged, err := stagingComposeFile(composeFile, store.Service, stagedVolumes)
 		if err != nil {
 			return fmt.Errorf("data store service %s for app %s cannot be staged, so choose a recreate or managed data store strategy or change the source compose before live apply: %w", store.Service, step.App, err)
 		}
-		envContent, err := readEnvContent(plan, step.App)
-		if err != nil {
+		if err := visit(plannedStagedRestore{app: app, store: store, composeFile: composeFile, stagingCompose: staged, stagedVolumes: stagedVolumes}); err != nil {
 			return err
-		}
-		if stagingComposeProjectNamePattern.MatchString(staged) || stagingComposeProjectNamePattern.MatchString(envContent) {
-			return fmt.Errorf("%w: data store service %s for app %s interpolates COMPOSE_PROJECT_NAME, which resolves to the Bort staging project instead of the Dokploy app; choose a recreate or managed data store strategy or change the source compose before live apply", ErrNotImplemented, store.Service, step.App)
 		}
 	}
 	return nil
@@ -775,22 +806,33 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 			emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusSkipped})
 			continue
 		}
-		// mark eagerly: a partial pause that stops some containers and
-		// then errors must still be cleaned up by bestEffortResume.
-		// resume is stateless and only starts what is currently stopped,
-		// so marking before the step is safe.
-		if step.Kind == StepPauseSource {
-			pausedApps[step.App] = false
-		}
-		if step.Kind == StepStopCoolifyProxy {
-			coolifyProxyStopped = true
-		}
 		stepCtx := ctx
 		var cancel context.CancelFunc
 		if plan.stepTimeout > 0 {
 			stepCtx, cancel = context.WithTimeout(ctx, plan.stepTimeout)
 		}
-		err := c.requireTransferredSourceStillPaused(stepCtx, actx, step, pausedApps, handedOff)
+		var err error
+		if step.Kind == StepPauseSource {
+			// an earlier attempt may have stopped some source containers
+			// before failing; a preflight refusal must still restart them.
+			if actx.entry(step.App).SourcePauseRecorded {
+				pausedApps[step.App] = false
+			}
+			err = c.preflightStagedRestores(stepCtx, actx, step.App)
+		}
+		if err == nil {
+			// mark eagerly: a partial pause that stops some containers and
+			// then errors must still be cleaned up by bestEffortResume.
+			// resume is stateless and only starts what is currently stopped,
+			// so marking before the step is safe.
+			if step.Kind == StepPauseSource {
+				pausedApps[step.App] = false
+			}
+			if step.Kind == StepStopCoolifyProxy {
+				coolifyProxyStopped = true
+			}
+			err = c.requireTransferredSourceStillPaused(stepCtx, actx, step, pausedApps, handedOff)
+		}
 		if err == nil {
 			err = c.applyStep(stepCtx, actx, step)
 		}
@@ -798,13 +840,25 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 			cancel()
 		}
 		if err != nil {
-			emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: step, Status: StepStatusError, Err: err, MutationAmbiguous: mutationResponseMayHaveSucceeded(err)})
+			var preflight stagedRestorePreflightError
+			requiresNewRun := errors.As(err, &preflight) && preflight.requiresNewRun
+			_, sourceOwned := pausedApps[step.App]
+			// a refusal may only claim the run is releasable once any source
+			// containers Bort owns for this app are running again, and the
+			// cleanup resume reports at this same index, so the claim is
+			// recorded after a successful resume.
+			refused := StepProgress{Index: index, Total: total, Step: step, Status: StepStatusError, Err: err, MutationAmbiguous: mutationResponseMayHaveSucceeded(err), RequiresNewRun: requiresNewRun && !sourceOwned}
+			emitProgress(plan.OnProgress, refused)
 			resumePausedApps := pausedApps
 			if isUnsafeSourceResumeError(err) {
 				resumePausedApps = nil
 			}
 			stepErr := fmt.Errorf("dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
 			cleanupErr := c.bestEffortResume(ctx, actx, plan, total, resumePausedApps, coolifyProxyStopped, isUnsafeTargetResumeError(err))
+			if requiresNewRun && sourceOwned && cleanupErr == nil {
+				refused.RequiresNewRun = true
+				emitProgress(plan.OnProgress, refused)
+			}
 			return errors.Join(stepErr, cleanupErr)
 		}
 		pausedApps.observeCompleted(step, handedOff)
