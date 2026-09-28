@@ -442,7 +442,17 @@ func validateLiveApplyReady(run loadedMigrationRun) error {
 }
 
 func stagedTransferRefusal(run loadedMigrationRun) error {
-	return dokploy.ValidateStagedTransfer(livePlanForApplied(run, run.Applied))
+	return stagedTransferRefusalForPlan(livePlanForApplied(run, run.Applied), run.Applied)
+}
+
+func stagedTransferRefusalForPlan(plan dokploy.Plan, applied runApplied) error {
+	if err := dokploy.ValidateStagedTransfer(plan); err != nil {
+		return err
+	}
+	if appliedHasHistory(applied) {
+		return nil
+	}
+	return dokploy.ValidatePlannedPostgresDataDirs(plan)
 }
 
 // validateStatefulLiveApply refuses to continue a stateful run recorded
@@ -826,7 +836,7 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 	}
 	plan.BundleFiles = bundleFiles
 	plan.ApprovedPrepareDecisions = approvedPrepareDecisions(run)
-	if err := dokploy.ValidateStagedTransfer(plan); err != nil {
+	if err := stagedTransferRefusalForPlan(plan, run.Applied); err != nil {
 		return fmt.Errorf("live apply refused before binding run %q to a Dokploy target: %w", run.Run.Name, err)
 	}
 	ledger, err := newAppliedLedger(appliedPath, run.Run)
@@ -2512,6 +2522,26 @@ func nextSafeStepContextWithSourceProbe(ctx context.Context, run loadedMigration
 			Reason: err.Error(),
 		}
 	}
+	if step, otherMoved, ok := appliedNewRunRefusal(run.Applied); ok {
+		if blocked, ok := sourceBlocker(); ok {
+			return blocked
+		}
+		if otherMoved {
+			reason := fmt.Sprintf("no retry of this run can pass pause_source for app %s, and an earlier app's source may already be paused or handed off: %s", step.App, step.Error)
+			action := "inspect and preserve both source and target data, restore the earlier apps' source writers and traffic manually"
+			if authorityRecoveryAvailable(run) {
+				action += fmt.Sprintf(", run `%s` to release host ownership", authorityRecoveryCommand(run, dokployTrafficSource))
+			}
+			return runNextStep{
+				Action: action + ", then create a fresh migration run (target authority is unavailable because app " + step.App + " has no target copy)",
+				Reason: reason,
+			}
+		}
+		return runNextStep{
+			Action: fmt.Sprintf("the source is still running and no state was transferred: delete or reconcile the Dokploy resources this run created, run `%s` to release host ownership, then choose `%s` or change the source compose, and scan a new run", authorityRecoveryCommand(run, dokployTrafficSource), bortCommand("data <app> <store> --recreate|--managed")),
+			Reason: step.Error,
+		}
+	}
 	if len(run.Applied.Steps) > 0 {
 		if blocked, ok := sourceBlocker(); ok {
 			return blocked
@@ -2607,6 +2637,9 @@ func unsupportedPlatformNextStep(run loadedMigrationRun) runNextStep {
 	case "plan-blocked":
 		action = "choose a data store strategy and re-plan, or change the source compose and scan a new run, on the Linux source host"
 		reason = "live apply would refuse the planned state transfer"
+	case "new-run-required":
+		action = "recover this run's authority on the Linux source host, then choose a data store strategy or change the source compose and create a new run"
+		reason = "live apply refused the planned state transfer, and this run cannot be re-planned"
 	case "partial", "applying":
 		action = "inspect the durable apply ledger, then resume on the Linux source host"
 		reason = "live apply has incomplete work"
@@ -2615,6 +2648,41 @@ func unsupportedPlatformNextStep(run loadedMigrationRun) runNextStep {
 		reason = "the run is not ready for live apply"
 	}
 	return runNextStep{Action: action, Reason: reason}
+}
+
+// appliedNewRunRefusal reports a pause_source refusal that no retry can
+// pass, and whether the ledger leaves another source paused or any state
+// or traffic moved: the run can only be released when it did neither.
+func appliedNewRunRefusal(applied runApplied) (refused appliedStep, otherMoved bool, found bool) {
+	pausedApps := map[string]struct{}{}
+	for _, step := range applied.Steps {
+		if step.RequiresNewRun && step.Status == string(dokploy.StepStatusError) {
+			refused, found = step, true
+			continue
+		}
+		if !appliedStepMayHaveRun(step) {
+			continue
+		}
+		switch dokploy.StepKind(step.Kind) {
+		case dokploy.StepPauseSource:
+			pausedApps[step.App] = struct{}{}
+		case dokploy.StepResumeSource:
+			if appliedStepCompleted(step) {
+				delete(pausedApps, step.App)
+			} else {
+				otherMoved = true
+			}
+		case dokploy.StepDumpDataStore, dokploy.StepRestoreDataStore, dokploy.StepSyncVolume,
+			dokploy.StepResumeTarget, dokploy.StepInstallGateway, dokploy.StepActivateRoutes, dokploy.StepStopCoolifyProxy, dokploy.StepStartDokployProxy:
+			otherMoved = true
+		}
+	}
+	return refused, otherMoved || len(pausedApps) > 0, found
+}
+
+func appliedRequiresNewRun(applied runApplied) bool {
+	_, _, ok := appliedNewRunRefusal(applied)
+	return ok
 }
 
 func authorityRecoveryNextStep(run loadedMigrationRun, reason string) runNextStep {

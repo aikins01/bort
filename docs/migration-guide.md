@@ -690,7 +690,11 @@ apps, or a compose file that cannot be staged). When the blocked volume belongs
 to a data store, choose `bort data <app> <store> --recreate` or `--managed`,
 then re-plan with `bort migrate --run <run>`. Otherwise change the source
 compose and scan a new run. Bort checks this before binding the run to a
-Dokploy target, so the run stays editable.
+Dokploy target, so the run stays editable. `NEW RUN REQUIRED` means live apply
+refused this run at `pause_source` (for example a Postgres data directory that
+only the created staged container revealed to be off its named volume) and the
+run cannot be re-planned; follow the recovery `bort status` shows, then create
+a new run.
 
 Use the guided screen for secret values so they are not placed in command
 arguments, shell history, or process and sudo audit records. The direct command
@@ -790,6 +794,37 @@ stores. The restore waits for the final server to accept connections on
 `127.0.0.1` inside the container, so the entrypoint's socket-only init server,
 which runs those scripts, never receives the dump. A custom `listen_addresses`
 must include that address; the official image's `*` default already does.
+
+A Postgres store's data directory (`PGDATA`; the official image defaults to
+`/var/lib/postgresql/data` through Postgres 17 and to
+`/var/lib/postgresql/<major>/docker` from 18, where the named volume normally
+mounts at `/var/lib/postgresql`) must sit on a named volume that the service
+mounts, with no writable bind mount inside it; otherwise the restore
+would be lost when the staged container stops, or shadowed by the mount once
+Dokploy starts the service. When the store service mounts no named volume,
+sets `PGDATA` in its compose `environment` to a literal path that breaks this
+rule, or interpolates a mount target, Bort refuses before live apply starts
+(`PLAN BLOCKED`): choose `bort data <app> <store> --recreate` or `--managed`
+and re-plan with `bort migrate --run <run>`, or change the source compose and
+scan a new run. When the image or interpolation decides `PGDATA`, or the run had already started live
+execution before Bort learned to check the layout, Bort creates the staged
+container without starting it right before `pause_source` and refuses then
+(`NEW RUN REQUIRED`). That app's source keeps running and none of
+its state was transferred, but the run has already started live execution and
+cannot be re-planned. (A run that had already completed that app's
+`pause_source` resumes past the check and refuses at the restore step instead;
+Bort restarts that app's source during cleanup and `bort status` offers to
+resume, and that resume stops at `pause_source` with the refusal described
+here.) When no other app's source was paused or handed off, delete or
+reconcile the Dokploy resources the run created, run the exact
+`recover-authority --authority source` command `bort status` shows to release
+host ownership, then choose a strategy or change the source compose and create
+a new run. When an earlier app's source may already be paused or handed off,
+`bort status` shows the manual path instead: inspect and preserve both sides,
+restore the earlier apps' source writers and traffic manually, release host
+ownership with the `recover-authority --authority source` command it shows,
+then create a new run; target authority is unavailable because the refused
+app has no target copy.
 
 Runs whose plan was created by an older Bort version copied state into an
 already deployed target. Live apply refuses those runs (`MANUAL STATE`). If
@@ -975,6 +1010,7 @@ Ordinary cleanup and destructive source purge are separate operations. See the
 | A staged state transfer fails (source restarted, foreign-owned volume, attached staging volume) | That app's target was not deployed. Fix the reported cause and rerun `sudo bort migrate --live`; the transfer restarts from the beginning for that volume or database. |
 | A stateful plan needs a bind-mount copy | Bort refuses before pausing the source. Re-plan with `bort migrate --run <run>`; current plans keep same-host bind mounts at their existing paths, and the run stays editable because nothing live has started. |
 | A named volume is mounted by more than one compose service | Bort refuses before changing Dokploy or pausing the source. For a data store volume, choose `bort data <app> <store> --recreate` or `--managed` and re-plan with `bort migrate --run <run>`; otherwise change the source compose so one service mounts the volume and scan a new run. |
+| A Postgres data directory is not on a named volume the service mounts, or a writable bind mount sits inside it | When the service mounts no named volume, sets `PGDATA` in its compose `environment` to a literal path that breaks this rule, or interpolates a mount target, Bort refuses before live apply (`PLAN BLOCKED`): choose `bort data <app> <store> --recreate` or `--managed` and re-plan with `bort migrate --run <run>`, or change the source compose and scan a new run. When the image or interpolation decides `PGDATA`, only the created staged container reveals the directory, so Bort refuses at `pause_source` (`NEW RUN REQUIRED`) with that app's source still running and none of its state transferred; the run cannot be re-planned. If no other app's source was paused or handed off, delete or reconcile the Dokploy resources the run created, run the exact `recover-authority --authority source` command `bort status` shows to release host ownership, then choose a strategy or change the source compose and create a new run; otherwise restore the earlier apps' source writers and traffic manually, release host ownership with the source-authority command `bort status` shows, then create a new run. |
 | A Dokploy target mutation (project or service creation, env upload, compose deploy, gateway install, route activation) was interrupted or ambiguous, or an older-plan ledger cannot prove writer authority after an in-place copy, restore, or handoff | Bort refuses automatic retry and rollback because Dokploy cannot durably fence the target. Inspect and preserve both sides. If the matching owner remains, establish authority manually and run the exact `recover-authority` command shown by `bort status`; otherwise complete recovery manually before starting a fresh run. |
 | A deployed target fails its migrated-volume check and Bort cannot stop its containers | Bort leaves the paused source stopped and refuses automatic retry, because target containers may still be writing to the transferred state. Stop the target containers yourself, then run the exact `recover-authority` command shown by `bort status`. |
 | Another change is running | Keep `status` open if useful and wait. A second live command joins an active live apply; other commands that make changes must wait. |

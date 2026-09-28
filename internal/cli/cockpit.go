@@ -179,6 +179,8 @@ func writeCockpitPhaseGuidance(w io.Writer, st *styler, run loadedMigrationRun, 
 		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Dokploy host ownership could not be verified: %s. %s.", summary.Next.Reason, summary.Next.Action)))
 	case "source-recovery":
 		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("A historical source pause needs cleanup. Run `%s` to restart the source without transferring state; automatic state migration remains unavailable.", liveApplyCommand(run))))
+	case "new-run-required":
+		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Live apply refused this run and no retry can pass it: %s. Next: %s.", summary.Next.Reason, summary.Next.Action)))
 	case "partial":
 		fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("Live apply is incomplete. Run `%s` to resume safely.", liveApplyCommand(run))))
 	case "manual-state":
@@ -246,6 +248,8 @@ func writeUnsupportedPlatformGuidance(w io.Writer, st *styler, run loadedMigrati
 		state = "Another migration run owns shared Dokploy host mutations."
 	case "source-recovery":
 		state = "A historical source pause still needs cleanup before this run can be retired."
+	case "new-run-required":
+		state = "Live apply refused the planned state transfer; this run cannot be re-planned and must be unwound before a new run."
 	case "partial":
 		state = "Live apply is incomplete and must be resumed from its durable ledger."
 	case "manual-state":
@@ -368,6 +372,8 @@ func migrationRunPhaseWithNext(run loadedMigrationRun, next runNextStep) string 
 		return "source-recovery"
 	case validateStatefulLiveApply(run) != nil:
 		return "manual-state"
+	case appliedRequiresNewRun(run.Applied):
+		return "new-run-required"
 	case len(run.Applied.Steps) > 0:
 		return "partial"
 	case stagedTransferRefusal(run) != nil:
@@ -415,6 +421,8 @@ func migrationRunPhaseLabel(phase string) string {
 		return "PLAN BLOCKED"
 	case "source-recovery":
 		return "SOURCE RECOVERY"
+	case "new-run-required":
+		return "NEW RUN REQUIRED"
 	default:
 		return strings.ToUpper(phase)
 	}
@@ -424,7 +432,7 @@ func severityForMigrationRunPhase(phase string) severity {
 	switch phase {
 	case "ready", "applied", "committed", "purged":
 		return sevGood
-	case "partial", "lock-error", "host-lock-error", "host-owner-error", "install-recovery", "host-busy", "host-owned", "authority-ambiguous", "authority-ambiguous-rollback", "authority-finalizing", "source-attestation-error":
+	case "partial", "new-run-required", "lock-error", "host-lock-error", "host-owner-error", "install-recovery", "host-busy", "host-owned", "authority-ambiguous", "authority-ambiguous-rollback", "authority-finalizing", "source-attestation-error":
 		return sevBad
 	default:
 		return sevWarn

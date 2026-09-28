@@ -49,6 +49,7 @@ type appliedStep struct {
 	UpdatedAt         time.Time `json:"updatedAt"`
 	Error             string    `json:"error,omitempty"`
 	MutationAmbiguous *bool     `json:"mutationAmbiguous,omitempty"`
+	RequiresNewRun    bool      `json:"requiresNewRun,omitempty"`
 }
 
 type appliedApp struct {
@@ -148,6 +149,7 @@ func recordAppliedStep(applied runApplied, progress dokploy.StepProgress) runApp
 		step.Error = progress.Err.Error()
 		ambiguous := progress.MutationAmbiguous
 		step.MutationAmbiguous = &ambiguous
+		step.RequiresNewRun = progress.RequiresNewRun
 	}
 	if progress.Step.App != "" && progress.Target != nil {
 		if applied.Apps == nil {

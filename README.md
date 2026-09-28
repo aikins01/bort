@@ -152,6 +152,9 @@ guidance or create a new run. `PLAN BLOCKED` means live apply would refuse the
 planned state transfer (for example a bind mount or a named volume shared by
 two apps); choose `bort data <app> <store> --recreate` or `--managed` for a data
 store volume and re-plan, or change the source compose and scan a new run.
+`NEW RUN REQUIRED` means live apply refused this run at `pause_source` and the
+run cannot be re-planned; follow the recovery `bort status` shows, then create
+a new run.
 
 To start discovery directly without the setup questions:
 
@@ -269,6 +272,22 @@ Bort's safety model defaults to “look first.”
   Live apply refuses it before changing Dokploy; choose `bort data <app>
   <store> --recreate` or `--managed` for a data store volume and re-plan with
   `bort migrate --run <run>`, or change the source compose and scan a new run.
+- A migrated Postgres store must keep its data directory (`PGDATA`) on a named
+  volume the service mounts, with no writable bind mount inside it.
+  Live apply refuses other layouts before the source pauses (a run already
+  past that app's `pause_source` when this check was added refuses at the
+  restore step and restarts the source during cleanup). When the service
+  mounts no named volume, sets `PGDATA` in its compose `environment` to a
+  literal path that breaks this rule, or interpolates a mount target, Bort
+  refuses before live apply starts (`PLAN BLOCKED`): choose `bort data <app>
+  <store> --recreate` or `--managed` and re-plan with `bort migrate --run
+  <run>`, or change the source compose and scan a new run. When the image or
+  interpolation decides `PGDATA`, only the created staged container reveals
+  the directory, so the refusal comes at `pause_source` (`NEW RUN REQUIRED`) with
+  that app's source still running and none of its state transferred, and the
+  run cannot be re-planned: follow the recovery `bort status` shows (releasing
+  the run when no other app's source was paused or handed off), then choose a
+  strategy or change the source compose and create a new run.
 - Runs created by older Bort versions whose plan copied state into an already
   deployed target remain refused (`MANUAL STATE`). Dokploy v0.30.7 cannot
   durably prevent queued or future deployments from restarting a target writer

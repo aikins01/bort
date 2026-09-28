@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -1036,6 +1037,139 @@ func TestCockpitBlocksPlanLiveApplyWouldRefuse(t *testing.T) {
 	}
 	if next := nextSafeStep(run, nil); !strings.Contains(next.Action, "resume the interrupted apply") || strings.Contains(next.Action, "re-plan") {
 		t.Fatalf("partial run with a currently unstageable bundle lost its resume step: %#v", next)
+	}
+	run.Applied.Steps = append(run.Applied.Steps, appliedStep{Index: 1, Kind: string(dokploy.StepPauseSource), App: "api", Ref: "api", Status: string(dokploy.StepStatusError), Error: "staged restore preflight of db for app api failed, so pause_source did not stop the source", RequiresNewRun: true})
+	next = nextSafeStep(run, nil)
+	if strings.Contains(next.Action, "resume the interrupted apply") || !strings.Contains(next.Action, "recover-authority --authority source") || !strings.Contains(next.Action, "no state was transferred") || !strings.Contains(next.Reason, "did not stop the source") {
+		t.Fatalf("pause_source preflight refusal offered resume instead of releasing the run: %#v", next)
+	}
+	if phase := migrationRunPhase(run); phase != "new-run-required" {
+		t.Fatalf("pause_source preflight refusal phase = %q, want new-run-required", phase)
+	}
+	output.Reset()
+	writeAppFirstCockpit(&output, run)
+	if !strings.Contains(output.String(), "NEW RUN REQUIRED") || strings.Contains(output.String(), "migrate --live") || strings.Contains(output.String(), "resume") || !strings.Contains(output.String(), "recover-authority --authority source") {
+		t.Fatalf("pause_source preflight refusal cockpit still offered resume:\n%s", output.String())
+	}
+	refusal := run.Applied.Steps
+	refusedProgress := dokploy.StepProgress{Index: 1, Step: dokploy.Step{Kind: dokploy.StepPauseSource, App: "api", Ref: "api"}, Status: dokploy.StepStatusError, Err: errors.New("staged restore preflight of db for app api failed, so pause_source did not stop the source"), RequiresNewRun: true}
+	resumeProgress := dokploy.StepProgress{Index: 1, Step: dokploy.Step{Kind: dokploy.StepResumeSource, App: "api", Ref: "api"}}
+	replayed := runApplied{APIVersion: appliedAPIVersion, PlanVersion: appliedPlanCurrent, TargetOrigin: "http://127.0.0.1:3000"}
+	replayed = recordAppliedStep(replayed, dokploy.StepProgress{Index: 0, Step: dokploy.Step{Kind: dokploy.StepCreateProject, App: "api", Ref: "api"}, Status: dokploy.StepStatusOK})
+	replayed = recordAppliedStep(replayed, refusedProgress)
+	resumeProgress.Status = dokploy.StepStatusOK
+	replayed = recordAppliedStep(replayed, resumeProgress)
+	replayed = recordAppliedStep(replayed, refusedProgress)
+	run.Applied = replayed
+	if next := nextSafeStep(run, nil); !strings.Contains(next.Action, "no state was transferred") || !strings.Contains(next.Action, "recover-authority --authority source") {
+		t.Fatalf("refusal re-recorded after restoring an earlier partial pause did not release the run: %#v", next)
+	}
+	replayed = recordAppliedStep(replayed, refusedProgress)
+	resumeProgress.Status, resumeProgress.Err = dokploy.StepStatusError, errors.New("start source container web-id: timeout")
+	run.Applied = recordAppliedStep(replayed, resumeProgress)
+	if phase := migrationRunPhase(run); phase != "partial" {
+		t.Fatalf("failed cleanup resume after a refusal phase = %q, want partial so the retry restores the source", phase)
+	}
+	if next := nextSafeStep(run, nil); !strings.Contains(next.Action, "resume the interrupted apply") {
+		t.Fatalf("failed cleanup resume after a refusal must retry to restore the source: %#v", next)
+	}
+	run.Applied.Steps = append([]appliedStep{
+		{Index: 0, Kind: string(dokploy.StepPauseSource), App: "web", Ref: "web", Status: string(dokploy.StepStatusOK)},
+		{Index: 0, Kind: string(dokploy.StepResumeSource), App: "web", Ref: "web", Status: string(dokploy.StepStatusOK)},
+	}, refusal...)
+	if next := nextSafeStep(run, nil); !strings.Contains(next.Action, "no state was transferred") || !strings.Contains(next.Action, "recover-authority --authority source") {
+		t.Fatalf("refusal after another app's restored pause did not release the run: %#v", next)
+	}
+	run.Applied.Steps = append([]appliedStep{
+		{Index: 0, Kind: string(dokploy.StepPauseSource), App: "web", Ref: "web", Status: string(dokploy.StepStatusOK)},
+		{Index: 1, Kind: string(dokploy.StepPushImage), App: "web", Ref: "web", Status: string(dokploy.StepStatusOK)},
+	}, refusal...)
+	if phase := migrationRunPhase(run); phase != "new-run-required" {
+		t.Fatalf("refusal after another app's handoff phase = %q, want new-run-required", phase)
+	}
+	next = nextSafeStep(run, nil)
+	if strings.Contains(next.Action, "resume the interrupted apply") || strings.Contains(next.Action, "no state was transferred") || strings.Contains(next.Action, "--authority") || !strings.Contains(next.Action, "restore the earlier apps' source writers and traffic manually") || !strings.Contains(next.Action, "create a fresh migration run") {
+		t.Fatalf("refusal after another app's handoff released or resumed the run: %#v", next)
+	}
+	if !strings.Contains(next.Reason, "earlier app's source may already be paused or handed off") || !strings.Contains(next.Reason, "did not stop the source") {
+		t.Fatalf("refusal after another app's handoff lost its reason: %#v", next)
+	}
+	output.Reset()
+	writeAppFirstCockpit(&output, run)
+	if !strings.Contains(output.String(), "NEW RUN REQUIRED") || strings.Contains(output.String(), "migrate --live") || strings.Contains(output.String(), "resume") {
+		t.Fatalf("refusal after another app's handoff cockpit offered resume:\n%s", output.String())
+	}
+	resetDokployTrafficOwner(t)
+	if err := claimDokployHostOwnership(run.Run, "http://127.0.0.1:3000", "cred-1"); err != nil {
+		t.Fatal(err)
+	}
+	next = nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "--authority source") || strings.Contains(next.Action, "--authority target") || !strings.Contains(next.Action, "create a fresh migration run") {
+		t.Fatalf("refusal after another app's handoff with a claimed host must offer only source authority before a new run: %#v", next)
+	}
+	run.Applied.RecoveryProtocol = appliedRecoveryProtocol
+	for name, moved := range map[string][]dokploy.StepKind{
+		"staged restore": {dokploy.StepDumpDataStore, dokploy.StepRestoreDataStore},
+		"staged sync":    {dokploy.StepSyncVolume},
+	} {
+		earlier := []appliedStep{{Index: 0, Kind: string(dokploy.StepPauseSource), App: "web", Ref: "web", Status: string(dokploy.StepStatusOK)}}
+		for _, kind := range append(moved, dokploy.StepResumeSource, dokploy.StepPushImage) {
+			earlier = append(earlier, appliedStep{Index: len(earlier), Kind: string(kind), App: "web", Ref: "web", Status: string(dokploy.StepStatusOK)})
+		}
+		refusedAPI := refusal[len(refusal)-1]
+		refusedAPI.Index = len(earlier)
+		run.Applied.Steps = append(earlier, refusedAPI)
+		if phase := migrationRunPhase(run); phase != "new-run-required" {
+			t.Fatalf("refusal after another app's %s and resumed source phase = %q, want new-run-required", name, phase)
+		}
+		next = nextSafeStep(run, nil)
+		if strings.Contains(next.Action, "no state was transferred") || !strings.Contains(next.Action, "restore the earlier apps' source writers and traffic manually") || !strings.Contains(next.Action, "--authority source") || !strings.Contains(next.Reason, "earlier app's source may already be paused or handed off") {
+			t.Fatalf("refusal after another app's %s and resumed source released the run: %#v", name, next)
+		}
+	}
+}
+
+func TestStagedTransferRefusalGatesPlannedPostgresDataDirOnApplyHistory(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	compose := "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /pg/data\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n"
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte(compose), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := preparer.AppPlan{
+		Name:            "api",
+		Directory:       "api",
+		Resources:       preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab", ContainerName: "api"}}},
+		TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "api", ComposePath: "compose.yaml"}}},
+	}
+	app.Resources.DataStores = []preparer.DataStoreResource{{Kind: "postgres", Service: "db", Strategy: "migrate"}}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data", SourceContainerID: "0123456789ab", SourceContainerName: "api"}}
+	run := loadedMigrationRun{
+		Run: migrationRun{Name: "pgdata", RunDir: t.TempDir(), Target: "dokploy", Source: "docker"},
+		Prepare: preparer.Result{
+			Source:               "docker",
+			SourceDockerEngineID: "engine-reviewed",
+			BundleDir:            bundleDir,
+			Apps:                 []preparer.AppPlan{app},
+		},
+		Sync: syncplan.Result{Apps: []syncplan.AppPlan{{Name: "api", Steps: []syncplan.Step{{ResourceType: "data_store", ResourceRef: "data-store:db"}}}}},
+	}
+	err := stagedTransferRefusal(run)
+	if !errors.Is(err, dokploy.ErrNotImplemented) || !strings.Contains(err.Error(), "/pg/data") {
+		t.Fatalf("a run without apply history must be refused before binding for a literal PGDATA off the staged volume, got %v", err)
+	}
+	if phase := migrationRunPhase(run); phase != "plan-blocked" {
+		t.Fatalf("unstarted run with an unstaged PGDATA phase = %q, want plan-blocked", phase)
+	}
+	run.Applied = runApplied{APIVersion: appliedAPIVersion, PlanVersion: appliedPlanCurrent, TargetOrigin: "http://127.0.0.1:3000", Steps: []appliedStep{{Index: 0, Kind: string(dokploy.StepCreateProject), App: "api", Ref: "api", Status: string(dokploy.StepStatusOK)}}}
+	if err := stagedTransferRefusal(run); err != nil {
+		t.Fatalf("a run with apply history must reach Apply so its pause_source preflight can restart an owned source, got %v", err)
+	}
+	if phase := migrationRunPhase(run); phase != "partial" {
+		t.Fatalf("started run with an unstaged PGDATA phase = %q, want partial", phase)
 	}
 }
 
