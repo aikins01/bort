@@ -40,6 +40,10 @@ func OpenPrivateDirNoFollow(path string) (*PrivateDir, error) {
 	return openPrivateDirPathNoFollow(path, true)
 }
 
+func OpenExistingPrivateDirNoFollow(path string) (*PrivateDir, error) {
+	return openPrivateDirPathNoFollow(path, false)
+}
+
 func openPrivateDirPathNoFollow(path string, create bool) (*PrivateDir, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("private directory path is empty")
@@ -91,6 +95,34 @@ func (d *PrivateDir) CreateFile(name string, mode os.FileMode) (*os.File, error)
 		return nil, err
 	}
 	return createPrivateFileNoFollow(dir, name, mode)
+}
+
+func (d *PrivateDir) OpenFile(name string) (*os.File, error) {
+	if err := validatePrivateFileName(name); err != nil {
+		return nil, err
+	}
+	dir, err := d.openFile()
+	if err != nil {
+		return nil, err
+	}
+	file, err := openPrivateFileNoFollow(dir, name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, fmt.Errorf("private file %s is not regular", name)
+	}
+	if err := d.ValidatePath(); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
 }
 
 func (d *PrivateDir) ReadFile(name string) ([]byte, error) {
@@ -173,6 +205,20 @@ func (d *PrivateDir) WriteFileAtomic(name string, data []byte, mode os.FileMode)
 		return err
 	}
 	if err := writePrivateFileAtomicNoFollow(dir, name, data, mode); err != nil {
+		return err
+	}
+	return d.ValidatePath()
+}
+
+func (d *PrivateDir) WriteFileAtomicNew(name string, data []byte, mode os.FileMode) error {
+	if err := validatePrivateFileName(name); err != nil {
+		return err
+	}
+	dir, err := d.openFile()
+	if err != nil {
+		return err
+	}
+	if err := writePrivateFileAtomicNewNoFollow(dir, name, data, mode); err != nil {
 		return err
 	}
 	return d.ValidatePath()

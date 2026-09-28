@@ -3,7 +3,6 @@ package dokploy
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/preparer"
+	syncplan "github.com/aikins01/bort/internal/sync"
 )
 
 func rollbackPrepareFixture() preparer.Result {
@@ -36,86 +36,75 @@ func stepKinds(steps []Step) []StepKind {
 	return kinds
 }
 
-func TestPlanForRollbackOrdersSteps(t *testing.T) {
-	plan := PlanForRollback(rollbackPrepareFixture(), rollbackCutoverFixture())
-	want := []StepKind{
-		StepResumeSource,
-		StepVerifySourceHealth,
-		StepStopDokployProxy,
-		StepStartCoolifyProxy,
-		StepObserveRollback,
+func TestPlanForRollbackRefusesStatefulAppsWithoutDurableTargetFence(t *testing.T) {
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{{
+		Name: "api",
+		Steps: []syncplan.Step{{
+			ResourceType: "volume",
+			ResourceRef:  "volume:web -> /data",
+			Strategy:     syncplan.StrategyDockerVolumeArchive,
+		}},
+	}}}
+	plan, err := PlanForRollback(rollbackPrepareFixture(), sync, rollbackCutoverFixture())
+	if err == nil || !strings.Contains(err.Error(), "no durable application fence") || !strings.Contains(err.Error(), "api") {
+		t.Fatalf("expected stateful rollback refusal, got plan=%#v err=%v", plan, err)
+	}
+	if len(plan.Steps) != 0 {
+		t.Fatalf("unsafe stateful rollback returned executable steps: %#v", plan.Steps)
+	}
+}
+
+func TestPlanForRollbackReturnsTrafficOnlyForStatelessApps(t *testing.T) {
+	plan, err := PlanForRollback(rollbackPrepareFixture(), syncplan.Result{}, rollbackCutoverFixture())
+	if err != nil {
+		t.Fatal(err)
 	}
 	got := stepKinds(plan.Steps)
+	want := []StepKind{StepVerifySourceHealth, StepStopDokployProxy, StepStartCoolifyProxy, StepObserveRollback}
 	if len(got) != len(want) {
-		t.Fatalf("expected steps %v, got %v", want, got)
+		t.Fatalf("expected stateless traffic rollback %v, got %v", want, got)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("expected steps %v, got %v", want, got)
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("expected stateless traffic rollback %v, got %v", want, got)
 		}
 	}
-	for _, step := range plan.Steps {
-		if step.Kind == StepVerifySourceHealth || step.Kind == StepObserveRollback {
-			if step.App != "api" {
-				t.Fatalf("expected app-scoped step for api, got %v", step)
-			}
+}
+
+func TestPlanForRollbackIgnoresSkippedPlatformState(t *testing.T) {
+	prepare := rollbackPrepareFixture()
+	prepare.Apps = append(prepare.Apps, preparer.AppPlan{Name: "coolify-proxy", Role: "platform"})
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{{
+		Name: "coolify-proxy",
+		Steps: []syncplan.Step{{
+			ResourceType: "volume",
+			ResourceRef:  "volume:proxy -> /data",
+			Strategy:     syncplan.StrategyDockerVolumeArchive,
+		}},
+	}}}
+	plan, err := PlanForRollback(prepare, sync, rollbackCutoverFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := stepKinds(plan.Steps)
+	want := []StepKind{StepVerifySourceHealth, StepStopDokployProxy, StepStartCoolifyProxy, StepObserveRollback}
+	if len(got) != len(want) {
+		t.Fatalf("expected skipped platform state to retain stateless rollback %v, got %v", want, got)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("expected skipped platform state to retain stateless rollback %v, got %v", want, got)
 		}
 	}
 }
 
 func TestPlanForRollbackSkipsProxySwapWithoutRoutes(t *testing.T) {
-	plan := PlanForRollback(rollbackPrepareFixture(), gateway.Result{})
-	for _, step := range plan.Steps {
-		switch step.Kind {
-		case StepStopDokployProxy, StepStartCoolifyProxy, StepObserveRollback:
-			t.Fatalf("did not expect proxy swap or observation without routes, got %v", plan.Steps)
-		}
+	plan, err := PlanForRollback(rollbackPrepareFixture(), syncplan.Result{}, gateway.Result{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	got := stepKinds(plan.Steps)
-	if len(got) != 2 || got[0] != StepResumeSource || got[1] != StepVerifySourceHealth {
-		t.Fatalf("expected resume and verify only, got %v", got)
-	}
-}
-
-type dependentSourceRunner struct {
-	fakeDockerRunner
-	running map[string]bool
-}
-
-func (r *dependentSourceRunner) Output(_ context.Context, args ...string) ([]byte, error) {
-	if args[0] == "start" {
-		r.running[args[1]] = true
-		return nil, nil
-	}
-	id := args[len(args)-1]
-	health := "healthy"
-	if id == "api-web-id" && !r.running["worker-id"] {
-		health = "unhealthy"
-	}
-	return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Running":%t,"Health":{"Status":%q}}}]`, id, r.running[id], health)), nil
-}
-
-func TestRollbackStartsDependenciesBeforeCheckingHealth(t *testing.T) {
-	prepare := rollbackPrepareFixture()
-	worker := preparer.AppPlan{Name: "worker"}
-	worker.Resources.SourceServices = []preparer.SourceServiceRef{{ServiceName: "worker", ContainerID: "worker-id"}}
-	prepare.Apps = append(prepare.Apps, worker)
-	runner := &dependentSourceRunner{running: map[string]bool{}}
-	client := &Client{Docker: runner}
-	if err := client.Apply(context.Background(), PlanForRollback(prepare, gateway.Result{})); err != nil {
-		t.Fatalf("expected dependent apps to resume before health checks: %v", err)
-	}
-	if !runner.running["api-web-id"] || !runner.running["worker-id"] {
-		t.Fatalf("expected both sources running, got %v", runner.running)
-	}
-}
-
-func TestPlanForRollbackSkimsAppsWithoutQuiesceTargets(t *testing.T) {
-	prepare := preparer.Result{Apps: []preparer.AppPlan{{Name: "assets"}}}
-	plan := PlanForRollback(prepare, rollbackCutoverFixture())
-	got := stepKinds(plan.Steps)
-	if len(got) != 2 || got[0] != StepStopDokployProxy || got[1] != StepStartCoolifyProxy {
-		t.Fatalf("expected proxy swap only for a run that stopped no source containers, got %v", got)
+	if len(plan.Steps) != 0 {
+		t.Fatalf("expected no rollback steps without state transfer or routes, got %v", plan.Steps)
 	}
 }
 
@@ -171,7 +160,10 @@ func TestRollbackBoundsEveryStepInspection(t *testing.T) {
 	oldSettle := rollbackObserveSettle
 	rollbackObserveSettle = 0
 	t.Cleanup(func() { rollbackObserveSettle = oldSettle })
-	plan := PlanForRollback(rollbackPrepareFixture(), rollbackCutoverFixture())
+	plan, err := PlanForRollback(rollbackPrepareFixture(), syncplan.Result{}, rollbackCutoverFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if plan.stepTimeout != dockerStartTimeout {
 		t.Fatalf("expected bounded rollback steps, got %s", plan.stepTimeout)
 	}

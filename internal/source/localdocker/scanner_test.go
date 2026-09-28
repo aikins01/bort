@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +14,54 @@ import (
 	"github.com/aikins01/bort/internal/manifest"
 	"github.com/aikins01/bort/internal/source"
 )
+
+func TestScannerDockerCommandRequiresSystemSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is Unix-only")
+	}
+	bin := filepath.Join(t.TempDir(), "docker")
+	marker := filepath.Join(t.TempDir(), "executed")
+	script := "#!/bin/sh\ntouch " + marker + "\nprintf '%s' \"$DOCKER_HOST\"\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, setting := range []struct {
+		key   string
+		value string
+	}{
+		{key: "DOCKER_HOST", value: "ssh://remote.example"},
+		{key: "DOCKER_CONTEXT", value: "production"},
+		{key: "DOCKER_TLS_VERIFY", value: "1"},
+		{key: "DOCKER_CERT_PATH", value: "/tmp/remote-certs"},
+	} {
+		t.Run(setting.key, func(t *testing.T) {
+			for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"} {
+				t.Setenv(key, "")
+			}
+			t.Setenv(setting.key, setting.value)
+			_, err := (&Scanner{DockerPath: bin}).run(context.Background(), "ps", "-aq")
+			if err == nil || !strings.Contains(err.Error(), setting.key) {
+				t.Fatalf("expected %s refusal, got %v", setting.key, err)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("Docker command ran despite %s refusal: %v", setting.key, err)
+			}
+		})
+	}
+
+	for _, key := range []string{"DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("DOCKER_HOST", "")
+	out, err := (&Scanner{DockerPath: bin}).run(context.Background(), "ps", "-aq")
+	if err != nil {
+		t.Fatalf("system socket command failed: %v", err)
+	}
+	if string(out) != "unix:///var/run/docker.sock" {
+		t.Fatalf("Docker command saw DOCKER_HOST=%q", out)
+	}
+}
 
 func TestRoutesFromLabelsExtractsHostsAndServicePort(t *testing.T) {
 	labels := map[string]string{
@@ -236,6 +287,8 @@ func TestScanPopulatesNewServiceFields(t *testing.T) {
 		Now: func() time.Time { return time.Unix(0, 0).UTC() },
 		runCommand: func(_ context.Context, args ...string) ([]byte, error) {
 			switch {
+			case len(args) == 3 && args[0] == "info" && args[1] == "--format" && args[2] == "{{.ID}}":
+				return []byte("engine-test\n"), nil
 			case len(args) == 2 && args[0] == "ps" && args[1] == "-aq":
 				return []byte("c1\n"), nil
 			case len(args) > 0 && args[0] == "inspect":
@@ -271,6 +324,9 @@ func TestScanPopulatesNewServiceFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if m.Source.DockerEngineID != "engine-test" {
+		t.Fatalf("expected Docker engine identity, got %q", m.Source.DockerEngineID)
+	}
 	if len(m.Apps) != 1 || len(m.Apps[0].Services) != 1 {
 		t.Fatalf("unexpected apps: %+v", m.Apps)
 	}
@@ -304,15 +360,21 @@ func TestScanIgnoresDokployTargetComposeStacks(t *testing.T) {
 		Now: func() time.Time { return time.Unix(0, 0).UTC() },
 		runCommand: func(_ context.Context, args ...string) ([]byte, error) {
 			switch {
+			case len(args) == 3 && args[0] == "info" && args[1] == "--format" && args[2] == "{{.ID}}":
+				return []byte("engine-test\n"), nil
 			case len(args) == 2 && args[0] == "ps" && args[1] == "-aq":
-				return []byte("source\ntarget\ndokploy\ndokploy-db\ndokploy-traefik\n"), nil
+				return []byte("source\ntarget\ndokploy\ndokploy-db\ndokploy-traefik\ndokploy-traefik-swarm\ndokploy-monitoring\ndokploy-fwd\ndokploy-backup\n"), nil
 			case len(args) > 0 && args[0] == "inspect":
 				return []byte(`[
 					{"Id":"source","Name":"/source-api","Image":"sha256:source","Config":{"Image":"app:1","Labels":{"com.docker.compose.project":"source-api","com.docker.compose.project.working_dir":"/data/coolify/app/source-api"}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
 					{"Id":"target","Name":"/compose-noisy-source-api-1","Image":"sha256:target","Config":{"Image":"app:1","Labels":{"com.docker.compose.project":"compose-noisy","com.docker.compose.project.working_dir":"/etc/dokploy/compose/compose-noisy/code"}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
 					{"Id":"dokploy","Name":"/dokploy.1.task","Image":"sha256:dokploy","Config":{"Image":"dokploy/dokploy:latest","Labels":{"com.docker.swarm.service.name":"dokploy"}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
 					{"Id":"dokploy-db","Name":"/dokploy-postgres.1.task","Image":"sha256:db","Config":{"Image":"postgres:16","Labels":{"com.docker.swarm.service.name":"dokploy-postgres"}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
-					{"Id":"dokploy-traefik","Name":"/dokploy-traefik","Image":"sha256:traefik","Config":{"Image":"traefik:v3.6.7","Labels":{}},"State":{"Status":"created"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}}
+					{"Id":"dokploy-traefik","Name":"/dokploy-traefik","Image":"sha256:traefik","Config":{"Image":"traefik:v3.6.7","Labels":{}},"State":{"Status":"created"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
+					{"Id":"dokploy-traefik-swarm","Name":"/dokploy-traefik.1.task","Image":"sha256:traefik","Config":{"Image":"traefik:v3.6.7","Labels":{"com.docker.swarm.service.name":"dokploy-traefik"}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
+					{"Id":"dokploy-monitoring","Name":"/dokploy-monitoring","Image":"sha256:monitoring","Config":{"Image":"dokploy/monitoring:latest","Labels":{}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
+					{"Id":"dokploy-fwd","Name":"/dokploy-forward-auth.1.task","Image":"sha256:oauth2","Config":{"Image":"quay.io/oauth2-proxy/oauth2-proxy:v7.6.0","Labels":{"com.docker.swarm.service.name":"dokploy-forward-auth"}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}},
+					{"Id":"dokploy-backup","Name":"/dokploy-backup","Image":"sha256:backup","Config":{"Image":"example/backup:1","Labels":{}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}}
 				]`), nil
 			case len(args) >= 2 && args[0] == "image" && args[1] == "inspect":
 				return []byte(`[]`), nil
@@ -329,8 +391,12 @@ func TestScanIgnoresDokployTargetComposeStacks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(m.Apps) != 1 || m.Apps[0].Name != "source-api" {
-		t.Fatalf("expected only source app, got %+v", m.Apps)
+	appNames := map[string]bool{}
+	for _, app := range m.Apps {
+		appNames[app.Name] = true
+	}
+	if len(m.Apps) != 2 || !appNames["source-api"] || !appNames["dokploy-backup"] {
+		t.Fatalf("expected source app and unrelated dokploy-prefix backup, got %+v", m.Apps)
 	}
 }
 
@@ -357,4 +423,19 @@ func inspectContainersJSON(t *testing.T, ids []string) []byte {
 		t.Fatal(err)
 	}
 	return encoded
+}
+
+func TestDetectPlatformPrefersCoolifyRegardlessOfLabelOrder(t *testing.T) {
+	labels := map[string]string{
+		"com.docker.compose.project":             "abc",
+		"traefik.http.routers.r.rule":            "Host(`dokploy.example.com`)",
+		"com.docker.compose.service":             "dokploy-exporter",
+		"coolify.managed":                        "true",
+		"com.docker.compose.project.working_dir": "/data/coolify/applications/abc",
+	}
+	for i := 0; i < 100; i++ {
+		if got := detectPlatform(labels); got != "coolify" {
+			t.Fatalf("iteration %d: detectPlatform=%q, want coolify", i, got)
+		}
+	}
 }

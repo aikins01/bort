@@ -174,6 +174,43 @@ func writePrivateFileAtomicNoFollow(dir *os.File, name string, data []byte, mode
 	return unix.Fsync(int(dir.Fd()))
 }
 
+func writePrivateFileAtomicNewNoFollow(dir *os.File, name string, data []byte, mode os.FileMode) (resultErr error) {
+	tmpName, err := privateTempName()
+	if err != nil {
+		return err
+	}
+	tmp, err := createPrivateFileNoFollow(dir, tmpName, mode)
+	if err != nil {
+		return err
+	}
+	removeTmp := true
+	defer func() {
+		_ = tmp.Close()
+		if removeTmp {
+			if err := removePrivateFileNoFollow(dir, tmpName); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("remove incomplete private file %s: %w", filepath.Join(dir.Name(), tmpName), err))
+			}
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := renamePrivateFileNoReplace(int(dir.Fd()), tmpName, name); err != nil {
+		return err
+	}
+	removeTmp = false
+	return unix.Fsync(int(dir.Fd()))
+}
+
 func removePrivateFileNoFollow(dir *os.File, name string) error {
 	err := unix.Unlinkat(int(dir.Fd()), name, 0)
 	if errors.Is(err, unix.ENOENT) {

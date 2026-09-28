@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,8 @@ import (
 
 	"github.com/aikins01/bort/internal/manifest"
 	"github.com/aikins01/bort/internal/preparer"
+	syncplan "github.com/aikins01/bort/internal/sync"
+	"github.com/aikins01/bort/internal/target/dokploy"
 )
 
 func TestSafeRunArtifactPathRejectsEscapes(t *testing.T) {
@@ -239,11 +243,668 @@ func TestAppliedFooterCountsOkAndError(t *testing.T) {
 	}
 }
 
+func TestCockpitLabelsAmbiguousLegacyHandoffAndScopesRollback(t *testing.T) {
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	externalDir := filepath.Join(t.TempDir(), "legacy-run")
+	if err := os.MkdirAll(externalDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run := ambiguousLegacyRunForTest("legacy-run", externalDir)
+	if err := validateApplyResumeAuthority(run.Applied); err == nil || !strings.Contains(err.Error(), "after the shared proxy handoff") {
+		t.Fatalf("legacy fixture is not ambiguous through the proxy handoff alone: %v", err)
+	}
+
+	if phase := migrationRunPhase(run); phase != "authority-ambiguous" {
+		t.Fatalf("expected authority-ambiguous phase, got %q", phase)
+	}
+	var output strings.Builder
+	writeAppFirstCockpit(&output, run)
+	for _, want := range []string{"AUTHORITY UNKNOWN", "Inspect and preserve both sides", "Automatic retry, commit, and rollback are unavailable", "establish authority manually"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("expected cockpit to contain %q, got:\n%s", want, output.String())
+		}
+	}
+	now := time.Now().UTC()
+	run.Run.RollbackStartedAt = &now
+	if phase := migrationRunPhase(run); phase != "authority-ambiguous-rollback" {
+		t.Fatalf("expected interrupted ambiguous rollback phase, got %q", phase)
+	}
+	output.Reset()
+	writeAppFirstCockpit(&output, run)
+	for _, want := range []string{"AUTHORITY UNKNOWN", "Target fencing may be partial", "source state may be unchanged", "Inspect and preserve both sides"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("expected interrupted ambiguous rollback cockpit to contain %q, got:\n%s", want, output.String())
+		}
+	}
+	next := nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "inspect and preserve both source and target data") || !strings.Contains(next.Reason, "fencing may be partial") {
+		t.Fatalf("expected interrupted ambiguous rollback guidance, got %#v", next)
+	}
+}
+
+func TestCockpitPrioritizesActiveApplyOverAmbiguousStep(t *testing.T) {
+	run := writeAmbiguousAuthorityRun(t, "active-ambiguous")
+	lock, err := acquireApplyLock(filepath.Join(run.Run.RunDir, "apply.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	if phase := migrationRunPhase(run); phase != "applying" {
+		t.Fatalf("active ambiguous run phase=%q, want applying", phase)
+	}
+	next := nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "view the active apply") || strings.Contains(next.Action, "recover-authority") {
+		t.Fatalf("active apply next step is unsafe: %#v", next)
+	}
+}
+
+func TestCockpitShowsConflictingHostOwner(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	ownerRun := migrationRun{Name: "owner-run", RunDir: filepath.Join(t.TempDir(), "owner-run"), CreatedAt: time.Now().UTC(), BundleDigest: "owner-digest"}
+	if err := claimDokployHostOwnership(ownerRun, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(ownerRun, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	run := loadedMigrationRun{
+		Run:     migrationRun{Name: "waiting-run", RunDir: t.TempDir(), Target: "dokploy", CreatedAt: time.Now().UTC(), BundleDigest: "waiting-digest"},
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}},
+	}
+	if phase := migrationRunPhase(run); phase != "host-owned" {
+		t.Fatalf("expected host-owned phase, got %q", phase)
+	}
+	var output strings.Builder
+	writeAppFirstCockpit(&output, run)
+	for _, want := range []string{"HOST OWNED", `owned by migration run "owner-run"`, ownerRun.RunDir, "target authority"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("expected cockpit to contain %q, got:\n%s", want, output.String())
+		}
+	}
+	next := nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, `finish migration run "owner-run"`) || !strings.Contains(next.Action, ownerRun.RunDir) || !strings.Contains(next.Reason, "target authority") {
+		t.Fatalf("expected owning-run guidance, got %#v", next)
+	}
+}
+
+func TestCockpitShowsHostOwnerGuidanceForEmptyRun(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	ownerRun := migrationRun{Name: "owner-run", RunDir: filepath.Join(t.TempDir(), "owner-run"), CreatedAt: time.Now().UTC(), BundleDigest: "owner-digest"}
+	if err := claimDokployHostOwnership(ownerRun, "http://127.0.0.1:3030", dokployCredentialID("owner-token")); err != nil {
+		t.Fatal(err)
+	}
+	run := loadedMigrationRun{Run: migrationRun{Name: "empty-run", RunDir: t.TempDir(), Target: "dokploy", CreatedAt: time.Now().UTC(), BundleDigest: "empty-digest"}}
+	var output strings.Builder
+	writeAppFirstCockpit(&output, run)
+	for _, want := range []string{"No apps in this run", "HOST OWNED", `migration run "owner-run"`, ownerRun.RunDir} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("empty-run cockpit missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestCockpitRefusesPlatformOnlyLiveApply(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	run := loadedMigrationRun{
+		Run: migrationRun{Name: "platform-only", RunDir: t.TempDir(), Target: "dokploy"},
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{{
+			Name: "coolify-proxy",
+			Role: "platform",
+		}}},
+	}
+	if phase := migrationRunPhase(run); phase != "empty" {
+		t.Fatalf("platform-only phase=%q, want empty", phase)
+	}
+	var output strings.Builder
+	writeAppFirstCockpit(&output, run)
+	if !strings.Contains(output.String(), "NO APPS") || !strings.Contains(output.String(), "no migratable applications") || strings.Contains(output.String(), "migrate --live") {
+		t.Fatalf("platform-only cockpit offered live apply:\n%s", output.String())
+	}
+	next := nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "at least one non-platform application") || strings.Contains(next.Action, "migrate --live") {
+		t.Fatalf("platform-only next step offered live apply: %#v", next)
+	}
+	if err := validateLiveApplyReady(run); err == nil || !strings.Contains(err.Error(), "no migratable applications") {
+		t.Fatalf("platform-only run passed live validation: %v", err)
+	}
+}
+
+func TestCockpitKeepsStaticallyUnattestedSourcesInspectionOnly(t *testing.T) {
+	newRun := func() loadedMigrationRun {
+		return loadedMigrationRun{
+			Run: migrationRun{Name: "unattested", RunDir: t.TempDir(), Target: "dokploy", Source: "docker"},
+			Prepare: preparer.Result{
+				Source:               "docker",
+				SourceDockerEngineID: "engine-reviewed",
+				Apps: []preparer.AppPlan{{
+					Name:      "api",
+					Resources: preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab", ContainerName: "api"}}},
+				}},
+			},
+		}
+	}
+	for _, test := range []struct {
+		name       string
+		configure  func(*loadedMigrationRun)
+		wantReason string
+	}{
+		{name: "imported manifest", configure: func(run *loadedMigrationRun) { run.Run.Source = "manifest" }, wantReason: "imported manifest"},
+		{name: "imported bundle", configure: func(run *loadedMigrationRun) { run.Run.Source = "" }, wantReason: "imported bundle"},
+		{name: "missing engine", configure: func(run *loadedMigrationRun) { run.Prepare.SourceDockerEngineID = "" }, wantReason: "no reviewed Docker engine identity"},
+		{name: "missing container", configure: func(run *loadedMigrationRun) { run.Prepare.Apps[0].Resources.SourceServices[0].ContainerID = "" }, wantReason: "no stable container ID"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetDokployTrafficOwner(t)
+			run := newRun()
+			test.configure(&run)
+			next := nextSafeStep(run, nil)
+			if next.Phase != "inspection-only" || !strings.Contains(next.Action, "new named migration run") || !strings.Contains(next.Reason, test.wantReason) || strings.Contains(next.Action, "migrate --live") {
+				t.Fatalf("unattested source received unsafe guidance: %#v", next)
+			}
+			if phase := migrationRunPhase(run); phase != "inspection-only" {
+				t.Fatalf("phase=%q, want inspection-only", phase)
+			}
+			var output strings.Builder
+			writeAppFirstCockpit(&output, run)
+			if !strings.Contains(output.String(), "INSPECTION ONLY") || !strings.Contains(output.String(), test.wantReason) || strings.Contains(output.String(), "migrate --live") {
+				t.Fatalf("cockpit hid static source-attestation failure:\n%s", output.String())
+			}
+		})
+	}
+}
+
+func TestCockpitBlocksReadyRunWhenRuntimeSourceAttestationFails(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	previous := verifyLocalSourceRun
+	verifyLocalSourceRun = func(context.Context, loadedMigrationRun) error { return context.DeadlineExceeded }
+	t.Cleanup(func() { verifyLocalSourceRun = previous })
+	run := loadedMigrationRun{
+		Run: migrationRun{Name: "source-changed", RunDir: t.TempDir(), Target: "dokploy", Source: "docker"},
+		Prepare: preparer.Result{
+			Source:               "docker",
+			SourceDockerEngineID: "engine-reviewed",
+			Apps: []preparer.AppPlan{{
+				Name:      "api",
+				Resources: preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab", ContainerName: "api"}}},
+			}},
+		},
+	}
+	next := nextSafeStep(run, nil)
+	if next.Phase != "source-attestation-error" || !strings.Contains(next.Reason, context.DeadlineExceeded.Error()) || strings.Contains(next.Action, "migrate --live") {
+		t.Fatalf("runtime source-attestation failure received unsafe guidance: %#v", next)
+	}
+	if phase := migrationRunPhase(run); phase != "source-attestation-error" {
+		t.Fatalf("phase=%q, want source-attestation-error", phase)
+	}
+	var output strings.Builder
+	writeAppFirstCockpit(&output, run)
+	if !strings.Contains(output.String(), "SOURCE CHANGED") || !strings.Contains(output.String(), context.DeadlineExceeded.Error()) || strings.Contains(output.String(), "migrate --live") {
+		t.Fatalf("cockpit hid runtime source-attestation failure:\n%s", output.String())
+	}
+}
+
+func TestMigrationSummaryPropagatesCancellationToSourceAttestation(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	previous := verifyLocalSourceRun
+	verifyLocalSourceRun = func(ctx context.Context, _ loadedMigrationRun) error { return ctx.Err() }
+	t.Cleanup(func() { verifyLocalSourceRun = previous })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	run := loadedMigrationRun{
+		Run: migrationRun{Name: "canceled", RunDir: t.TempDir(), Target: "dokploy", Source: "docker"},
+		Prepare: preparer.Result{
+			Source:               "docker",
+			SourceDockerEngineID: "engine-reviewed",
+			Apps: []preparer.AppPlan{{
+				Name:      "api",
+				Resources: preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab", ContainerName: "api"}}},
+			}},
+		},
+	}
+
+	summary := summarizeMigrationRunContext(ctx, run)
+	if summary.Next.Phase != "source-attestation-error" || !strings.Contains(summary.Next.Reason, context.Canceled.Error()) {
+		t.Fatalf("canceled source attestation produced unsafe guidance: %#v", summary.Next)
+	}
+}
+
+func TestLiveMigrationSummaryDefersRuntimeSourceAttestation(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	previous := verifyLocalSourceRun
+	calls := 0
+	verifyLocalSourceRun = func(context.Context, loadedMigrationRun) error {
+		calls++
+		return nil
+	}
+	t.Cleanup(func() { verifyLocalSourceRun = previous })
+	run := loadedMigrationRun{
+		Run: migrationRun{Name: "live", RunDir: t.TempDir(), Target: "dokploy", Source: "docker"},
+		Prepare: preparer.Result{
+			Source:               "docker",
+			SourceDockerEngineID: "engine-reviewed",
+			Apps: []preparer.AppPlan{{
+				Name:      "api",
+				Resources: preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab", ContainerName: "api"}}},
+			}},
+		},
+	}
+
+	summary := summarizeMigrationRunForLive(context.Background(), run)
+	if calls != 0 || !strings.Contains(summary.Next.Action, "migrate --live") {
+		t.Fatalf("live summary probed the source or hid the ready action: calls=%d next=%#v", calls, summary.Next)
+	}
+	summarizeMigrationRunContext(context.Background(), run)
+	if calls != 1 {
+		t.Fatalf("read-only summary source probes=%d, want 1", calls)
+	}
+}
+
+func TestCockpitBlocksMutationGuidanceWhenStartedRunSourceIsUnattested(t *testing.T) {
+	now := time.Now().UTC()
+	for _, test := range []struct {
+		name      string
+		configure func(*loadedMigrationRun)
+	}{
+		{
+			name: "partial apply",
+			configure: func(run *loadedMigrationRun) {
+				run.Applied.Steps = []appliedStep{{Index: 0, Kind: string(dokploy.StepCreateProject), App: "api", Ref: "api", Status: string(dokploy.StepStatusOK)}}
+			},
+		},
+		{
+			name: "target live",
+			configure: func(run *loadedMigrationRun) {
+				run.Run.LiveAppliedAt = &now
+			},
+		},
+		{
+			name: "stateful target live",
+			configure: func(run *loadedMigrationRun) {
+				run.Run.LiveAppliedAt = &now
+				run.Sync = syncplan.Result{Apps: []syncplan.AppPlan{{Name: "api", Steps: []syncplan.Step{{
+					ResourceType: "volume",
+					ResourceRef:  "volume:web -> /data",
+					Strategy:     syncplan.StrategyDockerVolumeArchive,
+				}}}}}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetDokployTrafficOwner(t)
+			run := loadedMigrationRun{
+				Run: migrationRun{Name: "started", RunDir: t.TempDir(), Target: "dokploy", Source: "docker"},
+				Prepare: preparer.Result{
+					Source:               "docker",
+					SourceDockerEngineID: "engine-reviewed",
+					Apps: []preparer.AppPlan{{
+						Name:      "api",
+						Resources: preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab"}}},
+					}},
+				},
+			}
+			test.configure(&run)
+			next := nextSafeStep(run, nil)
+			if next.Phase != "source-attestation-error" || !strings.Contains(next.Reason, "no reviewed container name") || !strings.Contains(next.Action, "do not replay") {
+				t.Fatalf("started unattested run received unsafe guidance: %#v", next)
+			}
+			for _, command := range []string{"migrate --live", "commit --apply", "rollback --live"} {
+				if strings.Contains(next.Action, command) {
+					t.Fatalf("started unattested run offered %q: %#v", command, next)
+				}
+			}
+			if phase := migrationRunPhase(run); phase != "source-attestation-error" {
+				t.Fatalf("phase=%q, want source-attestation-error", phase)
+			}
+			var output strings.Builder
+			writeAppFirstCockpit(&output, run)
+			if !strings.Contains(output.String(), "SOURCE CHANGED") || !strings.Contains(output.String(), "do not replay") {
+				t.Fatalf("cockpit hid started source-attestation failure:\n%s", output.String())
+			}
+			for _, command := range []string{"migrate --live", "commit --apply", "rollback --live"} {
+				if strings.Contains(output.String(), command) {
+					t.Fatalf("cockpit offered %q for started unattested run:\n%s", command, output.String())
+				}
+			}
+		})
+	}
+
+	run := loadedMigrationRun{
+		Run: migrationRun{Name: "active", RunDir: t.TempDir(), Target: "dokploy", Source: "docker"},
+		Prepare: preparer.Result{
+			Source:               "docker",
+			SourceDockerEngineID: "engine-reviewed",
+			Apps: []preparer.AppPlan{{
+				Name:      "api",
+				Resources: preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab"}}},
+			}},
+		},
+	}
+	lock, err := acquireApplyLock(filepath.Join(run.Run.RunDir, "apply.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	next := nextSafeStep(run, nil)
+	if next.Phase == "" || !strings.Contains(next.Reason, "no reviewed container name") || strings.Contains(next.Action, "migrate --live") {
+		t.Fatalf("active unattested run received unsafe attach guidance: %#v", next)
+	}
+}
+
+func TestCockpitReportsUnreadableHostOwner(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	path, err := dokployTrafficOwnerPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{invalid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := loadedMigrationRun{Run: migrationRun{Name: "blocked", RunDir: t.TempDir(), Target: "dokploy"}}
+	var output strings.Builder
+	writeAppFirstCockpit(&output, run)
+	if !strings.Contains(output.String(), "LOCK ERROR") || !strings.Contains(output.String(), "decode Dokploy traffic owner") || strings.Contains(output.String(), "fresh migration run") {
+		t.Fatalf("cockpit hid the durable-owner read failure:\n%s", output.String())
+	}
+	next := nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "dokploy-traffic-owner.json") || !strings.Contains(next.Reason, "decode Dokploy traffic owner") {
+		t.Fatalf("next step hid the durable-owner read failure: %#v", next)
+	}
+}
+
+func TestCockpitPreservesActiveLifecycleWhenHostOwnerIsUnreadable(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	path, err := dokployTrafficOwnerPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{invalid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, test := range []struct {
+		name      string
+		configure func(*migrationRun)
+		phase     string
+		status    string
+		context   string
+	}{
+		{
+			name:      "commit",
+			configure: func(run *migrationRun) { run.CommitStartedAt = &now },
+			phase:     "committing",
+			status:    "COMMITTING",
+			context:   "rollback is no longer available",
+		},
+		{
+			name:      "rollback",
+			configure: func(run *migrationRun) { run.RollbackStartedAt = &now },
+			phase:     "rolling back",
+			status:    "ROLLING BACK",
+			context:   "traffic or source state may already have changed",
+		},
+		{
+			name: "authority finalization",
+			configure: func(run *migrationRun) {
+				run.ResolvedAuthority = dokployTrafficSource
+				run.AuthorityResolvedAt = &now
+			},
+			phase:   "authority-finalizing",
+			status:  "RECOVERY PENDING",
+			context: "lifecycle finalization is incomplete",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			meta := migrationRun{Name: test.name, RunDir: t.TempDir(), Target: "dokploy", LiveAppliedAt: &now}
+			test.configure(&meta)
+			run := loadedMigrationRun{Run: meta}
+			if phase := migrationRunPhase(run); phase != test.phase {
+				t.Fatalf("phase=%q, want %q", phase, test.phase)
+			}
+			next := nextSafeStep(run, nil)
+			if !strings.Contains(next.Action, "dokploy-traffic-owner.json") || !strings.Contains(next.Reason, "decode Dokploy traffic owner") {
+				t.Fatalf("next step hid lifecycle or owner failure: %#v", next)
+			}
+			var output strings.Builder
+			writeAppFirstCockpit(&output, run)
+			if !strings.Contains(output.String(), test.status) || !strings.Contains(output.String(), test.context) || !strings.Contains(output.String(), "dokploy-traffic-owner.json") || strings.Contains(output.String(), "LOCK ERROR") {
+				t.Fatalf("cockpit hid lifecycle behind owner failure:\n%s", output.String())
+			}
+		})
+	}
+}
+
+func TestCockpitFinalizesCompletedDurableOwnerBeforeTerminalGuidance(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		configureRun   func(*migrationRun, *time.Time)
+		configureOwner func(migrationRun) error
+		phase          string
+		resumeCommand  string
+		releaseOwner   func(migrationRun) error
+		terminalPhase  string
+	}{
+		{
+			name: "commit",
+			configureRun: func(run *migrationRun, now *time.Time) {
+				run.CommitStartedAt = now
+				run.CommittedAt = now
+			},
+			configureOwner: func(run migrationRun) error { return markDokployTrafficTarget(run, "http://127.0.0.1:3030") },
+			phase:          "committing",
+			resumeCommand:  "commit --apply",
+			releaseOwner:   releaseDokployTargetOwner,
+			terminalPhase:  "committed",
+		},
+		{
+			name: "rollback",
+			configureRun: func(run *migrationRun, now *time.Time) {
+				run.RollbackStartedAt = now
+				run.RolledBackAt = now
+			},
+			configureOwner: func(run migrationRun) error { return markDokployTrafficSource(run) },
+			phase:          "rolling back",
+			resumeCommand:  "rollback --live",
+			releaseOwner:   releaseDokployTrafficOwner,
+			terminalPhase:  "rolled back",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetDokployTrafficOwner(t)
+			now := time.Now().UTC()
+			meta := migrationRun{Name: test.name, RunDir: filepath.Join(t.TempDir(), test.name), Target: "dokploy", CreatedAt: now, BundleDigest: test.name + "-digest"}
+			test.configureRun(&meta, &now)
+			meta = persistRunFixture(t, meta)
+			if err := claimDokployHostOwnership(meta, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.configureOwner(meta); err != nil {
+				t.Fatal(err)
+			}
+			run := loadedMigrationRun{Run: meta, Applied: newRunApplied(meta)}
+			if phase := migrationRunPhase(run); phase != test.phase {
+				t.Fatalf("phase=%q, want %q", phase, test.phase)
+			}
+			next := nextSafeStep(run, nil)
+			if !strings.Contains(next.Action, test.resumeCommand) || !strings.Contains(next.Reason, "not released") {
+				t.Fatalf("next step did not expose owner finalization: %#v", next)
+			}
+			if err := test.releaseOwner(meta); err != nil {
+				t.Fatal(err)
+			}
+			if phase := migrationRunPhase(run); phase != test.terminalPhase {
+				t.Fatalf("released phase=%q, want %q", phase, test.terminalPhase)
+			}
+		})
+	}
+}
+
+func TestCockpitManualTargetAuthorityDefersToHostOperationLock(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	previous := verifyLocalSourceRun
+	verifyLocalSourceRun = func(context.Context, loadedMigrationRun) error { return nil }
+	t.Cleanup(func() { verifyLocalSourceRun = previous })
+	now := time.Now().UTC()
+	rollbackStarted := now.Add(-time.Minute)
+	meta := migrationRun{Name: "manual-target", RunDir: filepath.Join(t.TempDir(), "manual-target"), Target: "dokploy", Source: "docker", CreatedAt: now, BundleDigest: "manual-digest", RollbackStartedAt: &rollbackStarted, LiveAppliedAt: &now, ResolvedAuthority: dokployTrafficTarget, AuthorityResolvedAt: &now}
+	if err := claimDokployHostOwnership(meta, "http://127.0.0.1:3030", dokployCredentialID("token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(meta, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	run := loadedMigrationRun{
+		Run:     meta,
+		Prepare: preparer.Result{Source: "docker", SourceDockerEngineID: "engine-reviewed", Apps: []preparer.AppPlan{{Name: "api", Resources: preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab", ContainerName: "api"}}}}}},
+		Applied: newRunApplied(meta),
+	}
+	next := nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "commit --apply") || strings.Contains(next.Action, "recover-authority") {
+		t.Fatalf("next step treated the resolved run as an unfinished rollback: %#v", next)
+	}
+	if phase := migrationRunPhase(run); phase != "applied" {
+		t.Fatalf("phase=%q, want applied before the host lock is held", phase)
+	}
+	hostLock, err := acquireDokployLiveOperationLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostLock.Release()
+	next = nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "wait for the active Dokploy host operation") || strings.Contains(next.Action, "commit --apply") {
+		t.Fatalf("next step ignored the host-wide operation lock: %#v", next)
+	}
+	if phase := migrationRunPhase(run); phase != "host-busy" {
+		t.Fatalf("phase=%q disagrees with next step %q", phase, next.Action)
+	}
+}
+
+func TestCockpitBlocksCompletedOrRecoveredRunWithoutProvableOwner(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		configure    func(*testing.T, migrationRun)
+		wantReason   string
+		manualTarget bool
+	}{
+		{name: "missing", configure: func(*testing.T, migrationRun) {}, wantReason: "no durable Dokploy host owner"},
+		{name: "different", configure: func(t *testing.T, _ migrationRun) {
+			other := migrationRun{Name: "other", RunDir: filepath.Join(t.TempDir(), "other"), CreatedAt: time.Now().UTC(), BundleDigest: "other-digest"}
+			if err := claimDokployHostOwnership(other, "http://127.0.0.1:3030", dokployCredentialID("other-token")); err != nil {
+				t.Fatal(err)
+			}
+			if err := markDokployTrafficTarget(other, "http://127.0.0.1:3030"); err != nil {
+				t.Fatal(err)
+			}
+		}, wantReason: "ownership belongs to"},
+		{name: "unreadable", configure: func(t *testing.T, _ migrationRun) {
+			path, err := dokployTrafficOwnerPath()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("{invalid"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, wantReason: "decode Dokploy traffic owner"},
+		{name: "manual target missing", configure: func(*testing.T, migrationRun) {}, wantReason: "no durable host-wide Dokploy traffic owner", manualTarget: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetDokployTrafficOwner(t)
+			now := time.Now().UTC()
+			meta := migrationRun{Name: test.name, RunDir: filepath.Join(t.TempDir(), test.name), Target: "dokploy", CreatedAt: now, BundleDigest: test.name + "-digest", CommitStartedAt: &now, CommittedAt: &now}
+			if test.manualTarget {
+				meta.CommitStartedAt = nil
+				meta.CommittedAt = nil
+				meta.ResolvedAuthority = dokployTrafficTarget
+				meta.AuthorityResolvedAt = &now
+				meta.LiveAppliedAt = &now
+			}
+			test.configure(t, meta)
+			run := loadedMigrationRun{Run: meta, Applied: newRunApplied(meta)}
+			if phase := migrationRunPhase(run); phase != "host-owner-error" {
+				t.Fatalf("phase=%q, want host-owner-error", phase)
+			}
+			next := nextSafeStep(run, nil)
+			if !strings.Contains(next.Action, "dokploy-traffic-owner.json") || !strings.Contains(next.Reason, test.wantReason) || strings.Contains(next.Action, "commit --apply") || strings.Contains(next.Action, "cleanup") {
+				t.Fatalf("next step hid owner finalization failure: %#v", next)
+			}
+		})
+	}
+}
+
+func TestCockpitRefusesAppliedActionsWithoutMatchingCurrentOwner(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		installOwner func(*testing.T)
+	}{
+		{name: "missing owner", installOwner: func(t *testing.T) {}},
+		{name: "different owner", installOwner: func(t *testing.T) {
+			ownerRun := migrationRun{Name: "other-run", RunDir: filepath.Join(t.TempDir(), "other-run"), CreatedAt: time.Now().UTC(), BundleDigest: "other-digest"}
+			if err := claimDokployHostOwnership(ownerRun, "http://127.0.0.1:3030", dokployCredentialID("other-token")); err != nil {
+				t.Fatal(err)
+			}
+			if err := markDokployTrafficTarget(ownerRun, "http://127.0.0.1:3030"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetDokployTrafficOwner(t)
+			runMeta := migrationRun{Name: "applied-run", RunDir: filepath.Join(t.TempDir(), "applied-run"), Target: "dokploy", CreatedAt: time.Now().UTC(), BundleDigest: "applied-digest"}
+			now := time.Now().UTC()
+			run := loadedMigrationRun{
+				Run:     runMeta,
+				Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}},
+				Applied: newRunApplied(runMeta),
+			}
+			run.Run.LiveAppliedAt = &now
+			run.Applied.SucceededAt = &now
+			tc.installOwner(t)
+
+			if phase := migrationRunPhase(run); phase != "authority-ambiguous" {
+				t.Fatalf("applied run without matching owner phase=%q, want authority-ambiguous", phase)
+			}
+			var output strings.Builder
+			writeAppFirstCockpit(&output, run)
+			if !strings.Contains(output.String(), "AUTHORITY UNKNOWN") || !strings.Contains(output.String(), "establish authority manually") || strings.Contains(output.String(), "commit --apply") || strings.Contains(output.String(), "rollback --live") {
+				t.Fatalf("cockpit offered actions without a matching owner:\n%s", output.String())
+			}
+			next := nextSafeStep(run, nil)
+			if !strings.Contains(next.Action, "establish writer and traffic authority manually") || strings.Contains(next.Action, "commit --apply") || strings.Contains(next.Action, "rollback --live") {
+				t.Fatalf("next offered actions without a matching owner: %#v", next)
+			}
+		})
+	}
+}
+
+func TestCockpitRefusesResumeAfterSuccessfulTargetMutationLosesOwner(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	runMeta := migrationRun{Name: "owner-lost", RunDir: t.TempDir(), Target: "dokploy", CreatedAt: time.Now().UTC(), BundleDigest: "owner-lost-digest"}
+	run := loadedMigrationRun{
+		Run:     runMeta,
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}},
+		Applied: newRunApplied(runMeta),
+	}
+	plan := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
+	if len(plan.Steps) == 0 {
+		t.Fatal("expected target mutation step")
+	}
+	step := plan.Steps[0]
+	run.Applied.Steps = []appliedStep{{Index: 0, Kind: string(step.Kind), App: step.App, Ref: step.Ref, Status: string(dokploy.StepStatusOK)}}
+	if phase := migrationRunPhase(run); phase != "authority-ambiguous" {
+		t.Fatalf("owner-lost partial run phase=%q, want authority-ambiguous", phase)
+	}
+	next := nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "establish writer and traffic authority manually") || strings.Contains(next.Action, "migrate --live") {
+		t.Fatalf("owner-lost partial run offered unsafe resume: %#v", next)
+	}
+}
+
 func TestCockpitShowsDownstreamDecisionsAsReviewOnly(t *testing.T) {
 	run := loadedMigrationRun{
-		Run: migrationRun{Name: "reviewed", RunDir: t.TempDir(), Target: "dokploy"},
-		Prepare: preparer.Result{Apps: []preparer.AppPlan{{
-			Name: "api",
+		Run: migrationRun{Name: "reviewed", RunDir: t.TempDir(), Target: "dokploy", Source: "docker"},
+		Prepare: preparer.Result{Source: "docker", SourceDockerEngineID: "engine-reviewed", Apps: []preparer.AppPlan{{
+			Name:      "api",
+			Resources: preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab", ContainerName: "api"}}},
 		}}},
 		Decisions: runDecisions{
 			APIVersion: decisionsAPIVersion,
@@ -270,6 +931,164 @@ func TestCockpitShowsDownstreamDecisionsAsReviewOnly(t *testing.T) {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("expected cockpit to contain %q, got:\n%s", want, output.String())
 		}
+	}
+}
+
+func TestCockpitDirectsStatefulPlanToManualMigration(t *testing.T) {
+	run := loadedMigrationRun{
+		Run: migrationRun{Name: "stateful", RunDir: t.TempDir(), Target: "dokploy", Source: "docker"},
+		Prepare: preparer.Result{
+			Source:               "docker",
+			SourceDockerEngineID: "engine-reviewed",
+			Apps: []preparer.AppPlan{{
+				Name:      "api",
+				Resources: preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab", ContainerName: "api"}}},
+			}},
+		},
+		Sync: syncplan.Result{Apps: []syncplan.AppPlan{{Name: "api", Steps: []syncplan.Step{{
+			ResourceType: "volume",
+			ResourceRef:  "volume:web -> /data",
+			Strategy:     syncplan.StrategyDockerVolumeArchive,
+		}}}}},
+	}
+	if phase := migrationRunPhase(run); phase != "ready" {
+		t.Fatalf("staged stateful plan phase = %q, want ready", phase)
+	}
+	if next := nextSafeStep(run, nil); !strings.Contains(next.Action, "migrate --live") {
+		t.Fatalf("staged stateful run did not offer live apply: %#v", next)
+	}
+	run.Applied = runApplied{APIVersion: appliedAPIVersion, PlanVersion: appliedPlanV1Alpha2, Apps: map[string]appliedApp{"api": {}}}
+	if phase := migrationRunPhase(run); phase != "manual-state" {
+		t.Fatalf("in-place stateful ledger phase = %q, want manual-state", phase)
+	}
+	var output strings.Builder
+	writeAppFirstCockpit(&output, run)
+	if !strings.Contains(output.String(), "MANUAL STATE") || !strings.Contains(output.String(), "cannot continue this run") || !strings.Contains(output.String(), "outside Bort") || strings.Contains(output.String(), "bort migrate --live") {
+		t.Fatalf("stateful cockpit offered an unusable live action:\n%s", output.String())
+	}
+	next := nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "do not rerun this blocked run") || !strings.Contains(next.Action, "outside Bort") || strings.Contains(next.Action, "migrate --live") {
+		t.Fatalf("stateful next step offered an unusable live action: %#v", next)
+	}
+	run.Applied.Steps = []appliedStep{{Index: 0, Kind: string(dokploy.StepCreateProject), App: "api", Ref: "api", Status: string(dokploy.StepStatusOK)}}
+	if phase := migrationRunPhase(run); phase != "manual-state" {
+		t.Fatalf("pre-pause stateful prefix phase = %q, want manual-state", phase)
+	}
+	if next := nextSafeStep(run, nil); strings.Contains(next.Action, "migrate --live") {
+		t.Fatalf("pre-pause stateful prefix offered an unusable live action: %#v", next)
+	}
+	run.Applied.Steps = append(run.Applied.Steps, appliedStep{Index: 1, Kind: string(dokploy.StepPauseSource), App: "api", Ref: "api", Status: string(dokploy.StepStatusOK)})
+	if phase := migrationRunPhase(run); phase != "source-recovery" {
+		t.Fatalf("paused stateful prefix phase = %q, want source-recovery", phase)
+	}
+	if next := nextSafeStep(run, nil); !strings.Contains(next.Action, "migrate --live") || !strings.Contains(next.Reason, "no state transfer") {
+		t.Fatalf("paused stateful prefix did not offer cleanup-only recovery: %#v", next)
+	}
+	run.Applied.Steps[1].Kind = string(dokploy.StepResumeSource)
+	if phase := migrationRunPhase(run); phase != "manual-state" {
+		t.Fatalf("cleaned stateful prefix phase = %q, want manual-state", phase)
+	}
+}
+
+func TestCockpitBlocksPlanLiveApplyWouldRefuse(t *testing.T) {
+	app := preparer.AppPlan{
+		Name:            "api",
+		Resources:       preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab", ContainerName: "api"}}},
+		TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "api"}}},
+	}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/data", Target: "/data", SourceContainerID: "0123456789ab", SourceContainerName: "api"}}
+	run := loadedMigrationRun{
+		Run: migrationRun{Name: "bind", RunDir: t.TempDir(), Target: "dokploy", Source: "docker"},
+		Prepare: preparer.Result{
+			Source:               "docker",
+			SourceDockerEngineID: "engine-reviewed",
+			Apps:                 []preparer.AppPlan{app},
+		},
+		Sync: syncplan.Result{Apps: []syncplan.AppPlan{{Name: "api", Steps: []syncplan.Step{{
+			ResourceType: "volume",
+			ResourceRef:  "volume:web -> /data",
+			Strategy:     syncplan.StrategyDockerVolumeArchive,
+		}}}}},
+	}
+	if phase := migrationRunPhase(run); phase != "plan-blocked" {
+		t.Fatalf("bind-mount staged plan phase = %q, want plan-blocked", phase)
+	}
+	next := nextSafeStep(run, nil)
+	if !strings.Contains(next.Reason, "only named volumes are transferred before deploy") || !strings.Contains(next.Action, "re-plan") || strings.Contains(next.Action, "migrate --live") {
+		t.Fatalf("bind-mount staged plan offered an unusable next step: %#v", next)
+	}
+	var output strings.Builder
+	writeAppFirstCockpit(&output, run)
+	if !strings.Contains(output.String(), "PLAN BLOCKED") || strings.Contains(output.String(), "READY") || strings.Contains(output.String(), "migrate --live") {
+		t.Fatalf("bind-mount staged plan cockpit offered live apply:\n%s", output.String())
+	}
+	run.Applied = runApplied{APIVersion: appliedAPIVersion, PlanVersion: appliedPlanCurrent, TargetOrigin: "http://127.0.0.1:3000"}
+	if phase := migrationRunPhase(run); phase != "plan-blocked" {
+		t.Fatalf("bound zero-step blocked plan phase = %q, want plan-blocked", phase)
+	}
+	next = nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "cannot be re-planned") || strings.Contains(next.Action, "bort migrate") {
+		t.Fatalf("bound zero-step blocked plan offered re-planning: %#v", next)
+	}
+	run.Applied.Steps = []appliedStep{{Index: 0, Kind: string(dokploy.StepCreateProject), App: "api", Ref: "api", Status: string(dokploy.StepStatusOK)}}
+	if phase := migrationRunPhase(run); phase != "partial" {
+		t.Fatalf("partial run with a currently unstageable bundle phase = %q, want partial", phase)
+	}
+	if next := nextSafeStep(run, nil); !strings.Contains(next.Action, "resume the interrupted apply") || strings.Contains(next.Action, "re-plan") {
+		t.Fatalf("partial run with a currently unstageable bundle lost its resume step: %#v", next)
+	}
+}
+
+func TestWizardDoesNotRecommendLiveApplyForInPlaceStatefulRun(t *testing.T) {
+	run := loadedMigrationRun{
+		Run:     migrationRun{Name: "stateful", RunDir: t.TempDir(), Target: "dokploy"},
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}},
+		Sync: syncplan.Result{Apps: []syncplan.AppPlan{{Name: "api", Steps: []syncplan.Step{{
+			ResourceType: "volume",
+			ResourceRef:  "volume:web -> /data",
+			Strategy:     syncplan.StrategyDockerVolumeArchive,
+		}}}}},
+		Applied: runApplied{APIVersion: appliedAPIVersion, PlanVersion: appliedPlanV1Alpha2, Apps: map[string]appliedApp{"api": {}}},
+	}
+	var output strings.Builder
+	if err := runWizard(context.Background(), run, strings.NewReader(""), &output, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "MANUAL STATE") || strings.Contains(output.String(), "migrate --live") {
+		t.Fatalf("stateful wizard offered an unusable live action:\n%s", output.String())
+	}
+}
+
+func TestWizardDoesNotRecommendLiveApplyWhileHostIsOwned(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	run := loadedMigrationRun{
+		Run: migrationRun{Name: "waiting-run", RunDir: t.TempDir(), Target: "dokploy", Source: "docker", CreatedAt: time.Now().UTC(), BundleDigest: "waiting-digest"},
+		Prepare: preparer.Result{
+			Source:               "docker",
+			SourceDockerEngineID: "engine-reviewed",
+			Apps: []preparer.AppPlan{{
+				Name:      "api",
+				Resources: preparer.ResourceSpecs{SourceServices: []preparer.SourceServiceRef{{ContainerID: "0123456789ab", ContainerName: "api"}}},
+			}},
+		},
+	}
+	var unowned strings.Builder
+	if err := runWizard(context.Background(), run, strings.NewReader(""), &unowned, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(unowned.String(), "Live apply is explicit") {
+		t.Fatalf("wizard did not offer live apply for an unowned host:\n%s", unowned.String())
+	}
+	ownerRun := migrationRun{Name: "owner-run", RunDir: filepath.Join(t.TempDir(), "owner-run"), CreatedAt: time.Now().UTC(), BundleDigest: "owner-digest"}
+	if err := claimDokployHostOwnership(ownerRun, "http://127.0.0.1:3030", dokployCredentialID("owner-token")); err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	if err := runWizard(context.Background(), run, strings.NewReader(""), &output, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "HOST OWNED") || strings.Contains(output.String(), "Live apply is explicit") {
+		t.Fatalf("wizard offered live apply while another run owned the host:\n%s", output.String())
 	}
 }
 

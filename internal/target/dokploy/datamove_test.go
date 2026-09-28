@@ -23,6 +23,7 @@ import (
 
 type fakeDockerRunner struct {
 	outputs    map[string][]byte
+	outputErrs map[string]error
 	runOutputs map[string][]byte
 	outputArgs [][]string
 	runs       []fakeDockerRun
@@ -53,8 +54,36 @@ func (f *fakeDockerRunner) Output(_ context.Context, args ...string) ([]byte, er
 		return []byte{}, nil
 	}
 	key := strings.Join(args, " ")
+	if err, ok := f.outputErrs[key]; ok {
+		return nil, err
+	}
 	if data, ok := f.outputs[key]; ok {
 		return data, nil
+	}
+	if key == "ps --filter label=com.docker.swarm.service.name=dokploy-postgres --filter status=running --format {{.ID}}" {
+		for _, name := range strings.Fields(string(f.outputs["ps --format {{.Names}}"])) {
+			if name == "dokploy-postgres" || strings.HasPrefix(name, "dokploy-postgres.") || strings.HasPrefix(name, "dokploy-postgres-") {
+				return []byte(name + "\n"), nil
+			}
+		}
+		return nil, nil
+	}
+	postgresContainer := ""
+	for _, name := range strings.Fields(string(f.outputs["ps --format {{.Names}}"])) {
+		if name == "dokploy-postgres" || strings.HasPrefix(name, "dokploy-postgres.") || strings.HasPrefix(name, "dokploy-postgres-") {
+			postgresContainer = name
+			break
+		}
+	}
+	if postgresContainer != "" {
+		switch key {
+		case "node inspect self --format {{.ID}}":
+			return []byte("local-node\n"), nil
+		case "service ps --filter desired-state=running -q dokploy-postgres":
+			return []byte("dokploy-postgres-task\n"), nil
+		case "inspect --type task dokploy-postgres-task":
+			return []byte(fmt.Sprintf(`[{"NodeID":"local-node","Status":{"State":"running","ContainerStatus":{"ContainerID":%q}}}]`, postgresContainer)), nil
+		}
 	}
 	for prefix, data := range f.outputs {
 		if strings.HasPrefix(key, prefix) {
@@ -92,14 +121,20 @@ type statefulTargetRunner struct {
 }
 
 func (r *statefulTargetRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
-	if len(args) == 4 && args[0] == "inspect" && args[1] == "--type" && args[2] == "container" && r.stopped[args[3]] {
-		output, err := r.fakeDockerRunner.Output(ctx, args...)
-		if err != nil {
-			return nil, err
+	if len(args) >= 4 && args[0] == "inspect" && args[1] == "--type" && args[2] == "container" {
+		allStopped := true
+		for _, id := range args[3:] {
+			allStopped = allStopped && r.stopped[id]
 		}
-		output = bytes.ReplaceAll(output, []byte(`"Running":true`), []byte(`"Running":false`))
-		output = bytes.ReplaceAll(output, []byte(`"Status":"running"`), []byte(`"Status":"exited"`))
-		return output, nil
+		if allStopped {
+			output, err := r.fakeDockerRunner.Output(ctx, args...)
+			if err != nil {
+				return nil, err
+			}
+			output = bytes.ReplaceAll(output, []byte(`"Running":true`), []byte(`"Running":false`))
+			output = bytes.ReplaceAll(output, []byte(`"Status":"running"`), []byte(`"Status":"exited"`))
+			return output, nil
+		}
 	}
 	output, err := r.fakeDockerRunner.Output(ctx, args...)
 	if err != nil || len(args) != 2 {
@@ -155,7 +190,7 @@ func (r *latePostDeployTargetRunner) Output(_ context.Context, args ...string) (
 	r.outputArgs = append(r.outputArgs, append([]string{}, args...))
 	key := strings.Join(args, " ")
 	switch key {
-	case "ps --format {{.Names}}":
+	case "ps --filter label=com.docker.swarm.service.name=dokploy-postgres --filter status=running --format {{.ID}}":
 		return []byte("dokploy-postgres.1.task\n"), nil
 	case "ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}":
 		r.psCalls++
@@ -721,8 +756,8 @@ func TestApplyRestoreDataStoreFiltersEventTriggers(t *testing.T) {
 			"exec -i dst-id pg_restore -l": []byte("; archive header\n20; 2615 16457 SCHEMA - auth supabase_admin\n7; 3079 16950 EXTENSION - supabase_vault \n239; 1259 16488 TABLE auth users supabase_auth_admin\n5332; 0 16458 TABLE DATA auth users supabase_auth_admin\n5337; 0 16496 TABLE DATA auth schema_migrations supabase_auth_admin\n260; 1259 16970 VIEW vault decrypted_secrets supabase_admin\n271; 1259 100 TABLE public widgets bob\n2; 0 0 EVENT TRIGGER - pgrst_drop_watch bob\n3; 0 0 COMMENT - EVENT TRIGGER pgrst_drop_watch bob\n4; 0 100 TABLE DATA public widgets bob\n"),
 		},
 	}
-	client := &Client{Docker: runner}
-	actx := &applyContext{cache: map[string]*appCache{}, plan: plan}
+	client := stagingCompatibleClient(t, runner, true, "")
+	actx := &applyContext{cache: map[string]*appCache{}, plan: plan, stagingEnvFormat: stagingEnvFormatKeepInterpolation}
 	actx.entry("api").ComposeAppName = "stack-1"
 
 	step := Step{Kind: StepRestoreDataStore, App: "api", Ref: "data-store:db"}
@@ -852,11 +887,15 @@ func TestApplySyncVolumeCopiesNamedVolume(t *testing.T) {
 	}
 	client := &Client{Docker: runner}
 
-	actx := &applyContext{cache: map[string]*appCache{}}
-	actx.entry("api").ComposeAppName = "stack-1"
-	actx.plan = Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}
-
 	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"}
+	actx := &applyContext{
+		cache: map[string]*appCache{},
+		plan: Plan{
+			Prepare: preparer.Result{Apps: []preparer.AppPlan{app}},
+		},
+	}
+	actx.entry("api").ComposeAppName = "stack-1"
+
 	if err := client.applySyncVolume(context.Background(), actx, step); err != nil {
 		t.Fatalf("applySyncVolume: %v", err)
 	}
@@ -1508,9 +1547,9 @@ func TestApplyResumeTargetLoadsPersistedMigratedVolumeState(t *testing.T) {
 
 	resumed := &applyContext{cache: map[string]*appCache{}, plan: plan}
 	resumed.entry("api").ComposeAppName = "stack-1"
-	pausedApps := map[string]struct{}{}
+	pausedApps := pausedSources{}
 	coolifyProxyStopped := false
-	if err := client.primeResumeState(context.Background(), resumed, nil, Step{Kind: StepResumeTarget, App: "api", Ref: "api"}, pausedApps, &coolifyProxyStopped); err != nil {
+	if err := client.primeResumeState(context.Background(), resumed, nil, pausedApps, map[string]struct{}{}, &coolifyProxyStopped); err != nil {
 		t.Fatalf("primeResumeState: %v", err)
 	}
 	runner.outputs["inspect --type container dst-id"] = []byte(`[{"Id":"dst-id","Name":"/dokploy-redis","Config":{"Labels":{"com.docker.compose.service":"redis","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`)
@@ -1553,8 +1592,10 @@ func TestBestEffortResumeSkipsTargetWritersAfterUnsafeResumeError(t *testing.T) 
 	client := &Client{Docker: runner}
 	actx := &applyContext{cache: map[string]*appCache{}}
 	actx.entry("api").TargetWritersStopped = []dockerContainer{{ID: "target-id"}}
+	actx.entry("source-app").SourcePauseRecorded = true
+	actx.entry("source-app").SourcePausedContainers = []sourcePausedContainer{{ID: "source-id", Stopped: true}}
 	plan := Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "source-app", Resources: preparer.ResourceSpecs{Volumes: []preparer.VolumeResource{{Service: "web", Type: "volume", Target: "/data", SourceContainerID: "source-id"}}}}}}}
-	client.bestEffortResume(context.Background(), actx, plan, 1, map[string]struct{}{"source-app": {}}, false, true)
+	client.bestEffortResume(context.Background(), actx, plan, 1, pausedSources{"source-app": false}, false, true)
 
 	if fakeOutputCalled(runner, "start", "target-id") {
 		t.Fatalf("target writer restarted after unsafe resume error, calls=%#v", runner.outputArgs)
@@ -1636,6 +1677,31 @@ func TestStopTargetComposeContainersWaitsForLatePostDeployTarget(t *testing.T) {
 	}
 	if !fakeOutputCalled(&fakeDockerRunner{outputArgs: runner.outputArgs}, "stop", "web-id") {
 		t.Fatalf("expected late post-deploy target to stop, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestPostDeployValidationStopFailureKeepsSourcePausedAndMarksAmbiguous(t *testing.T) {
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("web-id\n"),
+			"inspect --type container web-id":                                          []byte(`[{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`),
+		},
+		outputErrs: map[string]error{"stop web-id": errors.New("Error response from daemon: cannot stop container")},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{}}
+	entry := actx.entry("api")
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+
+	err := client.validateMigratedVolumeMountsAfterDeploy(context.Background(), actx, "api")
+	if err == nil || !strings.Contains(err.Error(), "changed from migrated volume migrated-vol to fresh-vol") || !strings.Contains(err.Error(), "also failed to stop unsafe target containers") {
+		t.Fatalf("expected drift error with failed stop, got %v", err)
+	}
+	if !isUnsafeSourceResumeError(err) || !isUnsafeTargetResumeError(err) || !mutationResponseMayHaveSucceeded(err) {
+		t.Fatalf("a target left running on migrated state must block source restart and ordinary retry, got %v", err)
 	}
 }
 
@@ -1855,13 +1921,13 @@ func TestPrimeResumeStateRecordsAlreadyStoppedTargetWriters(t *testing.T) {
 		Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}},
 	}}
 	actx.entry("api").ComposeAppName = "stack-api"
-	pausedApps := map[string]struct{}{}
+	pausedApps := pausedSources{}
 	coolifyProxyStopped := false
 
 	err := client.primeResumeState(context.Background(), actx,
 		[]Step{{Kind: StepPushImage, App: "api", Ref: "api"}},
-		Step{Kind: StepPauseSource, App: "other", Ref: "other"},
 		pausedApps,
+		map[string]struct{}{},
 		&coolifyProxyStopped,
 	)
 	if err != nil {
@@ -1876,6 +1942,89 @@ func TestPrimeResumeStateRecordsAlreadyStoppedTargetWriters(t *testing.T) {
 	}
 	if !fakeOutputCalled(runner, "start", "web-id") {
 		t.Fatalf("expected reconstructed target writer to restart, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestPrimeResumeStateDoesNotRedeployCompletedPush(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatalf("mkdir app dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte("services:\n  web:\n    image: example/web\n"), 0o600); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+	var mutations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			mutations = append(mutations, r.URL.Path)
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "compose-1", AppName: "stack-api"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter label=com.docker.compose.project=stack-api --format {{.ID}}": []byte("web-id\n"),
+		"inspect --type container web-id":                                            []byte(`[{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-api"}},"State":{"Running":true,"Status":"running"}}]`),
+		"stop web-id":                                                                []byte("web-id\n"),
+	}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	app := preparer.AppPlan{Name: "api", Directory: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", SourceContainerID: "source-id"}}
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
+	plan := Plan{
+		Steps: []Step{
+			{Kind: StepUploadEnv, App: "api", Ref: "api"},
+			{Kind: StepPushImage, App: "api", Ref: "api"},
+			{Kind: StepPauseSource, App: "api", Ref: "api"},
+		},
+		Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}},
+	}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{"api": {ComposeID: "compose-1", ComposeAppName: "stack-api"}}}
+	pausedApps := pausedSources{}
+	coolifyProxyStopped := false
+
+	if err := client.primeResumeState(context.Background(), actx, plan.Steps[:2], pausedApps, map[string]struct{}{}, &coolifyProxyStopped); err != nil {
+		t.Fatalf("primeResumeState: %v", err)
+	}
+	if len(mutations) != 0 {
+		t.Fatalf("expected priming to leave the completed push untouched, got Dokploy mutations %v", mutations)
+	}
+	if stopped := actx.entry("api").TargetWritersStopped; len(stopped) != 1 || stopped[0].ID != "web-id" {
+		t.Fatalf("expected completed push to reconstruct its stopped writer, got %#v", stopped)
+	}
+	if !fakeOutputCalled(runner, "stop", "web-id") {
+		t.Fatalf("expected running target writer to be stopped, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestTargetWriterReconciliationDoesNotRestartPreviouslyStoppedWriterOnFailure(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter label=com.docker.compose.project=stack-api --format {{.ID}}": []byte("web-id\nworker-id\n"),
+		"inspect --type container web-id worker-id": []byte(`[
+            {"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-api"}},"State":{"Running":false,"Status":"exited"}},
+            {"Id":"worker-id","Name":"/worker","Config":{"Labels":{"com.docker.compose.service":"worker","com.docker.compose.project":"stack-api"}},"State":{"Running":true,"Status":"running"}}
+        ]`),
+	}}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{
+		Steps: []Step{{Kind: StepPauseSource, App: "api", Ref: "api"}},
+	}}
+	entry := actx.entry("api")
+	entry.ComposeAppName = "stack-api"
+	entry.TargetWritersStopped = []dockerContainer{{ID: "web-id"}}
+
+	err := client.primeTargetWritersForResume(context.Background(), runner, actx, "api")
+	if err == nil || !strings.Contains(err.Error(), "stop target writer container worker-id") {
+		t.Fatalf("expected worker stop failure, got %v", err)
+	}
+	if fakeOutputCalled(runner, "start", "web-id") {
+		t.Fatalf("previously stopped target writer was restarted after reconciliation failure, calls=%#v", runner.outputArgs)
 	}
 }
 
@@ -1897,10 +2046,10 @@ func TestApplySyncVolumeBindMountFailsOnStaleSource(t *testing.T) {
 		},
 	}
 	client := &Client{Docker: runner}
+	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"}
 	actx := &applyContext{cache: map[string]*appCache{}}
 	actx.entry("api").ComposeAppName = "stack-1"
 	actx.plan = Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}
-	step := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"}
 	err := client.applySyncVolume(context.Background(), actx, step)
 	if err == nil || !strings.Contains(err.Error(), "rescan before retrying") {
 		t.Fatalf("expected stale-source error, got %v", err)

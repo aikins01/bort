@@ -10,7 +10,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,11 +41,206 @@ func TestNewClientFromEnvRequiresURLAndToken(t *testing.T) {
 	}
 }
 
+func TestLocalDockerRunnerRefusesExplicitRemoteDaemon(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "ssh://remote.example")
+	t.Setenv("DOCKER_CONTEXT", "production")
+	t.Setenv("DOCKER_TLS_VERIFY", "1")
+	t.Setenv("DOCKER_CERT_PATH", "/tmp/remote-certs")
+	_, err := (localDockerRunner{Path: filepath.Join(t.TempDir(), "docker")}).Output(context.Background(), "version")
+	if err == nil || !strings.Contains(err.Error(), "DOCKER_HOST") {
+		t.Fatalf("expected explicit remote Docker target refusal, got %v", err)
+	}
+}
+
+func TestPrimeResumeStateUsesPersistedComposeIdentity(t *testing.T) {
+	projectCatalogRequests := 0
+	composeSearchRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/project.one":
+			if r.URL.Query().Get("projectId") != "project-1" {
+				t.Fatalf("unexpected project identity: %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(Project{ProjectID: "project-1", Environments: []ProjectEnvironment{{EnvironmentID: "environment-1", Name: "production"}}})
+		case "/api/compose.one":
+			if r.URL.Query().Get("composeId") != "compose-selected" {
+				t.Fatalf("unexpected compose identity: %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "compose-selected", Name: "api", AppName: "stack-api", EnvironmentID: "environment-1"})
+		case "/api/project.all":
+			projectCatalogRequests++
+			http.Error(w, "name lookup must not run", http.StatusInternalServerError)
+		case "/api/compose.search":
+			composeSearchRequests++
+			http.Error(w, "name lookup must not run", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	app := preparer.AppPlan{Name: "api"}
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{
+		Project:    preparer.DokployProject{Name: "api", Environment: "production"},
+		ComposeApp: preparer.DokployComposeApp{Name: "api"},
+	}}
+	plan := Plan{
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{app}},
+		Steps: []Step{
+			{Kind: StepCreateProject, App: "api", Ref: "api"},
+			{Kind: StepCreateService, App: "api", Ref: "api"},
+			{Kind: StepInstallGateway, App: "api", Ref: "api.example.com"},
+		},
+		TargetIdentities: map[string]TargetIdentity{"api": {
+			ProjectID: "project-1", EnvironmentID: "environment-1", ComposeID: "compose-selected", ComposeAppName: "stack-api",
+		}},
+	}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	pausedApps := pausedSources{}
+	coolifyProxyStopped := false
+
+	if err := client.primeResumeState(context.Background(), actx, plan.Steps[:2], pausedApps, map[string]struct{}{}, &coolifyProxyStopped); err != nil {
+		t.Fatalf("primeResumeState: %v", err)
+	}
+	entry := actx.entry("api")
+	if entry.ProjectID != "project-1" || entry.EnvironmentID != "environment-1" || entry.ComposeID != "compose-selected" || entry.ComposeAppName != "stack-api" {
+		t.Fatalf("resume did not hydrate persisted target identity: %#v", entry)
+	}
+	if projectCatalogRequests != 0 || composeSearchRequests != 0 {
+		t.Fatalf("resume fell back to mutable names, project requests=%d compose searches=%d", projectCatalogRequests, composeSearchRequests)
+	}
+}
+
+func TestHydratePersistedTargetIdentitiesLoadsSharedProjectOnce(t *testing.T) {
+	projectRequests := 0
+	composeRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/project.one":
+			projectRequests++
+			_ = json.NewEncoder(w).Encode(Project{ProjectID: "project-1", Environments: []ProjectEnvironment{{EnvironmentID: "environment-1", Name: "production"}}})
+		case "/api/compose.one":
+			composeRequests++
+			id := r.URL.Query().Get("composeId")
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: id, AppName: "stack-" + id, EnvironmentID: "environment-1"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	apps := []preparer.AppPlan{
+		{Name: "alpha", TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{}}},
+		{Name: "beta", TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{}}},
+	}
+	actx := &applyContext{plan: Plan{
+		Prepare: preparer.Result{Apps: apps},
+		TargetIdentities: map[string]TargetIdentity{
+			"alpha": {ProjectID: "project-1", EnvironmentID: "environment-1", ComposeID: "compose-alpha"},
+			"beta":  {ProjectID: "project-1", EnvironmentID: "environment-1", ComposeID: "compose-beta"},
+		},
+	}, cache: map[string]*appCache{}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+
+	if err := client.hydratePersistedTargetIdentities(context.Background(), actx); err != nil {
+		t.Fatal(err)
+	}
+	if projectRequests != 1 || composeRequests != 2 {
+		t.Fatalf("expected one shared project lookup and two compose lookups, got projects=%d composes=%d", projectRequests, composeRequests)
+	}
+}
+
+func TestHydratePersistedTargetIdentitiesRejectsEnvironmentOutsideProject(t *testing.T) {
+	composeRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/project.one":
+			_ = json.NewEncoder(w).Encode(Project{ProjectID: "project-1", Environments: []ProjectEnvironment{{EnvironmentID: "other-environment"}}})
+		case "/api/compose.one":
+			composeRequests++
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "compose-1", EnvironmentID: "environment-1"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	app := preparer.AppPlan{Name: "api", TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{}}}
+	actx := &applyContext{plan: Plan{
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{app}},
+		TargetIdentities: map[string]TargetIdentity{"api": {
+			ProjectID: "project-1", EnvironmentID: "environment-1", ComposeID: "compose-1",
+		}},
+	}, cache: map[string]*appCache{}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+	err := client.hydratePersistedTargetIdentities(context.Background(), actx)
+	if err == nil || !strings.Contains(err.Error(), "no longer belongs to project") {
+		t.Fatalf("expected environment membership refusal, got %v", err)
+	}
+	if composeRequests != 0 {
+		t.Fatalf("compose was loaded before project membership was verified, requests=%d", composeRequests)
+	}
+}
+
+func TestLegacyPlanPreservesV1Alpha1RoutedStateOrder(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", Source: "data", Target: "/data"}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{app}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{{Name: "api", Steps: []syncplan.Step{{
+		ResourceType: "volume",
+		ResourceRef:  "volume:web -> /data",
+		Strategy:     syncplan.StrategyDockerVolumeArchive,
+	}}}}}
+	cutover := gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}}}}
+	legacy := LegacyPlanFromArtifactsV1Alpha1(prepare, sync, cutover)
+	current := PlanFromArtifactsV1Alpha2(prepare, sync, cutover)
+
+	indexOf := func(plan Plan, kind StepKind) int {
+		for index, step := range plan.Steps {
+			if step.Kind == kind {
+				return index
+			}
+		}
+		return -1
+	}
+	legacyResume := indexOf(legacy, StepResumeTarget)
+	legacyActivate := indexOf(legacy, StepActivateRoutes)
+	legacyStop := indexOf(legacy, StepStopCoolifyProxy)
+	if legacyResume < 0 || legacyActivate <= legacyResume || legacyStop <= legacyActivate {
+		t.Fatalf("unexpected legacy routed state order: %v", stepKinds(legacy.Steps))
+	}
+	currentStop := indexOf(current, StepStopCoolifyProxy)
+	currentResume := indexOf(current, StepResumeTarget)
+	currentActivate := indexOf(current, StepActivateRoutes)
+	if currentStop < 0 || currentResume <= currentStop || currentActivate <= currentResume {
+		t.Fatalf("unexpected current routed state order: %v", stepKinds(current.Steps))
+	}
+}
+
 func TestNewClientFromEnvRejectsRemoteHTTP(t *testing.T) {
 	t.Setenv(EnvBaseURL, "http://dokploy.example")
 	t.Setenv(EnvToken, "secret")
 	if _, err := NewClientFromEnv(); err == nil || !strings.Contains(err.Error(), "non-loopback http") {
 		t.Fatalf("expected remote http URL to be rejected, got %v", err)
+	}
+}
+
+func TestNormalizeTokenBaseURLPreservesPathAndRejectsRequestComponents(t *testing.T) {
+	got, err := NormalizeTokenBaseURL("https://DOKPLOY.example:443/tenant-a/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://dokploy.example/tenant-a" {
+		t.Fatalf("unexpected normalized URL %q", got)
+	}
+	for _, raw := range []string{
+		"https://user@dokploy.example",
+		"https://dokploy.example?tenant=a",
+		"https://dokploy.example#tenant-a",
+	} {
+		if _, err := NormalizeTokenBaseURL(raw); err == nil {
+			t.Fatalf("expected credentialed URL %q to be rejected", raw)
+		}
 	}
 }
 
@@ -253,6 +450,80 @@ func TestApplyResumeFromPrimesCompletedCreateSteps(t *testing.T) {
 	}
 }
 
+type partialSourcePauseRunner struct {
+	fakeDockerRunner
+	firstRunning bool
+}
+
+func (r *partialSourcePauseRunner) Output(_ context.Context, args ...string) ([]byte, error) {
+	r.outputArgs = append(r.outputArgs, append([]string{}, args...))
+	switch strings.Join(args, " ") {
+	case "inspect --type container source-a":
+		return []byte(fmt.Sprintf(`[{"Id":"source-a","Name":"/source-a","State":{"Running":%t,"Status":"running"}}]`, r.firstRunning)), nil
+	case "stop source-a":
+		r.firstRunning = false
+		return []byte("source-a\n"), nil
+	case "start source-a":
+		r.firstRunning = true
+		return []byte("source-a\n"), nil
+	case "inspect --type container source-b":
+		return []byte(`[{"Id":"source-b","Name":"/source-b","State":{"Running":true,"Status":"running"}}]`), nil
+	case "stop source-b":
+		return nil, errors.New("injected second source stop failure")
+	default:
+		return nil, fmt.Errorf("docker output not stubbed: %s", strings.Join(args, " "))
+	}
+}
+
+func TestApplyResumeFromReconcilesCompletedProxyStop(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container coolify-proxy": []byte(`[{"Id":"proxy-id","Name":"/coolify-proxy","State":{"Running":true,"Status":"running"}}]`),
+		"stop proxy-id":                          []byte("proxy-id\n"),
+	}}
+	client := &Client{Docker: runner}
+	plan := Plan{Steps: []Step{
+		{Kind: StepStopCoolifyProxy, Ref: coolifyProxyContainer},
+		{Kind: StepStartDokployProxy, Ref: dokployProxyContainer},
+	}}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	pausedApps := pausedSources{}
+	coolifyProxyStopped := false
+
+	if err := client.primeResumeState(context.Background(), actx, plan.Steps[:1], pausedApps, map[string]struct{}{}, &coolifyProxyStopped); err != nil {
+		t.Fatalf("prime resume state: %v", err)
+	}
+	if !fakeOutputCalled(runner, "stop", "proxy-id") {
+		t.Fatalf("retry did not restore the durable proxy stop, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestBestEffortProxyResumeUsesStandaloneProgressIndex(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container coolify-proxy": []byte(`[{"Id":"proxy-id","Name":"/coolify-proxy","State":{"Running":false,"Status":"exited"}}]`),
+		"start proxy-id":                         []byte("proxy-id\n"),
+	}}
+	client := &Client{Docker: runner}
+	progress := []StepProgress{}
+	onProgress := func(item StepProgress) {
+		progress = append(progress, item)
+	}
+	plan := Plan{
+		Steps:      []Step{{Kind: StepStopCoolifyProxy, Ref: coolifyProxyContainer}, {Kind: StepStartDokployProxy, Ref: dokployProxyContainer}},
+		OnProgress: &onProgress,
+	}
+	if err := client.bestEffortResume(context.Background(), &applyContext{}, plan, len(plan.Steps), nil, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(progress) != 2 {
+		t.Fatalf("expected proxy cleanup start and completion, got %#v", progress)
+	}
+	for _, item := range progress {
+		if item.Index != len(plan.Steps) || item.Step.Kind != StepStartCoolifyProxy {
+			t.Fatalf("proxy cleanup overwrote a forward step: %#v", item)
+		}
+	}
+}
+
 func TestApplySkipsPlatformAppSteps(t *testing.T) {
 	client := &Client{}
 	var progress []StepProgress
@@ -308,17 +579,14 @@ func TestApplyStopsBeforeStepWhenPersistenceHookFails(t *testing.T) {
 	}
 }
 
-func TestApplyResumesPausedSourceWhenPersistenceFailsBetweenSteps(t *testing.T) {
+func TestApplyResumesPausedSourceWhenNoStateTransferCompleted(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
 	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", SourceContainerID: "web-id"}}
-	runner := &fakeDockerRunner{outputs: map[string][]byte{
-		"inspect --type container web-id": []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
-		"stop web-id":                     []byte("web-id\n"),
-	}}
+	runner := &sourceOwnershipRunner{running: map[string]bool{"web-id": true}}
 	var beforeCalls int
 	beforeStep := func(StepProgress) error {
 		beforeCalls++
-		if beforeCalls == 2 {
+		if beforeCalls >= 2 {
 			return errors.New("persist failed")
 		}
 		return nil
@@ -337,12 +605,21 @@ func TestApplyResumesPausedSourceWhenPersistenceFailsBetweenSteps(t *testing.T) 
 	if err == nil || !strings.Contains(err.Error(), "persist failed") {
 		t.Fatalf("expected persistence failure, got %v", err)
 	}
+	resumed := false
 	for _, p := range progress {
 		if p.Step.Kind == StepResumeSource && p.Status == StepStatusOK {
-			return
+			resumed = true
 		}
 	}
-	t.Fatalf("expected cleanup to resume the paused source, got %#v", progress)
+	if !resumed {
+		t.Fatalf("source did not resume after a pre-transfer failure: %#v", progress)
+	}
+	if !runner.running["web-id"] || !fakeOutputCalled(&runner.fakeDockerRunner, "start", "web-id") {
+		t.Fatalf("paused source was not restarted: running=%v calls=%v", runner.running, runner.outputArgs)
+	}
+	if beforeCalls != 2 {
+		t.Fatalf("unexpected cleanup persistence attempt before any state transfer, calls=%d", beforeCalls)
+	}
 }
 
 func TestActivePatchGuardBlocksGitBackedCompose(t *testing.T) {
@@ -369,6 +646,31 @@ func TestActivePatchGuardBlocksGitBackedCompose(t *testing.T) {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("expected patch guard sql to contain %q, got:\n%s", want, sql)
 		}
+	}
+}
+
+func TestActivePatchGuardUsesCurrentLocalServiceTask(t *testing.T) {
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"ps --format {{.Names}}": []byte("dokploy-postgres-backup\ndokploy-postgres.1.current\n"),
+			"ps --filter label=com.docker.swarm.service.name=dokploy-postgres --filter status=running --format {{.ID}}": []byte("current-container-id\n"),
+		},
+		runOutputs: map[string][]byte{
+			"exec -i dokploy-postgres-backup psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": {},
+			"exec -i current-container-id psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At":    []byte(`{"patchId":"bort-current","filePath":"compose.yml","composeName":"api","sourceType":"github","repository":"owner/repo","branch":"main"}` + "\n"),
+		},
+	}
+	client := &Client{Docker: runner}
+
+	err := client.validateNoActiveBortOverrides(context.Background(), "compose-api")
+	if err == nil || !strings.Contains(err.Error(), "bort-current") {
+		t.Fatalf("expected current service task patch to block apply, got %v", err)
+	}
+	if len(runner.runs) != 1 || !slices.Contains(runner.runs[0].Args, "current-container-id") {
+		t.Fatalf("active patch guard queried the wrong database container: %#v", runner.runs)
+	}
+	if len(runner.outputArgs) != 1 || strings.Join(runner.outputArgs[0], " ") != "ps --filter label=com.docker.swarm.service.name=dokploy-postgres --filter status=running --format {{.ID}}" {
+		t.Fatalf("active patch guard did not use one exact service-label query: %#v", runner.outputArgs)
 	}
 }
 
@@ -459,6 +761,37 @@ func TestUpdateComposePatchGuardDetectsConcurrentPatch(t *testing.T) {
 	}
 	if updates != 1 || runner.checks != 2 {
 		t.Fatalf("expected one update between two patch checks, updates=%d checks=%d", updates, runner.checks)
+	}
+}
+
+func TestDeployComposeForApplyChecksPatchBeforeDeploy(t *testing.T) {
+	deploys := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			deploys++
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	runner := &stagedBortPatchRunner{patchAt: 3, fakeDockerRunner: fakeDockerRunner{
+		outputs:    map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
+		runOutputs: map[string][]byte{},
+	}}
+	actx := &applyContext{
+		cache: map[string]*appCache{"api": {ComposeID: "compose-api", ComposeAppName: "stack-1"}},
+	}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	err := client.deployComposeForApply(context.Background(), actx, "api", "services: {}\n", "")
+	if err == nil || !strings.Contains(err.Error(), "active Bort-owned Dokploy patch") {
+		t.Fatalf("expected pre-deployment patch refusal, got %v", err)
+	}
+	if deploys != 0 {
+		t.Fatalf("pre-deployment refusal called compose.deploy %d time(s)", deploys)
 	}
 }
 
@@ -624,6 +957,9 @@ func TestDeployComposeForApplyFailsClosedWhenAmbiguousResponseCannotBeResolved(t
 	if !isUnsafeSourceResumeError(err) || !isUnsafeTargetResumeError(err) {
 		t.Fatalf("unresolved ambiguous response must prevent source and target recovery, got %v", err)
 	}
+	if !mutationResponseMayHaveSucceeded(err) {
+		t.Fatalf("unresolved deploy response was not marked mutation-ambiguous: %v", err)
+	}
 	if composeReads != 2 || deploymentTitle == "" {
 		t.Fatalf("expected monitoring and quiescence to inspect the titled attempt, reads=%d title=%q", composeReads, deploymentTitle)
 	}
@@ -682,6 +1018,9 @@ func TestDeployComposeForApplyDoesNotMonitorAuthoritativeAPIRejection(t *testing
 			var apiErr *APIError
 			if !errors.As(err, &apiErr) || apiErr.Status != test.status {
 				t.Fatalf("expected authoritative API rejection %d, got %v", test.status, err)
+			}
+			if mutationResponseMayHaveSucceeded(err) {
+				t.Fatalf("authoritative API rejection was marked mutation-ambiguous: %v", err)
 			}
 			if composeReads != 0 || redirects != 0 || isUnsafeSourceResumeError(err) || isUnsafeTargetResumeError(err) {
 				t.Fatalf("authoritative rejection followed redirect or entered deployment recovery, redirects=%d reads=%d err=%v", redirects, composeReads, err)
@@ -862,6 +1201,45 @@ func TestDeploymentMonitoringQuiescenceFailurePreventsSourceRecovery(t *testing.
 	}
 }
 
+func TestRejectedDeployKeepsPostDeploySafetyMarkers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			http.Error(w, "deploy rejected", http.StatusBadRequest)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	runner := &stagedBortPatchRunner{patchAt: 100, fakeDockerRunner: fakeDockerRunner{
+		outputs: map[string][]byte{
+			"ps --format {{.Names}}": []byte("dokploy-postgres\n"),
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("web-id\n"),
+			"inspect --type container web-id":                                          []byte(`[{"Id":"web-id","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`),
+		},
+		outputErrs: map[string]error{"stop web-id": errors.New("Error response from daemon: cannot stop container")},
+		runOutputs: map[string][]byte{},
+	}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	actx := &applyContext{plan: Plan{}, cache: map[string]*appCache{}}
+	entry := actx.entry("api")
+	entry.ComposeID = "compose-api"
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+
+	err := client.deployComposeForApply(context.Background(), actx, "api", "services: {}\n", "")
+	if err == nil || !strings.Contains(err.Error(), "deploy rejected") || !strings.Contains(err.Error(), "also failed to stop unsafe target containers") {
+		t.Fatalf("expected rejected deploy with failed safety stop, got %v", err)
+	}
+	if !isUnsafeSourceResumeError(err) || !isUnsafeTargetResumeError(err) || !mutationResponseMayHaveSucceeded(err) {
+		t.Fatalf("rejected deploy must keep the post-deploy safety markers, got %v", err)
+	}
+}
+
 func TestDeploymentQuiescenceRespectsCallerDeadline(t *testing.T) {
 	composeReads := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -996,8 +1374,15 @@ func TestApplyLeavesPausedSourceStoppedWhenGuardedDeploymentCannotBeQuiesced(t *
 	app := preparer.AppPlan{Name: "api", Directory: "api"}
 	app.Resources.SourceServices = []preparer.SourceServiceRef{{ServiceName: "web", ContainerID: "source-id"}}
 	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "api", ComposePath: "compose.yaml"}}}
+	paused := &applyContext{plan: Plan{RunDir: bundleDir}, cache: map[string]*appCache{}}
+	paused.entry("api").SourcePauseRecorded = true
+	paused.entry("api").SourcePausedContainers = []sourcePausedContainer{{ID: "source-id", Stopped: true}}
+	if err := paused.persistSourcePauseState(); err != nil {
+		t.Fatal(err)
+	}
 	err := client.Apply(context.Background(), Plan{
 		ResumeFrom: 3,
+		RunDir:     bundleDir,
 		Steps: []Step{
 			{Kind: StepCreateProject, App: "api", Ref: "api"},
 			{Kind: StepCreateService, App: "api", Ref: "api"},
@@ -1009,55 +1394,61 @@ func TestApplyLeavesPausedSourceStoppedWhenGuardedDeploymentCannotBeQuiesced(t *
 	if err == nil || !strings.Contains(err.Error(), "leave any paused source applications stopped") {
 		t.Fatalf("expected fail-closed guarded deployment error, got %v", err)
 	}
+	if !mutationResponseMayHaveSucceeded(err) {
+		t.Fatalf("accepted deployment with unproven quiescence was not marked mutation-ambiguous: %v", err)
+	}
 	if fakeOutputCalled(&runner.fakeDockerRunner, "start", "source-id") {
 		t.Fatalf("unsafe recovery restarted the paused source, calls=%#v", runner.outputArgs)
 	}
 }
 
-func TestComposeMutationPatchGuardRechecksAfterHTTPError(t *testing.T) {
-	for _, test := range []struct {
-		name       string
-		path       string
-		wantPatch  bool
-		wantChecks int
-		mutate     func(*Client) error
-	}{
-		{name: "update", path: "/api/compose.update", wantPatch: true, wantChecks: 2, mutate: func(client *Client) error {
-			return client.updateComposeWithPatchGuard(context.Background(), "compose-api", "services: {}\n", "")
-		}},
-		{name: "deploy", path: "/api/compose.deploy", wantChecks: 1, mutate: func(client *Client) error {
-			return client.deployComposeWithPatchGuard(context.Background(), "compose-api", "bort-migrate")
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodPost || r.URL.Path != test.path {
-					http.NotFound(w, r)
-					return
-				}
-				http.Error(w, "mutation failed", http.StatusInternalServerError)
-			}))
-			defer server.Close()
-			runner := &stagedBortPatchRunner{fakeDockerRunner: fakeDockerRunner{
-				outputs:    map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
-				runOutputs: map[string][]byte{},
-			}}
-			client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
-			err := test.mutate(client)
-			if err == nil || !strings.Contains(err.Error(), "mutation failed") {
-				t.Fatalf("expected HTTP mutation error, got %v", err)
-			}
-			if got := strings.Contains(err.Error(), "appeared while Bort was changing compose"); got != test.wantPatch {
-				t.Fatalf("post-mutation patch error = %t, want %t: %v", got, test.wantPatch, err)
-			}
-			var deployedGuardErr deployedComposeGuardError
-			if errors.As(err, &deployedGuardErr) {
-				t.Fatalf("failed HTTP mutation was classified as a successful deploy: %v", err)
-			}
-			if runner.checks != test.wantChecks {
-				t.Fatalf("patch checks = %d, want %d", runner.checks, test.wantChecks)
-			}
-		})
+func TestComposeUpdatePatchGuardRechecksAfterHTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/compose.update" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "mutation failed", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	runner := &stagedBortPatchRunner{fakeDockerRunner: fakeDockerRunner{
+		outputs:    map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
+		runOutputs: map[string][]byte{},
+	}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	err := client.updateComposeWithPatchGuard(context.Background(), "compose-api", "services: {}\n", "")
+	if err == nil || !strings.Contains(err.Error(), "mutation failed") || !strings.Contains(err.Error(), "appeared while Bort was changing compose") {
+		t.Fatalf("expected HTTP mutation and post-mutation patch errors, got %v", err)
+	}
+	if !mutationResponseMayHaveSucceeded(err) {
+		t.Fatalf("HTTP 500 compose update was not marked mutation-ambiguous: %v", err)
+	}
+	if runner.checks != 2 {
+		t.Fatalf("patch checks = %d, want 2", runner.checks)
+	}
+}
+
+func TestComposeUpdateTransportFailureIsMutationAmbiguous(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/compose.update" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+	runner := &stagedBortPatchRunner{patchAt: 100, fakeDockerRunner: fakeDockerRunner{
+		outputs:    map[string][]byte{"ps --format {{.Names}}": []byte("dokploy-postgres\n")},
+		runOutputs: map[string][]byte{},
+	}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	err := client.updateComposeWithPatchGuard(context.Background(), "compose-api", "services: {}\n", "")
+	if err == nil || !mutationResponseMayHaveSucceeded(err) {
+		t.Fatalf("expected ambiguous compose update response, got %v", err)
 	}
 }
 
@@ -1085,6 +1476,29 @@ func TestApplyPushImageChecksActivePatchWithoutEnvOrRoutes(t *testing.T) {
 	err := client.applyPushImage(context.Background(), actx, Step{Kind: StepPushImage, App: "api", Ref: "api"})
 	if err == nil || !strings.Contains(err.Error(), "active Bort-owned Dokploy patch") {
 		t.Fatalf("expected unconditional deployment path to block active patch, got %v", err)
+	}
+	if mutationResponseMayHaveSucceeded(err) {
+		t.Fatalf("pre-mutation active patch rejection was marked ambiguous: %v", err)
+	}
+}
+
+func TestApplyProgressMarksPreMutationFailureRetryable(t *testing.T) {
+	var terminal StepProgress
+	onProgress := func(progress StepProgress) {
+		if progress.Status == StepStatusError {
+			terminal = progress
+		}
+	}
+	client := &Client{Docker: &fakeDockerRunner{}}
+	err := client.Apply(context.Background(), Plan{
+		Steps:      []Step{{Kind: StepPushImage, App: "api", Ref: "api"}},
+		OnProgress: &onProgress,
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing composeId") {
+		t.Fatalf("expected pre-mutation validation failure, got %v", err)
+	}
+	if terminal.Status != StepStatusError || terminal.MutationAmbiguous {
+		t.Fatalf("pre-mutation progress was not explicitly retryable: %#v", terminal)
 	}
 }
 
@@ -1195,9 +1609,10 @@ func TestParseActiveBortOverridePatchesFailsClosedOnMalformedRow(t *testing.T) {
 }
 
 func TestActivePatchGuardFailsClosedWhenInspectionCannotFindDokploy(t *testing.T) {
-	client := &Client{Docker: &fakeDockerRunner{}}
+	const query = "ps --filter label=com.docker.swarm.service.name=dokploy-postgres --filter status=running --format {{.ID}}"
+	client := &Client{Docker: &fakeDockerRunner{outputErrs: map[string]error{query: errors.New("docker unavailable")}}}
 	err := client.validateNoActiveBortOverrides(context.Background(), "compose-api")
-	if err == nil || !strings.Contains(err.Error(), "active patch inspection") || !strings.Contains(err.Error(), "docker output not stubbed") {
+	if err == nil || !strings.Contains(err.Error(), "active patch inspection") || !strings.Contains(err.Error(), "docker unavailable") {
 		t.Fatalf("expected active patch inspection to fail closed, got %v", err)
 	}
 }
@@ -1208,7 +1623,7 @@ func TestActivePatchGuardFailsClosedWhenDokployDatabaseIsUnavailable(t *testing.
 	}}
 	client := &Client{Docker: runner}
 
-	if err := client.validateNoActiveBortOverrides(context.Background(), "compose-api"); err == nil || !strings.Contains(err.Error(), "dokploy postgres container was not found") {
+	if err := client.validateNoActiveBortOverrides(context.Background(), "compose-api"); err == nil || !strings.Contains(err.Error(), "has 0 running dokploy-postgres service containers") {
 		t.Fatalf("expected missing Dokploy DB to fail closed, got %v", err)
 	}
 	if len(runner.runs) != 0 {
@@ -1430,6 +1845,102 @@ func TestPingPropagatesAPIError(t *testing.T) {
 	}
 }
 
+func TestSearchComposeSelectsOnlyExactName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/compose.search" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(composeSearchResponse{Items: []Compose{
+			{ComposeID: "near", Name: "api-old"},
+			{ComposeID: "exact", Name: "api"},
+		}, Total: 2})
+	}))
+	defer server.Close()
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+
+	compose, err := client.SearchCompose(context.Background(), "api", "env1")
+	if err != nil {
+		t.Fatalf("SearchCompose: %v", err)
+	}
+	if compose == nil || compose.ComposeID != "exact" {
+		t.Fatalf("expected only exact-name compose, got %#v", compose)
+	}
+}
+
+func TestSearchComposeConsumesEveryCandidatePage(t *testing.T) {
+	items := make([]Compose, 100)
+	for i := range items {
+		items[i] = Compose{ComposeID: fmt.Sprintf("near-%d", i), Name: fmt.Sprintf("api-%d", i)}
+	}
+	var offsets []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/compose.search" {
+			http.NotFound(w, r)
+			return
+		}
+		offsets = append(offsets, r.URL.Query().Get("offset"))
+		if r.URL.Query().Get("offset") == "100" {
+			_ = json.NewEncoder(w).Encode(composeSearchResponse{Items: []Compose{{ComposeID: "exact", Name: "api"}}, Total: 101})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(composeSearchResponse{Items: items, Total: 101})
+	}))
+	defer server.Close()
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+
+	compose, err := client.SearchCompose(context.Background(), "api", "env1")
+	if err != nil {
+		t.Fatalf("SearchCompose: %v", err)
+	}
+	if compose == nil || compose.ComposeID != "exact" || !slices.Equal(offsets, []string{"0", "100"}) {
+		t.Fatalf("expected exact compose from second page, got compose=%#v offsets=%v", compose, offsets)
+	}
+}
+
+func TestSearchComposeUsesOneDeadlineAcrossPages(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		request := requests.Add(1)
+		time.Sleep(70 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(composeSearchResponse{Items: []Compose{{ComposeID: fmt.Sprintf("near-%d", request), Name: "api-old"}}, Total: 2})
+	}))
+	defer server.Close()
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: &http.Client{Timeout: 100 * time.Millisecond}}
+
+	_, err := client.SearchCompose(context.Background(), "api", "env1")
+	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("expected operation-level search timeout, got %v", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("search made %d requests before its operation deadline, want 2", got)
+	}
+}
+
+func TestSearchComposeRefusesDuplicateExactNames(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/compose.search" {
+			http.NotFound(w, r)
+			return
+		}
+		requests++
+		_ = json.NewEncoder(w).Encode(composeSearchResponse{Items: []Compose{
+			{ComposeID: "first", Name: "api"},
+			{ComposeID: "second", Name: "api"},
+		}, Total: 200})
+	}))
+	defer server.Close()
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+
+	if _, err := client.SearchCompose(context.Background(), "api", "env1"); err == nil || !strings.Contains(err.Error(), `multiple Dokploy compose apps named "api"`) {
+		t.Fatalf("expected duplicate exact-name refusal, got %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("duplicate exact names fetched unnecessary pages: requests=%d", requests)
+	}
+}
+
 func TestCreateComposeIsIdempotent(t *testing.T) {
 	calls := map[string]int{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1499,6 +2010,47 @@ func TestCreateComposeCreatesWhenMissing(t *testing.T) {
 	}
 }
 
+func TestApplyCreateServiceRefreshesMissingComposeAppName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.search":
+			_ = json.NewEncoder(w).Encode(composeSearchResponse{Items: []Compose{{ComposeID: "c1", Name: "api"}}, Total: 1})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "c1", Name: "api", AppName: "stack-api"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	bundleDir := t.TempDir()
+	composePath := filepath.Join(bundleDir, "api", "compose.yaml")
+	if err := os.MkdirAll(filepath.Dir(composePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(composePath, []byte("services: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := preparer.AppPlan{
+		Name:      "api",
+		Directory: "api",
+		TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{
+			ComposeApp: preparer.DokployComposeApp{Name: "api", ComposePath: "compose.yaml"},
+		}},
+	}
+	actx := &applyContext{
+		plan:  Plan{Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}},
+		cache: map[string]*appCache{"api": {EnvironmentID: "env1"}},
+	}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+	if err := client.applyCreateService(context.Background(), actx, Step{Kind: StepCreateService, App: "api", Ref: "api"}); err != nil {
+		t.Fatal(err)
+	}
+	entry := actx.entry("api")
+	if entry.ComposeID != "c1" || entry.ComposeAppName != "stack-api" {
+		t.Fatalf("compose identity was not refreshed before create completed: %#v", entry)
+	}
+}
+
 func TestCreateDomainIsIdempotent(t *testing.T) {
 	calls := map[string]int{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1529,6 +2081,49 @@ func TestCreateDomainIsIdempotent(t *testing.T) {
 	}
 	if calls["POST /api/domain.create"] != 0 {
 		t.Fatalf("expected no domain.create calls, got %#v", calls)
+	}
+}
+
+func TestDomainMutationTransportFailuresAreAmbiguous(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		existing      []Domain
+		failedPath    string
+		wantAmbiguous bool
+	}{
+		{name: "lookup", failedPath: "/api/domain.byComposeId"},
+		{name: "create", failedPath: "/api/domain.create", wantAmbiguous: true},
+		{name: "update", existing: []Domain{{DomainID: "domain-1", Host: "api.example.com", ServiceName: "old", Port: 3000}}, failedPath: "/api/domain.update", wantAmbiguous: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == test.failedPath {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Fatal(err)
+					}
+					_ = conn.Close()
+					return
+				}
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/domain.byComposeId":
+					_ = json.NewEncoder(w).Encode(test.existing)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client()}
+			_, err := client.CreateDomain(context.Background(), CreateDomainRequest{
+				Host: "api.example.com", ComposeID: "compose-1", ServiceName: "web", Port: 8080,
+			})
+			if err == nil {
+				t.Fatal("expected transport failure")
+			}
+			if got := mutationResponseMayHaveSucceeded(err); got != test.wantAmbiguous {
+				t.Fatalf("mutation ambiguity = %t, want %t: %v", got, test.wantAmbiguous, err)
+			}
+		})
 	}
 }
 

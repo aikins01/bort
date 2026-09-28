@@ -32,12 +32,14 @@ type Options struct {
 }
 
 type Result struct {
-	APIVersion string          `json:"apiVersion"`
-	BundleDir  string          `json:"bundleDir"`
-	Target     string          `json:"target"`
-	DryRun     bool            `json:"dryRun"`
-	Status     preparer.Status `json:"status"`
-	Apps       []AppPlan       `json:"apps"`
+	APIVersion         string          `json:"apiVersion"`
+	BundleDir          string          `json:"bundleDir"`
+	Target             string          `json:"target"`
+	DryRun             bool            `json:"dryRun"`
+	AutomaticAvailable *bool           `json:"automaticAvailable,omitempty"`
+	AutomaticBlocker   string          `json:"automaticBlocker,omitempty"`
+	Status             preparer.Status `json:"status"`
+	Apps               []AppPlan       `json:"apps"`
 }
 
 type AppPlan struct {

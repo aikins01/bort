@@ -78,16 +78,19 @@ type Options struct {
 }
 
 type Result struct {
-	APIVersion string    `json:"apiVersion"`
-	BundleDir  string    `json:"bundleDir"`
-	Target     string    `json:"target"`
-	Status     Status    `json:"status"`
-	Apps       []AppPlan `json:"apps"`
+	APIVersion           string    `json:"apiVersion"`
+	BundleDir            string    `json:"bundleDir"`
+	Target               string    `json:"target"`
+	Source               string    `json:"source,omitempty"`
+	SourceDockerEngineID string    `json:"sourceDockerEngineId,omitempty"`
+	Status               Status    `json:"status"`
+	Apps                 []AppPlan `json:"apps"`
 }
 
 type AppPlan struct {
 	Name            string           `json:"name"`
 	Directory       string           `json:"directory"`
+	Platform        string           `json:"platform,omitempty"`
 	Role            string           `json:"role,omitempty"`
 	ProjectGroup    *ProjectGroup    `json:"projectGroup,omitempty"`
 	Status          Status           `json:"status"`
@@ -236,7 +239,14 @@ func Plan(opts Options) (Result, error) {
 		return Result{}, err
 	}
 
-	result := Result{APIVersion: APIVersion, BundleDir: opts.BundleDir, Target: opts.Target, Status: StatusGreen}
+	result := Result{
+		APIVersion:           APIVersion,
+		BundleDir:            opts.BundleDir,
+		Target:               opts.Target,
+		Source:               index.Source,
+		SourceDockerEngineID: index.SourceDockerEngineID,
+		Status:               StatusGreen,
+	}
 	for _, app := range index.Apps {
 		if opts.AppName != "" && app.Name != opts.AppName && app.Directory != opts.AppName && planutil.Slug(app.Name) != planutil.Slug(opts.AppName) {
 			continue
@@ -267,7 +277,7 @@ func planApp(bundleDir, target string, app exporter.AppSummary) (AppPlan, error)
 		return AppPlan{}, fmt.Errorf("read topology for %s: %w", app.Name, err)
 	}
 
-	plan := AppPlan{Name: app.Name, Directory: app.Directory, Role: app.Role, ProjectGroup: projectGroup(app.ProjectGroup), Status: StatusGreen, Readiness: ReadinessReadyToCreate}
+	plan := AppPlan{Name: app.Name, Directory: app.Directory, Platform: app.Platform, Role: app.Role, ProjectGroup: projectGroup(app.ProjectGroup), Status: StatusGreen, Readiness: ReadinessReadyToCreate}
 	plan.Resources = resourceSpecs(app, appDir, topology)
 	addReadinessGates(&plan, topology)
 	plan.add(SeverityInfo, "compose", fmt.Sprintf("would create %s compose app from compose.yaml", target))

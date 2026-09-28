@@ -3,10 +3,12 @@ package dokploy
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/preparer"
+	syncplan "github.com/aikins01/bort/internal/sync"
 )
 
 var rollbackObserveSettle = 5 * time.Second
@@ -14,31 +16,43 @@ var rollbackObserveSettle = 5 * time.Second
 var sourceHealthPollInterval = 2 * time.Second
 
 // PlanForRollback builds the steps that return traffic to the source.
-func PlanForRollback(prepare preparer.Result, cutover gateway.Result) Plan {
+func PlanForRollback(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result) (Plan, error) {
 	plan := Plan{Prepare: prepare, Cutover: cutover, stepTimeout: dockerStartTimeout}
-	quiescedApps := []preparer.AppPlan{}
-	for _, app := range prepare.Apps {
-		if len(sourceQuiesceTargetRefs(app)) == 0 {
+	statefulApps := []string{}
+	seen := map[string]struct{}{}
+	livePlan := PlanFromArtifacts(prepare, sync, cutover)
+	for _, step := range livePlan.Steps {
+		if step.Kind != StepPauseSource || shouldSkipApplyStep(livePlan, step) {
 			continue
 		}
-		quiescedApps = append(quiescedApps, app)
+		if _, exists := seen[step.App]; exists {
+			continue
+		}
+		seen[step.App] = struct{}{}
+		statefulApps = append(statefulApps, step.App)
 	}
-	for _, app := range quiescedApps {
-		plan.Steps = append(plan.Steps, Step{Kind: StepResumeSource, App: app.Name, Ref: app.Name})
-	}
-	for _, app := range quiescedApps {
-		plan.Steps = append(plan.Steps, Step{Kind: StepVerifySourceHealth, App: app.Name, Ref: app.Name})
+	if len(statefulApps) > 0 {
+		return Plan{}, fmt.Errorf("automatic rollback is unsafe for stateful app(s) %s: Dokploy has no durable application fence that prevents a queued or future deployment from restarting target writers after source writers resume; preserve both sides and establish writer and traffic authority manually", strings.Join(statefulApps, ", "))
 	}
 	if cutoverPlanHasRoutes(cutover) {
+		statelessApps := []preparer.AppPlan{}
+		for _, app := range prepare.Apps {
+			if len(sourceQuiesceTargetRefs(app)) > 0 {
+				statelessApps = append(statelessApps, app)
+			}
+		}
+		for _, app := range statelessApps {
+			plan.Steps = append(plan.Steps, Step{Kind: StepVerifySourceHealth, App: app.Name, Ref: app.Name})
+		}
 		plan.Steps = append(plan.Steps,
 			Step{Kind: StepStopDokployProxy, Ref: dokployProxyContainer},
 			Step{Kind: StepStartCoolifyProxy, Ref: coolifyProxyContainer},
 		)
-		for _, app := range quiescedApps {
+		for _, app := range statelessApps {
 			plan.Steps = append(plan.Steps, Step{Kind: StepObserveRollback, App: app.Name, Ref: app.Name})
 		}
 	}
-	return plan
+	return plan, nil
 }
 
 func (c *Client) applyVerifySourceHealth(ctx context.Context, actx *applyContext, step Step) error {

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -240,6 +242,7 @@ func TestRunCommitUsesDefaultBundleWithoutCurrentRun(t *testing.T) {
 }
 
 func TestNewRunRequiresSuccessfulOutcomeBeforeCommit(t *testing.T) {
+	resetDokployTrafficOwner(t)
 	workDir := t.TempDir()
 	t.Chdir(workDir)
 	bundleDir := filepath.Join(workDir, "bort-bundle")
@@ -285,6 +288,245 @@ func TestNewRunRequiresSuccessfulOutcomeBeforeCommit(t *testing.T) {
 	if err := applyCommitFromArgs(context.Background(), "missing-outcome", io.Discard); err == nil || !strings.Contains(err.Error(), "no successful live-apply outcome") {
 		t.Fatalf("expected commit to reject complete steps without a durable outcome, got %v", err)
 	}
+	succeededAt := time.Now().UTC()
+	applied.SucceededAt = &succeededAt
+	if err := writeRunApplied(appliedPath, applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimDokployHostOwnership(run.Run, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(run.Run, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(dokploy.EnvBaseURL, "http://127.0.0.1:3030")
+	t.Setenv(dokploy.EnvToken, "test-token")
+	targetLock, err := acquireDokployLiveOperationLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = applyCommitFromArgs(context.Background(), "missing-outcome", io.Discard)
+	if !errors.Is(err, errDokployLiveOperationActive) {
+		t.Fatalf("expected another Dokploy live operation to block commit, got %v", err)
+	}
+	targetLock.Release()
+	blocked, err := loadMigrationRun("missing-outcome")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Run.CommitStartedAt != nil {
+		t.Fatal("commit recorded a start before acquiring the host Dokploy lock")
+	}
+}
+
+func TestCommitRefusesCoolifySourceBeforeRetirement(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "docker"), []byte("#!/bin/sh\necho \"$*\" >> docker-calls\nexit 90\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	writeTestBundle(t, "bundle", manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local", DockerEngineID: "engine-reviewed"},
+		Apps: []manifest.App{{
+			Name:     "api",
+			Services: []manifest.Service{{ID: "source-id", Name: "web", Image: "example/api:latest"}},
+			Routes:   []manifest.Route{{Host: "api.example.com", ServiceName: "web", Port: "3000"}},
+		}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", "bundle", "--run", "coolify-commit", "--observation-window", "0", "--rollback-window", "0"})
+	run, err := loadMigrationRun("coolify-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := newRunApplied(run.Run)
+	now := time.Now().UTC()
+	applied.SucceededAt = &now
+	for index, step := range dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps {
+		applied.Steps = append(applied.Steps, appliedStep{Index: index, Kind: string(step.Kind), App: step.App, Ref: step.Ref, Status: string(dokploy.StepStatusOK)})
+	}
+	if err := writeRunApplied(runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied), applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunLiveAppliedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimDokployHostOwnership(run.Run, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(run.Run, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+
+	forbidLocalSourceVerification(t)
+	err = applyCommitFromArgs(context.Background(), "coolify-commit", io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "Bort cannot durably fence that orchestrator") || !strings.Contains(err.Error(), authorityRecoverySourceRetiredCommand(run)) {
+		t.Fatalf("expected Coolify commit refusal with exact manual-retirement command, got %v", err)
+	}
+	blocked, err := loadMigrationRun("coolify-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Run.CommitStartedAt != nil {
+		t.Fatal("Coolify commit refusal recorded source retirement")
+	}
+	if _, err := os.Stat(filepath.Join(run.Run.RunDir, "source-pause.json")); !os.IsNotExist(err) {
+		t.Fatalf("Coolify commit refusal created source pause state: %v", err)
+	}
+	if _, err := os.Stat("docker-calls"); !os.IsNotExist(err) {
+		t.Fatalf("Coolify commit refusal made Docker calls: %v", err)
+	}
+}
+
+func TestCommitRefusesIncompleteSourceAuthorityRecoveryBeforeDocker(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "docker"), []byte("#!/bin/sh\necho \"$*\" >> docker-calls\nexit 90\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	writeTestBundle(t, "bundle", manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local"},
+		Apps: []manifest.App{{
+			Name:   "api",
+			Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "web", Port: "3000"}},
+			Services: []manifest.Service{{
+				ID:    "source-id",
+				Name:  "web",
+				Image: "example/api:latest",
+				Mounts: []manifest.Mount{{
+					Type: "volume", Name: "api-data", Target: "/data",
+				}},
+			}},
+		}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", "bundle", "--run", "source-recovery", "--observation-window", "0", "--rollback-window", "0"})
+	run, err := loadMigrationRun("source-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := newRunApplied(run.Run)
+	now := time.Now().UTC()
+	applied.SucceededAt = &now
+	for index, step := range dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps {
+		applied.Steps = append(applied.Steps, appliedStep{Index: index, Kind: string(step.Kind), App: step.App, Ref: step.Ref, Status: string(dokploy.StepStatusOK)})
+	}
+	if err := writeRunApplied(runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied), applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunLiveAppliedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimDokployHostOwnership(run.Run, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(run.Run, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunAuthorityResolvedLocked(run.Run, dokployTrafficSource); err != nil {
+		t.Fatal(err)
+	}
+
+	forbidLocalSourceVerification(t)
+	err = applyCommitFromArgs(context.Background(), "source-recovery", io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "manual source-authority recovery is incomplete") || !strings.Contains(err.Error(), "recover source-recovery as source") {
+		t.Fatalf("expected incomplete source-authority recovery refusal, got %v", err)
+	}
+	blocked, err := loadMigrationRun("source-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Run.CommitStartedAt != nil {
+		t.Fatal("commit recorded source retirement during incomplete source-authority recovery")
+	}
+	if _, err := os.Stat("docker-calls"); !os.IsNotExist(err) {
+		t.Fatalf("blocked commit made Docker calls: %v", err)
+	}
+}
+
+func TestCommitRetryRepublishesCompletedMetadataBeforeOwnerRelease(t *testing.T) {
+	run := writeAmbiguousAuthorityRun(t, "durable-commit")
+	if err := markRunAuthorityResolvedLocked(run.Run, dokployTrafficTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(run.Run, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunLiveAppliedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunCommitStartedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunCommittedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunHostOwnerReleaseStartedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(run.Run.RunDir, "run.json")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyCommitFromArgs(context.Background(), run.Run.Name, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("completed commit metadata was not atomically republished before owner release")
+	}
+	owner, found, err := readDokployTrafficOwner()
+	if err != nil || !found || owner.Authority != dokployTrafficReleased {
+		t.Fatalf("completed commit owner = %#v, found=%t err=%v", owner, found, err)
+	}
+}
+
+func TestCommitRetryKeepsOwnerWhenCompletedMetadataRepublishFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	run := writeAmbiguousAuthorityRun(t, "durable-commit-readonly")
+	if err := markRunAuthorityResolvedLocked(run.Run, dokployTrafficTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(run.Run, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunLiveAppliedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunCommitStartedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunCommittedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(run.Run.RunDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(run.Run.RunDir, 0o700) })
+	err := applyCommitFromArgs(context.Background(), run.Run.Name, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "reconfirm completed commit metadata durability") {
+		t.Fatalf("expected metadata republish failure, got %v", err)
+	}
+	owner, found, err := readDokployTrafficOwner()
+	if err != nil || !found || owner.Authority != dokployTrafficTarget {
+		t.Fatalf("owner released before completed commit metadata was durable: %#v found=%t err=%v", owner, found, err)
+	}
 }
 
 func TestLegacyCompleteLedgerDoesNotRequireSuccessfulOutcomeMarker(t *testing.T) {
@@ -293,7 +535,9 @@ func TestLegacyCompleteLedgerDoesNotRequireSuccessfulOutcomeMarker(t *testing.T)
 		Prepare: preparer.Result{Apps: []preparer.AppPlan{{Name: "api"}}},
 		Cutover: gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}}}},
 	}
-	steps := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps
+	run.Applied.APIVersion = appliedLegacyAPIVersion
+	run.Applied.TargetOrigin = "http://127.0.0.1:3030"
+	steps := dokploy.LegacyPlanFromArtifactsV1Alpha1(run.Prepare, run.Sync, run.Cutover).Steps
 	for index, step := range steps {
 		run.Applied.Steps = append(run.Applied.Steps, appliedStep{
 			Index:  index,
@@ -462,5 +706,57 @@ func TestRequireLiveApplySucceededForAppsSkippingAllowsMissingSkippedKinds(t *te
 	}
 	if err := requireLiveApplySucceeded(run); err == nil || !strings.Contains(err.Error(), string(skipKind)) {
 		t.Fatalf("expected regular guard to reject missing %s step, got %v", skipKind, err)
+	}
+}
+
+func TestCoolifySourceRetirementRequiredDetectsLabeledAppsInDockerScans(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		source string
+		apps   []preparer.AppPlan
+		want   bool
+	}{
+		{name: "coolify-local source", source: "coolify-local", want: true},
+		{name: "coolify-local-traefik source", source: "coolify-local-traefik", want: true},
+		{name: "docker scan without coolify apps", source: "docker", apps: []preparer.AppPlan{{Name: "api", Platform: "docker"}}, want: false},
+		{name: "docker scan with coolify-labeled app", source: "docker", apps: []preparer.AppPlan{{Name: "api", Platform: "docker"}, {Name: "web", Platform: "coolify"}}, want: true},
+		{name: "legacy bundle without app platform", source: "docker", apps: []preparer.AppPlan{{Name: "api"}}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run := loadedMigrationRun{Prepare: preparer.Result{Source: test.source, Apps: test.apps}}
+			if got := coolifySourceRetirementRequired(run); got != test.want {
+				t.Fatalf("coolifySourceRetirementRequired = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func forbidLocalSourceVerification(t *testing.T) {
+	t.Helper()
+	previousRun, previousEngine := verifyLocalSourceRun, verifyLocalSourceEngine
+	verifyLocalSourceRun = func(context.Context, loadedMigrationRun) error {
+		t.Error("commit refusal probed the local source run")
+		return nil
+	}
+	verifyLocalSourceEngine = func(context.Context, loadedMigrationRun) error {
+		t.Error("commit refusal probed the local source engine")
+		return nil
+	}
+	t.Cleanup(func() {
+		verifyLocalSourceRun, verifyLocalSourceEngine = previousRun, previousEngine
+	})
+}
+
+func TestManualCoolifySourceRetirementActionScopesProxyToRoutedCutovers(t *testing.T) {
+	run := loadedMigrationRun{
+		Run:     migrationRun{Name: "coolify-run"},
+		Prepare: preparer.Result{Source: "coolify-local", Apps: []preparer.AppPlan{{Name: "api"}}},
+	}
+	if action := manualCoolifySourceRetirementAction(run); strings.Contains(action, "source proxy") || !strings.Contains(action, "--source-retired") {
+		t.Fatalf("route-free retirement hint touched the shared proxy: %q", action)
+	}
+	run.Cutover = gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}}}}
+	if action := manualCoolifySourceRetirementAction(run); !strings.Contains(action, "and the source proxy") {
+		t.Fatalf("routed retirement hint omitted the proxy handoff: %q", action)
 	}
 }

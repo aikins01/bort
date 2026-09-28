@@ -65,6 +65,8 @@ func RunWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		return runNext(ctx, args[1:], stdout, stderr)
 	case "init-target":
 		return runInitTarget(ctx, args[1:], stdin, stdout, stderr)
+	case "recover-authority":
+		return runRecoverAuthority(ctx, args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q (run `bort help` for usage)", args[0])
 	}
@@ -87,8 +89,8 @@ func writePrimaryHelp(w io.Writer, st *styler) {
 		{verb: bortCommand(""), desc: "start or resume the current migration"},
 		{verb: bortCommand("migrate --live"), desc: "apply the selected planned run to its target"},
 		{verb: bortCommand("rollback"), desc: "inspect the stored rollback plan"},
-		{verb: bortCommand("rollback --live"), desc: "restart source containers and return traffic to the source"},
-		{verb: bortCommand("commit --apply"), desc: "accept the target and retire source containers"},
+		{verb: bortCommand("rollback --live"), desc: "return stateless traffic to the source when safe"},
+		{verb: bortCommand("commit --apply"), desc: "accept the target when no source orchestrator can recreate it"},
 		{verb: bortCommand("cleanup"), desc: "audit leftovers; --apply removes safe metadata only"},
 		{verb: bortCommand("cleanup purge"), desc: "purge eligible source leftovers with confirmation"},
 	})
@@ -105,6 +107,7 @@ func writeAdvancedHelp(w io.Writer, st *styler) {
 		{verb: bortCommand("env <app> KEY=value ..."), desc: "record env values non-interactively"},
 		{verb: bortCommand("data <app> <store> --migrate|--recreate|--managed"), desc: "record a data strategy non-interactively"},
 		{verb: bortCommand("init-target dokploy"), desc: "bootstrap target credentials before live execution"},
+		{verb: bortCommand("recover-authority"), desc: "record manual authority recovery or source retirement shown by bort status"},
 	})
 	writeHelpSection(w, st, "Power-user pipeline (each step is local and dry-run only):", []helpLine{
 		{verb: "bort scan", desc: "discover local resources and write a migration manifest"},

@@ -40,11 +40,8 @@ func TestCleanupStalePlatformProjectsBacksUpThenDeletesMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := &fakeDockerRunner{
-		outputs: map[string][]byte{
-			"ps --format {{.Names}}": []byte("dokploy-postgres.1.task\n"),
-		},
 		runOutputs: map[string][]byte{
-			"exec -i dokploy-postgres.1.task psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At -F |": []byte("BEGIN\ndeleted|proxy|p1\nCOMMIT\n"),
+			"exec -i postgres-container-id psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At -F |": []byte("BEGIN\ndeleted|proxy|p1\nCOMMIT\n"),
 		},
 	}
 	client := &Client{Docker: runner}
@@ -53,7 +50,7 @@ func TestCleanupStalePlatformProjectsBacksUpThenDeletesMetadata(t *testing.T) {
 		ProjectNames: []string{"proxy", "source", "proxy"},
 		BackupDir:    backupDir,
 		BackupPrefix: "cleanup-test",
-	})
+	}, "postgres-container-id")
 	if err != nil {
 		t.Fatalf("CleanupStalePlatformProjects: %v", err)
 	}
@@ -117,16 +114,14 @@ func (r *replacingBackupDirRunner) Run(ctx context.Context, stdin io.Reader, std
 func TestCleanupStalePlatformProjectsRejectsReplacedBackupDirectoryBeforeDelete(t *testing.T) {
 	backupDir := dokployBackupTestDir(t)
 	runner := &replacingBackupDirRunner{
-		fakeDockerRunner: fakeDockerRunner{outputs: map[string][]byte{
-			"ps --format {{.Names}}": []byte("dokploy-postgres.1.task\n"),
-		}},
-		backupDir: backupDir,
+		fakeDockerRunner: fakeDockerRunner{},
+		backupDir:        backupDir,
 	}
 	client := &Client{Docker: runner}
 	_, err := client.cleanupStalePlatformProjects(context.Background(), StalePlatformCleanupOptions{
 		ProjectNames: []string{"proxy"},
 		BackupDir:    backupDir,
-	})
+	}, "postgres-container-id")
 	if err == nil || !strings.Contains(err.Error(), "private directory path changed") {
 		t.Fatalf("expected replaced backup directory to block metadata deletion, got %v", err)
 	}
@@ -1051,12 +1046,5 @@ func TestPathAbsentNoFollowPreservesExistingDirectoryTree(t *testing.T) {
 	}
 	if contents, err := os.ReadFile(filepath.Join(target, "nested", "file")); err != nil || string(contents) != "remove" {
 		t.Fatalf("absence validation changed the target tree: contents=%q err=%v", contents, err)
-	}
-}
-
-func TestFindDokployPostgresContainerRequiresDokployPostgres(t *testing.T) {
-	runner := &fakeDockerRunner{outputs: map[string][]byte{"ps --format {{.Names}}": []byte("postgres\n")}}
-	if _, err := findDokployPostgresContainer(context.Background(), runner); err == nil {
-		t.Fatal("expected missing dokploy postgres to error")
 	}
 }

@@ -1,7 +1,9 @@
 # Cleanup and purge
 
-Cleanup normally happens after live apply succeeds and you accept Dokploy. Bort
-keeps two commands separate:
+Cleanup normally happens after live apply succeeds and you accept Dokploy. A
+completed manual target-authority recovery can establish the same
+prerequisite when automated live apply cannot prove the outcome. Bort keeps two
+commands separate:
 
 - `cleanup` lists leftovers and can remove a small set of eligible unused
   records from the Dokploy database;
@@ -13,19 +15,28 @@ credentials.
 
 ## Accept the target first
 
-Validate the target and wait through the `rollback window` recorded in the plan
-before running:
+Validate the target and wait through the `rollback window` recorded in the plan.
+For a source without an external orchestrator, then run:
 
 ```sh
 sudo bort commit --apply
 ```
 
-This confirms that Dokploy is now the active platform and stops the source
-application containers. Automated rollback is refused once source retirement
-starts, even if commit is interrupted. Rerun `commit --apply` to finish an
-interrupted acceptance. Do not start it until you have independently checked the
-target. Bort does not measure the rollback window or block this command when the
-window has not passed.
+This confirms that Dokploy is now the active platform and stops the exact
+reviewed source application containers. Automated rollback is refused once
+source retirement starts, even if commit is interrupted. Rerun `commit --apply`
+to finish an interrupted acceptance.
+
+For a Coolify source, `commit --apply` refuses because Bort cannot disable
+queued or future Coolify deployments. Disable future deployments in Coolify for
+the reviewed apps, manually retire every reviewed source app (and the source
+proxy when the cutover moved routes), and verify they remain retired. Then run
+the exact
+`recover-authority --authority target --source-retired --confirm ...` command
+Bort prints. This records acceptance without mutating source resources.
+
+Do not accept the target until you have independently checked it. Bort does not
+measure the rollback window or block acceptance when the window has not passed.
 
 ## Ordinary cleanup
 
@@ -49,6 +60,14 @@ Before changing the Dokploy database, Bort backs it up. The command only removes
 eligible empty records with no domains from Dokploy projects named
 `coolify-proxy`, `proxy`, or `source`. It does not remove source containers,
 volumes, networks, paths, credentials, Docker images, or target applications.
+It also requires a run created from a local Docker scan with its persisted
+target origin, durable owner record, and original Dokploy credential identity.
+Runs imported from a manifest or bundle stay audit-only. Preserve `.bort`,
+`/var/lib/bort/dokploy-traffic-owner.json`, and the original credential through
+this step. Complete any intended metadata `cleanup --apply` before another
+migration performs its first Dokploy target mutation; that mutation replaces a
+released owner record with the new run's ownership. Pre-upgrade runs without
+the binding remain audit-only and do not offer an apply command.
 
 ## Plan a source purge
 
@@ -83,8 +102,10 @@ sudo bort cleanup purge --apply --run "$run" --all-apps --confirm "purge $run"
 Purge apply refuses to run unless:
 
 - `--app`, `--project`, or `--all-apps` selects what to remove;
-- Bort's saved record shows that live apply succeeded;
-- the target was accepted with `commit --apply`;
+- Bort's saved record shows that live apply succeeded or manual
+  target-authority recovery completed;
+- the target was accepted with `commit --apply` or confirmed target-authority
+  recovery with `--source-retired`;
 - the exact `purge <run-name>` confirmation is supplied.
 
 Bort writes a private purge-plan backup under `.bort/backups` before destructive

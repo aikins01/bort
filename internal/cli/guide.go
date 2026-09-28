@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aikins01/bort/internal/dockercli"
 	"github.com/aikins01/bort/internal/exporter"
 	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/manifest"
@@ -38,6 +39,10 @@ type guidePromptInput interface {
 }
 
 func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
+	handled, err := writeStandaloneDokployInstallationRecovery(stdout)
+	if err != nil || handled {
+		return err
+	}
 	runRef, currentSelected, ok, err := guideRunRef()
 	if err != nil {
 		return err
@@ -48,7 +53,7 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 			if err != nil {
 				return err
 			}
-			writeAppFirstCockpit(stdout, run)
+			writeAppFirstCockpitContext(ctx, stdout, run)
 			fmt.Fprintf(stdout, "This existing run is not selected for mutation. Run `%s` to make it current and refresh its dry-run.\n", bortCommand("migrate --run "+shellQuote(run.Run.Name)))
 			return nil
 		}
@@ -58,7 +63,7 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 			if err != nil {
 				return err
 			}
-			writeAppFirstCockpit(stdout, run)
+			writeAppFirstCockpitContext(ctx, stdout, run)
 			return nil
 		}
 		run, err := refreshGuideRun(ctx, runRef, stdin, stdout)
@@ -68,7 +73,7 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 		if isRealTTY(stdin, stdout) {
 			return runWizard(ctx, run, stdin, stdout, stderr)
 		}
-		writeAppFirstCockpit(stdout, run)
+		writeAppFirstCockpitContext(ctx, stdout, run)
 		return nil
 	}
 
@@ -85,7 +90,7 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 		if err := rememberCurrentRun(run.Run); err != nil {
 			return err
 		}
-		writeAppFirstCockpit(stdout, run)
+		writeAppFirstCockpitContext(ctx, stdout, run)
 		return nil
 	}
 
@@ -119,7 +124,7 @@ func runGuide(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) er
 		if isRealTTY(stdin, stdout) {
 			return runWizard(ctx, run, stdin, stdout, stderr)
 		}
-		writeAppFirstCockpit(stdout, run)
+		writeAppFirstCockpitContext(ctx, stdout, run)
 		return nil
 	}
 
@@ -137,11 +142,11 @@ func refreshGuideRun(ctx context.Context, runRef string, stdin io.Reader, stdout
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
-	hasAppliedSteps, err := runHasAppliedSteps(existing)
+	liveExecutionStarted, err := runHasStartedLiveExecution(existing)
 	if err != nil {
 		return loadedMigrationRun{}, fmt.Errorf("read applied migration progress: %w", err)
 	}
-	if existing.LiveAppliedAt != nil || existing.CommitStartedAt != nil || existing.CommittedAt != nil || existing.RollbackStartedAt != nil || existing.RolledBackAt != nil || existing.PurgedAt != nil || hasAppliedSteps {
+	if existing.LiveAppliedAt != nil || existing.CommitStartedAt != nil || existing.CommittedAt != nil || existing.RollbackStartedAt != nil || existing.RolledBackAt != nil || existing.PurgedAt != nil || liveExecutionStarted {
 		return loadMigrationRun(runRef)
 	}
 	if shouldAutoRescanRun(existing) {
@@ -180,7 +185,7 @@ func shouldAutoRescanRun(run migrationRun) bool {
 	return containedPath(runDir, bundleDir) == nil
 }
 
-func runHasAppliedSteps(run migrationRun) (bool, error) {
+func runHasStartedLiveExecution(run migrationRun) (bool, error) {
 	run.Artifacts = run.Artifacts.withDefaults()
 	runDir := filepath.FromSlash(run.RunDir)
 	if runDir == "" {
@@ -194,7 +199,7 @@ func runHasAppliedSteps(run migrationRun) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return len(applied.Steps) > 0, nil
+	return applied.TargetOrigin != "" || len(applied.Steps) > 0, nil
 }
 
 func refreshRunSourceBundle(ctx context.Context, run migrationRun) (string, string, error) {
@@ -394,7 +399,13 @@ func checkSourceRequirements(ctx context.Context, sourceName string) error {
 	if _, err := exec.LookPath("docker"); err != nil {
 		return fmt.Errorf("docker CLI not found: %w; install Docker on the source server first", err)
 	}
-	out, err := exec.CommandContext(ctx, "docker", "ps", "-q").CombinedOutput()
+	env, err := dockercli.LocalEnvironment(os.Environ())
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "docker", "ps", "-q")
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		detail := firstOutputLine(out)
 		if detail == "" {

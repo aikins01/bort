@@ -88,7 +88,7 @@ func (s *styler) pill(label string, level severity) string {
 	case sevWarn:
 		style = style.Background(lipgloss.Color("214")).Foreground(lipgloss.Color("232"))
 	case sevBad:
-		style = style.Background(lipgloss.Color("203")).Foreground(lipgloss.Color("231"))
+		style = style.Background(lipgloss.Color("203")).Foreground(lipgloss.Color("232"))
 	}
 	return style.Render(label)
 }

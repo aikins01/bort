@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 )
 
 func TestLifecycleAcceptanceTraceWithFakeDokploy(t *testing.T) {
+	resetDokployTrafficOwner(t)
 	composeCreated := false
 	deploymentTitle := ""
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -71,33 +73,68 @@ func TestLifecycleAcceptanceTraceWithFakeDokploy(t *testing.T) {
 		t.Fatal(err)
 	}
 	dockerPath := filepath.Join(binDir, "docker")
-	dockerStub := "#!/bin/sh\nif [ \"$1\" = inspect ]; then\n  echo 'Error: No such object' >&2\n  exit 1\nfi\nif [ \"$1\" = ps ]; then\n  echo dokploy-postgres\nfi\nexit 0\n"
+	dockerStub := `#!/bin/sh
+if [ "$*" = "info --format {{.ID}}" ]; then
+  echo engine-reviewed
+  exit 0
+fi
+if [ "$*" = "ps -aq" ]; then
+  echo source-api
+  exit 0
+fi
+if [ "$*" = "inspect source-api" ]; then
+  printf '%s\n' '[{"Id":"source-api","Name":"/api","Image":"sha256:api","Config":{"Image":"example/api:latest","Labels":{}},"State":{"Status":"running"}}]'
+  exit 0
+fi
+if [ "$*" = "inspect --type container source-api" ]; then
+  if [ -f source-stopped ]; then
+    printf '%s\n' '[{"Id":"source-api","Name":"/api","State":{"Running":false,"Status":"exited"}}]'
+  else
+    printf '%s\n' '[{"Id":"source-api","Name":"/api","State":{"Running":true,"Status":"running"}}]'
+  fi
+  exit 0
+fi
+if [ "$*" = "stop source-api" ]; then
+  touch source-stopped
+  echo source-api
+  exit 0
+fi
+if [ "$*" = "node inspect self --format {{.ID}}" ]; then
+  echo local-node
+  exit 0
+fi
+if [ "$*" = "service ps --filter desired-state=running -q dokploy-postgres" ]; then
+  echo dokploy-postgres-task
+  exit 0
+fi
+if [ "$*" = "inspect --type task dokploy-postgres-task" ]; then
+  printf '%s\n' '[{"NodeID":"local-node","Status":{"State":"running","ContainerStatus":{"ContainerID":"dokploy-postgres"}}}]'
+  exit 0
+fi
+if [ "$1" = inspect ]; then
+  echo 'Error: No such object' >&2
+  exit 1
+fi
+if [ "$1" = ps ]; then
+  echo dokploy-postgres
+fi
+exit 0
+`
 	if err := os.WriteFile(dockerPath, []byte(dockerStub), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	manifestPath := filepath.Join(workDir, "manifest.json")
-	if err := writeJSONArtifact(manifestPath, manifest.Manifest{
-		Source: manifest.Source{Platform: "coolify-local"},
-		Apps: []manifest.App{{
-			Name: "api",
-			Services: []manifest.Service{{
-				ID:    "source-api",
-				Name:  "api",
-				Image: "example/api:latest",
-			}},
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	runCommand(t, runMigrate, []string{"--manifest", manifestPath, "--run", "acceptance", "--observation-window", "0", "--rollback-window", "0"})
+	runCommand(t, runMigrate, []string{"--source", "docker", "--run", "acceptance", "--observation-window", "0", "--rollback-window", "0"})
 	planned, err := loadMigrationRun("acceptance")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(filepath.ToSlash(planned.Run.BundleDir), ".bort/runs/acceptance/bundle") {
 		t.Fatalf("expected a self-contained bundle, got %s", planned.Run.BundleDir)
+	}
+	if planned.Run.Source != "docker" || planned.Prepare.SourceDockerEngineID != "engine-reviewed" || len(planned.Prepare.Apps) != 1 || planned.Prepare.Apps[0].Name != "api" {
+		t.Fatalf("expected a locally scanned api run, got run=%#v prepare=%#v", planned.Run, planned.Prepare)
 	}
 	for _, decision := range openSetupDecisions(planned) {
 		if err := recordReviewDecision(planned, decision, planned.Run.UpdatedAt.Add(time.Second)); err != nil {
@@ -179,7 +216,10 @@ func TestLifecycleAcceptanceTraceWithFakeDokploy(t *testing.T) {
 }
 
 func TestRunCleanupInventoriesLeftoversAndSafeMetadata(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/project.all":
 			_ = json.NewEncoder(w).Encode([]dokploy.Project{{ProjectID: "p-proxy", Name: "proxy"}})
@@ -202,7 +242,7 @@ func TestRunCleanupInventoriesLeftoversAndSafeMetadata(t *testing.T) {
 	t.Chdir(workDir)
 	bundleDir := filepath.Join(workDir, "bort-bundle")
 	writeTestBundle(t, bundleDir, manifest.Manifest{
-		Source: manifest.Source{Platform: "coolify-local"},
+		Source: manifest.Source{Platform: "coolify-local", DockerEngineID: "engine-reviewed"},
 		Apps: []manifest.App{{
 			Name: "api",
 			Git: &manifest.GitSource{
@@ -227,7 +267,69 @@ func TestRunCleanupInventoriesLeftoversAndSafeMetadata(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	if err := runCleanup(context.Background(), []string{"--run", "cleanup-run"}, &stdout, &stderr); err != nil {
+		t.Fatalf("imported cleanup failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("imported cleanup dry run sent %d Dokploy API request(s)", requests.Load())
+	}
+	if !strings.Contains(stdout.String(), "Audit only: `cleanup --apply` is unavailable because run was created from an imported bundle, not a local Docker scan") {
+		t.Fatalf("expected imported-bundle cleanup to stay audit-only, got:\n%s", stdout.String())
+	}
+
+	markRunLocallyScanned(t, "cleanup-run", "coolify-local")
+	stdout.Reset()
+	stderr.Reset()
+	if err := runCleanup(context.Background(), []string{"--run", "cleanup-run"}, &stdout, &stderr); err != nil {
+		t.Fatalf("unbound cleanup failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("unbound cleanup dry run sent %d Dokploy API request(s) before verifying the target", requests.Load())
+	}
+	for _, want := range []string{
+		"[blocked] proxy: not inspected; metadata cleanup is unavailable for this run",
+		"Audit only: `cleanup --apply` is unavailable because migration run \"cleanup-run\" has no persisted Dokploy target origin.",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("expected unbound cleanup output to contain %q, got:\n%s", want, stdout.String())
+		}
+	}
+
+	run, err := loadMigrationRun("cleanup-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := newRunApplied(run.Run)
+	applied.TargetOrigin = server.URL
+	if err := writeRunApplied(runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied), applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimDokployHostOwnership(run.Run, server.URL, dokployCredentialID("secret")); err != nil {
+		t.Fatal(err)
+	}
+	previousVerify := verifyLocalDokployCleanupHost
+	verifyLocalDokployCleanupHost = func(context.Context, *dokploy.Client) error {
+		return errors.New("DATABASE_URL selects an external database")
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if err := runCleanup(context.Background(), []string{"--run", "cleanup-run"}, &stdout, &stderr); err != nil {
+		t.Fatalf("unverified-host cleanup failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+	verifyLocalDokployCleanupHost = previousVerify
+	if requests.Load() != 0 {
+		t.Fatalf("unverified-host cleanup dry run sent %d Dokploy API request(s)", requests.Load())
+	}
+	if !strings.Contains(stdout.String(), "Audit only: `cleanup --apply` is unavailable because the configured Dokploy API and database are not an eligible local installation: DATABASE_URL selects an external database") {
+		t.Fatalf("expected unverified-host cleanup to report the blocker, got:\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := runCleanup(context.Background(), []string{"--run", "cleanup-run"}, &stdout, &stderr); err != nil {
 		t.Fatalf("cleanup failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if requests.Load() == 0 {
+		t.Fatal("bound cleanup dry run did not inspect Dokploy")
 	}
 
 	output := stdout.String()
@@ -244,7 +346,7 @@ func TestRunCleanupInventoriesLeftoversAndSafeMetadata(t *testing.T) {
 		"Source networks preserved:",
 		"api api-net",
 		"Target artifacts kept by default:",
-		"Dry run only: run `bort cleanup --apply --run cleanup-run`",
+		"Dry run only: run `bort cleanup --apply --run cleanup-run` to remove only stale zero-domain Dokploy platform metadata after a DB backup.",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected cleanup output to contain %q, got:\n%s", want, output)
@@ -252,6 +354,34 @@ func TestRunCleanupInventoriesLeftoversAndSafeMetadata(t *testing.T) {
 	}
 	if strings.Contains(output, "Source containers, volumes, networks, and target apps were removed") {
 		t.Fatalf("cleanup dry run claimed destructive removal:\n%s", output)
+	}
+	if strings.Contains(output, "Audit only") || strings.Contains(output, "not inspected") {
+		t.Fatalf("bound cleanup dry run reported an audit-only blocker:\n%s", output)
+	}
+}
+
+func TestCleanupMetadataApplyRequiresCurrentDurableBinding(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	runMeta := migrationRun{Name: "cleanup-current", RunDir: filepath.Join(t.TempDir(), "cleanup-current"), CreatedAt: time.Now().UTC(), BundleDigest: "cleanup-digest", Source: "docker"}
+	run := loadedMigrationRun{Run: runMeta, Applied: newRunApplied(runMeta), Prepare: preparer.Result{Source: "docker", SourceDockerEngineID: "engine-reviewed"}}
+	client := &dokploy.Client{BaseURL: "http://127.0.0.1:3030", Token: "original-token"}
+	if blocker := cleanupMetadataApplyBlocker(context.Background(), run, client); !strings.Contains(blocker, "no persisted Dokploy target origin") {
+		t.Fatalf("unbound cleanup blocker=%q", blocker)
+	}
+	run.Applied.TargetOrigin = client.BaseURL
+	if err := claimDokployHostOwnership(runMeta, client.BaseURL, dokployCredentialID(client.Token)); err != nil {
+		t.Fatal(err)
+	}
+	if blocker := cleanupMetadataApplyBlocker(context.Background(), run, client); blocker != "" {
+		t.Fatalf("current durable cleanup binding was blocked: %s", blocker)
+	}
+	previousVerify := verifyLocalDokployCleanupHost
+	verifyLocalDokployCleanupHost = func(context.Context, *dokploy.Client) error {
+		return errors.New("DATABASE_URL selects an external database")
+	}
+	t.Cleanup(func() { verifyLocalDokployCleanupHost = previousVerify })
+	if blocker := cleanupMetadataApplyBlocker(context.Background(), run, client); !strings.Contains(blocker, "not an eligible local installation") || !strings.Contains(blocker, "external database") {
+		t.Fatalf("ineligible local cleanup blocker=%q", blocker)
 	}
 }
 
@@ -438,6 +568,7 @@ func TestCleanupManifestNetworkIdentitiesRejectsManifestSymlink(t *testing.T) {
 }
 
 func TestRunCleanupPurgeApplyRequiresExplicitScopeAndConfirmation(t *testing.T) {
+	resetDokployTrafficOwner(t)
 	workDir := t.TempDir()
 	t.Chdir(workDir)
 	binDir := filepath.Join(workDir, "bin")
@@ -496,12 +627,18 @@ func TestRunCleanupPurgeApplyRequiresExplicitScopeAndConfirmation(t *testing.T) 
 	if err := writeRunApplied(appliedPath, applied); err != nil {
 		t.Fatal(err)
 	}
+	if err := claimDokployHostOwnership(run.Run, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(run.Run, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
 
 	stdout.Reset()
 	stderr.Reset()
 	err = runCleanup(context.Background(), []string{"purge", "--run", "purge-run", "--apply", "--app", "api"}, &stdout, &stderr)
-	if err == nil || !strings.Contains(err.Error(), "before `bort commit --apply --run purge-run`") {
-		t.Fatalf("expected target acceptance before confirmation, got err=%v stdout=%s stderr=%s", err, stdout.String(), stderr.String())
+	if err == nil || !strings.Contains(err.Error(), "before target acceptance") || !strings.Contains(err.Error(), authorityRecoverySourceRetiredCommand(run)) {
+		t.Fatalf("expected Coolify source retirement before confirmation, got err=%v stdout=%s stderr=%s", err, stdout.String(), stderr.String())
 	}
 
 	operationLock, err := acquireRunOperationLock(run.Run.RunDir)
@@ -532,6 +669,144 @@ func TestRunCleanupRejectsMisplacedPurgeSubcommand(t *testing.T) {
 	err := runCleanup(context.Background(), []string{"--run", "prod", "--apply", "purge", "--all-apps"}, io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "purge must immediately follow cleanup") {
 		t.Fatalf("expected misplaced purge to be rejected before metadata apply, got %v", err)
+	}
+}
+
+func TestCleanupApplyCommandsShareDokployHostLock(t *testing.T) {
+	runDir := t.TempDir()
+	targetLock, err := acquireDokployLiveOperationLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetLock.Release()
+	for _, args := range [][]string{
+		{"--run", runDir, "--apply"},
+		{"purge", "--run", runDir, "--apply", "--all-apps", "--confirm", "purge fixture"},
+	} {
+		err := runCleanup(context.Background(), args, io.Discard, io.Discard)
+		if !errors.Is(err, errDokployLiveOperationActive) {
+			t.Fatalf("cleanup apply %v did not honor host lock: %v", args, err)
+		}
+	}
+}
+
+func TestCleanupApplyRefusesAnotherRunsHostOwnership(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	workDir := cleanupBackupTestDir(t)
+	t.Chdir(workDir)
+	bundleDir := filepath.Join(workDir, "bundle")
+	writeTestBundle(t, bundleDir, manifest.Manifest{
+		Source: manifest.Source{Platform: "docker"},
+		Apps:   []manifest.App{{Name: "api", Services: []manifest.Service{{Name: "api", Image: "example/api:v1"}}}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", bundleDir, "--run", "cleanup-run"})
+
+	ownerRun := migrationRun{Name: "owner-run", RunDir: filepath.Join(t.TempDir(), "owner-run"), CreatedAt: time.Now().UTC(), BundleDigest: "owner-digest"}
+	if err := claimDokployHostOwnership(ownerRun, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(ownerRun, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	ownerDir, err := dokployTrafficRunDir(ownerRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = runCleanup(context.Background(), []string{"--run", "cleanup-run", "--apply"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), `owned by migration run "owner-run" at "`+ownerDir+`" with target authority`) {
+		t.Fatalf("expected conflicting host owner refusal, got %v", err)
+	}
+}
+
+func TestCleanupBindingRequiresRunOriginAndCredential(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	runMeta := migrationRun{Name: "cleanup-bound", RunDir: filepath.Join(t.TempDir(), "cleanup-bound"), CreatedAt: time.Now().UTC(), BundleDigest: "cleanup-digest", Source: "docker"}
+	if err := claimDokployHostOwnership(runMeta, "http://127.0.0.1:3030", dokployCredentialID("original-token")); err != nil {
+		t.Fatal(err)
+	}
+	run := loadedMigrationRun{Run: runMeta, Applied: newRunApplied(runMeta), Prepare: preparer.Result{Source: "docker", SourceDockerEngineID: "engine-reviewed"}}
+	client := &dokploy.Client{BaseURL: "http://127.0.0.1:3030", Token: "original-token"}
+	if err := validateCleanupDokployIdentity(run, client); err == nil || !strings.Contains(err.Error(), "no persisted Dokploy target origin") {
+		t.Fatalf("expected cleanup without a run target binding to fail, got %v", err)
+	}
+	run.Applied.TargetOrigin = client.BaseURL
+	for source, want := range map[string]string{"": "imported bundle", "manifest": "imported manifest"} {
+		imported := run
+		imported.Run.Source = source
+		if err := validateCleanupDokployIdentity(imported, client); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected cleanup for run source %q with a valid target binding to fail with %q, got %v", source, want, err)
+		}
+	}
+	if err := validateCleanupDokployIdentity(run, client); err != nil {
+		t.Fatalf("expected a locally scanned, bound run to be cleanup-eligible, got %v", err)
+	}
+	owner, found, err := readDokployTrafficOwner()
+	if err != nil || !found {
+		t.Fatalf("read cleanup owner: found=%t err=%v", found, err)
+	}
+	owner.TargetCredentialID = ""
+	if err := writeDokployTrafficOwner(owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCleanupDokployIdentity(run, client); err == nil || !strings.Contains(err.Error(), "no durable Dokploy credential identity") {
+		t.Fatalf("expected cleanup without durable credential identity to fail, got %v", err)
+	}
+	owner.TargetCredentialID = dokployCredentialID("original-token")
+	if err := writeDokployTrafficOwner(owner); err != nil {
+		t.Fatal(err)
+	}
+	client.Token = "replacement-token"
+	if err := validateCleanupDokployIdentity(run, client); err == nil || !strings.Contains(err.Error(), "different target credential identity") {
+		t.Fatalf("expected cleanup with replacement credential to fail, got %v", err)
+	}
+}
+
+func TestCleanupPurgeApplyRefusesAnotherRunsHostOwnership(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	writeTestBundle(t, "bundle", manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local"},
+		Apps: []manifest.App{{
+			Name: "api",
+			Services: []manifest.Service{{
+				ID: "source-id", Name: "web", Image: "example/api:v1",
+			}},
+		}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", "bundle", "--run", "purge-owner"})
+	run, err := loadMigrationRun("purge-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := newRunApplied(run.Run)
+	for index, step := range dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps {
+		applied.Steps = append(applied.Steps, appliedStep{Index: index, Kind: string(step.Kind), App: step.App, Ref: step.Ref, Status: string(dokploy.StepStatusOK)})
+	}
+	now := time.Now().UTC()
+	applied.SucceededAt = &now
+	if err := writeRunApplied(runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied), applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunCommittedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	ownerRun := migrationRun{Name: "newer-run", RunDir: filepath.Join(t.TempDir(), "newer-run"), CreatedAt: time.Now().UTC(), BundleDigest: "newer-digest"}
+	if err := claimDokployHostOwnership(ownerRun, "http://127.0.0.1:3030", dokployCredentialID("newer-token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(ownerRun, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	ownerDir, err := dokployTrafficRunDir(ownerRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = runCleanup(context.Background(), []string{"purge", "--run", "purge-owner", "--apply", "--app", "api", "--confirm", "purge purge-owner"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), `owned by migration run "newer-run" at "`+ownerDir+`" with target authority`) {
+		t.Fatalf("expected conflicting purge owner refusal, got %v", err)
 	}
 }
 

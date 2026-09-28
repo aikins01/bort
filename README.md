@@ -20,16 +20,17 @@
 
 Bort is a guided migration tool for people running their own app platform on a
 VPS. It checks what is actually running, explains what needs attention, prepares
-Dokploy, copies supported data, switches web traffic, and requires an explicit
-command before each destructive step.
+Dokploy, moves named volumes and Postgres dumps into Bort-owned volumes before
+the target deploys, switches web traffic, and requires an explicit command
+before each destructive step.
 
 Bort organizes the migration by app rather than exposing a wall of Docker
 details. It shows what is ready, provides copy-paste fixes, saves your answers,
 and tells you what to do next. Discovery and planning only preview app changes.
 If Dokploy is not prepared, the `migrate --live` preflight can offer to install
 it before application migration begins. Bort explains the server changes and
-asks first. Moving apps, data, and traffic begins only when you explicitly run
-the live command.
+asks first. Creating target apps, transferring persistent state, and moving
+traffic begin only when you explicitly run the live command.
 
 ## Supported path
 
@@ -39,9 +40,13 @@ The current product path is **Coolify → Dokploy on the same Linux VPS**.
 | --- | --- |
 | Guided Coolify → Dokploy planning | Implemented |
 | Explicit live apply and resume | Implemented |
-| Accepting Dokploy and stopping source containers | Implemented |
+| Accepting Dokploy and stopping source containers (sources without an orchestrator) | Implemented |
+| Accepting Dokploy for a Coolify source | Manual source retirement, then recorded with the exact `bort recover-authority --run <run> --authority target --source-retired --confirm '...'` command Bort prints |
 | Safe Dokploy database cleanup and separately confirmed source removal | Implemented |
-| Executable rollback | Implemented (`bort rollback --live`) |
+| Stateless traffic rollback | Implemented (`bort rollback --live`) |
+| Stateful live apply (named volumes and Postgres dump/restore) | Implemented; state is staged into Bort-owned volumes before the target deploys |
+| Bind-mount transfer for stateful apps | Not implemented; same-host bind mounts that keep their paths need no transfer |
+| Automatic stateful rollback | Not available; manual authority recovery is required |
 | Dokploy → Coolify or cross-server migration | Not implemented |
 
 Bort publishes macOS, Linux, and Windows binaries, but a complete same-VPS move
@@ -59,12 +64,13 @@ Today Bort can:
 - record missing environment values and how each database or storage service
   should be moved;
 - prepare Dokploy projects and compose applications before explicit live apply;
-- move supported local data by exporting and importing databases or copying data
-  while a service is stopped;
+- copy named volumes and Postgres dumps into Bort-owned staging volumes during
+  live apply, before the target deploys, and identify the state that must be
+  migrated outside Bort, such as bind-mount copies;
 - switch web traffic during explicit live apply, save progress for retries, and
   store rollback instructions;
-- execute the reviewed rollback (`bort rollback --live`) to restart source
-  containers and return traffic to the source;
+- execute a reviewed stateless rollback (`bort rollback --live`) to return web
+  traffic to the source;
 - accept the target only after successful live apply;
 - list leftovers, remove only eligible unused records from Dokploy, and
   separately remove eligible source containers and networks after confirmation.
@@ -77,20 +83,33 @@ the workload-level coverage and limitations.
 Use a fresh VM or restorable snapshot while evaluating Bort. Do not test source
 purge on a host containing data you intend to keep.
 
-Follow two workspace rules during the migration:
+Follow two state-management rules during the migration:
 
 1. Run every command from the **same working directory**. Bort stores its
    workspace under `.bort` relative to that directory.
 2. Use the **same OS user** throughout the migration. If the first command
    uses `sudo`, keep using `sudo`; if the first command does not, do not add it
-   later.
+   later. Bort also stores its host-wide operation lock and durable Dokploy
+   traffic owner under `/var/lib/bort`.
 
-Bort keeps workspace directories and files private, but `.bort` contains target
-credentials and application configuration. Do not commit or publish it.
+Bort keeps these directories and files private. `.bort` contains target
+credentials and application configuration; `/var/lib/bort` binds shared
+Dokploy traffic to one migration run. Preserve both, including the original
+Dokploy credential, through any `cleanup --apply` you intend to run. Do not
+commit or publish either directory.
 
 Read the [prerequisites and recovery guidance](docs/migration-guide.md) before a
 live migration. In particular, review how `bort rollback --live` works before you
 need it.
+
+For a Dokploy install, prepare an absolute authentication-secret escrow path on
+encrypted or off-host storage, inside a mode-0700 directory owned by root or
+the invoking sudo user. No directory in the path may be a symbolic link or be
+writable by group or others. Pass the path as `--auth-secret-backup` or as
+`sudo BORT_DOKPLOY_AUTH_SECRET_BACKUP=/path bort ...` (sudo drops exported
+variables by default), and retain it with the private provenance marker under
+`/var/lib/bort`. Interrupted creation is retried only when the
+retained escrow, private creation intent, and Docker secret label still match.
 
 ## Install
 
@@ -124,8 +143,15 @@ sudo bort
 
 The guided screen starts setup when needed and otherwise resumes the current
 run. Review each application, follow its generated `fix:` and `next:` guidance,
-and rerun `sudo bort` until the run shows `READY`. This means blocking inputs
-are resolved; review any remaining non-blocking notes before live apply.
+and rerun `sudo bort` until the run shows `READY` or reports `MANUAL STATE`.
+`READY` means blocking inputs are resolved; review any remaining non-blocking
+notes before live apply. `MANUAL STATE` means a historical stateful run was
+applied with an older plan version that copied state into an already deployed
+target. Bort cannot continue that run; follow the displayed manual recovery
+guidance or create a new run. `PLAN BLOCKED` means live apply would refuse the
+planned state transfer (for example a bind mount or a named volume shared by
+two apps); choose `bort data <app> <store> --recreate` or `--managed` for a data
+store volume and re-plan, or change the source compose and scan a new run.
 
 To start discovery directly without the setup questions:
 
@@ -140,15 +166,21 @@ The migration uses separate commands for each important step:
 sudo bort                 # start or resume, then review and fix
 sudo bort migrate --live  # apply only the selected planned run
 sudo bort rollback        # inspect the stored rollback plan
-sudo bort rollback --live # restart source containers and return traffic
-sudo bort commit --apply  # accept the target and retire source containers
+sudo bort rollback --live # return stateless traffic when safe
+sudo bort commit --apply  # accept the target when no source orchestrator can recreate it
 sudo bort cleanup         # audit leftovers without deleting source resources
 ```
 
-After reviewing the cleanup results, `cleanup --apply` can remove only eligible
-unused records from the Dokploy database, and only after making a database
-backup. Removing source resources remains a separate command that previews its
-work first:
+For a Coolify source, first disable future deployments and manually retire the
+reviewed source apps and proxy. Then record permanent target authority with the
+exact `recover-authority --authority target --source-retired` command Bort
+prints; `commit --apply` refuses because stopping containers cannot fence
+Coolify itself.
+
+For owner-bound current runs, `cleanup --apply` can remove only eligible unused
+records from the bound local Dokploy database, and only after making a database
+backup. Pre-upgrade runs without that durable binding are audit-only. Removing
+source resources remains a separate command that previews its work first:
 
 ```sh
 sudo bort cleanup purge --all-apps
@@ -170,29 +202,54 @@ Bort's safety model defaults to “look first.”
   writes system configuration, creates Docker resources, initializes Swarm when
   needed, and may disable Docker live-restore and reload Docker before asking
   for confirmation. Application migration begins only after confirmation.
-- **Explicit live apply:** creating target apps, copying data, and moving traffic
-  only happen through `bort migrate --live` for an existing planned run.
+- **Explicit live apply:** creating target apps and moving traffic only happen
+  through `bort migrate --live` for an existing planned run.
+- **State moves before the target exists:** for apps with named volumes or a
+  Postgres database, Bort stops the source app, copies each volume and restores
+  each dump into volumes it owns and labels with the run name, verifies the
+  source stayed stopped and nothing else attached those volumes, and only then
+  deploys the Dokploy compose with those volumes declared as external. Bort
+  does not deploy the compose until state is staged and refuses the transfer
+  if the source restarts or any container attaches to a staging volume; do not
+  deploy the app manually in Dokploy during live apply. Routed apps stay
+  stopped until traffic moves; unrouted apps restart the source after the copy.
 - **Known current run:** `.bort/state.json` identifies the current run. Commands
   that make changes do not guess based on which file was modified most recently.
 - **Plans are locked during live work:** once live execution begins, changing
   the selected plan requires a new run.
+- **Attested source host:** local discovery records the Docker Engine ID and
+  exact source container identities. Automated source mutation during live
+  apply, recovery, rollback, and commit refuses a different daemon, replaced
+  containers, imported manifests or bundles, and legacy runs without that
+  attestation. Those runs remain inspectable but require manual source handling
+  or a new local scan for live work. Runtime checks catch a replaced daemon or
+  container, not every stale detail in a reviewed configuration.
 - **One change at a time:** Bort prevents two commands from changing the same run
   at once, saves live progress for retries, and keeps `status` available.
-- **Private files:** bundles, state, environment values, live progress, and
-  target credentials stay in the local workspace with private permissions.
+- **Private files:** bundles, environment values, live progress, and target
+  credentials stay in the local workspace. The host-wide operation lock and
+  durable Dokploy traffic owner stay under `/var/lib/bort`. Both locations use
+  private permissions.
 - **Separate acceptance:** `commit --apply` retires source application containers
-  only after successful live apply and is required before destructive source
-  purge.
+  only when no external orchestrator can recreate them. It refuses Coolify
+  sources. Disable future Coolify deployments, manually retire the reviewed
+  source apps and proxy, verify they remain retired, then use confirmed
+  target-authority recovery with `--source-retired` to record acceptance.
+  Destructive source purge requires either accepted state.
 - **Separate destructive purge:** purge requires selected apps or projects, a
-  successful live apply, an accepted target, the exact confirmation phrase, a
-  recheck of Docker IDs, and a private backup.
-- **Health-gated rollback:** `bort rollback --live` restarts the quiesced source
-  containers, verifies they are running and healthy before touching any traffic,
-  swaps the proxies back, and observes the result. It never deletes data; the
-  Dokploy target resources remain on the server for cleanup, and an interrupted
-  rollback can be re-run. Commit and live apply stay blocked once rollback starts.
-  Live rollback uses a five-second settling check per observed app, not the
-  stored observation window; continue monitoring for the reviewed period.
+  successful live apply or completed manual target-authority
+  recovery, an accepted target, the exact confirmation phrase, a recheck of
+  Docker IDs, and a private backup.
+- **Fail-closed rollback:** `bort rollback --live` can swap traffic back only
+  when the run transferred no database or volume state. Dokploy v0.30.7 cannot
+  durably block queued or future deployments, so Bort refuses automatic
+  stateful rollback before changing either side. Preserve both sides and
+  establish writer and traffic authority manually if a stateful target fails
+  validation. When the durable host owner still belongs to the run,
+  `bort recover-authority` records the verified source or target decision and
+  finishes that run without abandoning its ownership record.
+  Rollback inspection reports `automaticAvailable` and `automaticBlocker` in
+  JSON and the equivalent reason in text before any mutation.
 
 ## Documentation
 
@@ -205,11 +262,23 @@ Bort's safety model defaults to “look first.”
 
 ## Current limitations
 
-- Rollback returns traffic to the source but does not copy back data written to
-  the target after cutover.
-- Bort does not keep copying new volume changes while applications remain live.
-- Database moves currently use local export/import or copy data while the
-  database is stopped.
+- Stateful live apply transfers named volumes and Postgres dumps only. A
+  stateful app whose plan needs a bind-mount copy is refused; same-host bind
+  mounts that stay at their existing paths do not require a transfer.
+- A named volume mounted by more than one compose service cannot be staged.
+  Live apply refuses it before changing Dokploy; choose `bort data <app>
+  <store> --recreate` or `--managed` for a data store volume and re-plan with
+  `bort migrate --run <run>`, or change the source compose and scan a new run.
+- Runs created by older Bort versions whose plan copied state into an already
+  deployed target remain refused (`MANUAL STATE`). Dokploy v0.30.7 cannot
+  durably prevent queued or future deployments from restarting a target writer
+  during such a copy. Create a new run instead.
+- Automatic rollback is limited to stateless traffic handoff. Stateful rollback
+  requires manual writer and traffic authority recovery.
+- The temporary compose project Bort uses to restore a database writes its
+  `.env` in the format the running Dokploy release uses, read from
+  `settings.getDokployVersion` before the source is paused. Live apply refuses
+  staged restores when that version is not a `vMAJOR.MINOR.PATCH` release.
 - GitHub Apps, deploy keys, webhooks, and equivalent source connections are
   recorded as details but are not copied, recreated, or revoked.
 - Bort does not automatically delete source Docker images because the target may

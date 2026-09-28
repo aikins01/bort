@@ -1,0 +1,817 @@
+package dokploy
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/aikins01/bort/internal/preparer"
+	"github.com/aikins01/bort/internal/safepath"
+	"gopkg.in/yaml.v3"
+)
+
+const (
+	stagingVolumeRunLabel     = "bort.run"
+	stagingVolumeRunIDLabel   = "bort.run-id"
+	stagingVolumeAppLabel     = "bort.app"
+	stagingVolumeServiceLabel = "bort.service"
+	stagingVolumeTargetLabel  = "bort.target"
+)
+
+// stagingOwner identifies the run that owns staging volumes. run names
+// repeat across directories and machines, so the CLI supplies a digest
+// of the run's durable identity; the name alone is the fallback.
+func stagingOwner(plan Plan) string {
+	if id := strings.TrimSpace(plan.RunID); id != "" {
+		return id
+	}
+	return plan.RunName
+}
+
+type stagedVolume struct {
+	Service    string
+	Target     string
+	VolumeName string
+	Source     preparer.VolumeResource
+}
+
+// appStateIsStaged reports whether the app's persistent state is
+// transferred before its Dokploy deployment exists. in that order the
+// target never runs while Bort copies data, so no target writer pause is
+// needed and the deployed compose must mount the staging volumes.
+func appStateIsStaged(plan Plan, appName string) bool {
+	pushIndex, lastStateIndex := -1, -1
+	for index, step := range plan.Steps {
+		if step.App != appName {
+			continue
+		}
+		switch step.Kind {
+		case StepPushImage:
+			pushIndex = index
+		case StepPauseSource, StepDumpDataStore, StepRestoreDataStore, StepSyncVolume:
+			lastStateIndex = index
+		}
+	}
+	return lastStateIndex >= 0 && pushIndex > lastStateIndex
+}
+
+func stagedVolumesForApp(plan Plan, appName string) []stagedVolume {
+	if !appStateIsStaged(plan, appName) {
+		return nil
+	}
+	app, ok := findPrepareApp(plan.Prepare, appName)
+	if !ok {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	staged := []stagedVolume{}
+	add := func(volume preparer.VolumeResource) {
+		if volume.Type != "volume" || strings.TrimSpace(volume.Service) == "" || strings.TrimSpace(volume.Target) == "" {
+			return
+		}
+		key := migratedMountKey(volume.Service, volume.Target)
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		staged = append(staged, stagedVolume{
+			Service:    volume.Service,
+			Target:     volume.Target,
+			VolumeName: stagingVolumeName(plan, appName, volume.Service, volume.Target),
+			Source:     volume,
+		})
+	}
+	for _, step := range plan.Steps {
+		if step.App != appName {
+			continue
+		}
+		switch step.Kind {
+		case StepSyncVolume:
+			if volume, ok := findPrepareVolume(app, step.Ref); ok {
+				add(volume)
+			}
+		case StepRestoreDataStore:
+			store, ok := findPrepareDataStore(app, step.Ref)
+			if !ok {
+				continue
+			}
+			for _, volume := range app.Resources.Volumes {
+				if volume.Service == store.Service {
+					add(volume)
+				}
+			}
+		}
+	}
+	return staged
+}
+
+func stagedVolumesForService(plan Plan, appName, service string) []stagedVolume {
+	volumes := []stagedVolume{}
+	for _, volume := range stagedVolumesForApp(plan, appName) {
+		if volume.Service == service {
+			volumes = append(volumes, volume)
+		}
+	}
+	return volumes
+}
+
+func stagedVolumeFor(plan Plan, appName string, volume preparer.VolumeResource) (stagedVolume, bool) {
+	for _, staged := range stagedVolumesForApp(plan, appName) {
+		if staged.Service == volume.Service && staged.Target == volume.Target {
+			return staged, true
+		}
+	}
+	return stagedVolume{}, false
+}
+
+func stagingVolumeName(plan Plan, appName, service, target string) string {
+	return strings.Join([]string{
+		"bort",
+		dockerNameSegment(plan.RunName, 24),
+		dockerNameSegment(appName, 24),
+		dockerNameSegment(service, 24),
+		stagingHash(stagingOwner(plan), appName, service, target),
+	}, "-")
+}
+
+func stagingProjectName(plan Plan, appName, service string) string {
+	return "bort-stage-" + dockerNameSegment(appName, 24) + "-" + dockerNameSegment(service, 24) + "-" + stagingHash(stagingOwner(plan), appName, service)
+}
+
+func stagingHash(parts ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
+func dockerNameSegment(value string, limit int) string {
+	var b strings.Builder
+	lastDash := true
+	for _, r := range strings.ToLower(strings.TrimSpace(value)) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash {
+				b.WriteRune('-')
+				lastDash = true
+			}
+		}
+		if b.Len() >= limit {
+			break
+		}
+	}
+	segment := strings.Trim(b.String(), "-")
+	if segment == "" {
+		return "x"
+	}
+	return segment
+}
+
+func stagingVolumeLabels(plan Plan, appName string, volume stagedVolume) []string {
+	return []string{
+		stagingVolumeRunLabel + "=" + plan.RunName,
+		stagingVolumeRunIDLabel + "=" + stagingOwner(plan),
+		stagingVolumeAppLabel + "=" + appName,
+		stagingVolumeServiceLabel + "=" + volume.Service,
+		stagingVolumeTargetLabel + "=" + volume.Target,
+	}
+}
+
+func stagingVolumeExists(ctx context.Context, runner dockerRunner, plan Plan, volume stagedVolume) (bool, error) {
+	out, err := runner.Output(ctx, "volume", "inspect", "--format", "{{index .Labels \""+stagingVolumeRunIDLabel+"\"}}", volume.VolumeName)
+	if err != nil {
+		if isDockerVolumeOrNetworkMissingErr(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect staging volume %s: %w", volume.VolumeName, err)
+	}
+	if owner := strings.TrimSpace(string(out)); owner != stagingOwner(plan) {
+		return true, fmt.Errorf("docker volume %s already exists but is not owned by run %q (label %s=%q)", volume.VolumeName, plan.RunName, stagingVolumeRunIDLabel, owner)
+	}
+	return true, nil
+}
+
+func ensureStagingVolume(ctx context.Context, runner dockerRunner, plan Plan, appName string, volume stagedVolume) error {
+	exists, err := stagingVolumeExists(ctx, runner, plan, volume)
+	if err != nil || exists {
+		return err
+	}
+	args := []string{"volume", "create"}
+	for _, label := range stagingVolumeLabels(plan, appName, volume) {
+		args = append(args, "--label", label)
+	}
+	args = append(args, volume.VolumeName)
+	if _, err := runner.Output(ctx, args...); err != nil {
+		return fmt.Errorf("create staging volume %s: %w", volume.VolumeName, err)
+	}
+	return nil
+}
+
+func recreateStagingVolume(ctx context.Context, runner dockerRunner, plan Plan, appName string, volume stagedVolume) error {
+	exists, err := stagingVolumeExists(ctx, runner, plan, volume)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if _, err := runner.Output(ctx, "volume", "rm", "-f", volume.VolumeName); err != nil {
+			return fmt.Errorf("remove staging volume %s: %w", volume.VolumeName, err)
+		}
+	}
+	return ensureStagingVolume(ctx, runner, plan, appName, volume)
+}
+
+func requireStagingVolumeUnattached(ctx context.Context, runner dockerRunner, volume stagedVolume) error {
+	out, err := runner.Output(ctx, "ps", "-a", "--filter", "volume="+volume.VolumeName, "-q")
+	if err != nil {
+		return fmt.Errorf("list containers using staging volume %s: %w", volume.VolumeName, err)
+	}
+	if ids := strings.Fields(string(out)); len(ids) > 0 {
+		return fmt.Errorf("staging volume %s is attached to container(s) %s before Bort handed it to Dokploy; refusing to treat the transferred state as authoritative", volume.VolumeName, strings.Join(ids, ", "))
+	}
+	return nil
+}
+
+const defaultPostgresDataDir = "/var/lib/postgresql/data"
+
+// requireStagedPostgresDataDir refuses a staging restore whose data
+// directory is not backed by one of the staged volumes: the restore
+// would land in the container layer and vanish with it.
+func requireStagedPostgresDataDir(container dockerContainer, staged []stagedVolume) error {
+	dataDir := strings.TrimSpace(envMap(container.Config.Env)["PGDATA"])
+	if dataDir == "" {
+		dataDir = defaultPostgresDataDir
+	}
+	var mount dockerMount
+	found := false
+	for _, candidate := range container.Mounts {
+		if candidate.Destination != dataDir && !strings.HasPrefix(dataDir, strings.TrimSuffix(candidate.Destination, "/")+"/") {
+			continue
+		}
+		if !found || len(candidate.Destination) > len(mount.Destination) {
+			mount, found = candidate, true
+		}
+	}
+	if !found {
+		return fmt.Errorf("postgres data directory %s is not mounted from a staged volume; the restore would be lost when the staging container stops", dataDir)
+	}
+	for _, volume := range staged {
+		if mount.Type == "volume" && mount.Name == volume.VolumeName {
+			return nil
+		}
+	}
+	return fmt.Errorf("postgres data directory %s is mounted from %s %q, not a staged volume; the restore would be lost when the staging container stops", dataDir, mount.Type, firstNonEmpty(mount.Name, mount.Source))
+}
+
+func requireSourceQuiescent(containers []dockerContainer) error {
+	for _, container := range containers {
+		if container.State.Running {
+			return fmt.Errorf("source container %s is running while its state is being copied; pause_source must stop it first", container.Name)
+		}
+	}
+	return nil
+}
+
+func requireSourceQuiesceUnchanged(before, after []dockerContainer) error {
+	if len(before) != len(after) {
+		return fmt.Errorf("source container set changed during state copy (%d before, %d after)", len(before), len(after))
+	}
+	for index := range before {
+		b, a := before[index], after[index]
+		switch {
+		case b.ID != a.ID:
+			return fmt.Errorf("source container %s was replaced by %s during state copy", b.Name, a.Name)
+		case a.State.Running:
+			return fmt.Errorf("source container %s started during state copy; the copied state may be inconsistent", a.Name)
+		case b.State.FinishedAt != a.State.FinishedAt || b.State.StartedAt != a.State.StartedAt:
+			return fmt.Errorf("source container %s ran during state copy (started %s, finished %s); the copied state may be inconsistent", a.Name, a.State.StartedAt, a.State.FinishedAt)
+		}
+	}
+	return nil
+}
+
+func composeServiceVolumeKeys(root *yaml.Node, service string) map[string]string {
+	keys := map[string]string{}
+	services := mappingValue(root, "services")
+	entry := mappingValue(services, service)
+	volumes := mappingValue(entry, "volumes")
+	if volumes == nil || volumes.Kind != yaml.SequenceNode {
+		return keys
+	}
+	for _, item := range volumes.Content {
+		key, target, ok := composeVolumeEntry(item)
+		if ok {
+			keys[target] = key
+		}
+	}
+	return keys
+}
+
+func composeVolumeEntry(item *yaml.Node) (key, target string, ok bool) {
+	switch item.Kind {
+	case yaml.ScalarNode:
+		parts := strings.SplitN(item.Value, ":", 3)
+		if len(parts) < 2 {
+			return "", "", false
+		}
+		key, target = strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		if key == "" || target == "" || strings.ContainsAny(key[:1], "/.~$") {
+			return "", "", false
+		}
+		return key, target, true
+	case yaml.MappingNode:
+		kind := mappingValue(item, "type")
+		if kind == nil || kind.Value != "volume" {
+			return "", "", false
+		}
+		source, dest := mappingValue(item, "source"), mappingValue(item, "target")
+		if source == nil || dest == nil || strings.TrimSpace(source.Value) == "" || strings.TrimSpace(dest.Value) == "" {
+			return "", "", false
+		}
+		return strings.TrimSpace(source.Value), strings.TrimSpace(dest.Value), true
+	default:
+		return "", "", false
+	}
+}
+
+const composeInitScriptsDir = "/docker-entrypoint-initdb.d"
+
+func composeServiceInitBindMounts(entry *yaml.Node) ([]*yaml.Node, error) {
+	volumes := mappingValue(entry, "volumes")
+	if volumes == nil || volumes.Kind != yaml.SequenceNode {
+		return nil, nil
+	}
+	mounts := []*yaml.Node{}
+	for _, item := range volumes.Content {
+		var source, target string
+		var options []string
+		switch item.Kind {
+		case yaml.ScalarNode:
+			parts := strings.SplitN(item.Value, ":", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			source, target = strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			if source == "" || !strings.ContainsAny(source[:1], "/.~$") {
+				continue
+			}
+			if len(parts) == 3 {
+				options = strings.Split(parts[2], ",")
+			}
+		case yaml.MappingNode:
+			if kind := mappingValue(item, "type"); kind == nil || kind.Value != "bind" {
+				continue
+			}
+			src, dest := mappingValue(item, "source"), mappingValue(item, "target")
+			if src == nil || dest == nil {
+				continue
+			}
+			source, target = strings.TrimSpace(src.Value), strings.TrimSpace(dest.Value)
+		default:
+			continue
+		}
+		cleaned := path.Clean(target)
+		if cleaned != composeInitScriptsDir && !strings.HasPrefix(cleaned, composeInitScriptsDir+"/") {
+			continue
+		}
+		if !strings.HasPrefix(source, "/") {
+			return nil, fmt.Errorf("init script mount %s -> %s must use an absolute host path so the staged restore runs the same scripts as the deploy", source, target)
+		}
+		if item.Kind == yaml.MappingNode {
+			ensureMappingBool(item, "read_only", true)
+			mounts = append(mounts, item)
+			continue
+		}
+		mounts = append(mounts, stringNode(source+":"+target+":"+strings.Join(append(withoutAccessMode(options), "ro"), ",")))
+	}
+	return mounts, nil
+}
+
+func withoutAccessMode(options []string) []string {
+	kept := options[:0:0]
+	for _, option := range options {
+		if option := strings.TrimSpace(option); option != "" && option != "ro" && option != "rw" {
+			kept = append(kept, option)
+		}
+	}
+	return kept
+}
+
+func externalVolumeNode(name string) *yaml.Node {
+	return &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+		stringNode("name"), stringNode(name),
+		stringNode("external"), {Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"},
+	}}
+}
+
+func composeRoot(doc *yaml.Node) (*yaml.Node, error) {
+	root := doc
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		root = doc.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("compose file is not a mapping")
+	}
+	return root, nil
+}
+
+// rewriteComposeStagedVolumes points the compose file's top-level volume
+// entries at the Bort-owned staging volumes so Dokploy's deploy mounts
+// the transferred state instead of creating fresh project volumes.
+func rewriteComposeStagedVolumes(composeFile string, staged []stagedVolume) (string, error) {
+	if len(staged) == 0 {
+		return composeFile, nil
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(composeFile), &doc); err != nil {
+		return "", err
+	}
+	root, err := composeRoot(&doc)
+	if err != nil {
+		return "", err
+	}
+	topLevel := mappingValue(root, "volumes")
+	if topLevel == nil || topLevel.Kind != yaml.MappingNode {
+		topLevel = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		setMappingNode(root, "volumes", topLevel)
+	}
+	assigned := map[string]stagedVolume{}
+	for _, volume := range staged {
+		key, ok := composeServiceVolumeKeys(root, volume.Service)[volume.Target]
+		if !ok {
+			return "", fmt.Errorf("compose service %s has no named volume mounted at %s; cannot hand staged volume %s to Dokploy", volume.Service, volume.Target, volume.VolumeName)
+		}
+		if other, dup := assigned[key]; dup && other.VolumeName != volume.VolumeName {
+			return "", fmt.Errorf("compose volume %s is mounted by %s:%s and %s:%s, which would stage as separate volumes %s and %s; a shared named volume cannot be transferred before deploy", key, other.Service, other.Target, volume.Service, volume.Target, other.VolumeName, volume.VolumeName)
+		}
+		assigned[key] = volume
+		setMappingNode(topLevel, key, externalVolumeNode(volume.VolumeName))
+	}
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func stagingComposeFile(composeFile, service string, staged []stagedVolume) (string, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(composeFile), &doc); err != nil {
+		return "", err
+	}
+	root, err := composeRoot(&doc)
+	if err != nil {
+		return "", err
+	}
+	services := mappingValue(root, "services")
+	entry := mappingValue(services, service)
+	if entry != nil {
+		if entry, err = selfContainedNode(entry, map[*yaml.Node]bool{}); err != nil {
+			return "", fmt.Errorf("compose service %s: %w", service, err)
+		}
+	}
+	if entry == nil || entry.Kind != yaml.MappingNode {
+		return "", fmt.Errorf("compose service %s not found", service)
+	}
+	if mappingValue(entry, "extends") != nil {
+		return "", fmt.Errorf("compose service %s uses extends, which Bort cannot resolve for staging", service)
+	}
+	setMappingNode(services, service, entry)
+	keys := composeServiceVolumeKeys(root, service)
+	mounts := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	topLevel := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	for _, volume := range staged {
+		key, ok := keys[volume.Target]
+		if !ok {
+			return "", fmt.Errorf("compose service %s has no named volume mounted at %s; cannot stage volume %s", service, volume.Target, volume.VolumeName)
+		}
+		mounts.Content = append(mounts.Content, stringNode(key+":"+volume.Target))
+		setMappingNode(topLevel, key, externalVolumeNode(volume.VolumeName))
+	}
+	initMounts, err := composeServiceInitBindMounts(entry)
+	if err != nil {
+		return "", fmt.Errorf("compose service %s: %w", service, err)
+	}
+	mounts.Content = append(mounts.Content, initMounts...)
+	for _, key := range []string{"ports", "depends_on", "container_name", "networks", "network_mode", "secrets", "configs", "links", "profiles", "build"} {
+		removeMappingKey(entry, key)
+	}
+	setMappingNode(entry, "volumes", mounts)
+	setMappingScalar(entry, "restart", "no")
+	root.Content = []*yaml.Node{
+		stringNode("services"), {Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{stringNode(service), entry}},
+		stringNode("volumes"), topLevel,
+	}
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// selfContainedNode copies a subtree with every alias expanded and every
+// merge key applied, so it stays valid after the anchors it referenced are
+// pruned from the document.
+func selfContainedNode(node *yaml.Node, expanding map[*yaml.Node]bool) (*yaml.Node, error) {
+	if node.Kind == yaml.AliasNode {
+		if node.Alias == nil || expanding[node.Alias] {
+			return nil, fmt.Errorf("alias *%s cannot be expanded", node.Value)
+		}
+		expanding[node.Alias] = true
+		defer delete(expanding, node.Alias)
+		return selfContainedNode(node.Alias, expanding)
+	}
+	copied := *node
+	copied.Anchor = ""
+	copied.Content = nil
+	for _, child := range node.Content {
+		resolved, err := selfContainedNode(child, expanding)
+		if err != nil {
+			return nil, err
+		}
+		copied.Content = append(copied.Content, resolved)
+	}
+	if copied.Kind == yaml.MappingNode {
+		applyMergeKeys(&copied)
+	}
+	return &copied, nil
+}
+
+func applyMergeKeys(mapping *yaml.Node) {
+	var content, merged []*yaml.Node
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		key, value := mapping.Content[i], mapping.Content[i+1]
+		if key.Tag != "!!merge" {
+			content = append(content, key, value)
+			continue
+		}
+		if value.Kind == yaml.SequenceNode {
+			merged = append(merged, value.Content...)
+		} else {
+			merged = append(merged, value)
+		}
+	}
+	mapping.Content = content
+	for _, source := range merged {
+		for i := 0; i+1 < len(source.Content); i += 2 {
+			if mappingValue(mapping, source.Content[i].Value) == nil {
+				mapping.Content = append(mapping.Content, source.Content[i], source.Content[i+1])
+			}
+		}
+	}
+}
+
+type stagingEnvFormat int
+
+const (
+	stagingEnvFormatUnresolved stagingEnvFormat = iota
+	stagingEnvFormatRaw
+	stagingEnvFormatEscapeEveryDollar
+	stagingEnvFormatKeepInterpolation
+)
+
+var dokployReleaseVersionPattern = regexp.MustCompile(`^v?(\d{1,6})\.(\d{1,6})\.(\d{1,6})$`)
+
+// stagingEnvFormatForDokployVersion picks the .env writer Dokploy's own
+// compose deploy uses at that version: raw KEY=value before v0.30.0, quoted
+// with every $ escaped through v0.30.2, quoted with ${VAR} kept from v0.30.3.
+func stagingEnvFormatForDokployVersion(version string) (stagingEnvFormat, error) {
+	match := dokployReleaseVersionPattern.FindStringSubmatch(strings.TrimSpace(version))
+	if match == nil {
+		return stagingEnvFormatUnresolved, fmt.Errorf("Dokploy reported version %q, want vMAJOR.MINOR.PATCH; staged state transfer needs a release version to write the same .env Dokploy will", version)
+	}
+	major, _ := strconv.Atoi(match[1])
+	minor, _ := strconv.Atoi(match[2])
+	patch, _ := strconv.Atoi(match[3])
+	switch {
+	case major > 0 || minor > 30 || minor == 30 && patch >= 3:
+		return stagingEnvFormatKeepInterpolation, nil
+	case minor == 30:
+		return stagingEnvFormatEscapeEveryDollar, nil
+	default:
+		return stagingEnvFormatRaw, nil
+	}
+}
+
+func planStagesDataStoreRestore(plan Plan) bool {
+	for _, step := range plan.Steps {
+		if step.Kind == StepRestoreDataStore && appStateIsStaged(plan, step.App) {
+			return true
+		}
+	}
+	return false
+}
+
+// stagingEnvFileContent mirrors the .env Dokploy writes next to a compose
+// deployment so interpolation in the staged service resolves identically.
+func stagingEnvFileContent(composeAppName, envContent string, format stagingEnvFormat) string {
+	content := "APP_NAME=" + composeAppName + "\nCOMPOSE_PROJECT_NAME=" + composeAppName + "\n" + envContent
+	if !strings.Contains(content, "DOCKER_CONFIG") {
+		content += "\nDOCKER_CONFIG=/root/.docker"
+	}
+	lines := []string{}
+	for _, raw := range strings.Split(content, "\n") {
+		key, value, ok := parseDotenvLine(raw)
+		if !ok {
+			continue
+		}
+		switch format {
+		case stagingEnvFormatRaw:
+			lines = append(lines, key+"="+value)
+		case stagingEnvFormatEscapeEveryDollar:
+			lines = append(lines, key+"=\""+escapeDotenvValue(value, false)+"\"")
+		default:
+			lines = append(lines, key+"=\""+escapeDotenvValue(value, true)+"\"")
+		}
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func parseDotenvLine(raw string) (string, string, bool) {
+	line := strings.TrimSpace(raw)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return "", "", false
+	}
+	line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+	key, value, ok := strings.Cut(line, "=")
+	key = strings.TrimSpace(key)
+	if !ok || !dotenvKey(key) {
+		return "", "", false
+	}
+	value = strings.TrimSpace(value)
+	if inner, ok := dotenvQuotedValue(value); ok {
+		return key, inner, true
+	}
+	if comment := strings.IndexByte(value, '#'); comment >= 0 {
+		value = value[:comment]
+	}
+	return key, strings.TrimSpace(value), true
+}
+
+func dotenvKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for _, r := range key {
+		switch {
+		case r == '_', r == '.', r == '-', r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func dotenvQuotedValue(value string) (string, bool) {
+	if len(value) < 2 {
+		return "", false
+	}
+	quote := value[0]
+	if quote != '"' && quote != '\'' && quote != '`' {
+		return "", false
+	}
+	end := -1
+	for index := 1; index < len(value); index++ {
+		if value[index] == '\\' && index+1 < len(value) && value[index+1] == quote {
+			index++
+			continue
+		}
+		if value[index] == quote {
+			end = index
+			break
+		}
+	}
+	if end < 0 {
+		return "", false
+	}
+	if rest := strings.TrimSpace(value[end+1:]); rest != "" && !strings.HasPrefix(rest, "#") {
+		return "", false
+	}
+	inner := value[1:end]
+	if quote == '"' {
+		inner = strings.ReplaceAll(inner, `\n`, "\n")
+		inner = strings.ReplaceAll(inner, `\r`, "\r")
+	}
+	return inner, true
+}
+
+func escapeDotenvValue(value string, keepInterpolation bool) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	var b strings.Builder
+	for index := 0; index < len(value); index++ {
+		if value[index] == '$' && !(keepInterpolation && dotenvInterpolationAt(value[index:])) {
+			b.WriteString(`\$`)
+			continue
+		}
+		b.WriteByte(value[index])
+	}
+	return b.String()
+}
+
+func dotenvInterpolationAt(value string) bool {
+	if len(value) < 3 || value[1] != '{' || !dotenvNameStart(value[2]) {
+		return false
+	}
+	index := 3
+	for index < len(value) && (dotenvNameStart(value[index]) || value[index] >= '0' && value[index] <= '9') {
+		index++
+	}
+	if index < len(value) && value[index] == '}' {
+		return true
+	}
+	if index < len(value) && value[index] == ':' {
+		index++
+	}
+	if index >= len(value) || !strings.ContainsRune("-+?", rune(value[index])) {
+		return false
+	}
+	for index++; index < len(value); index++ {
+		switch value[index] {
+		case '}':
+			return true
+		case '{':
+			return false
+		}
+	}
+	return false
+}
+
+func dotenvNameStart(c byte) bool {
+	return c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+}
+
+type stagingProject struct {
+	name        string
+	composePath string
+	envPath     string
+}
+
+func (p stagingProject) args(extra ...string) []string {
+	return append([]string{"compose", "-p", p.name, "--env-file", p.envPath, "-f", p.composePath}, extra...)
+}
+
+func (p stagingProject) down(runner dockerRunner) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerStopTimeout+dockerStartTimeout)
+	defer cancel()
+	if err := runner.Run(ctx, nil, nil, p.args("down", "--remove-orphans")...); err != nil {
+		return fmt.Errorf("stop staging compose project %s: %w", p.name, err)
+	}
+	return nil
+}
+
+func writeStagingProject(plan Plan, appName, service, composeFile, envContent string) (stagingProject, error) {
+	if strings.TrimSpace(plan.RunDir) == "" {
+		return stagingProject{}, fmt.Errorf("plan.RunDir is empty; cannot stage compose project for %s/%s", appName, service)
+	}
+	dir := filepath.Join(plan.RunDir, "stage", safeDataPathSegment(appName), safeDataPathSegment(service))
+	if err := safepath.ContainedPath(plan.RunDir, dir); err != nil {
+		return stagingProject{}, err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return stagingProject{}, fmt.Errorf("prepare staging dir: %w", err)
+	}
+	project := stagingProject{
+		name:        stagingProjectName(plan, appName, service),
+		composePath: filepath.Join(dir, "compose.yaml"),
+		envPath:     filepath.Join(dir, ".env"),
+	}
+	if err := os.WriteFile(project.composePath, []byte(composeFile), 0o600); err != nil {
+		return stagingProject{}, fmt.Errorf("write staging compose: %w", err)
+	}
+	if err := os.WriteFile(project.envPath, []byte(envContent), 0o600); err != nil {
+		return stagingProject{}, fmt.Errorf("write staging env: %w", err)
+	}
+	return project, nil
+}
+
+func (p stagingProject) serviceContainer(ctx context.Context, runner dockerRunner, service string) (dockerContainer, error) {
+	deadline := time.Now().Add(targetDiscoveryTimeout)
+	for {
+		out, err := runner.Output(ctx, p.args("ps", "-a", "-q", service)...)
+		if err != nil {
+			return dockerContainer{}, fmt.Errorf("find staging container for %s: %w", service, err)
+		}
+		if ids := strings.Fields(string(out)); len(ids) == 1 {
+			return inspectContainer(ctx, runner, ids[0])
+		} else if len(ids) > 1 {
+			return dockerContainer{}, fmt.Errorf("staging compose project %s has %d containers for service %s", p.name, len(ids), service)
+		}
+		if time.Now().After(deadline) {
+			return dockerContainer{}, fmt.Errorf("staging compose project %s has no container for service %s after %s", p.name, service, targetDiscoveryTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return dockerContainer{}, ctx.Err()
+		case <-time.After(targetDiscoveryDelay):
+		}
+	}
+}

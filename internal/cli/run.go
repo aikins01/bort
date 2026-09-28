@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,6 +24,7 @@ import (
 	"github.com/aikins01/bort/internal/planutil"
 	"github.com/aikins01/bort/internal/preparer"
 	rollbackplan "github.com/aikins01/bort/internal/rollback"
+	"github.com/aikins01/bort/internal/source/localdocker"
 	syncplan "github.com/aikins01/bort/internal/sync"
 	"github.com/aikins01/bort/internal/target/dokploy"
 )
@@ -32,32 +34,40 @@ const (
 	decisionsAPIVersion = "bort.decisions/v1alpha1"
 )
 
-var errRunOperationActive = errors.New("migration run operation already in progress")
+var (
+	errRunOperationActive             = errors.New("migration run operation already in progress")
+	errDokployLiveOperationActive     = errors.New("another Dokploy live operation is already running on this host")
+	errDokployInstallRecoveryRequired = errors.New("an interrupted Dokploy installation requires recovery; rerun the same init-target --install command before other host mutations")
+)
 
 type migrationRun struct {
-	APIVersion               string       `json:"apiVersion"`
-	Name                     string       `json:"name"`
-	RunDir                   string       `json:"runDir"`
-	CreatedAt                time.Time    `json:"createdAt"`
-	UpdatedAt                time.Time    `json:"updatedAt"`
-	LiveAppliedAt            *time.Time   `json:"liveAppliedAt,omitempty"`
-	CommitStartedAt          *time.Time   `json:"commitStartedAt,omitempty"`
-	CommittedAt              *time.Time   `json:"committedAt,omitempty"`
-	RollbackStartedAt        *time.Time   `json:"rollbackStartedAt,omitempty"`
-	RolledBackAt             *time.Time   `json:"rolledBackAt,omitempty"`
-	PurgedAt                 *time.Time   `json:"purgedAt,omitempty"`
-	ApplyOutcomeRequired     bool         `json:"applyOutcomeRequired,omitempty"`
-	Source                   string       `json:"source,omitempty"`
-	BundleDir                string       `json:"bundleDir"`
-	BundleDigest             string       `json:"bundleDigest,omitempty"`
-	SourceBundleDir          string       `json:"sourceBundleDir,omitempty"`
-	ManifestPath             string       `json:"manifest,omitempty"`
-	Target                   string       `json:"target"`
-	AppName                  string       `json:"app,omitempty"`
-	DryRun                   bool         `json:"dryRun"`
-	ObservationWindowSeconds int          `json:"observationWindowSeconds"`
-	RollbackWindowSeconds    int          `json:"rollbackWindowSeconds"`
-	Artifacts                runArtifacts `json:"artifacts"`
+	APIVersion                string       `json:"apiVersion"`
+	Name                      string       `json:"name"`
+	RunDir                    string       `json:"runDir"`
+	CreatedAt                 time.Time    `json:"createdAt"`
+	UpdatedAt                 time.Time    `json:"updatedAt"`
+	LiveAppliedAt             *time.Time   `json:"liveAppliedAt,omitempty"`
+	CommitStartedAt           *time.Time   `json:"commitStartedAt,omitempty"`
+	CommittedAt               *time.Time   `json:"committedAt,omitempty"`
+	RollbackStartedAt         *time.Time   `json:"rollbackStartedAt,omitempty"`
+	RolledBackAt              *time.Time   `json:"rolledBackAt,omitempty"`
+	PurgedAt                  *time.Time   `json:"purgedAt,omitempty"`
+	ResolvedAuthority         string       `json:"resolvedAuthority,omitempty"`
+	AuthorityResolvedAt       *time.Time   `json:"authorityResolvedAt,omitempty"`
+	AuthorityFinalizedAt      *time.Time   `json:"authorityFinalizedAt,omitempty"`
+	HostOwnerReleaseStartedAt *time.Time   `json:"hostOwnerReleaseStartedAt,omitempty"`
+	ApplyOutcomeRequired      bool         `json:"applyOutcomeRequired,omitempty"`
+	Source                    string       `json:"source,omitempty"`
+	BundleDir                 string       `json:"bundleDir"`
+	BundleDigest              string       `json:"bundleDigest,omitempty"`
+	SourceBundleDir           string       `json:"sourceBundleDir,omitempty"`
+	ManifestPath              string       `json:"manifest,omitempty"`
+	Target                    string       `json:"target"`
+	AppName                   string       `json:"app,omitempty"`
+	DryRun                    bool         `json:"dryRun"`
+	ObservationWindowSeconds  int          `json:"observationWindowSeconds"`
+	RollbackWindowSeconds     int          `json:"rollbackWindowSeconds"`
+	Artifacts                 runArtifacts `json:"artifacts"`
 }
 
 type runArtifacts struct {
@@ -167,6 +177,7 @@ type runNextStep struct {
 	Reason     string
 	Artifact   string
 	DecisionID string
+	Phase      string
 }
 
 type migrationRunOptions struct {
@@ -256,7 +267,7 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		if err := rememberCurrentRun(loadedRun.Run); err != nil {
 			return err
 		}
-		writeAppFirstCockpit(stdout, loadedRun)
+		writeAppFirstCockpitContext(ctx, stdout, loadedRun)
 		return nil
 	}
 
@@ -281,7 +292,7 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 			if err := rememberCurrentRun(loadedRun.Run); err != nil {
 				return err
 			}
-			summary := summarizeMigrationRun(loadedRun)
+			summary := summarizeMigrationRunForLive(ctx, loadedRun)
 			writeLiveMigrationRunText(stdout, "Migration run loaded", summary)
 			return attachLiveMigrationRun(ctx, loadedRun, stderr, nil)
 		}
@@ -303,7 +314,7 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 				if loadErr != nil {
 					return loadErr
 				}
-				writeLiveMigrationRunText(stdout, "Migration run loaded", summarizeMigrationRun(loadedRun))
+				writeLiveMigrationRunText(stdout, "Migration run loaded", summarizeMigrationRunForLive(ctx, loadedRun))
 				return attachLiveMigrationRun(ctx, loadedRun, stderr, nil)
 			}
 			return fmt.Errorf("start live migration for run %q: %w", resolved, err)
@@ -316,7 +327,7 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		if err := rememberCurrentRun(loadedRun.Run); err != nil {
 			return err
 		}
-		writeLiveMigrationRunText(stdout, "Migration run loaded", summarizeMigrationRun(loadedRun))
+		writeLiveMigrationRunText(stdout, "Migration run loaded", summarizeMigrationRunForLive(ctx, loadedRun))
 		if err := validateLiveApplyReady(loadedRun); err != nil {
 			return err
 		}
@@ -331,7 +342,7 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		return err
 	}
 
-	summary := summarizeMigrationRun(loadedRun)
+	summary := summarizeMigrationRunContext(ctx, loadedRun)
 	writeMigrationRunText(stdout, "Migration run created", summary)
 	return nil
 }
@@ -387,11 +398,11 @@ func refreshMigrationRunSafelyLocked(runRef string) (loadedMigrationRun, error) 
 	if err != nil {
 		return loadedMigrationRun{}, err
 	}
-	hasAppliedSteps, err := runHasAppliedSteps(run)
+	liveExecutionStarted, err := runHasStartedLiveExecution(run)
 	if err != nil {
 		return loadedMigrationRun{}, fmt.Errorf("read applied migration progress: %w", err)
 	}
-	if run.LiveAppliedAt != nil || run.CommittedAt != nil || run.PurgedAt != nil || hasAppliedSteps {
+	if run.LiveAppliedAt != nil || run.CommitStartedAt != nil || run.CommittedAt != nil || run.RollbackStartedAt != nil || run.RolledBackAt != nil || run.PurgedAt != nil || liveExecutionStarted {
 		return loadMigrationRun(runRef)
 	}
 	return refreshMigrationRunLocked(runRef)
@@ -402,10 +413,19 @@ func validateLiveApplyReady(run loadedMigrationRun) error {
 		return fmt.Errorf("live apply refused: run %q was rolled back; start a fresh migration run to migrate again", run.Run.Name)
 	}
 	if run.Run.RollbackStartedAt != nil {
-		return fmt.Errorf("live apply refused: rollback started for run %q; run `%s` to finish recovery", run.Run.Name, runScopedCommand(run, "rollback --live"))
+		return fmt.Errorf("live apply refused: rollback started for run %q; %s", run.Run.Name, incompleteRollbackRecovery(run))
 	}
 	if run.Run.CommitStartedAt != nil {
-		return fmt.Errorf("live apply refused: source retirement started for run %q; run `%s` to finish acceptance", run.Run.Name, runScopedCommand(run, "commit --apply"))
+		return fmt.Errorf("live apply refused: source retirement started for run %q; %s", run.Run.Name, finishStartedAcceptanceAction(run))
+	}
+	if run.Run.ResolvedAuthority != "" {
+		return fmt.Errorf("live apply refused: run %q has a manual %s-authority resolution; finish that recovery instead of replaying the ambiguous apply", run.Run.Name, run.Run.ResolvedAuthority)
+	}
+	if err := validateStatefulLiveApply(run); err != nil {
+		if len(interruptedStatefulSourceCleanup(run)) > 0 {
+			return nil
+		}
+		return err
 	}
 	if decisions := liveApplyBlockingDecisions(run); len(decisions) > 0 {
 		decision := decisions[0]
@@ -415,7 +435,189 @@ func validateLiveApplyReady(run loadedMigrationRun) error {
 		}
 		return fmt.Errorf("live apply is blocked by %d unresolved requirement(s); next safe step: %s (run `%s` to review this run)", len(decisions), action, runScopedCommand(run, "status"))
 	}
+	if hasOnlyPlatformRunApps(run) {
+		return fmt.Errorf("live apply refused: run %q has no migratable applications; platform-role entries are excluded from live apply", run.Run.Name)
+	}
 	return nil
+}
+
+func stagedTransferRefusal(run loadedMigrationRun) error {
+	return dokploy.ValidateStagedTransfer(livePlanForApplied(run, run.Applied))
+}
+
+// validateStatefulLiveApply refuses to continue a stateful run recorded
+// under a plan order that copied state into the deployed target: Dokploy
+// cannot durably keep a queued or future deployment from restarting
+// target writers mid-copy. current plans transfer state into Bort-owned
+// staging volumes before the target exists and need no such guard.
+func validateStatefulLiveApply(run loadedMigrationRun) error {
+	if !appliedPlanTransfersStateInPlace(run.Applied) {
+		return nil
+	}
+	platformApps := map[string]struct{}{}
+	for _, app := range run.Prepare.Apps {
+		if strings.EqualFold(strings.TrimSpace(app.Role), "platform") {
+			platformApps[app.Name] = struct{}{}
+		}
+	}
+	apps := []string{}
+	seen := map[string]struct{}{}
+	for _, step := range livePlanForApplied(run, run.Applied).Steps {
+		if step.Kind != dokploy.StepPauseSource {
+			continue
+		}
+		if _, platform := platformApps[step.App]; platform {
+			continue
+		}
+		if _, exists := seen[step.App]; exists {
+			continue
+		}
+		seen[step.App] = struct{}{}
+		apps = append(apps, step.App)
+	}
+	if len(apps) == 0 {
+		return nil
+	}
+	return fmt.Errorf("live apply refused for stateful app(s) %s: this run was applied with an older plan version that copied state into the deployed target, and Dokploy cannot durably prevent a queued or future deployment from restarting target writers during that copy; Bort cannot continue this run, so complete target setup, state transfer, traffic cutover, and source retirement outside Bort, or create a new run (new runs stage state before the target is deployed)", strings.Join(apps, ", "))
+}
+
+type sourceCleanupStep struct {
+	app   string
+	index int
+}
+
+func interruptedStatefulSourceCleanup(run loadedMigrationRun) []sourceCleanupStep {
+	plan := livePlanForApplied(run, run.Applied)
+	byIndex := map[int]appliedStep{}
+	for _, recorded := range run.Applied.Steps {
+		if recorded.Index < 0 || recorded.Index >= len(plan.Steps) {
+			return nil
+		}
+		byIndex[recorded.Index] = recorded
+	}
+	pending := map[string]sourceCleanupStep{}
+	for index, step := range plan.Steps {
+		recorded, ok := byIndex[index]
+		if !ok {
+			continue
+		}
+		if recorded.Kind == string(dokploy.StepResumeSource) && step.Kind == dokploy.StepPauseSource && recorded.App == step.App && recorded.Ref == step.Ref {
+			if appliedStepCompleted(recorded) {
+				delete(pending, step.App)
+			} else if appliedStepMayHaveRun(recorded) {
+				pending[step.App] = sourceCleanupStep{app: step.App, index: index}
+			}
+			continue
+		}
+		if !appliedStepMatches(recorded, step) {
+			return nil
+		}
+		if !appliedStepMayHaveRun(recorded) {
+			continue
+		}
+		switch step.Kind {
+		case dokploy.StepPushImage, dokploy.StepRestoreDataStore, dokploy.StepSyncVolume,
+			dokploy.StepResumeTarget, dokploy.StepInstallGateway, dokploy.StepActivateRoutes,
+			dokploy.StepStopCoolifyProxy, dokploy.StepStartDokployProxy:
+			return nil
+		case dokploy.StepPauseSource:
+			pending[step.App] = sourceCleanupStep{app: step.App, index: index}
+		case dokploy.StepResumeSource:
+			if appliedStepCompleted(recorded) {
+				delete(pending, step.App)
+			}
+		}
+	}
+	cleanup := make([]sourceCleanupStep, 0, len(pending))
+	for _, step := range pending {
+		cleanup = append(cleanup, step)
+	}
+	sort.Slice(cleanup, func(i, j int) bool { return cleanup[i].index < cleanup[j].index })
+	return cleanup
+}
+
+func recoverInterruptedStatefulSources(ctx context.Context, run loadedMigrationRun, stderr io.Writer, onProgress func(dokploy.StepProgress), refusal error) error {
+	cleanup := interruptedStatefulSourceCleanup(run)
+	if len(cleanup) == 0 {
+		return refusal
+	}
+	if err := verifyLocalSourceRun(ctx, run); err != nil {
+		return errors.Join(refusal, fmt.Errorf("refusing interrupted source cleanup on an unverified Docker host: %w", err))
+	}
+	appliedPath, err := safeRunArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied)
+	if err != nil {
+		return errors.Join(refusal, err)
+	}
+	lockPath, err := safeRunArtifactPath(run.Run.RunDir, "apply.lock")
+	if err != nil {
+		return errors.Join(refusal, err)
+	}
+	lock, err := acquireApplyLock(lockPath)
+	if err != nil {
+		return errors.Join(refusal, fmt.Errorf("lock interrupted source cleanup: %w", err))
+	}
+	defer lock.Release()
+	hostLock, err := acquireDokployLiveOperationLock()
+	if err != nil {
+		return errors.Join(refusal, fmt.Errorf("lock Dokploy live operations for interrupted source cleanup: %w", err))
+	}
+	defer hostLock.Release()
+	if err := ensureDokploySourceCleanupAvailable(run.Run); err != nil {
+		return errors.Join(refusal, err)
+	}
+	ledger, err := newAppliedLedger(appliedPath, run.Run)
+	if err != nil {
+		return errors.Join(refusal, err)
+	}
+	apps := map[string]struct{}{}
+	appNames := make([]string, 0, len(cleanup))
+	steps := make([]dokploy.Step, 0, len(cleanup))
+	for _, item := range cleanup {
+		apps[item.app] = struct{}{}
+		appNames = append(appNames, item.app)
+		steps = append(steps, dokploy.Step{Kind: dokploy.StepResumeSource, App: item.app, Ref: item.app})
+	}
+	prepare := run.Prepare
+	prepare.Apps = nil
+	for _, app := range run.Prepare.Apps {
+		if _, ok := apps[app.Name]; !ok {
+			continue
+		}
+		app.Readiness = ""
+		app.Gates = nil
+		prepare.Apps = append(prepare.Apps, app)
+	}
+	remap := func(progress dokploy.StepProgress) dokploy.StepProgress {
+		progress.Index = cleanup[progress.Index].index
+		return progress
+	}
+	beforeStep := func(progress dokploy.StepProgress) error {
+		return ledger.Record(remap(progress))
+	}
+	progress := func(item dokploy.StepProgress) {
+		item = remap(item)
+		if item.Status == dokploy.StepStatusOK || item.Status == dokploy.StepStatusError || item.Status == dokploy.StepStatusSkipped {
+			if recordErr := ledger.Record(item); recordErr != nil {
+				fmt.Fprintf(stderr, "warning: failed to record source cleanup for %s: %v\n", item.Step.App, recordErr)
+			}
+		}
+		if onProgress != nil {
+			onProgress(item)
+		}
+	}
+	plan := dokploy.Plan{Steps: steps, Prepare: prepare, RunDir: run.Run.RunDir, BeforeStep: &beforeStep, OnProgress: &progress}
+	client := &dokploy.Client{}
+	if err := client.AdoptHistoricalSourcePause(ctx, plan, appNames); err != nil {
+		return errors.Join(refusal, fmt.Errorf("record historical source pause ownership: %w", err))
+	}
+	if err := client.Apply(ctx, plan); err != nil {
+		return errors.Join(refusal, fmt.Errorf("resume source after interrupted historical pause: %w", err))
+	}
+	if err := ledger.Err(); err != nil {
+		return errors.Join(refusal, fmt.Errorf("persist interrupted source cleanup: %w", err))
+	}
+	fmt.Fprintln(stderr, "stateful recovery: resumed and recorded the source pause cleanup; no state transfer was attempted")
+	return fmt.Errorf("%w; the previously paused source was resumed and recorded, but state transfer remains disabled", refusal)
 }
 
 func liveApplyBlockingDecisions(run loadedMigrationRun) []runDecision {
@@ -467,6 +669,67 @@ func acquireRunOperationLock(runRef string) (*applyLock, error) {
 	return lock, err
 }
 
+func acquireDokployLiveOperationLock() (*applyLock, error) {
+	return acquireDokployLiveOperationLockWithRecovery(false)
+}
+
+func acquireDokployInstallRecoveryLock() (*applyLock, error) {
+	return acquireDokployLiveOperationLockWithRecovery(true)
+}
+
+func acquireDokployLiveOperationLockWithRecovery(allowInstallRecovery bool) (*applyLock, error) {
+	if !dokployLiveOperationsSupported() {
+		return nil, fmt.Errorf("Dokploy live operations are unavailable on this platform; continue on the Linux source host")
+	}
+	lockPath, err := dokployLiveOperationLockPath()
+	if err != nil {
+		return nil, err
+	}
+	if err := prepareDokployLiveOperationLockPath(lockPath); err != nil {
+		return nil, err
+	}
+	lock, err := acquireApplyLock(lockPath)
+	if errors.Is(err, errApplyAlreadyRunning) {
+		return nil, errDokployLiveOperationActive
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !allowInstallRecovery {
+		if err := dokployInstallationRecoveryBlocker(); err != nil {
+			lock.Release()
+			return nil, err
+		}
+	}
+	return lock, err
+}
+
+func dokployInstallationRecoveryBlocker() error {
+	command, found, err := dokployInstallationRecoveryCommand()
+	if err != nil {
+		return fmt.Errorf("verify Dokploy installation recovery state: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	return fmt.Errorf("%w: run `%s`", errDokployInstallRecoveryRequired, command)
+}
+
+func dokployLiveOperationActive() (bool, error) {
+	if !dokployLiveOperationsSupported() {
+		return false, nil
+	}
+	lockPath, err := dokployLiveOperationLockPath()
+	if err != nil {
+		return false, err
+	}
+	active, err := applyLockActive(lockPath)
+	if err != nil || active {
+		return active, err
+	}
+	return false, dokployInstallationRecoveryBlocker()
+}
+
 func runOperationActive(runRef string) (bool, error) {
 	runDir, err := existingRunDir(runRef)
 	if err != nil {
@@ -513,6 +776,9 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 	if run.Run.Target != "dokploy" {
 		return fmt.Errorf("--live is only supported for target dokploy, got %q", run.Run.Target)
 	}
+	if err := validateStatefulLiveApply(run); err != nil {
+		return recoverInterruptedStatefulSources(ctx, run, stderr, onProgress, err)
+	}
 	var err error
 	run, err = ensureSelfContainedLiveRunLocked(run)
 	if err != nil {
@@ -551,18 +817,17 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 	if err := validateLiveApplyReady(run); err != nil {
 		return err
 	}
-	plan := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
+	plan := livePlanForApplied(run, run.Applied)
 	if len(plan.Steps) == 0 {
 		return fmt.Errorf("live migration plan has no executable steps")
 	}
+	if err := verifyLocalSourceRun(ctx, run); err != nil {
+		return fmt.Errorf("refusing live migration on an unverified Docker source: %w", err)
+	}
 	plan.BundleFiles = bundleFiles
 	plan.ApprovedPrepareDecisions = approvedPrepareDecisions(run)
-	client, err := ensureDokployClient(ctx, run.Run.Target, os.Stdin, stderr, stderr)
-	if err != nil {
-		if err == errDokploySetupSkipped {
-			return nil
-		}
-		return err
+	if err := dokploy.ValidateStagedTransfer(plan); err != nil {
+		return fmt.Errorf("live apply refused before binding run %q to a Dokploy target: %w", run.Run.Name, err)
 	}
 	ledger, err := newAppliedLedger(appliedPath, run.Run)
 	if err != nil {
@@ -570,9 +835,51 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 	}
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
-	resumeFrom := completedApplyPrefix(plan.Steps, ledger.Snapshot())
+	if plan.RunID, err = dokployTrafficRunID(run.Run); err != nil {
+		return err
+	}
+	applied := ledger.Snapshot()
+	if err := validateApplyResumeAuthority(applied); err != nil {
+		return fmt.Errorf("%w; %s", err, authorityRecoveryInstruction(run))
+	}
+	var targetLock *applyLock
+	client, err := ensureBoundDokployClient(ctx, run.Run, run.Run.Target, os.Stdin, stderr, stderr, ledger, dokploySetupLockOptions{
+		retain: &targetLock,
+		revalidate: func() error {
+			return ensureDokployTrafficRunAvailable(run.Run, plan)
+		},
+	})
+	if targetLock != nil {
+		defer targetLock.Release()
+	}
+	if err != nil {
+		if err == errDokploySetupSkipped {
+			return nil
+		}
+		return err
+	}
+	if targetLock == nil {
+		return fmt.Errorf("dokploy client became ready without retaining the host operation lock")
+	}
+	applied = ledger.Snapshot()
+	plan.TargetIdentities = appliedTargetIdentities(applied)
+	resumeFrom := completedApplyPrefix(plan.Steps, applied)
+	if err := validateDokployTrafficResume(run.Run, plan, applied, client.BaseURL, dokployCredentialID(client.Token), resumeFrom); err != nil {
+		return err
+	}
+	if resumeFrom < len(plan.Steps) {
+		if err := ledger.PrepareRetry(resumeFrom); err != nil {
+			return fmt.Errorf("prepare applied ledger for retry: %w", err)
+		}
+	}
 	plan.ResumeFrom = resumeFrom
+	ownershipIndex := dokployOwnershipStepIndex(plan)
 	beforeStep := func(p dokploy.StepProgress) error {
+		if p.Index == ownershipIndex {
+			if err := claimDokployHostOwnership(run.Run, client.BaseURL, dokployCredentialID(client.Token)); err != nil {
+				return err
+			}
+		}
 		return ledger.Record(p)
 	}
 	plan.BeforeStep = &beforeStep
@@ -597,13 +904,245 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 	if err := client.Apply(ctx, plan); err != nil {
 		return err
 	}
+	if trafficHandoffStepIndex(plan) >= 0 {
+		if err := client.ReconcileTargetTrafficAuthority(ctx); err != nil {
+			return fmt.Errorf("verify Dokploy target traffic authority: %w", err)
+		}
+	}
+	if err := markDokployTrafficTarget(run.Run, client.BaseURL); err != nil {
+		return fmt.Errorf("record Dokploy target authority: %w", err)
+	}
 	if err := ledger.Err(); err != nil {
 		return fmt.Errorf("live apply completed but applied ledger could not be persisted: %w", err)
+	}
+	if err := client.FinalizeSourceResumes(plan); err != nil {
+		return fmt.Errorf("live apply completed but source resume ownership could not be cleared: %w", err)
 	}
 	if err := ledger.MarkSucceeded(); err != nil {
 		return fmt.Errorf("live apply completed but its successful outcome could not be persisted: %w", err)
 	}
 	return markRunLiveAppliedLocked(run.Run)
+}
+
+func ensureBoundDokployClient(ctx context.Context, run migrationRun, target string, stdin io.Reader, stdout, stderr io.Writer, ledger *appliedLedger, lockOptions dokploySetupLockOptions) (*dokploy.Client, error) {
+	client, acquired, lookupErr := lookupDokployClientForApply(target, lockOptions)
+	if lookupErr == nil {
+		if err := ledger.ValidateTargetOrigin(client.BaseURL); err != nil {
+			if acquired != nil {
+				acquired.Release()
+			}
+			return nil, fmt.Errorf("bind migration run to Dokploy target: %w", err)
+		}
+		if err := verifyLocalDokployClient(ctx, client); err != nil {
+			if acquired != nil {
+				acquired.Release()
+			}
+			return nil, err
+		}
+		pingErr := client.Ping(ctx)
+		if pingErr == nil {
+			if err := ledger.BindTargetOrigin(client.BaseURL); err != nil {
+				if acquired != nil {
+					acquired.Release()
+				}
+				return nil, fmt.Errorf("bind migration run to Dokploy target: %w", err)
+			}
+			if acquired != nil {
+				*lockOptions.retain = acquired
+			}
+			return client, nil
+		}
+		if acquired != nil {
+			acquired.Release()
+		}
+		if err := validateInlineDokploySetup(run, ledger.Snapshot(), client.BaseURL); err != nil {
+			return nil, fmt.Errorf("dokploy is not reachable at %s: %w; %v", client.BaseURL, pingErr, err)
+		}
+		if target != "dokploy" || !stdinIsTerminal(stdin) {
+			return nil, fmt.Errorf("dokploy is not reachable at %s: %w. run `%s`", client.BaseURL, pingErr, dokployInstallRepairCommand(client.BaseURL))
+		}
+		if err := promptInstallAndBootstrapDokploy(ctx, stdin, stdout, stderr, client.BaseURL, pingErr, lockOptions); err != nil {
+			return nil, err
+		}
+	} else {
+		var preflightErr *dokployLiveOperationPreflightError
+		if errors.As(lookupErr, &preflightErr) || target != "dokploy" || !stdinIsTerminal(stdin) {
+			return nil, lookupErr
+		}
+		if err := validateInlineDokploySetup(run, ledger.Snapshot(), ""); err != nil {
+			return nil, err
+		}
+		if err := promptInstallAndBootstrapDokploy(ctx, stdin, stdout, stderr, "", lookupErr, lockOptions); err != nil {
+			return nil, err
+		}
+	}
+	client, err := lookupDokployClient(target)
+	if err != nil {
+		return nil, err
+	}
+	if err := ledger.ValidateTargetOrigin(client.BaseURL); err != nil {
+		return nil, fmt.Errorf("bind migration run to Dokploy target: %w", err)
+	}
+	if err := verifyLocalDokployClient(ctx, client); err != nil {
+		return nil, err
+	}
+	if err := client.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("dokploy ping failed after install/bootstrap: %w", err)
+	}
+	if err := ledger.BindTargetOrigin(client.BaseURL); err != nil {
+		return nil, fmt.Errorf("bind migration run to Dokploy target: %w", err)
+	}
+	return client, nil
+}
+
+func dokployInstallRepairCommand(baseURL string) string {
+	command := "init-target dokploy --install --auth-secret-backup /absolute/path/to/encrypted-or-off-host/dokploy-auth-secret"
+	if parsed, err := url.Parse(baseURL); err == nil && parsed.Port() != "" {
+		command += " --install-port " + shellQuote(parsed.Port())
+	}
+	return bortCommand(command + " --dokploy-url " + shellQuote(baseURL))
+}
+
+var verifyLocalDokployClient = defaultVerifyLocalDokployClient
+
+var verifyLocalSourceRun = defaultVerifyLocalSourceRun
+var verifyLocalSourceEngine = defaultVerifyLocalSourceEngine
+
+func defaultVerifyLocalSourceRun(ctx context.Context, run loadedMigrationRun) error {
+	if err := defaultVerifyLocalSourceEngine(ctx, run); err != nil {
+		return err
+	}
+	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return dokploy.VerifySourceContainers(verifyCtx, run.Prepare.Apps)
+}
+
+func defaultVerifyLocalSourceEngine(ctx context.Context, run loadedMigrationRun) error {
+	if err := validateLocalSourceEngineAttestation(run); err != nil {
+		return err
+	}
+	expected := strings.TrimSpace(run.Prepare.SourceDockerEngineID)
+	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	actual, err := localdocker.DockerEngineID(verifyCtx)
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return fmt.Errorf("reviewed Docker engine %q does not match local engine %q", expected, actual)
+	}
+	return nil
+}
+
+func validateLocalSourceEngineAttestation(run loadedMigrationRun) error {
+	recovery := "refresh it from a local Docker scan before live work"
+	if sourceAttestationCannotRefresh(run) {
+		recovery = "this run already started live execution and cannot be refreshed; verify and recover or retire its reviewed sources manually"
+	}
+	switch strings.ToLower(strings.TrimSpace(run.Run.Source)) {
+	case "docker", "local-docker", "coolify-local":
+	case "manifest":
+		return fmt.Errorf("run was created from an imported manifest, not a local Docker scan; %s", recovery)
+	case "":
+		return fmt.Errorf("run was created from an imported bundle, not a local Docker scan; %s", recovery)
+	default:
+		return fmt.Errorf("run was created from source %q, not a local Docker scan; %s", run.Run.Source, recovery)
+	}
+	source := strings.ToLower(strings.TrimSpace(run.Prepare.Source))
+	switch source {
+	case "docker", "coolify-local", "coolify-local-traefik", "coolify-local-caddy":
+	default:
+		return fmt.Errorf("run source %q is not a locally attested Docker scan; %s", run.Prepare.Source, recovery)
+	}
+	expected := strings.TrimSpace(run.Prepare.SourceDockerEngineID)
+	if expected == "" {
+		return fmt.Errorf("run has no reviewed Docker engine identity; %s", recovery)
+	}
+	return nil
+}
+
+func validateLocalSourceAttestation(run loadedMigrationRun) error {
+	if err := validateLocalSourceEngineAttestation(run); err != nil {
+		return err
+	}
+	return dokploy.ValidateSourceContainerAttestations(run.Prepare.Apps)
+}
+
+func sourceAttestationCannotRefresh(run loadedMigrationRun) bool {
+	return run.Applied.TargetOrigin != "" || len(run.Applied.Steps) > 0 || run.Run.LiveAppliedAt != nil || run.Run.CommitStartedAt != nil || run.Run.CommittedAt != nil || run.Run.RollbackStartedAt != nil || run.Run.RolledBackAt != nil || run.Run.PurgedAt != nil || run.Run.ResolvedAuthority != ""
+}
+
+func sourceAttestationBlockerWithProbe(ctx context.Context, run loadedMigrationRun, probe bool) (runNextStep, bool) {
+	if err := validateLocalSourceAttestation(run); err != nil {
+		if sourceAttestationCannotRefresh(run) {
+			return runNextStep{
+				Action: "inspect and preserve both source and target state, then recover or retire the reviewed sources manually; do not replay this run against replacement containers",
+				Reason: err.Error(),
+				Phase:  "source-attestation-error",
+			}, true
+		}
+		return runNextStep{
+			Action: "create a new named migration run from a local Docker scan on this source host",
+			Reason: err.Error(),
+			Phase:  "inspection-only",
+		}, true
+	}
+	if !probe {
+		return runNextStep{}, false
+	}
+	if err := verifyLocalSourceRun(ctx, run); err != nil {
+		action := "restore the reviewed local Docker daemon and source containers, then check this run again; if they were replaced, create a new named migration run from a fresh local scan"
+		if sourceAttestationCannotRefresh(run) {
+			action = "inspect and preserve both source and target state, restore the reviewed Docker host and containers if safe, then recover or retire this run manually; do not replay it against replacement containers"
+		}
+		if run.Run.ResolvedAuthority == dokployTrafficTarget && run.Run.LiveAppliedAt != nil {
+			action = fmt.Sprintf("manually verify that the source is retired, then run `%s` to record manual retirement and release host ownership without mutating the unattested source", authorityRecoverySourceRetiredCommand(run))
+		}
+		return runNextStep{
+			Action: action,
+			Reason: "source attestation failed: " + err.Error(),
+			Phase:  "source-attestation-error",
+		}, true
+	}
+	return runNextStep{}, false
+}
+
+func defaultVerifyLocalDokployClient(ctx context.Context, client *dokploy.Client) error {
+	if err := client.VerifySameDockerHost(ctx); err != nil {
+		return fmt.Errorf("refusing same-VPS migration through %s: %w", client.BaseURL, err)
+	}
+	return nil
+}
+
+type dokployLiveOperationPreflightError struct {
+	err error
+}
+
+func (e *dokployLiveOperationPreflightError) Error() string { return e.err.Error() }
+
+func (e *dokployLiveOperationPreflightError) Unwrap() error { return e.err }
+
+func lookupDokployClientForApply(target string, lockOptions dokploySetupLockOptions) (*dokploy.Client, *applyLock, error) {
+	client, err := lookupDokployClient(target)
+	if err != nil || lockOptions.retain == nil || *lockOptions.retain != nil {
+		return client, nil, err
+	}
+	acquired, err := acquireDokployLiveOperationLock()
+	if err != nil {
+		return nil, nil, &dokployLiveOperationPreflightError{err: fmt.Errorf("lock Dokploy live operations: %w", err)}
+	}
+	if lockOptions.revalidate != nil {
+		if err := lockOptions.revalidate(); err != nil {
+			acquired.Release()
+			return nil, nil, &dokployLiveOperationPreflightError{err: err}
+		}
+	}
+	client, err = lookupDokployClient(target)
+	if err != nil {
+		acquired.Release()
+		return nil, nil, err
+	}
+	return client, acquired, nil
 }
 
 func approvedPrepareDecisions(run loadedMigrationRun) map[dokploy.PrepareDecision]struct{} {
@@ -779,11 +1318,11 @@ func finalizeAttachedLiveMigration(ctx context.Context, runRef string) error {
 const liveAttachPollInterval = 2 * time.Second
 
 func attachLiveMigration(ctx context.Context, run loadedMigrationRun, appliedPath, lockPath string, stderr io.Writer, onProgress func(dokploy.StepProgress)) error {
-	plan := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
 	pid := readApplyLockPID(lockPath)
 	startedAt := time.Now().UTC()
 	var lastSeen time.Time
 	initialApplied, initialAppliedOK := readRunApplied(appliedPath, run.Run)
+	plan := livePlanForApplied(run, initialApplied)
 	if initialAppliedOK == nil && initialApplied.SucceededAt != nil && completedApplyPrefix(plan.Steps, initialApplied) >= len(plan.Steps) && len(plan.Steps) > 0 {
 		entries := attachProgressEntries(plan.Steps, initialApplied, time.Time{})
 		emitAttachProgress(onProgress, entries)
@@ -803,7 +1342,7 @@ func attachLiveMigration(ctx context.Context, run loadedMigrationRun, appliedPat
 		if latest, ok := latestAttachProgressEntry(entries); ok {
 			lastSeen = latest.updatedAt
 			if onProgress == nil {
-				writeAttachTextProgress(stderr, latest.progress, len(plan.Steps), "already recorded")
+				writeAttachTextProgress(stderr, latest.progress, latest.progress.Total, "already recorded")
 			}
 		} else if onProgress == nil {
 			fmt.Fprintf(stderr, "live mode: 0/%d step(s) already recorded\n", len(plan.Steps))
@@ -822,13 +1361,14 @@ func attachLiveMigration(ctx context.Context, run loadedMigrationRun, appliedPat
 				fmt.Fprintf(stderr, "warning: failed to read applied progress: %v\n", err)
 				continue
 			}
+			plan = livePlanForApplied(run, applied)
 			entries := attachProgressEntries(plan.Steps, applied, lastSeen)
 			if len(entries) > 0 {
 				emitAttachProgress(onProgress, entries)
 				latest, _ := latestAttachProgressEntry(entries)
 				lastSeen = latest.updatedAt
 				if onProgress == nil {
-					writeAttachTextProgress(stderr, latest.progress, len(plan.Steps), "recorded")
+					writeAttachTextProgress(stderr, latest.progress, latest.progress.Total, "recorded")
 				}
 			}
 			if applied.SucceededAt != nil && completedApplyPrefix(plan.Steps, applied) >= len(plan.Steps) {
@@ -866,14 +1406,29 @@ type attachProgressEntry struct {
 func attachProgressEntries(steps []dokploy.Step, applied runApplied, after time.Time) []attachProgressEntry {
 	entries := []attachProgressEntry{}
 	for _, recorded := range applied.Steps {
-		if recorded.Index < 0 || recorded.Index >= len(steps) || recorded.UpdatedAt.IsZero() || !recorded.UpdatedAt.After(after) {
+		if recorded.Index < 0 || recorded.UpdatedAt.IsZero() || !recorded.UpdatedAt.After(after) {
 			continue
 		}
-		step := steps[recorded.Index]
-		if !appliedStepMatches(recorded, step) || !attachStatusRecorded(recorded.Status) {
+		if !attachStatusRecorded(recorded.Status) {
 			continue
 		}
-		progress := dokploy.StepProgress{Index: recorded.Index, Total: len(steps), Step: step, Status: dokploy.StepStatus(recorded.Status)}
+		step := dokploy.Step{Kind: dokploy.StepKind(recorded.Kind), App: recorded.App, Ref: recorded.Ref}
+		if recorded.Index < len(steps) {
+			step = steps[recorded.Index]
+			if !appliedStepMatches(recorded, step) {
+				if !appliedCleanupMatches(recorded, step) {
+					continue
+				}
+				step = dokploy.Step{Kind: dokploy.StepKind(recorded.Kind), App: recorded.App, Ref: recorded.Ref}
+			}
+		} else if !standaloneAppliedCleanup(recorded, len(steps)) {
+			continue
+		}
+		total := len(steps)
+		if standaloneAppliedCleanup(recorded, len(steps)) {
+			total++
+		}
+		progress := dokploy.StepProgress{Index: recorded.Index, Total: total, Step: step, Status: dokploy.StepStatus(recorded.Status)}
 		if recorded.Error != "" {
 			progress.Err = errors.New(recorded.Error)
 		}
@@ -885,6 +1440,17 @@ func attachProgressEntries(steps []dokploy.Step, applied runApplied, after time.
 
 func attachStatusRecorded(status string) bool {
 	return status == string(dokploy.StepStatusOK) || status == string(dokploy.StepStatusSkipped) || status == string(dokploy.StepStatusError)
+}
+
+func appliedCleanupMatches(recorded appliedStep, planned dokploy.Step) bool {
+	sameIdentity := recorded.App == planned.App && recorded.Ref == planned.Ref
+	return sameIdentity &&
+		(planned.Kind == dokploy.StepPauseSource && recorded.Kind == string(dokploy.StepResumeSource) ||
+			planned.Kind == dokploy.StepStopCoolifyProxy && recorded.Kind == string(dokploy.StepStartCoolifyProxy))
+}
+
+func standaloneAppliedCleanup(recorded appliedStep, stepCount int) bool {
+	return recorded.Index == stepCount && recorded.Kind == string(dokploy.StepStartCoolifyProxy) && recorded.Ref == "coolify-proxy"
 }
 
 func emitAttachProgress(onProgress func(dokploy.StepProgress), entries []attachProgressEntry) {
@@ -928,7 +1494,14 @@ func latestAttachFailure(steps []dokploy.Step, applied runApplied, attachedAt ti
 		if step.Status != string(dokploy.StepStatusError) || step.UpdatedAt.Before(attachedAt.Add(-5*time.Second)) {
 			continue
 		}
-		if step.Index < 0 || step.Index >= len(steps) || !appliedStepMatches(step, steps[step.Index]) {
+		if step.Index < 0 || step.Index > len(steps) {
+			continue
+		}
+		if step.Index == len(steps) {
+			if !standaloneAppliedCleanup(step, len(steps)) {
+				continue
+			}
+		} else if !appliedStepMatches(step, steps[step.Index]) && !appliedCleanupMatches(step, steps[step.Index]) {
 			continue
 		}
 		if !found || step.UpdatedAt.After(latest.UpdatedAt) {
@@ -939,43 +1512,13 @@ func latestAttachFailure(steps []dokploy.Step, applied runApplied, attachedAt ti
 	return latest, found
 }
 
-func ensureDokployClient(ctx context.Context, target string, stdin io.Reader, stdout, stderr io.Writer) (*dokploy.Client, error) {
-	client, err := lookupDokployClient(target)
-	if err == nil {
-		if pingErr := client.Ping(ctx); pingErr == nil {
-			return client, nil
-		} else if target == "dokploy" && stdinIsTerminal(stdin) {
-			if err := promptInstallAndBootstrapDokploy(ctx, stdin, stdout, stderr, client.BaseURL, pingErr); err != nil {
-				return nil, err
-			}
-			return pingConfiguredDokployClient(ctx, target)
-		} else {
-			return nil, fmt.Errorf("dokploy is not reachable at %s: %w. run `%s`", client.BaseURL, pingErr, bortCommand("init-target dokploy --install --dokploy-url "+shellQuote(client.BaseURL)))
-		}
-	}
-	if target == "dokploy" && stdinIsTerminal(stdin) {
-		if err := promptInstallAndBootstrapDokploy(ctx, stdin, stdout, stderr, "", err); err != nil {
-			return nil, err
-		}
-		return pingConfiguredDokployClient(ctx, target)
-	}
-	return nil, err
-}
-
-func pingConfiguredDokployClient(ctx context.Context, target string) (*dokploy.Client, error) {
-	client, err := lookupDokployClient(target)
-	if err != nil {
-		return nil, err
-	}
-	if err := client.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("dokploy ping failed after install/bootstrap: %w", err)
-	}
-	return client, nil
-}
-
 func lookupDokployClient(target string) (*dokploy.Client, error) {
-	if client, err := dokploy.NewClientFromEnv(); err == nil {
+	client, envErr := dokploy.NewClientFromEnv()
+	if envErr == nil {
 		return client, nil
+	}
+	if strings.TrimSpace(os.Getenv(dokploy.EnvBaseURL)) != "" || strings.TrimSpace(os.Getenv(dokploy.EnvToken)) != "" {
+		return nil, envErr
 	}
 	state, err := readBortState(defaultStatePath())
 	if err != nil {
@@ -983,50 +1526,18 @@ func lookupDokployClient(target string) (*dokploy.Client, error) {
 	}
 	creds, ok := state.Targets[target]
 	if ok && creds.URL != "" && creds.Token != "" {
-		if err := dokploy.ValidateTokenBaseURL(creds.URL); err != nil {
-			return nil, err
-		}
-		return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
-	}
-	return nil, fmt.Errorf("no dokploy credentials available: set %s and %s, or run `%s`", dokploy.EnvBaseURL, dokploy.EnvToken, bortCommand("init-target dokploy --install"))
-}
-
-func resolveDokployClient(ctx context.Context, target string, stdin io.Reader, stderr io.Writer) (*dokploy.Client, error) {
-	if client, err := lookupDokployClient(target); err == nil {
-		return client, nil
-	}
-	state, err := readBortState(defaultStatePath())
-	if err != nil {
-		return nil, err
-	}
-	creds, ok := state.Targets[target]
-	if ok && creds.URL != "" && creds.Token != "" {
-		if err := dokploy.ValidateTokenBaseURL(creds.URL); err != nil {
-			return nil, err
-		}
-		return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
-	}
-	if target == "dokploy" && stdinIsTerminal(stdin) {
-		fmt.Fprintf(stderr, "no dokploy credentials found; running `%s` interactively\n", bortCommand("init-target dokploy"))
-		if err := runInitTarget(ctx, nil, stdin, stderr, stderr); err != nil {
-			return nil, err
-		}
-		state, err = readBortState(defaultStatePath())
+		baseURL, err := dokploy.NormalizeTokenBaseURL(creds.URL)
 		if err != nil {
 			return nil, err
 		}
-		creds = state.Targets[target]
-		if creds.URL != "" && creds.Token != "" {
-			if err := dokploy.ValidateTokenBaseURL(creds.URL); err != nil {
-				return nil, err
-			}
-			return &dokploy.Client{BaseURL: creds.URL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
-		}
+		return &dokploy.Client{BaseURL: baseURL, Token: creds.Token, HTTPClient: &http.Client{Timeout: 30 * time.Second}}, nil
 	}
-	return nil, fmt.Errorf("no dokploy credentials available: set %s and %s, or run `%s` first", dokploy.EnvBaseURL, dokploy.EnvToken, bortCommand("init-target dokploy"))
+	return nil, fmt.Errorf("no dokploy credentials available: set %s and %s; for an existing Dokploy run `%s` (replace 3030 if it uses another published port), or if Dokploy is absent run `%s`", dokploy.EnvBaseURL, dokploy.EnvToken, bortCommand("init-target dokploy --dokploy-url http://127.0.0.1:3030"), bortCommand("init-target dokploy --install --auth-secret-backup /absolute/path/to/encrypted-or-off-host/dokploy-auth-secret"))
 }
 
-func stdinIsTerminal(stdin io.Reader) bool {
+var stdinIsTerminal = defaultStdinIsTerminal
+
+func defaultStdinIsTerminal(stdin io.Reader) bool {
 	file, ok := stdin.(*os.File)
 	if !ok {
 		return false
@@ -1055,7 +1566,7 @@ func existingMutableMigrationRun(runDir, runName string) (migrationRun, error) {
 		if err != nil {
 			return migrationRun{}, fmt.Errorf("refusing to rewrite run %q because its apply ledger cannot be verified: %w", runName, err)
 		}
-		if len(applied.Steps) > 0 {
+		if applied.TargetOrigin != "" || len(applied.Steps) > 0 {
 			return migrationRun{}, immutableError()
 		}
 		return migrationRun{}, nil
@@ -1078,7 +1589,7 @@ func existingMutableMigrationRun(runDir, runName string) (migrationRun, error) {
 	if err != nil {
 		return migrationRun{}, fmt.Errorf("refusing to rewrite run %q because its apply ledger cannot be verified: %w", runName, err)
 	}
-	if len(applied.Steps) > 0 {
+	if applied.TargetOrigin != "" || len(applied.Steps) > 0 {
 		return migrationRun{}, immutableError()
 	}
 	return existing, nil
@@ -1296,7 +1807,7 @@ func captureReviewedMigrationBundle(run loadedMigrationRun) (map[string][]byte, 
 }
 
 func reviewedMigrationBundleRecovery(run loadedMigrationRun) string {
-	if len(run.Applied.Steps) > 0 || run.Run.LiveAppliedAt != nil {
+	if len(run.Applied.Steps) > 0 || run.Applied.TargetOrigin != "" || run.Run.LiveAppliedAt != nil {
 		return "this run has started live execution and cannot be re-planned; reconcile any applied target changes, then create a new run"
 	}
 	return fmt.Sprintf("run `%s` to re-plan before live apply", runScopedCommand(run, "migrate"))
@@ -1402,29 +1913,33 @@ func createMigrationRunLocked(opts migrationRunOptions, runDir, runName string, 
 	}()
 
 	run := migrationRun{
-		APIVersion:               runAPIVersion,
-		Name:                     runName,
-		RunDir:                   filepath.ToSlash(filepath.Clean(runDir)),
-		CreatedAt:                createdAt,
-		UpdatedAt:                now,
-		LiveAppliedAt:            existingRun.LiveAppliedAt,
-		CommitStartedAt:          existingRun.CommitStartedAt,
-		CommittedAt:              existingRun.CommittedAt,
-		RollbackStartedAt:        existingRun.RollbackStartedAt,
-		RolledBackAt:             existingRun.RolledBackAt,
-		PurgedAt:                 existingRun.PurgedAt,
-		ApplyOutcomeRequired:     true,
-		Source:                   opts.Source,
-		BundleDir:                bundleDir,
-		BundleDigest:             hex.EncodeToString(bundleDigest[:]),
-		SourceBundleDir:          sourceBundleDir,
-		ManifestPath:             opts.ManifestPath,
-		Target:                   opts.Target,
-		AppName:                  opts.AppName,
-		DryRun:                   true,
-		ObservationWindowSeconds: opts.ObservationWindowSeconds,
-		RollbackWindowSeconds:    opts.RollbackWindowSeconds,
-		Artifacts:                artifacts,
+		APIVersion:                runAPIVersion,
+		Name:                      runName,
+		RunDir:                    filepath.ToSlash(filepath.Clean(runDir)),
+		CreatedAt:                 createdAt,
+		UpdatedAt:                 now,
+		LiveAppliedAt:             existingRun.LiveAppliedAt,
+		CommitStartedAt:           existingRun.CommitStartedAt,
+		CommittedAt:               existingRun.CommittedAt,
+		RollbackStartedAt:         existingRun.RollbackStartedAt,
+		RolledBackAt:              existingRun.RolledBackAt,
+		PurgedAt:                  existingRun.PurgedAt,
+		ResolvedAuthority:         existingRun.ResolvedAuthority,
+		AuthorityResolvedAt:       existingRun.AuthorityResolvedAt,
+		AuthorityFinalizedAt:      existingRun.AuthorityFinalizedAt,
+		HostOwnerReleaseStartedAt: existingRun.HostOwnerReleaseStartedAt,
+		ApplyOutcomeRequired:      true,
+		Source:                    opts.Source,
+		BundleDir:                 bundleDir,
+		BundleDigest:              hex.EncodeToString(bundleDigest[:]),
+		SourceBundleDir:           sourceBundleDir,
+		ManifestPath:              opts.ManifestPath,
+		Target:                    opts.Target,
+		AppName:                   opts.AppName,
+		DryRun:                    true,
+		ObservationWindowSeconds:  opts.ObservationWindowSeconds,
+		RollbackWindowSeconds:     opts.RollbackWindowSeconds,
+		Artifacts:                 artifacts,
 	}
 
 	if err := writeJSONArtifact(runArtifactPath(runDir, run.Artifacts.Prepare), preparePlan); err != nil {
@@ -1539,22 +2054,52 @@ func refreshMigrationRunLockedWithInputs(runRef, bundleOverride, manifestOverrid
 	}, runDir, runNameFromDir(runDir), time.Now().UTC())
 }
 
-func runStatus(_ context.Context, args []string, stdout, stderr io.Writer) error {
+func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		handled, err := writeStandaloneDokployInstallationRecovery(stdout)
+		if err != nil || handled {
+			return err
+		}
+	}
 	run, err := loadRunFromArgs("status", args, stderr)
 	if err != nil {
 		return err
 	}
-	writeAppFirstCockpit(stdout, run)
+	writeAppFirstCockpitContext(ctx, stdout, run)
 	return nil
 }
 
-func runNext(_ context.Context, args []string, stdout, stderr io.Writer) error {
+func runNext(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		handled, err := writeStandaloneDokployInstallationRecovery(stdout)
+		if err != nil || handled {
+			return err
+		}
+	}
 	run, err := loadRunFromArgs("next", args, stderr)
 	if err != nil {
 		return err
 	}
-	writeRunNextText(stdout, summarizeMigrationRun(run))
+	writeRunNextText(stdout, summarizeMigrationRunContext(ctx, run))
 	return nil
+}
+
+func writeStandaloneDokployInstallationRecovery(w io.Writer) (bool, error) {
+	if !dokployLiveOperationsSupported() {
+		return false, nil
+	}
+	command, found, err := dokployInstallationRecoveryCommand()
+	if err != nil {
+		return false, fmt.Errorf("read interrupted Dokploy installation recovery command: %w", err)
+	}
+	if !found {
+		return false, nil
+	}
+	st := newStyler(w)
+	fmt.Fprintln(w, st.glyph("Dokploy installation recovery required", sevBad))
+	fmt.Fprintf(w, "Next safe step: run `%s` to reconcile the interrupted installation\n", command)
+	fmt.Fprintln(w, "Reason: the durable installation-recovery marker blocks other host mutations")
+	return true, nil
 }
 
 func loadRunFromArgs(command string, args []string, stderr io.Writer) (loadedMigrationRun, error) {
@@ -1651,6 +2196,18 @@ func loadMigrationRun(runRef string) (loadedMigrationRun, error) {
 }
 
 func summarizeMigrationRun(run loadedMigrationRun) migrationRunSummary {
+	return summarizeMigrationRunContext(context.Background(), run)
+}
+
+func summarizeMigrationRunContext(ctx context.Context, run loadedMigrationRun) migrationRunSummary {
+	return summarizeMigrationRunContextWithSourceProbe(ctx, run, true)
+}
+
+func summarizeMigrationRunForLive(ctx context.Context, run loadedMigrationRun) migrationRunSummary {
+	return summarizeMigrationRunContextWithSourceProbe(ctx, run, false)
+}
+
+func summarizeMigrationRunContextWithSourceProbe(ctx context.Context, run loadedMigrationRun, probeSource bool) migrationRunSummary {
 	summary := migrationRunSummary{Run: run.Run, Readiness: preparer.ReadinessReadyToCreate, Status: preparer.StatusGreen}
 
 	for _, app := range run.Commit.Apps {
@@ -1714,7 +2271,7 @@ func summarizeMigrationRun(run loadedMigrationRun) migrationRunSummary {
 	summary.Decisions = openRunDecisions(run)
 	summary.Progress = progressSummary(run.Progress)
 	summary.FirstGates = firstUnresolvedRunGates(run, 3)
-	summary.Next = nextSafeStep(run, blockingDecisions)
+	summary.Next = nextSafeStepContextWithSourceProbe(ctx, run, blockingDecisions, probeSource)
 	return summary
 }
 
@@ -1732,33 +2289,240 @@ func firstUnresolvedRunGates(run loadedMigrationRun, limit int) []runGateSummary
 }
 
 func nextSafeStep(run loadedMigrationRun, decisions []runDecision) runNextStep {
+	return nextSafeStepContext(context.Background(), run, decisions)
+}
+
+func nextSafeStepContext(ctx context.Context, run loadedMigrationRun, decisions []runDecision) runNextStep {
+	return nextSafeStepContextWithSourceProbe(ctx, run, decisions, true)
+}
+
+func nextSafeStepContextWithSourceProbe(ctx context.Context, run loadedMigrationRun, decisions []runDecision, probeSource bool) runNextStep {
+	sourceBlocker := func() (runNextStep, bool) {
+		return sourceAttestationBlockerWithProbe(ctx, run, probeSource)
+	}
+	if dokployLiveOperationsSupported() && !authorityRecoveryPending(run) {
+		ownerFinalizationPending, ownerFinalizationErr := completedDokployOwnerFinalization(run)
+		if ownerFinalizationErr != nil {
+			return runNextStep{Action: "inspect /var/lib/bort/dokploy-traffic-owner.json before treating this run as complete", Reason: ownerFinalizationErr.Error()}
+		}
+		if ownerFinalizationPending {
+			if run.Run.RolledBackAt != nil {
+				return runNextStep{Action: fmt.Sprintf("run `%s` to finish releasing rollback host ownership", runScopedCommand(run, "rollback --live")), Reason: "rollback is recorded, but its durable source-authority owner is not released"}
+			}
+			return runNextStep{Action: fmt.Sprintf("run `%s` to finish releasing commit host ownership", runScopedCommand(run, "commit --apply")), Reason: "commit is recorded, but its durable target-authority owner is not released"}
+		}
+	}
 	if run.Run.PurgedAt != nil {
 		return runNextStep{Action: "migration complete", Reason: "selected source leftovers were purged after target acceptance"}
 	}
 	if run.Run.CommittedAt != nil {
 		return runNextStep{Action: fmt.Sprintf("run `%s` to audit remaining metadata and source leftovers", runScopedCommand(run, "cleanup")), Reason: "the target is accepted and source app containers are retired"}
 	}
-	if run.Run.RolledBackAt != nil {
+	if run.Run.RolledBackAt != nil && !authorityRecoveryPending(run) {
 		return runNextStep{Action: "create a new named migration run with `bort migrate --run <new-name>` and current `--source` or `--bundle` inputs", Reason: "the rollback returned traffic to the source; the Dokploy target resources remain on the server"}
 	}
-	if run.Run.RollbackStartedAt != nil {
+	if !dokployLiveOperationsSupported() {
+		return unsupportedPlatformNextStep(run)
+	}
+	owner, hostOwned, hostOwnerErr := conflictingDokployHostOwner(run.Run)
+	applyActive, applyActiveErr := false, error(nil)
+	if run.Run.LiveAppliedAt == nil {
+		applyActive, applyActiveErr = applyRunActive(run.Run.RunDir)
+	}
+	hostOperationActive, hostOperationErr := dokployLiveOperationActive()
+	if authorityRecoveryPending(run) {
+		if hostOwnerErr != nil {
+			return runNextStep{Action: "inspect /var/lib/bort/dokploy-traffic-owner.json before finishing authority recovery", Reason: "manual authority is recorded but lifecycle finalization is incomplete: " + hostOwnerErr.Error()}
+		}
+		if applyActiveErr != nil {
+			return runNextStep{Action: fmt.Sprintf("inspect the live-apply lock for run %s before finishing authority recovery", shellQuote(run.Run.Name)), Reason: "manual authority is recorded but lifecycle finalization is incomplete: " + applyActiveErr.Error()}
+		}
+		if blocked, ok := dokployHostOperationBlocker(hostOperationActive, hostOperationErr); ok {
+			blocked.Reason = "manual authority is recorded but lifecycle finalization is incomplete: " + blocked.Reason
+			return blocked
+		}
+		return runNextStep{
+			Action: fmt.Sprintf("run `%s` to finish the recorded manual %s-authority recovery", pendingAuthorityRecoveryCommand(run), run.Run.ResolvedAuthority),
+			Reason: "the authority decision is durable, but its lifecycle and host-owner finalization did not complete",
+		}
+	}
+	trafficOwnerErr := validateCurrentDokployTrafficOwner(run, rollbackInProgress(run))
+	if rollbackInProgress(run) {
+		if hostOwnerErr != nil {
+			return runNextStep{Action: "inspect /var/lib/bort/dokploy-traffic-owner.json before continuing rollback", Reason: "rollback started and traffic or source state may already have changed: " + hostOwnerErr.Error()}
+		}
+		if applyActiveErr != nil {
+			return runNextStep{Action: fmt.Sprintf("inspect the live-apply lock for run %s before continuing rollback", shellQuote(run.Run.Name)), Reason: "rollback started and traffic or source state may already have changed: " + applyActiveErr.Error()}
+		}
+		if blocked, ok := dokployHostOperationBlocker(hostOperationActive, hostOperationErr); ok {
+			blocked.Reason = "rollback started and traffic or source state may already have changed: " + blocked.Reason
+			return blocked
+		}
+		if runMayHaveAmbiguousAuthority(run) {
+			if authorityRecoveryAvailable(run) {
+				return authorityRecoveryNextStep(run, "authority-ambiguous recovery did not complete; target fencing may be partial and source state may be unchanged")
+			}
+			return runNextStep{
+				Action: "inspect and preserve both source and target data, establish writer and traffic authority manually, then create a fresh migration run",
+				Reason: "authority-ambiguous recovery did not complete; target fencing may be partial, source state may be unchanged, and Dokploy cannot durably fence later starts or deployments",
+			}
+		}
+		if trafficOwnerErr != nil {
+			if authorityRecoveryAvailable(run) {
+				return authorityRecoveryNextStep(run, "the durable owner remains bound to this run, but automatic rollback cannot prove authority")
+			}
+			return runNextStep{
+				Action: "inspect and preserve both source and target data, establish writer and traffic authority manually, then create a fresh migration run",
+				Reason: "the durable Dokploy host owner no longer proves authority for rollback recovery: " + trafficOwnerErr.Error(),
+			}
+		}
+		if _, err := planAutomaticRollback(run); err != nil {
+			if authorityRecoveryAvailable(run) {
+				return authorityRecoveryNextStep(run, "automatic stateful rollback is unavailable because Dokploy cannot durably prevent later target deployments")
+			}
+			return runNextStep{
+				Action: "inspect and preserve both source and target data, establish writer and traffic authority manually, then create a fresh migration run",
+				Reason: "automatic stateful rollback is unavailable because Dokploy cannot durably prevent later target deployments",
+			}
+		}
+		if blocked, ok := sourceBlocker(); ok {
+			return blocked
+		}
 		return runNextStep{Action: fmt.Sprintf("run `%s` to finish recovery", runScopedCommand(run, "rollback --live")), Reason: "rollback started but has not completed; traffic may already be on the source"}
 	}
 	if run.Run.CommitStartedAt != nil {
-		return runNextStep{Action: fmt.Sprintf("run `%s` to finish acceptance", runScopedCommand(run, "commit --apply")), Reason: "source retirement started; rollback is no longer available"}
+		if hostOwnerErr != nil {
+			return runNextStep{Action: "inspect /var/lib/bort/dokploy-traffic-owner.json before continuing source retirement", Reason: "source retirement started and rollback is no longer available: " + hostOwnerErr.Error()}
+		}
+		if applyActiveErr != nil {
+			return runNextStep{Action: fmt.Sprintf("inspect the live-apply lock for run %s before continuing source retirement", shellQuote(run.Run.Name)), Reason: "source retirement started and rollback is no longer available: " + applyActiveErr.Error()}
+		}
+		if blocked, ok := dokployHostOperationBlocker(hostOperationActive, hostOperationErr); ok {
+			blocked.Reason = "source retirement started and rollback is no longer available: " + blocked.Reason
+			return blocked
+		}
+		if trafficOwnerErr != nil {
+			return runNextStep{
+				Action: "inspect and preserve both source and target state, establish traffic authority manually, then complete source retirement manually",
+				Reason: "the durable Dokploy host owner no longer proves target authority for the interrupted commit: " + trafficOwnerErr.Error(),
+			}
+		}
+		if blocked, ok := sourceBlocker(); ok {
+			return blocked
+		}
+		return runNextStep{Action: finishStartedAcceptanceAction(run), Reason: "source retirement started; rollback is no longer available"}
 	}
-	if run.Run.LiveAppliedAt != nil || liveApplySucceeded(run) {
-		return runNextStep{Action: fmt.Sprintf("verify the target, then run `%s` after the rollback window", runScopedCommand(run, "commit --apply")), Reason: "the live apply completed and the source remains available for rollback"}
+	if applyActive {
+		if hostOwnerErr != nil {
+			return runNextStep{Action: "inspect /var/lib/bort/dokploy-traffic-owner.json before retrying live apply", Reason: "live apply is recorded as active: " + hostOwnerErr.Error()}
+		}
+		if blocked, ok := dokployHostOperationBlocker(hostOperationActive, hostOperationErr); ok && !hostOperationActive {
+			blocked.Reason = "live apply is recorded as active: " + blocked.Reason
+			return blocked
+		}
+		if blocked, ok := sourceBlocker(); ok {
+			return blocked
+		}
+		return runNextStep{Action: fmt.Sprintf("run `%s` to view the active apply", liveApplyCommand(run)), Reason: "another process is applying this run"}
 	}
-	applyActive, applyActiveErr := applyRunActive(run.Run.RunDir)
+	if hostOwnerErr != nil {
+		return runNextStep{
+			Action: "inspect /var/lib/bort/dokploy-traffic-owner.json before further migration work",
+			Reason: hostOwnerErr.Error(),
+		}
+	}
 	if applyActiveErr != nil {
 		return runNextStep{Action: fmt.Sprintf("inspect the live-apply lock for run %s before retrying", shellQuote(run.Run.Name)), Reason: applyActiveErr.Error()}
 	}
-	if applyActive {
-		return runNextStep{Action: fmt.Sprintf("run `%s` to view the active apply", liveApplyCommand(run)), Reason: "another process is applying this run"}
+	if blocked, ok := dokployHostOperationBlocker(hostOperationActive, hostOperationErr); ok {
+		return blocked
+	}
+	if manualTargetAuthorityRecorded(run) {
+		if trafficOwnerErr != nil {
+			return runNextStep{Action: "inspect /var/lib/bort/dokploy-traffic-owner.json before retiring the source", Reason: "manual target authority is recorded, but the durable Dokploy host owner no longer proves it: " + trafficOwnerErr.Error()}
+		}
+		if blocked, ok := sourceBlocker(); ok {
+			return blocked
+		}
+		if coolifySourceRetirementRequired(run) {
+			return runNextStep{Action: "verify the target, then " + manualCoolifySourceRetirementAction(run), Reason: "manual target authority is durable; automatic rollback remains unavailable"}
+		}
+		return runNextStep{Action: fmt.Sprintf("verify the target, then run `%s` to retire the source", runScopedCommand(run, "commit --apply")), Reason: "manual target authority is durable; automatic rollback remains unavailable"}
+	}
+	if runMayHaveAmbiguousAuthority(run) {
+		if authorityRecoveryAvailable(run) {
+			return authorityRecoveryNextStep(run, "the stored run cannot prove writer or traffic authority, and Dokploy cannot durably fence later target starts or deployments")
+		}
+		return runNextStep{
+			Action: "inspect and preserve both source and target data, establish writer and traffic authority manually, then create a fresh migration run",
+			Reason: "the stored run cannot prove writer or traffic authority, and Dokploy cannot durably fence later target starts or deployments",
+		}
+	}
+	if run.Run.LiveAppliedAt != nil || liveApplySucceeded(run) {
+		if trafficOwnerErr != nil {
+			if authorityRecoveryAvailable(run) {
+				return authorityRecoveryNextStep(run, "the durable owner remains bound to this run, but automatic actions cannot prove target authority")
+			}
+			return runNextStep{
+				Action: "inspect and preserve both source and target data, establish writer and traffic authority manually, then create a fresh migration run",
+				Reason: "the durable Dokploy host owner no longer proves target authority: " + trafficOwnerErr.Error(),
+			}
+		}
+		if blocked, ok := sourceBlocker(); ok {
+			return blocked
+		}
+		if _, err := planAutomaticRollback(run); err != nil {
+			if authorityRecoveryAvailable(run) {
+				return authorityRecoveryNextStep(run, "the live stateful migration completed, but Dokploy cannot durably fence target writers for automatic rollback")
+			}
+			if coolifySourceRetirementRequired(run) {
+				return runNextStep{
+					Action: "verify the target; if validation fails, preserve both sides and recover authority manually; otherwise, after the rollback window, " + manualCoolifySourceRetirementAction(run),
+					Reason: "the live stateful migration completed, but Dokploy cannot durably fence target writers for automatic rollback",
+				}
+			}
+			return runNextStep{
+				Action: fmt.Sprintf("verify the target; if validation fails, preserve both sides and recover authority manually; otherwise run `%s` after the rollback window", runScopedCommand(run, "commit --apply")),
+				Reason: "the live stateful migration completed, but Dokploy cannot durably fence target writers for automatic rollback",
+			}
+		}
+		if coolifySourceRetirementRequired(run) {
+			return runNextStep{Action: "verify the target through the rollback window, then " + manualCoolifySourceRetirementAction(run) + fmt.Sprintf("; if validation fails, run `%s` to roll back stateless traffic", runScopedCommand(run, "rollback --live")), Reason: "the live apply completed and the source remains available for rollback"}
+		}
+		return runNextStep{Action: fmt.Sprintf("verify the target, then run `%s` after the rollback window", runScopedCommand(run, "commit --apply")), Reason: "the live apply completed and the source remains available for rollback"}
+	}
+	if hostOwned {
+		return runNextStep{
+			Action: fmt.Sprintf("finish %s before applying this run", dokployOwnerRunLabel(owner)),
+			Reason: fmt.Sprintf("that run owns Dokploy host mutations with %s authority", owner.Authority),
+		}
+	}
+	if err := validateStatefulLiveApply(run); err != nil {
+		if len(interruptedStatefulSourceCleanup(run)) > 0 {
+			if blocked, ok := sourceBlocker(); ok {
+				return blocked
+			}
+			return runNextStep{
+				Action: fmt.Sprintf("run `%s` to restart the historically paused source without transferring state", liveApplyCommand(run)),
+				Reason: "the ledger proves no state transfer or traffic handoff started; automatic state migration remains unavailable after cleanup",
+			}
+		}
+		return runNextStep{
+			Action: "do not rerun this blocked run; complete target setup, persistent-state transfer, traffic cutover, and source retirement outside Bort, or create a new run (new runs stage state before the target is deployed)",
+			Reason: err.Error(),
+		}
 	}
 	if len(run.Applied.Steps) > 0 {
+		if blocked, ok := sourceBlocker(); ok {
+			return blocked
+		}
 		return runNextStep{Action: fmt.Sprintf("run `%s` to resume the interrupted apply", liveApplyCommand(run)), Reason: "the apply ledger contains incomplete work"}
+	}
+	if err := stagedTransferRefusal(run); err != nil {
+		return runNextStep{
+			Action: fmt.Sprintf("for a data store volume, choose `%s`, then %s; otherwise change the source compose and scan a new run", bortCommand("data <app> <store> --recreate|--managed"), reviewedMigrationBundleRecovery(run)),
+			Reason: err.Error(),
+		}
 	}
 	if decisions == nil {
 		decisions = liveApplyBlockingDecisions(run)
@@ -1772,11 +2536,91 @@ func nextSafeStep(run loadedMigrationRun, decisions []runDecision) runNextStep {
 			DecisionID: decision.ID,
 		}
 	}
-
+	if !hasMigratableRunApps(run) {
+		return runNextStep{Action: "create a new migration run that selects at least one non-platform application", Reason: "this run contains no migratable applications; platform-role entries are excluded from live apply"}
+	}
+	if blocked, ok := sourceBlocker(); ok {
+		return blocked
+	}
 	return runNextStep{
 		Action:   fmt.Sprintf("run `%s` to apply the planned steps against the target", liveApplyCommand(run)),
 		Reason:   "all setup requirements are resolved; interactive target setup runs inline if needed",
 		Artifact: runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Commit),
+	}
+}
+
+func dokployHostOperationBlocker(active bool, err error) (runNextStep, bool) {
+	if err != nil {
+		if errors.Is(err, errDokployInstallRecoveryRequired) {
+			command, found, recoveryErr := dokployInstallationRecoveryCommand()
+			if recoveryErr != nil || !found {
+				return runNextStep{Action: "inspect /var/lib/bort/dokploy-live.lock.install-recovery-required before further host mutation", Reason: errors.Join(err, recoveryErr).Error()}, true
+			}
+			return runNextStep{Action: fmt.Sprintf("run `%s` to reconcile the interrupted installation", command), Reason: errDokployInstallRecoveryRequired.Error()}, true
+		}
+		return runNextStep{Action: "inspect the host-wide Dokploy operation lock before changing this run", Reason: err.Error()}, true
+	}
+	if active {
+		return runNextStep{Action: "wait for the active Dokploy host operation to finish, then check this run again", Reason: "another process holds the host-wide Dokploy operation lock"}, true
+	}
+	return runNextStep{}, false
+}
+
+func unsupportedPlatformNextStep(run loadedMigrationRun) runNextStep {
+	phase := migrationRunPhase(run)
+	action := "inspect this run here, then continue it on the Linux source host"
+	reason := "Dokploy live actions and their host-wide lock are available only on Linux"
+	switch phase {
+	case "empty":
+		action = "create a new migration run that selects at least one non-platform application"
+		reason = "this run contains only platform-role entries, which Bort excludes from live apply"
+	case "lock-error":
+		action = fmt.Sprintf("inspect the live-apply lock for run %s, then continue recovery on the Linux source host", shellQuote(run.Run.Name))
+		reason = "the run's apply.lock state could not be verified"
+	case "host-lock-error":
+		action = "inspect /var/lib/bort/dokploy-live.lock, then continue recovery on the Linux source host"
+		reason = "the host-wide Dokploy operation lock could not be verified"
+	case "host-owner-error":
+		action = "inspect /var/lib/bort/dokploy-traffic-owner.json, then continue recovery on the Linux source host"
+		reason = "Dokploy host ownership could not be verified"
+	case "authority-finalizing":
+		action = fmt.Sprintf("continue the recorded manual %s-authority finalization on the Linux source host", run.Run.ResolvedAuthority)
+		reason = "the authority decision is durable, but lifecycle or host-owner finalization is incomplete"
+	case "authority-ambiguous", "authority-ambiguous-rollback":
+		action = "preserve both sides, then establish writer and traffic authority on the Linux source host"
+		reason = "the stored run cannot prove current writer or traffic authority"
+	case "applied":
+		action = "verify the live target here, then continue acceptance or rollback on the Linux source host"
+		reason = "the target is recorded live and the source remains pending acceptance or recovery"
+	case "committing":
+		action = "finish source retirement on the Linux source host"
+		reason = "commit started and rollback is no longer available"
+	case "rolling back":
+		action = "finish rollback recovery on the Linux source host"
+		reason = "rollback started and may already have changed traffic or source state"
+	case "source-recovery":
+		action = "resume the historically paused source on the Linux source host"
+		reason = "the durable ledger records an incomplete source cleanup"
+	case "manual-state":
+		action = "complete state transfer and authority recovery manually on the Linux source host"
+		reason = "automatic stateful migration is unavailable"
+	case "plan-blocked":
+		action = "choose a data store strategy and re-plan, or change the source compose and scan a new run, on the Linux source host"
+		reason = "live apply would refuse the planned state transfer"
+	case "partial", "applying":
+		action = "inspect the durable apply ledger, then resume on the Linux source host"
+		reason = "live apply has incomplete work"
+	case "planning":
+		action = "resolve the recorded planning requirements before continuing on the Linux source host"
+		reason = "the run is not ready for live apply"
+	}
+	return runNextStep{Action: action, Reason: reason}
+}
+
+func authorityRecoveryNextStep(run loadedMigrationRun, reason string) runNextStep {
+	return runNextStep{
+		Action: fmt.Sprintf("manually fence the other side and verify authority, then run `%s` for source or `%s` for target", authorityRecoveryCommand(run, dokployTrafficSource), authorityRecoveryCommand(run, dokployTrafficTarget)),
+		Reason: reason,
 	}
 }
 
@@ -2337,6 +3181,19 @@ func isPlatformRunApp(role string) bool {
 	return strings.EqualFold(strings.TrimSpace(role), "platform")
 }
 
+func hasMigratableRunApps(run loadedMigrationRun) bool {
+	for _, app := range run.Prepare.Apps {
+		if !isPlatformRunApp(app.Role) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasOnlyPlatformRunApps(run loadedMigrationRun) bool {
+	return len(run.Prepare.Apps) > 0 && !hasMigratableRunApps(run)
+}
+
 func (counts *runStatusCounts) add(status preparer.Status) {
 	switch status {
 	case preparer.StatusRed:
@@ -2495,6 +3352,18 @@ func readRunMetadata(path string) (migrationRun, error) {
 	if !run.DryRun {
 		return migrationRun{}, fmt.Errorf("%s is not a dry-run migration run", path)
 	}
+	if (run.ResolvedAuthority == "") != (run.AuthorityResolvedAt == nil) {
+		return migrationRun{}, fmt.Errorf("%s has an incomplete manual authority resolution", path)
+	}
+	if run.ResolvedAuthority != "" && run.ResolvedAuthority != dokployTrafficSource && run.ResolvedAuthority != dokployTrafficTarget {
+		return migrationRun{}, fmt.Errorf("%s has invalid resolved authority %q", path, run.ResolvedAuthority)
+	}
+	if run.AuthorityFinalizedAt != nil && (run.ResolvedAuthority != dokployTrafficSource || run.RolledBackAt == nil) {
+		return migrationRun{}, fmt.Errorf("%s has invalid manual authority finalization", path)
+	}
+	if run.HostOwnerReleaseStartedAt != nil && run.CommittedAt == nil && run.RolledBackAt == nil {
+		return migrationRun{}, fmt.Errorf("%s records a host-owner release before commit or rollback", path)
+	}
 	return run, nil
 }
 
@@ -2502,6 +3371,31 @@ func markRunLiveAppliedLocked(run migrationRun) error {
 	return updateRunLifecycleLocked(run, func(current *migrationRun, now time.Time) {
 		if current.LiveAppliedAt == nil {
 			current.LiveAppliedAt = &now
+		}
+	})
+}
+
+func markRunAuthorityResolvedLocked(run migrationRun, authority string) error {
+	return updateRunLifecycleLocked(run, func(current *migrationRun, now time.Time) {
+		if current.ResolvedAuthority == "" {
+			current.ResolvedAuthority = authority
+			current.AuthorityResolvedAt = &now
+		}
+	})
+}
+
+func markRunAuthorityFinalizedLocked(run migrationRun) error {
+	return updateRunLifecycleLocked(run, func(current *migrationRun, now time.Time) {
+		if current.AuthorityFinalizedAt == nil {
+			current.AuthorityFinalizedAt = &now
+		}
+	})
+}
+
+func markRunHostOwnerReleaseStartedLocked(run migrationRun) error {
+	return updateRunLifecycleLocked(run, func(current *migrationRun, now time.Time) {
+		if current.HostOwnerReleaseStartedAt == nil {
+			current.HostOwnerReleaseStartedAt = &now
 		}
 	})
 }

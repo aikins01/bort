@@ -39,6 +39,7 @@ type cleanupResult struct {
 	Target               string                         `json:"target"`
 	DryRun               bool                           `json:"dryRun"`
 	Applied              bool                           `json:"applied,omitempty"`
+	MetadataApplyBlocked string                         `json:"metadataApplyBlocked,omitempty"`
 	BackupPath           string                         `json:"backupPath,omitempty"`
 	DeletedProjects      []dokploy.StalePlatformProject `json:"deletedProjects,omitempty"`
 	StalePlatformRecords []cleanupStalePlatformRecord   `json:"stalePlatformRecords,omitempty"`
@@ -200,18 +201,44 @@ func runCleanupWithInput(ctx context.Context, args []string, stdin io.Reader, st
 		return err
 	}
 	var operationLock *applyLock
+	var targetLock *applyLock
 	if apply {
 		operationLock, err = acquireRunOperationLock(resolvedRunRef)
 		if err != nil {
 			return fmt.Errorf("cleanup run %q: %w", resolvedRunRef, err)
 		}
 		defer operationLock.Release()
+		targetLock, err = acquireDokployLiveOperationLock()
+		if err != nil {
+			return fmt.Errorf("lock Dokploy live operations: %w", err)
+		}
+		defer targetLock.Release()
 	}
 	run, err := loadMigrationRun(resolvedRunRef)
 	if err != nil {
 		return err
 	}
-	result := planCleanup(ctx, run, target)
+	var client *dokploy.Client
+	if apply {
+		owner, conflict, err := conflictingDokployHostOwner(run.Run)
+		if err != nil {
+			return fmt.Errorf("verify Dokploy host ownership before cleanup: %w", err)
+		}
+		if conflict {
+			return fmt.Errorf("refusing cleanup --apply for run %q because Dokploy host mutations are owned by %s with %s authority", run.Run.Name, dokployOwnerRunLabel(owner), owner.Authority)
+		}
+		client, err = lookupDokployClient(target)
+		if err != nil {
+			return err
+		}
+		if err := validateCleanupDokployIdentity(run, client); err != nil {
+			return fmt.Errorf("refusing cleanup --apply without a bound local Dokploy installation: %w", err)
+		}
+		if err := verifyLocalDokployCleanupAPIHost(ctx, client); err != nil {
+			return fmt.Errorf("refusing cleanup --apply before Dokploy API access: %w", err)
+		}
+	}
+	result := planCleanupWithClient(ctx, run, target, client, !apply)
 	result.DryRun = !apply
 	if apply {
 		if collisions := cleanupStaleProjectNameCollisions(run, defaultStaleDokployPlatformProjects); len(collisions) > 0 {
@@ -219,13 +246,12 @@ func runCleanupWithInput(ctx context.Context, args []string, stdin io.Reader, st
 		}
 		applyNames := cleanupStaleProjectNamesForApply(result.StalePlatformRecords)
 		if len(applyNames) == 0 {
+			if err := verifyLocalDokployCleanupHost(ctx, client); err != nil {
+				return fmt.Errorf("refusing cleanup --apply without a bound local Dokploy installation: %w", err)
+			}
 			result.Applied = true
 			result.Actions = append(result.Actions, cleanupAction{Kind: "dokploy_metadata", Ref: strings.Join(defaultStaleDokployPlatformProjects, ","), Safety: "metadata_only", Status: "noop", Message: "no empty zero-domain stale Dokploy platform project records are ready to delete"})
 			return writeFormattedOutput(stdout, outputPath, format, result, writeCleanupText)
-		}
-		client, err := lookupDokployClient(target)
-		if err != nil {
-			return err
 		}
 		applied, err := client.CleanupStalePlatformProjects(ctx, dokploy.StalePlatformCleanupOptions{
 			ProjectNames: applyNames,
@@ -302,12 +328,20 @@ func runCleanupPurge(ctx context.Context, args []string, stdin io.Reader, stdout
 		return err
 	}
 	var operationLock *applyLock
+	var targetLock *applyLock
 	if apply {
 		operationLock, err = acquireRunOperationLock(resolvedRunRef)
 		if err != nil {
 			return fmt.Errorf("cleanup purge run %q: %w", resolvedRunRef, err)
 		}
 		defer operationLock.Release()
+		if strings.TrimSpace(confirm) != "" {
+			targetLock, err = acquireDokployLiveOperationLock()
+			if err != nil {
+				return fmt.Errorf("lock Dokploy live operations: %w", err)
+			}
+			defer targetLock.Release()
+		}
 	}
 	run, err := loadMigrationRun(resolvedRunRef)
 	if err != nil {
@@ -345,20 +379,40 @@ func runCleanupPurge(ctx context.Context, args []string, stdin io.Reader, stdout
 		return fmt.Errorf("refusing cleanup purge --apply before a successful live apply: %w", err)
 	}
 	if run.Run.CommittedAt == nil {
+		if coolifySourceRetirementRequired(run) {
+			return fmt.Errorf("refusing cleanup purge --apply before target acceptance; the source is still the rollback path: %s", manualCoolifySourceRetirementAction(run))
+		}
 		return fmt.Errorf("refusing cleanup purge --apply before `%s`; the source is still the rollback path", runScopedCommand(run, "commit --apply"))
 	}
-	client := &dokploy.Client{}
-	identified, err := client.IdentifySourcePurgeResources(ctx, cleanupPurgeOptions(result))
-	if err != nil {
-		return fmt.Errorf("identify selected source resources before confirmation: %w", err)
-	}
-	applyCleanupPurgeIdentities(&result, identified)
 	if err := confirmCleanupPurgeApply(stdin, stderr, run.Run.Name, confirm); err != nil {
 		return err
+	}
+	if targetLock == nil {
+		targetLock, err = acquireDokployLiveOperationLock()
+		if err != nil {
+			return fmt.Errorf("lock Dokploy live operations: %w", err)
+		}
+		defer targetLock.Release()
+	}
+	owner, conflict, err := conflictingDokployHostOwner(run.Run)
+	if err != nil {
+		return fmt.Errorf("verify Dokploy host ownership before source purge: %w", err)
+	}
+	if conflict {
+		return fmt.Errorf("refusing cleanup purge --apply for run %q because Dokploy host mutations are owned by %s with %s authority", run.Run.Name, dokployOwnerRunLabel(owner), owner.Authority)
 	}
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("cleanup purge --apply is unavailable on %s; rerun the same scoped and confirmed command on the Linux source host", runtime.GOOS)
 	}
+	if err := verifyLocalSourceEngine(ctx, run); err != nil {
+		return fmt.Errorf("refusing source purge on an unverified Docker source: %w", err)
+	}
+	client := &dokploy.Client{}
+	identified, err := client.IdentifySourcePurgeResources(ctx, cleanupPurgeOptions(result))
+	if err != nil {
+		return fmt.Errorf("identify selected source resources under host lock: %w", err)
+	}
+	applyCleanupPurgeIdentities(&result, identified)
 	recorder, err := newCleanupPurgeBackupRecorder(backupDir, &result)
 	if err != nil {
 		return err
@@ -1309,6 +1363,10 @@ func cleanupStaleProjectNamesForApply(records []cleanupStalePlatformRecord) []st
 }
 
 func planCleanup(ctx context.Context, run loadedMigrationRun, target string) cleanupResult {
+	return planCleanupWithClient(ctx, run, target, nil, true)
+}
+
+func planCleanupWithClient(ctx context.Context, run loadedMigrationRun, target string, client *dokploy.Client, assessMetadataApply bool) cleanupResult {
 	result := cleanupResult{
 		APIVersion: cleanupAPIVersion,
 		RunName:    run.Run.Name,
@@ -1316,7 +1374,20 @@ func planCleanup(ctx context.Context, run loadedMigrationRun, target string) cle
 		Target:     target,
 		DryRun:     true,
 	}
-	result.StalePlatformRecords, result.Warnings = inspectStalePlatformRecords(ctx, target)
+	if client == nil {
+		var err error
+		if client, err = lookupDokployClient(target); err != nil {
+			result.MetadataApplyBlocked = err.Error()
+		}
+	}
+	if result.MetadataApplyBlocked == "" && assessMetadataApply {
+		result.MetadataApplyBlocked = cleanupMetadataApplyBlocker(ctx, run, client)
+	}
+	if result.MetadataApplyBlocked != "" {
+		result.StalePlatformRecords = stalePlatformRecordsWithStatus("blocked", "not inspected; metadata cleanup is unavailable for this run")
+	} else {
+		result.StalePlatformRecords, result.Warnings = inspectStalePlatformRecordsWithClient(ctx, client)
+	}
 	networkIdentities, networkIdentityErr := cleanupManifestNetworkIdentities(run)
 	if networkIdentityErr != nil {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("inspect source network identities: %v", networkIdentityErr))
@@ -1375,15 +1446,29 @@ func planCleanup(ctx context.Context, run loadedMigrationRun, target string) cle
 	return result
 }
 
-func inspectStalePlatformRecords(ctx context.Context, target string) ([]cleanupStalePlatformRecord, []string) {
+func cleanupMetadataApplyBlocker(ctx context.Context, run loadedMigrationRun, client *dokploy.Client) string {
+	if err := validateCleanupDokployIdentity(run, client); err != nil {
+		return err.Error()
+	}
+	if !dokployLiveOperationsSupported() {
+		return "Dokploy metadata cleanup must run on the Linux Dokploy host"
+	}
+	if err := verifyLocalDokployCleanupHost(ctx, client); err != nil {
+		return fmt.Sprintf("the configured Dokploy API and database are not an eligible local installation: %v", err)
+	}
+	return ""
+}
+
+func stalePlatformRecordsWithStatus(status, message string) []cleanupStalePlatformRecord {
 	records := make([]cleanupStalePlatformRecord, 0, len(defaultStaleDokployPlatformProjects))
 	for _, name := range defaultStaleDokployPlatformProjects {
-		records = append(records, cleanupStalePlatformRecord{Name: name, Status: "unknown", Message: "will verify the project is empty and has zero domains against Dokploy DB before deleting"})
+		records = append(records, cleanupStalePlatformRecord{Name: name, Status: status, Message: message})
 	}
-	client, err := lookupDokployClient(target)
-	if err != nil {
-		return records, []string{err.Error()}
-	}
+	return records
+}
+
+func inspectStalePlatformRecordsWithClient(ctx context.Context, client *dokploy.Client) ([]cleanupStalePlatformRecord, []string) {
+	records := stalePlatformRecordsWithStatus("unknown", "will verify the project is empty and has zero domains against Dokploy DB before deleting")
 	projects, err := client.ListProjects(ctx)
 	if err != nil {
 		return records, []string{fmt.Sprintf("inspect Dokploy projects: %v", err)}
@@ -1441,6 +1526,50 @@ func inspectStalePlatformRecords(ctx context.Context, target string) ([]cleanupS
 		records[i].Message = "safe metadata cleanup candidate: empty project with zero domains visible"
 	}
 	return records, warnings
+}
+
+var verifyLocalDokployCleanupHost = func(ctx context.Context, client *dokploy.Client) error {
+	return client.VerifySameDockerHostAndDatabase(ctx)
+}
+
+var verifyLocalDokployCleanupAPIHost = func(ctx context.Context, client *dokploy.Client) error {
+	return client.VerifySameDockerHost(ctx)
+}
+
+func validateCleanupDokployIdentity(run loadedMigrationRun, client *dokploy.Client) error {
+	if err := validateLocalSourceEngineAttestation(run); err != nil {
+		return err
+	}
+	if err := validateAppliedTargetOrigin(run.Applied, client.BaseURL); err != nil {
+		return err
+	}
+	if run.Applied.TargetOrigin == "" {
+		return fmt.Errorf("migration run %q has no persisted Dokploy target origin", run.Run.Name)
+	}
+	owner, found, err := readDokployTrafficOwner()
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("migration run %q has no durable Dokploy host owner", run.Run.Name)
+	}
+	runID, err := dokployTrafficRunID(run.Run)
+	if err != nil {
+		return err
+	}
+	if owner.RunID != runID {
+		return fmt.Errorf("Dokploy host ownership belongs to %s, not %q", dokployOwnerRunLabel(owner), run.Run.Name)
+	}
+	if owner.TargetOrigin != client.BaseURL {
+		return fmt.Errorf("migration run %q owns Dokploy traffic for target %q, not %q", run.Run.Name, owner.TargetOrigin, client.BaseURL)
+	}
+	if owner.TargetCredentialID == "" {
+		return fmt.Errorf("migration run %q has no durable Dokploy credential identity", run.Run.Name)
+	}
+	if owner.TargetCredentialID != dokployCredentialID(client.Token) {
+		return fmt.Errorf("migration run %q owns Dokploy traffic with a different target credential identity; restore the exact Dokploy API key this run claimed the host with and retry", run.Run.Name)
+	}
+	return nil
 }
 
 func cleanupSourceControlForApp(app preparer.AppPlan) *cleanupSourceControl {
@@ -2001,6 +2130,11 @@ func writeCleanupText(w io.Writer, result cleanupResult) {
 
 	if result.Applied {
 		fmt.Fprintln(w, "Applied only the safe Dokploy metadata cleanup. Source containers, volumes, networks, source-control credentials, and target apps were not removed.")
+		return
+	}
+	if result.MetadataApplyBlocked != "" {
+		fmt.Fprintf(w, "Audit only: `cleanup --apply` is unavailable because %s.\n", result.MetadataApplyBlocked)
+		fmt.Fprintln(w, "Source containers, volumes, networks, source-control credentials, and target apps are inventoried only and are preserved by this command.")
 		return
 	}
 	run := loadedMigrationRun{Run: migrationRun{Name: result.RunName, RunDir: result.RunDir}}
