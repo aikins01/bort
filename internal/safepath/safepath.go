@@ -264,6 +264,9 @@ func (d *PrivateDir) ValidatePath() error {
 	if !os.SameFile(heldInfo, currentInfo) {
 		return fmt.Errorf("private directory path changed during operation")
 	}
+	if currentInfo.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("private directory %s has permissions %o; remove group and other access before retrying", d.path, currentInfo.Mode().Perm())
+	}
 	return nil
 }
 

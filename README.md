@@ -104,8 +104,9 @@ need it.
 
 For a Dokploy install, prepare an absolute authentication-secret escrow path on
 encrypted or off-host storage, inside a mode-0700 directory owned by root or
-the invoking sudo user. No directory in the path may be a symbolic link or be
-writable by group or others. Pass the path as `--auth-secret-backup` or as
+the invoking sudo user. No directory in the path may be a symbolic link. Every
+parent must be owned by root or that user; a parent writable by group or others
+must have the sticky bit set. Pass the path as `--auth-secret-backup` or as
 `sudo BORT_DOKPLOY_AUTH_SECRET_BACKUP=/path bort ...` (sudo drops exported
 variables by default), and retain it with the private provenance marker under
 `/var/lib/bort`. Interrupted creation is retried only when the

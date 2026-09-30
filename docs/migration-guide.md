@@ -53,15 +53,15 @@ encrypted or off-host storage, or run
 `sudo BORT_DOKPLOY_AUTH_SECRET_BACKUP=/path bort ...` (sudo drops exported
 variables by default). Put it
 inside a mode-0700 directory owned by root or the invoking sudo user. Every
-ancestor must be a real directory owned by root or that user and must not be
-writable by group or others. Bort creates and fsyncs the authentication key,
-opens it without following links, and supplies that validated file descriptor
-to Docker. It then persists a private creation intent and labels the new Docker
-secret with the matching nonce. After creation it records the exact Docker
-secret ID and escrow digest in `/var/lib/bort/dokploy-auth-secret.id`. A retry
-can finish the marker transition after interruption only when the pending nonce,
-Docker label, and retained escrow all match; otherwise it refuses the orphaned
-secret.
+ancestor must be a real directory owned by root or that user. An ancestor
+writable by group or others must have the sticky bit set. Bort creates and
+fsyncs the authentication key, opens it without following links, and supplies
+that validated file descriptor to Docker. It then persists a private creation
+intent and labels the new Docker secret with the matching nonce. After creation
+it records the exact Docker secret ID and escrow digest in
+`/var/lib/bort/dokploy-auth-secret.id`. A retry can finish the marker transition
+after interruption only when the pending nonce, Docker label, and retained
+escrow all match; otherwise it refuses the orphaned secret.
 Retain both files. Bort mounts the key into Dokploy without putting it in the
 service environment or migration workspace. Do not delete or rotate it
 casually: Dokploy uses it for sessions and encrypted settings. If an existing

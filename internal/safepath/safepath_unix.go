@@ -20,12 +20,12 @@ func openPrivateDirNoFollow(path string, create bool) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := validatePrivateDirDescriptor(parentFD, string(filepath.Separator)); err != nil {
+	if err := validatePrivateDirDescriptor(parentFD, string(filepath.Separator), true); err != nil {
 		_ = unix.Close(parentFD)
 		return nil, err
 	}
 	currentPath := string(filepath.Separator)
-	for _, part := range parts {
+	for index, part := range parts {
 		if part == "" {
 			continue
 		}
@@ -49,7 +49,7 @@ func openPrivateDirNoFollow(path string, create bool) (*os.File, error) {
 			_ = unix.Close(parentFD)
 			return nil, fmt.Errorf("open private directory component %s without following links: %w", componentPath, err)
 		}
-		if err := validatePrivateDirDescriptor(nextFD, componentPath); err != nil {
+		if err := validatePrivateDirDescriptor(nextFD, componentPath, index < len(parts)-1); err != nil {
 			_ = unix.Close(parentFD)
 			_ = unix.Close(nextFD)
 			return nil, err
@@ -69,18 +69,25 @@ func openPrivateDirNoFollow(path string, create bool) (*os.File, error) {
 	return dir, nil
 }
 
-func validatePrivateDirDescriptor(fd int, path string) error {
+func validatePrivateDirDescriptor(fd int, path string, allowSticky bool) error {
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil {
 		return err
 	}
-	if stat.Mode&0o022 != 0 {
-		return fmt.Errorf("private directory ancestor %s is writable by group or others", path)
+	return validatePrivateDirMetadata(uint32(stat.Mode), stat.Uid, path, allowSticky)
+}
+
+func validatePrivateDirMetadata(mode, uid uint32, path string, allowSticky bool) error {
+	if !trustedPrivateDirOwner(uid) {
+		return fmt.Errorf("private directory component %s is owned by untrusted uid %d", path, uid)
 	}
-	if !trustedPrivateDirOwner(stat.Uid) {
-		return fmt.Errorf("private directory ancestor %s is owned by untrusted uid %d", path, stat.Uid)
+	if mode&0o022 == 0 || (allowSticky && mode&unix.S_ISVTX != 0) {
+		return nil
 	}
-	return nil
+	if allowSticky {
+		return fmt.Errorf("private directory ancestor %s is writable by group or others without the sticky bit; remove group and other write access or set the sticky bit before retrying", path)
+	}
+	return fmt.Errorf("private directory %s has permissions %o; remove group and other access before retrying", path, mode&0o777)
 }
 
 func trustedPrivateDirOwner(uid uint32) bool {
