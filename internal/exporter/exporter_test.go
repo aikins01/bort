@@ -122,12 +122,15 @@ func TestExportSkipsResolvedCompose(t *testing.T) {
 }
 
 func TestAppSummaryEffectiveComposeSourceSupportsLegacyIndexes(t *testing.T) {
-	generated := AppSummary{Warnings: []string{generatedComposeWarning}}
-	if got := generated.EffectiveComposeSource(); got != ComposeSourceGenerated {
-		t.Fatalf("expected legacy generated compose provenance, got %q", got)
+	var generated AppSummary
+	if err := json.Unmarshal([]byte(`{"warnings":["generated compose from discovered container metadata"]}`), &generated); err != nil {
+		t.Fatal(err)
 	}
-	if got := (AppSummary{}).EffectiveComposeSource(); got != ComposeSourceRaw {
-		t.Fatalf("expected legacy raw compose provenance, got %q", got)
+	if got, err := generated.EffectiveComposeSource(); err != nil || got != ComposeSourceGenerated {
+		t.Fatalf("expected legacy generated compose provenance, got %q, error %v", got, err)
+	}
+	if got, err := (AppSummary{}).EffectiveComposeSource(); err != nil || got != ComposeSourceRaw {
+		t.Fatalf("expected legacy raw compose provenance, got %q, error %v", got, err)
 	}
 }
 

@@ -773,7 +773,7 @@ func purgeSourceNetwork(ctx context.Context, runner dockerRunner, item SourcePur
 	}
 	result.Identity = identity
 	if _, err := runner.Output(ctx, "network", "rm", identity); err != nil {
-		if isDockerVolumeOrNetworkMissingErr(err) {
+		if isDockerResourceMissingErr(err, "network", identity) {
 			_, absent, inspectErr := inspectSourcePurgeNetworkIdentity(ctx, runner, name)
 			if inspectErr != nil {
 				result.Status = "error"
@@ -856,7 +856,7 @@ type sourcePurgeNetworkIdentity struct {
 func inspectSourcePurgeVolumeAbsent(ctx context.Context, runner dockerRunner, name string) (bool, error) {
 	out, err := runner.Output(ctx, "volume", "inspect", name)
 	if err != nil {
-		if isDockerVolumeOrNetworkMissingErr(err) {
+		if isDockerResourceMissingErr(err, "volume", name) {
 			return true, nil
 		}
 		return false, err
@@ -874,7 +874,7 @@ func inspectSourcePurgeVolumeAbsent(ctx context.Context, runner dockerRunner, na
 func inspectSourcePurgeNetworkIdentity(ctx context.Context, runner dockerRunner, name string) (string, bool, error) {
 	out, err := runner.Output(ctx, "network", "inspect", name)
 	if err != nil {
-		if isDockerVolumeOrNetworkMissingErr(err) {
+		if isDockerResourceMissingErr(err, "network", name) {
 			return "", true, nil
 		}
 		return "", false, err
@@ -1031,29 +1031,30 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func isDockerVolumeOrNetworkMissingErr(err error) bool {
+func isDockerResourceMissingErr(err error, resource, name string) bool {
 	if err == nil {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "no such volume") ||
-		strings.Contains(message, "no such network") ||
-		dockerDaemonResourceNotFound(message, "volume") ||
-		dockerDaemonResourceNotFound(message, "network")
-}
-
-func dockerDaemonResourceNotFound(message, resource string) bool {
-	marker := "error response from daemon: " + resource + " "
+	marker := "error response from daemon: "
 	index := strings.LastIndex(message, marker)
 	if index < 0 {
 		return false
 	}
 	detail := strings.TrimSpace(message[index+len(marker):])
-	if resource == "network" && detail == "not found" {
-		return true
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch resource {
+	case "volume":
+		return detail == "get "+name+": no such volume" ||
+			detail == "remove "+name+": no such volume" ||
+			detail == "volume "+name+" not found"
+	case "network":
+		return detail == "network not found" ||
+			detail == "network "+name+" not found" ||
+			detail == "no such network: "+name
+	default:
+		return false
 	}
-	name, suffix, ok := strings.Cut(detail, " ")
-	return ok && name != "" && suffix == "not found"
 }
 
 func cleanupProjectNames(names []string) []string {

@@ -12,6 +12,7 @@ import (
 	"github.com/aikins01/bort/internal/analyzer"
 	"github.com/aikins01/bort/internal/exporter"
 	"github.com/aikins01/bort/internal/planutil"
+	"gopkg.in/yaml.v3"
 )
 
 type Status string
@@ -54,6 +55,7 @@ const (
 	GateEnvValuesRedacted              = "env.values_redacted"
 	GateDomainHostMissing              = "domain.host_missing"
 	GateDomainServiceMissing           = "domain.service_missing"
+	GateDomainServiceNotInCompose      = "domain.service_not_in_compose"
 	GateRoutesNone                     = "routes.none"
 	GateDataStoreManualReview          = "data_store.manual_review"
 	GateDataStorePrepareRequired       = "data_store.prepare_required"
@@ -279,9 +281,13 @@ func planApp(bundleDir, target string, app exporter.AppSummary) (AppPlan, error)
 	if err != nil {
 		return AppPlan{}, fmt.Errorf("read topology for %s: %w", app.Name, err)
 	}
+	composeSource, err := app.EffectiveComposeSource()
+	if err != nil {
+		return AppPlan{}, fmt.Errorf("read compose source for %s: %w", app.Name, err)
+	}
 
 	plan := AppPlan{Name: app.Name, Directory: app.Directory, Platform: app.Platform, Role: app.Role, ProjectGroup: projectGroup(app.ProjectGroup), Status: StatusGreen, Readiness: ReadinessReadyToCreate}
-	plan.Resources = resourceSpecs(app, appDir, topology)
+	plan.Resources = resourceSpecs(app, appDir, topology, composeSource)
 	addReadinessGates(&plan, topology)
 	plan.add(SeverityInfo, "compose", fmt.Sprintf("would create %s compose app from compose.yaml", target))
 	addSourceControlActions(&plan)
@@ -312,23 +318,37 @@ func projectGroup(group *exporter.ProjectGroup) *ProjectGroup {
 	return &ProjectGroup{Name: group.Name, Environment: group.Environment, Source: group.Source}
 }
 
-func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Topology) ResourceSpecs {
+func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Topology, composeSource string) ResourceSpecs {
 	resources := ResourceSpecs{
-		App:      appResource(app.Name, appDir, app.EffectiveComposeSource()),
+		App:      appResource(app.Name, appDir, composeSource),
 		EnvFiles: envFileResources(appDir, app.PrivateEnvValues),
 	}
 	resources.SourceControl = sourceControlResource(topology.SourceControl)
+	for _, service := range topology.SourceServices {
+		if service.ContainerID == "" && service.ContainerName == "" {
+			continue
+		}
+		resources.SourceServices = append(resources.SourceServices, SourceServiceRef{
+			ServiceName:   service.ServiceName,
+			ContainerID:   service.ContainerID,
+			ContainerName: service.ContainerName,
+		})
+	}
+	composeServices := composeServiceNames(filepath.Join(appDir, resources.App.ComposePath))
 
 	for _, route := range topology.Routes {
+		serviceName, serviceExists := preparedServiceName(route.ServiceName, resources.SourceServices, composeSource, composeServices)
 		readiness := ReadinessReadyToCreate
 		if strings.TrimSpace(route.Host) == "" {
 			readiness = ReadinessNeedsInput
-		} else if strings.TrimSpace(route.ServiceName) == "" {
-			readiness = ReadinessNeedsDecision
+		} else if strings.TrimSpace(serviceName) == "" {
+			readiness = ReadinessBlocked
+		} else if !serviceExists {
+			readiness = ReadinessBlocked
 		}
 		resources.Domains = append(resources.Domains, DomainResource{
 			Host:        route.Host,
-			ServiceName: route.ServiceName,
+			ServiceName: serviceName,
 			Port:        route.Port,
 			Source:      route.Source,
 			Readiness:   readiness,
@@ -353,18 +373,49 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 	for _, link := range topology.LinkedResources {
 		resources.LinkedResources = append(resources.LinkedResources, linkedResourceCandidate(link))
 	}
-	for _, service := range topology.SourceServices {
-		if service.ContainerID == "" && service.ContainerName == "" {
-			continue
-		}
-		resources.SourceServices = append(resources.SourceServices, SourceServiceRef{
-			ServiceName:   service.ServiceName,
-			ContainerID:   service.ContainerID,
-			ContainerName: service.ContainerName,
-		})
-	}
 
 	return resources
+}
+
+func composeServiceNames(path string) map[string]struct{} {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var document struct {
+		Services map[string]yaml.Node `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(contents, &document); err != nil {
+		return nil
+	}
+	names := make(map[string]struct{}, len(document.Services))
+	for name := range document.Services {
+		names[name] = struct{}{}
+	}
+	return names
+}
+
+func preparedServiceName(serviceName string, sourceServices []SourceServiceRef, composeSource string, composeServices map[string]struct{}) (string, bool) {
+	serviceName = strings.TrimSpace(serviceName)
+	if serviceName == "" && len(composeServices) == 1 {
+		for name := range composeServices {
+			return name, true
+		}
+	}
+	if composeSource != ComposeSourceRaw {
+		_, ok := composeServices[serviceName]
+		return serviceName, ok
+	}
+	for _, sourceService := range sourceServices {
+		if sourceService.ContainerName != serviceName {
+			continue
+		}
+		if _, ok := composeServices[sourceService.ServiceName]; ok {
+			return sourceService.ServiceName, true
+		}
+	}
+	_, ok := composeServices[serviceName]
+	return serviceName, ok
 }
 
 func appResource(name, appDir, composeSource string) AppResource {
@@ -555,7 +606,9 @@ func addReadinessGates(plan *AppPlan, topology analyzer.Topology) {
 		if strings.TrimSpace(domain.Host) == "" {
 			plan.addGate(ReadinessNeedsInput, SeverityWarn, GateDomainHostMissing, "domain route has no host and must be filled before deploy", resourceRef, nil)
 		} else if strings.TrimSpace(domain.ServiceName) == "" {
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateDomainServiceMissing, fmt.Sprintf("domain %s has no service mapping; confirm target service manually", domain.Host), resourceRef, nil)
+			plan.addGate(ReadinessBlocked, SeverityError, GateDomainServiceMissing, fmt.Sprintf("domain %s has no service mapping and compose.yaml does not identify a unique service; rescan or correct the route before deploy", domain.Host), resourceRef, nil)
+		} else if domain.Readiness == ReadinessBlocked {
+			plan.addGate(ReadinessBlocked, SeverityError, GateDomainServiceNotInCompose, fmt.Sprintf("domain %s points at service %q, which is not present in compose.yaml; rescan or correct the route before deploy", domain.Host, domain.ServiceName), resourceRef, []string{domain.ServiceName})
 		}
 	}
 	if len(plan.Resources.Domains) == 0 {

@@ -189,7 +189,7 @@ func stagingVolumeLabels(plan Plan, appName string, volume stagedVolume) []strin
 func stagingVolumeExists(ctx context.Context, runner dockerRunner, plan Plan, volume stagedVolume) (bool, error) {
 	out, err := runner.Output(ctx, "volume", "inspect", "--format", "{{index .Labels \""+stagingVolumeRunIDLabel+"\"}}", volume.VolumeName)
 	if err != nil {
-		if isDockerVolumeOrNetworkMissingErr(err) {
+		if isDockerResourceMissingErr(err, "volume", volume.VolumeName) {
 			return false, nil
 		}
 		return false, fmt.Errorf("inspect staging volume %s: %w", volume.VolumeName, err)

@@ -480,7 +480,7 @@ func TestApplyCreateVolumeCreatesOnlyItsOwnStagedVolume(t *testing.T) {
 	}
 	runner := &fakeDockerRunner{outputs: map[string][]byte{"volume create": []byte("created\n")}, outputErrs: map[string]error{}}
 	for _, volume := range staged {
-		runner.outputErrs["volume inspect --format {{index .Labels \"bort.run-id\"}} "+volume.VolumeName] = errors.New("Error response from daemon: get " + volume.VolumeName + ": no such volume")
+		runner.outputErrs["volume inspect --format {{index .Labels \"bort.run-id\"}} "+volume.VolumeName] = errors.New("Error response from daemon: volume " + volume.VolumeName + " not found")
 	}
 	client := &Client{Docker: runner}
 	actx := &applyContext{cache: map[string]*appCache{}, plan: plan}

@@ -962,26 +962,35 @@ func (r *cleanupDockerRunner) Output(ctx context.Context, args ...string) ([]byt
 }
 
 func TestDockerMissingResourceClassifier(t *testing.T) {
-	for _, err := range []error{
-		errors.New(`exec: "docker": executable file not found in $PATH`),
-		errors.New("Error response from daemon: plugin local not found"),
-		errors.New("Error response from daemon: volume api-data: error looking up volume plugin local: plugin local not found"),
-		errors.New("Error response from daemon: network api-net: error looking up network plugin local: plugin local not found"),
-	} {
-		if isDockerVolumeOrNetworkMissingErr(err) {
-			t.Fatalf("non-resource failure was classified as an absent resource: %v", err)
-		}
+	tests := []struct {
+		name     string
+		resource string
+		ref      string
+		err      error
+		want     bool
+	}{
+		{name: "legacy volume", resource: "volume", ref: "api-data", err: errors.New("Error response from daemon: get api-data: no such volume"), want: true},
+		{name: "removed volume", resource: "volume", ref: "api-data", err: errors.New("Error response from daemon: remove api-data: no such volume"), want: true},
+		{name: "Docker 29 volume", resource: "volume", ref: "api-data", err: errors.New("Error response from daemon: volume api-data not found"), want: true},
+		{name: "wrapped Docker 29 volume", resource: "volume", ref: "api-data", err: errors.New("exit status 1: Error response from daemon: volume api-data not found"), want: true},
+		{name: "named network", resource: "network", ref: "api-net", err: errors.New("Error response from daemon: network api-net not found"), want: true},
+		{name: "removed network", resource: "network", ref: strings.Repeat("a", 64), err: errors.New("Error response from daemon: network not found"), want: true},
+		{name: "legacy network", resource: "network", ref: "api-net", err: errors.New("Error response from daemon: no such network: api-net"), want: true},
+		{name: "missing executable", resource: "volume", ref: "api-data", err: errors.New(`exec: "docker": executable file not found in $PATH`)},
+		{name: "plugin", resource: "volume", ref: "api-data", err: errors.New("Error response from daemon: plugin local not found")},
+		{name: "volume plugin", resource: "volume", ref: "api-data", err: errors.New("Error response from daemon: volume api-data: error looking up volume plugin local: plugin local not found")},
+		{name: "network plugin", resource: "network", ref: "api-net", err: errors.New("Error response from daemon: network api-net: error looking up network plugin local: plugin local not found")},
+		{name: "wrong volume", resource: "volume", ref: "api-data", err: errors.New("Error response from daemon: volume other-data not found")},
+		{name: "network error during volume inspect", resource: "volume", ref: "api-data", err: errors.New("Error response from daemon: network not found")},
+		{name: "volume error during network inspect", resource: "network", ref: "api-net", err: errors.New("Error response from daemon: get api-data: no such volume")},
+		{name: "unknown resource", resource: "secret", ref: "api-key", err: errors.New("Error response from daemon: secret api-key not found")},
 	}
-	for _, err := range []error{
-		errors.New("Error response from daemon: remove api-data: no such volume"),
-		errors.New("Error response from daemon: volume api-data not found"),
-		errors.New("exit status 1: Error response from daemon: volume api-data not found"),
-		errors.New("Error response from daemon: network api-net not found"),
-		errors.New("Error response from daemon: network not found"),
-	} {
-		if !isDockerVolumeOrNetworkMissingErr(err) {
-			t.Fatalf("expected missing Docker resource classification for %v", err)
-		}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isDockerResourceMissingErr(tc.err, tc.resource, tc.ref); got != tc.want {
+				t.Fatalf("isDockerResourceMissingErr(%q, %q, %v) = %t, want %t", tc.resource, tc.ref, tc.err, got, tc.want)
+			}
+		})
 	}
 }
 

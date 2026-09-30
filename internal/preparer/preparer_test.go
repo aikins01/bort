@@ -1,6 +1,9 @@
 package preparer
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -191,6 +194,139 @@ func TestPlanSurfacesSourceControlAsNonBlockingAction(t *testing.T) {
 		if strings.HasPrefix(gate.Code, "source_control.") {
 			t.Fatalf("did not expect source-control gate: %#v", app.Gates)
 		}
+	}
+}
+
+func TestPlanPersistsReviewedRawComposeRouteService(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify"},
+		Apps: []manifest.App{{
+			Name:    "api",
+			Compose: &manifest.ComposeSource{Raw: "services:\n  apiworker:\n    image: example/api\n"},
+			Services: []manifest.Service{{
+				Name:   "project-apiworker-1",
+				Image:  "example/api",
+				Labels: map[string]string{"com.docker.compose.service": "apiworker"},
+			}},
+			Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "project-apiworker-1", Port: "8080"}},
+		}},
+	}
+
+	if _, err := exporter.Export(m, exporter.Options{OutputDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := result.Apps[0]
+	if len(app.Resources.Domains) != 1 || app.Resources.Domains[0].ServiceName != "apiworker" {
+		t.Fatalf("expected reviewed route service in prepare output, got %#v", app.Resources.Domains)
+	}
+	if app.TargetResources == nil || app.TargetResources.Dokploy == nil || len(app.TargetResources.Dokploy.Domains) != 1 || app.TargetResources.Dokploy.Domains[0].ServiceName != "apiworker" {
+		t.Fatalf("expected reviewed route service in target output, got %#v", app.TargetResources)
+	}
+	assertAction(t, app, "route|would create dokploy domain api.example.com for service apiworker on port 8080")
+}
+
+func TestPlanPersistsUniqueComposeServiceForEmptyRouteMapping(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:     "api",
+		Compose:  &manifest.ComposeSource{Raw: "services:\n  api:\n    image: example/api\n"},
+		Services: []manifest.Service{{Name: "api", Image: "example/api"}},
+		Routes:   []manifest.Route{{Host: "api.example.com", Port: "8080"}},
+	}}}
+	if _, err := exporter.Export(m, exporter.Options{OutputDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := result.Apps[0]
+	if result.Status != StatusGreen || app.Readiness != ReadinessReadyToCreate || len(app.Resources.Domains) != 1 || app.Resources.Domains[0].ServiceName != "api" {
+		t.Fatalf("expected unique Compose service to be persisted, got %#v", app)
+	}
+	assertNoGate(t, app, GateDomainServiceMissing)
+}
+
+func TestPlanBlocksEmptyRouteMappingWithMultipleComposeServices(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:     "api",
+		Compose:  &manifest.ComposeSource{Raw: "services:\n  web:\n    image: example/web\n  api:\n    image: example/api\n"},
+		Services: []manifest.Service{{Name: "web", Image: "example/web"}, {Name: "api", Image: "example/api"}},
+		Routes:   []manifest.Route{{Host: "api.example.com", Port: "8080"}},
+	}}}
+	if _, err := exporter.Export(m, exporter.Options{OutputDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := result.Apps[0]
+	if result.Status != StatusRed || app.Readiness != ReadinessBlocked || len(app.Resources.Domains) != 1 || app.Resources.Domains[0].Readiness != ReadinessBlocked {
+		t.Fatalf("expected ambiguous empty route mapping to block preparation, got %#v", app)
+	}
+	assertGate(t, app, GateDomainServiceMissing)
+}
+
+func TestPlanBlocksRouteServiceMissingFromCompose(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:     "api",
+		Compose:  &manifest.ComposeSource{Raw: "services:\n  api:\n    image: example/api\n"},
+		Services: []manifest.Service{{Name: "api", Image: "example/api"}},
+		Routes:   []manifest.Route{{Host: "api.example.com", ServiceName: "api-stale", Port: "8080"}},
+	}}}
+	if _, err := exporter.Export(m, exporter.Options{OutputDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := result.Apps[0]
+	if result.Status != StatusRed || app.Readiness != ReadinessBlocked || len(app.Resources.Domains) != 1 || app.Resources.Domains[0].Readiness != ReadinessBlocked {
+		t.Fatalf("expected missing Compose service to block preparation, got %#v", app)
+	}
+	assertGate(t, app, GateDomainServiceNotInCompose)
+	if app.TargetResources == nil || app.TargetResources.Dokploy == nil || len(app.TargetResources.Dokploy.Domains) != 1 || app.TargetResources.Dokploy.Domains[0].Readiness != ReadinessBlocked {
+		t.Fatalf("expected blocked route in target output, got %#v", app.TargetResources)
+	}
+}
+
+func TestPlanRejectsUnknownComposeSource(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:     "api",
+		Services: []manifest.Service{{Name: "api", Image: "example/api"}},
+	}}}
+	if _, err := exporter.Export(m, exporter.Options{OutputDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	indexPath := filepath.Join(dir, "index.json")
+	contents, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summary exporter.Summary
+	if err := json.Unmarshal(contents, &summary); err != nil {
+		t.Fatal(err)
+	}
+	summary.Apps[0].ComposeSource = "genrated"
+	contents, err = json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(indexPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Plan(Options{BundleDir: dir}); err == nil || !strings.Contains(err.Error(), `unsupported compose source "genrated"`) {
+		t.Fatalf("expected unknown compose source rejection, got %v", err)
 	}
 }
 

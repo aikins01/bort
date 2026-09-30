@@ -1261,7 +1261,7 @@ networks:
 	}
 }
 
-func TestResolveRouteForComposeUsesCurrentServiceByPort(t *testing.T) {
+func TestResolveRouteForComposeLegacyPlanUsesCurrentServiceByPort(t *testing.T) {
 	compose := `services:
   web:
     image: example/web
@@ -1278,7 +1278,7 @@ func TestResolveRouteForComposeUsesCurrentServiceByPort(t *testing.T) {
 		Port:        "8080",
 		Source:      "traefik.http.routers.https-0-stack-api.rule",
 	}
-	resolved, err := resolveRouteForCompose(route, compose, nil, preparer.ComposeSourceRaw)
+	resolved, err := resolveRouteForCompose(route, compose, nil, "")
 	if err != nil {
 		t.Fatalf("resolveRouteForCompose: %v", err)
 	}
@@ -1287,7 +1287,7 @@ func TestResolveRouteForComposeUsesCurrentServiceByPort(t *testing.T) {
 	}
 }
 
-func TestResolveRouteForComposeStripsGeneratedCoolifyServiceSuffix(t *testing.T) {
+func TestResolveRouteForComposeLegacyPlanStripsGeneratedCoolifyServiceSuffix(t *testing.T) {
 	compose := `services:
   proxy:
     image: example/proxy
@@ -1306,7 +1306,7 @@ func TestResolveRouteForComposeStripsGeneratedCoolifyServiceSuffix(t *testing.T)
 			Host:        "app.example.com",
 			ServiceName: tc.name,
 		}
-		resolved, err := resolveRouteForCompose(route, compose, nil, preparer.ComposeSourceRaw)
+		resolved, err := resolveRouteForCompose(route, compose, nil, "")
 		if err != nil {
 			t.Fatalf("resolveRouteForCompose(%s): %v", tc.name, err)
 		}
@@ -1316,68 +1316,76 @@ func TestResolveRouteForComposeStripsGeneratedCoolifyServiceSuffix(t *testing.T)
 	}
 }
 
-func TestResolveRouteForComposeUsesReviewedSourceServiceMapping(t *testing.T) {
+func TestResolveRouteForComposeKeepsReviewedService(t *testing.T) {
+	compose := "services:\n  project-apiworker-1:\n    image: example/runtime-name\n  apiworker:\n    image: example/worker\n"
+	for _, tc := range []struct {
+		name          string
+		serviceName   string
+		composeSource string
+	}{
+		{name: "raw", serviceName: "apiworker", composeSource: preparer.ComposeSourceRaw},
+		{name: "generated", serviceName: "project-apiworker-1", composeSource: preparer.ComposeSourceGenerated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			route := gateway.Route{Host: "stateless.example.com", ServiceName: tc.serviceName}
+			resolved, err := resolveRouteForCompose(route, compose, nil, tc.composeSource)
+			if err != nil {
+				t.Fatalf("resolve reviewed service: %v", err)
+			}
+			if resolved.ServiceName != tc.serviceName {
+				t.Fatalf("reviewed service changed from %q to %q", tc.serviceName, resolved.ServiceName)
+			}
+		})
+	}
+}
+
+func TestResolveRouteForComposeRejectsReviewedServiceMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		serviceName   string
+		compose       string
+		composeSource string
+	}{
+		{name: "raw", serviceName: "apiworker", compose: "services:\n  project-apiworker-1:\n    image: example/runtime-name\n", composeSource: preparer.ComposeSourceRaw},
+		{name: "generated", serviceName: "project-apiworker-1", compose: "services:\n  apiworker:\n    image: example/worker\n", composeSource: preparer.ComposeSourceGenerated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			route := gateway.Route{Host: "stateless.example.com", ServiceName: tc.serviceName}
+			if _, err := resolveRouteForCompose(route, tc.compose, nil, tc.composeSource); err == nil || !strings.Contains(err.Error(), "points at service") {
+				t.Fatalf("expected reviewed service mismatch, got %v", err)
+			}
+		})
+	}
+}
+
+func TestResolveRouteForComposeRejectsUnknownProvenance(t *testing.T) {
+	route := gateway.Route{Host: "stateless.example.com", ServiceName: "apiworker"}
+	if _, err := resolveRouteForCompose(route, "services:\n  apiworker:\n    image: example/worker\n", nil, "genrated"); err == nil || !strings.Contains(err.Error(), `unsupported compose source "genrated"`) {
+		t.Fatalf("expected unknown compose provenance rejection, got %v", err)
+	}
+}
+
+func TestResolveRouteForComposeLegacyPlanUsesExactThenMappedService(t *testing.T) {
 	route := gateway.Route{Host: "stateless.example.com", ServiceName: "project-apiworker-1"}
 	sourceServices := []preparer.SourceServiceRef{{
 		ServiceName:   "apiworker",
 		ContainerName: "project-apiworker-1",
 	}}
-
-	resolved, err := resolveRouteForCompose(route, "services:\n  project:\n    image: example/project\n  apiworker:\n    image: example/worker\n", sourceServices, preparer.ComposeSourceRaw)
-	if err != nil {
-		t.Fatalf("resolve route through source service mapping: %v", err)
-	}
-	if resolved.ServiceName != "apiworker" {
-		t.Fatalf("expected source container mapping to outrank generated-name heuristic, got %#v", resolved)
-	}
-
 	compose := "services:\n  project-apiworker-1:\n    image: example/runtime-name\n  apiworker:\n    image: example/worker\n"
-	resolved, err = resolveRouteForCompose(route, compose, sourceServices, preparer.ComposeSourceRaw)
+	resolved, err := resolveRouteForCompose(route, compose, sourceServices, "")
 	if err != nil {
-		t.Fatalf("resolve reviewed service when exact key also exists: %v", err)
+		t.Fatalf("resolve exact legacy service: %v", err)
+	}
+	if resolved.ServiceName != "project-apiworker-1" {
+		t.Fatalf("expected exact service to win for legacy plan, got %#v", resolved)
+	}
+
+	resolved, err = resolveRouteForCompose(route, "services:\n  apiworker:\n    image: example/worker\n", sourceServices, "")
+	if err != nil {
+		t.Fatalf("resolve mapped legacy service: %v", err)
 	}
 	if resolved.ServiceName != "apiworker" {
-		t.Fatalf("expected reviewed source mapping to outrank unrelated exact key, got %#v", resolved)
-	}
-
-	resolved, err = resolveRouteForCompose(route, compose, nil, preparer.ComposeSourceRaw)
-	if err != nil {
-		t.Fatalf("resolve exact Compose service without source mapping: %v", err)
-	}
-	if resolved.ServiceName != "project-apiworker-1" {
-		t.Fatalf("expected exact Compose service without source mapping, got %#v", resolved)
-	}
-
-	resolved, err = resolveRouteForCompose(route, compose, sourceServices, preparer.ComposeSourceGenerated)
-	if err != nil {
-		t.Fatalf("resolve exact generated Compose service: %v", err)
-	}
-	if resolved.ServiceName != "project-apiworker-1" {
-		t.Fatalf("expected generated Compose to retain exact runtime service, got %#v", resolved)
-	}
-
-	resolved, err = resolveRouteForCompose(route, "services:\n  project-apiworker-1:\n    image: example/runtime-name\n", sourceServices, preparer.ComposeSourceRaw)
-	if err != nil {
-		t.Fatalf("resolve raw Compose fallback to exact service: %v", err)
-	}
-	if resolved.ServiceName != "project-apiworker-1" {
-		t.Fatalf("expected raw Compose to fall back to exact runtime service, got %#v", resolved)
-	}
-
-	resolved, err = resolveRouteForCompose(route, "services:\n  apiworker:\n    image: example/worker\n", sourceServices, preparer.ComposeSourceGenerated)
-	if err != nil {
-		t.Fatalf("resolve generated Compose fallback to mapped service: %v", err)
-	}
-	if resolved.ServiceName != "apiworker" {
-		t.Fatalf("expected generated Compose to fall back to mapped service, got %#v", resolved)
-	}
-
-	resolved, err = resolveRouteForCompose(route, compose, sourceServices, "")
-	if err != nil {
-		t.Fatalf("resolve exact Compose service for legacy plan: %v", err)
-	}
-	if resolved.ServiceName != "project-apiworker-1" {
-		t.Fatalf("expected legacy plan to retain exact runtime service, got %#v", resolved)
+		t.Fatalf("expected mapped service fallback for legacy plan, got %#v", resolved)
 	}
 }
 

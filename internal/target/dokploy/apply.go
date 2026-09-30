@@ -1816,6 +1816,9 @@ func routeServiceContextForApp(plan Plan, appName string) ([]preparer.SourceServ
 	if !ok {
 		return nil, ""
 	}
+	if app.Resources.App.ComposeSource != "" {
+		return nil, app.Resources.App.ComposeSource
+	}
 	return app.Resources.SourceServices, app.Resources.App.ComposeSource
 }
 
@@ -1824,19 +1827,32 @@ func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServi
 	if err != nil {
 		return gateway.Route{}, err
 	}
-	if len(services) == 0 {
+	switch composeSource {
+	case preparer.ComposeSourceRaw, preparer.ComposeSourceGenerated:
+		serviceName := strings.TrimSpace(route.ServiceName)
+		if _, ok := services[serviceName]; ok {
+			route.ServiceName = serviceName
+			return route, nil
+		}
+	case "":
+	default:
+		return gateway.Route{}, fmt.Errorf("route %s has unsupported compose source %q", planutilFallback(route.Host, "unknown"), composeSource)
+	}
+	if len(services) == 0 && composeSource == "" {
 		return route, nil
 	}
-	if serviceName, ok := inferComposeServiceForRoute(route, services, sourceServices, composeSource); ok {
-		route.ServiceName = serviceName
-		return route, nil
+	if composeSource == "" {
+		if serviceName, ok := inferComposeServiceForRoute(route, services, sourceServices, composeSource); ok {
+			route.ServiceName = serviceName
+			return route, nil
+		}
 	}
 	available := make([]string, 0, len(services))
 	for name := range services {
 		available = append(available, name)
 	}
 	sort.Strings(available)
-	return gateway.Route{}, fmt.Errorf("route %s points at service %q, but the dokploy compose has %s; rescan before retrying so bort can refresh the route mapping",
+	return gateway.Route{}, fmt.Errorf("route %s points at service %q, but the Dokploy Compose file has %s; rescan before retrying so Bort can refresh the route mapping",
 		planutilFallback(route.Host, "unknown"), route.ServiceName, strings.Join(available, ", "))
 }
 

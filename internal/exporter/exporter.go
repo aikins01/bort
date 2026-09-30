@@ -50,16 +50,20 @@ type AppSummary struct {
 	Warnings         []string      `json:"warnings,omitempty"`
 }
 
-func (a AppSummary) EffectiveComposeSource() string {
-	if a.ComposeSource == ComposeSourceGenerated {
-		return ComposeSourceGenerated
-	}
-	for _, warning := range a.Warnings {
-		if warning == generatedComposeWarning {
-			return ComposeSourceGenerated
+func (a AppSummary) EffectiveComposeSource() (string, error) {
+	switch a.ComposeSource {
+	case ComposeSourceRaw, ComposeSourceGenerated:
+		return a.ComposeSource, nil
+	case "":
+		for _, warning := range a.Warnings {
+			if warning == generatedComposeWarning {
+				return ComposeSourceGenerated, nil
+			}
 		}
+		return ComposeSourceRaw, nil
+	default:
+		return "", fmt.Errorf("unsupported compose source %q", a.ComposeSource)
 	}
-	return ComposeSourceRaw
 }
 
 type ProjectGroup struct {
@@ -103,7 +107,7 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 		}
 
 		topology := analyzer.TopologyForAppInManifest(m, app)
-		warnings, err := exportApp(appDir, app, topology, opts)
+		composeSource, warnings, err := exportApp(appDir, app, topology, opts)
 		if err != nil {
 			return Summary{}, err
 		}
@@ -115,7 +119,7 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 			Role:             migrationRole(app),
 			ProjectGroup:     projectGroups[appKey(app)],
 			PrivateEnvValues: opts.IncludeEnvValues,
-			ComposeSource:    composeSource(app),
+			ComposeSource:    composeSource,
 			Routes:           routeHosts(app.Routes),
 			Warnings:         warnings,
 		})
@@ -128,16 +132,9 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 	return summary, nil
 }
 
-func composeSource(app manifest.App) string {
-	if app.Compose != nil && strings.TrimSpace(app.Compose.Raw) != "" {
-		return ComposeSourceRaw
-	}
-	return ComposeSourceGenerated
-}
-
-func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts Options) ([]string, error) {
+func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts Options) (string, []string, error) {
 	warnings := []string{}
-	compose, composeWarnings, serviceEnvFiles := composeForApp(app, opts.IncludeEnvValues)
+	compose, composeSource, composeWarnings, serviceEnvFiles := composeForApp(app, opts.IncludeEnvValues)
 	warnings = append(warnings, composeWarnings...)
 	if names := analyzer.CoolifyServiceMagicEnvNames(app); len(names) > 0 {
 		warnings = append(warnings, "preserved Coolify service magic env vars for review: "+strings.Join(names, ", "))
@@ -164,21 +161,21 @@ func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts
 
 	for name, contents := range files {
 		if err := writePrivateFile(filepath.Join(appDir, name), contents); err != nil {
-			return nil, err
+			return "", nil, err
 		}
 	}
 
 	if err := writeJSON(filepath.Join(appDir, "routes.json"), app.Routes); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	if err := writeJSON(filepath.Join(appDir, "storages.json"), app.Storages); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	if err := writeJSON(filepath.Join(appDir, "topology.json"), topology); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
-	return warnings, nil
+	return composeSource, warnings, nil
 }
 
 func exportEnvMode(opts Options) string {
@@ -193,7 +190,7 @@ type envFile struct {
 	Vars []manifest.EnvVar
 }
 
-func composeForApp(app manifest.App, includePrivateValues bool) (string, []string, []envFile) {
+func composeForApp(app manifest.App, includePrivateValues bool) (string, string, []string, []envFile) {
 	warnings := []string{}
 	if app.Compose != nil {
 		if strings.TrimSpace(app.Compose.Raw) != "" {
@@ -204,7 +201,7 @@ func composeForApp(app manifest.App, includePrivateValues bool) (string, []strin
 			if names := composeCoolifyServiceMagicEnvNames(compose); len(names) > 0 {
 				warnings = append(warnings, "preserved Coolify service magic env vars in raw compose for review: "+strings.Join(names, ", "))
 			}
-			return ensureTrailingNewline(compose), warnings, serviceEnvFilesForMode(app.Services, includePrivateValues)
+			return ensureTrailingNewline(compose), ComposeSourceRaw, warnings, serviceEnvFilesForMode(app.Services, includePrivateValues)
 		}
 		if strings.TrimSpace(app.Compose.Resolved) != "" {
 			warnings = append(warnings, "skipped resolved compose because it may contain interpolated secret values")
@@ -213,7 +210,7 @@ func composeForApp(app manifest.App, includePrivateValues bool) (string, []strin
 
 	if len(app.Services) == 0 {
 		warnings = append(warnings, "no services were present in the manifest")
-		return "services: {}\n", warnings, nil
+		return "services: {}\n", ComposeSourceGenerated, warnings, nil
 	}
 
 	var builder strings.Builder
@@ -279,7 +276,7 @@ func composeForApp(app manifest.App, includePrivateValues bool) (string, []strin
 	}
 
 	warnings = append(warnings, generatedComposeWarning)
-	return builder.String(), warnings, sortedEnvFiles(serviceEnvFileMap)
+	return builder.String(), ComposeSourceGenerated, warnings, sortedEnvFiles(serviceEnvFileMap)
 }
 
 func serviceEnvFilesForMode(services []manifest.Service, includePrivateValues bool) []envFile {
