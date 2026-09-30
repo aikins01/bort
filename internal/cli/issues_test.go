@@ -87,6 +87,17 @@ func TestFixCommandOnlyReturnsCommandsThatPersistState(t *testing.T) {
 	}
 }
 
+func TestRouteIssueNextStepDistinguishesBlockedMappings(t *testing.T) {
+	blocked := appIssue{Kind: issueKindRoute, Items: []runDecisionItem{{Code: preparer.GateDomainServiceNotInCompose}}}
+	if got := blocked.NextStep(); got != "correct the source route-to-Compose-service mapping, then re-plan or scan a new run" {
+		t.Fatalf("unexpected blocked route guidance: %q", got)
+	}
+	review := appIssue{Kind: issueKindRoute, Items: []runDecisionItem{{Code: preparer.GateRoutesNone}}}
+	if got := review.NextStep(); got != "confirm the route host and service in Dokploy before live apply" {
+		t.Fatalf("unexpected review route guidance: %q", got)
+	}
+}
+
 func TestFixCommandShellQuotesUntrustedNames(t *testing.T) {
 	envIssue := appIssue{Kind: issueKindEnv}
 	if got := envIssue.FixCommand("My App"); got != "bort env 'My App' KEY=value" {

@@ -322,8 +322,10 @@ func projectGroup(group *exporter.ProjectGroup) *ProjectGroup {
 }
 
 func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Topology, composeSource string) (ResourceSpecs, error) {
+	composePath := filepath.Join(appDir, "compose.yaml")
+	composeContents, composeErr := os.ReadFile(composePath)
 	resources := ResourceSpecs{
-		App:      appResource(app.Name, appDir, composeSource),
+		App:      appResource(app.Name, composeSource, composeContents, composeErr),
 		EnvFiles: envFileResources(appDir, app.PrivateEnvValues),
 	}
 	resources.SourceControl = sourceControlResource(topology.SourceControl)
@@ -340,7 +342,7 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 	composeServices := map[string]struct{}{}
 	if !resources.App.ComposeMissing {
 		var err error
-		composeServices, err = composeServiceNames(filepath.Join(appDir, resources.App.ComposePath))
+		composeServices, err = composeServiceNames(composeContents)
 		if err != nil {
 			return ResourceSpecs{}, err
 		}
@@ -405,11 +407,7 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 	return resources, nil
 }
 
-func composeServiceNames(path string) (map[string]struct{}, error) {
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+func composeServiceNames(contents []byte) (map[string]struct{}, error) {
 	var document struct {
 		Services map[string]yaml.Node `yaml:"services"`
 	}
@@ -425,6 +423,11 @@ func composeServiceNames(path string) (map[string]struct{}, error) {
 
 func preparedServiceName(serviceName string, rawServiceNamesByContainer map[string]string, composeSource string, composeServices map[string]struct{}) (string, bool) {
 	serviceName = strings.TrimSpace(serviceName)
+	switch composeSource {
+	case ComposeSourceRaw, ComposeSourceGenerated:
+	default:
+		return serviceName, false
+	}
 	if serviceName == "" && len(composeServices) == 1 {
 		for name := range composeServices {
 			return name, true
@@ -443,10 +446,6 @@ func preparedServiceName(serviceName string, rawServiceNamesByContainer map[stri
 		}
 		return serviceName, false
 	}
-	if composeSource != ComposeSourceRaw {
-		_, ok := composeServices[serviceName]
-		return serviceName, ok
-	}
 	if mappedService, ok := rawServiceNamesByContainer[serviceName]; ok {
 		return mappedService, true
 	}
@@ -454,7 +453,7 @@ func preparedServiceName(serviceName string, rawServiceNamesByContainer map[stri
 	return serviceName, ok
 }
 
-func appResource(name, appDir, composeSource string) AppResource {
+func appResource(name, composeSource string, contents []byte, composeErr error) AppResource {
 	resource := AppResource{
 		Type:          "compose",
 		Name:          name,
@@ -463,8 +462,7 @@ func appResource(name, appDir, composeSource string) AppResource {
 		Readiness:     ReadinessReadyToCreate,
 	}
 
-	contents, err := os.ReadFile(filepath.Join(appDir, resource.ComposePath))
-	if err != nil {
+	if composeErr != nil {
 		resource.Readiness = ReadinessBlocked
 		resource.ComposeMissing = true
 		return resource

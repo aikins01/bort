@@ -97,6 +97,11 @@ func (i appIssue) FixCommand(app string) string {
 func (i appIssue) NextStep() string {
 	switch i.Kind {
 	case issueKindRoute:
+		for _, item := range i.Items {
+			if item.Code == preparer.GateDomainServiceMissing || item.Code == preparer.GateDomainServiceNotInCompose {
+				return "correct the source route-to-Compose-service mapping, then re-plan or scan a new run"
+			}
+		}
 		return "confirm the route host and service in Dokploy before live apply"
 	case issueKindLink:
 		return "review the detected database/storage settings only if you expect this app to switch to a different service"
