@@ -1278,7 +1278,7 @@ func TestResolveRouteForComposeUsesCurrentServiceByPort(t *testing.T) {
 		Port:        "8080",
 		Source:      "traefik.http.routers.https-0-stack-api.rule",
 	}
-	resolved, err := resolveRouteForCompose(route, compose, nil)
+	resolved, err := resolveRouteForCompose(route, compose, nil, preparer.ComposeSourceRaw)
 	if err != nil {
 		t.Fatalf("resolveRouteForCompose: %v", err)
 	}
@@ -1306,7 +1306,7 @@ func TestResolveRouteForComposeStripsGeneratedCoolifyServiceSuffix(t *testing.T)
 			Host:        "app.example.com",
 			ServiceName: tc.name,
 		}
-		resolved, err := resolveRouteForCompose(route, compose, nil)
+		resolved, err := resolveRouteForCompose(route, compose, nil, preparer.ComposeSourceRaw)
 		if err != nil {
 			t.Fatalf("resolveRouteForCompose(%s): %v", tc.name, err)
 		}
@@ -1323,7 +1323,7 @@ func TestResolveRouteForComposeUsesReviewedSourceServiceMapping(t *testing.T) {
 		ContainerName: "project-apiworker-1",
 	}}
 
-	resolved, err := resolveRouteForCompose(route, "services:\n  project:\n    image: example/project\n  apiworker:\n    image: example/worker\n", sourceServices)
+	resolved, err := resolveRouteForCompose(route, "services:\n  project:\n    image: example/project\n  apiworker:\n    image: example/worker\n", sourceServices, preparer.ComposeSourceRaw)
 	if err != nil {
 		t.Fatalf("resolve route through source service mapping: %v", err)
 	}
@@ -1332,7 +1332,7 @@ func TestResolveRouteForComposeUsesReviewedSourceServiceMapping(t *testing.T) {
 	}
 
 	compose := "services:\n  project-apiworker-1:\n    image: example/runtime-name\n  apiworker:\n    image: example/worker\n"
-	resolved, err = resolveRouteForCompose(route, compose, sourceServices)
+	resolved, err = resolveRouteForCompose(route, compose, sourceServices, preparer.ComposeSourceRaw)
 	if err != nil {
 		t.Fatalf("resolve reviewed service when exact key also exists: %v", err)
 	}
@@ -1340,7 +1340,7 @@ func TestResolveRouteForComposeUsesReviewedSourceServiceMapping(t *testing.T) {
 		t.Fatalf("expected reviewed source mapping to outrank unrelated exact key, got %#v", resolved)
 	}
 
-	resolved, err = resolveRouteForCompose(route, compose, nil)
+	resolved, err = resolveRouteForCompose(route, compose, nil, preparer.ComposeSourceRaw)
 	if err != nil {
 		t.Fatalf("resolve exact Compose service without source mapping: %v", err)
 	}
@@ -1348,12 +1348,36 @@ func TestResolveRouteForComposeUsesReviewedSourceServiceMapping(t *testing.T) {
 		t.Fatalf("expected exact Compose service without source mapping, got %#v", resolved)
 	}
 
-	resolved, err = resolveRouteForCompose(route, "services:\n  project-apiworker-1:\n    image: example/worker\n", sourceServices)
+	resolved, err = resolveRouteForCompose(route, compose, sourceServices, preparer.ComposeSourceGenerated)
 	if err != nil {
-		t.Fatalf("resolve exact generated Compose service when mapped key is absent: %v", err)
+		t.Fatalf("resolve exact generated Compose service: %v", err)
 	}
 	if resolved.ServiceName != "project-apiworker-1" {
-		t.Fatalf("expected exact Compose service when mapped key is absent, got %#v", resolved)
+		t.Fatalf("expected generated Compose to retain exact runtime service, got %#v", resolved)
+	}
+
+	resolved, err = resolveRouteForCompose(route, "services:\n  project-apiworker-1:\n    image: example/runtime-name\n", sourceServices, preparer.ComposeSourceRaw)
+	if err != nil {
+		t.Fatalf("resolve raw Compose fallback to exact service: %v", err)
+	}
+	if resolved.ServiceName != "project-apiworker-1" {
+		t.Fatalf("expected raw Compose to fall back to exact runtime service, got %#v", resolved)
+	}
+
+	resolved, err = resolveRouteForCompose(route, "services:\n  apiworker:\n    image: example/worker\n", sourceServices, preparer.ComposeSourceGenerated)
+	if err != nil {
+		t.Fatalf("resolve generated Compose fallback to mapped service: %v", err)
+	}
+	if resolved.ServiceName != "apiworker" {
+		t.Fatalf("expected generated Compose to fall back to mapped service, got %#v", resolved)
+	}
+
+	resolved, err = resolveRouteForCompose(route, compose, sourceServices, "")
+	if err != nil {
+		t.Fatalf("resolve exact Compose service for legacy plan: %v", err)
+	}
+	if resolved.ServiceName != "project-apiworker-1" {
+		t.Fatalf("expected legacy plan to retain exact runtime service, got %#v", resolved)
 	}
 }
 

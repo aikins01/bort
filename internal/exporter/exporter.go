@@ -22,8 +22,11 @@ type Options struct {
 }
 
 const (
-	privateDirMode  os.FileMode = 0o700
-	privateFileMode os.FileMode = 0o600
+	privateDirMode          os.FileMode = 0o700
+	privateFileMode         os.FileMode = 0o600
+	ComposeSourceRaw                    = "raw"
+	ComposeSourceGenerated              = "generated"
+	generatedComposeWarning             = "generated compose from discovered container metadata"
 )
 
 type Summary struct {
@@ -42,8 +45,21 @@ type AppSummary struct {
 	Role             string        `json:"role,omitempty"`
 	ProjectGroup     *ProjectGroup `json:"projectGroup,omitempty"`
 	PrivateEnvValues bool          `json:"privateEnvValues,omitempty"`
+	ComposeSource    string        `json:"composeSource,omitempty"`
 	Routes           []string      `json:"routes,omitempty"`
 	Warnings         []string      `json:"warnings,omitempty"`
+}
+
+func (a AppSummary) EffectiveComposeSource() string {
+	if a.ComposeSource == ComposeSourceGenerated {
+		return ComposeSourceGenerated
+	}
+	for _, warning := range a.Warnings {
+		if warning == generatedComposeWarning {
+			return ComposeSourceGenerated
+		}
+	}
+	return ComposeSourceRaw
 }
 
 type ProjectGroup struct {
@@ -99,6 +115,7 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 			Role:             migrationRole(app),
 			ProjectGroup:     projectGroups[appKey(app)],
 			PrivateEnvValues: opts.IncludeEnvValues,
+			ComposeSource:    composeSource(app),
 			Routes:           routeHosts(app.Routes),
 			Warnings:         warnings,
 		})
@@ -109,6 +126,13 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 	}
 
 	return summary, nil
+}
+
+func composeSource(app manifest.App) string {
+	if app.Compose != nil && strings.TrimSpace(app.Compose.Raw) != "" {
+		return ComposeSourceRaw
+	}
+	return ComposeSourceGenerated
 }
 
 func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts Options) ([]string, error) {
@@ -254,7 +278,7 @@ func composeForApp(app manifest.App, includePrivateValues bool) (string, []strin
 		}
 	}
 
-	warnings = append(warnings, "generated compose from discovered container metadata")
+	warnings = append(warnings, generatedComposeWarning)
 	return builder.String(), warnings, sortedEnvFiles(serviceEnvFileMap)
 }
 

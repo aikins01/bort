@@ -17,7 +17,9 @@ import (
 type Status string
 
 const (
-	APIVersion = "bort.prepare/v1alpha1"
+	APIVersion             = "bort.prepare/v1alpha1"
+	ComposeSourceRaw       = exporter.ComposeSourceRaw
+	ComposeSourceGenerated = exporter.ComposeSourceGenerated
 
 	StatusGreen  Status = "green"
 	StatusYellow Status = "yellow"
@@ -146,6 +148,7 @@ type AppResource struct {
 	Type           string    `json:"type"`
 	Name           string    `json:"name"`
 	ComposePath    string    `json:"composePath"`
+	ComposeSource  string    `json:"composeSource,omitempty"`
 	ComposeMissing bool      `json:"composeMissing,omitempty"`
 	MissingInputs  []string  `json:"missingInputs,omitempty"`
 	Readiness      Readiness `json:"readiness"`
@@ -311,7 +314,7 @@ func projectGroup(group *exporter.ProjectGroup) *ProjectGroup {
 
 func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Topology) ResourceSpecs {
 	resources := ResourceSpecs{
-		App:      appResource(app.Name, appDir),
+		App:      appResource(app.Name, appDir, app.EffectiveComposeSource()),
 		EnvFiles: envFileResources(appDir, app.PrivateEnvValues),
 	}
 	resources.SourceControl = sourceControlResource(topology.SourceControl)
@@ -364,12 +367,13 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 	return resources
 }
 
-func appResource(name, appDir string) AppResource {
+func appResource(name, appDir, composeSource string) AppResource {
 	resource := AppResource{
-		Type:        "compose",
-		Name:        name,
-		ComposePath: "compose.yaml",
-		Readiness:   ReadinessReadyToCreate,
+		Type:          "compose",
+		Name:          name,
+		ComposePath:   "compose.yaml",
+		ComposeSource: composeSource,
+		Readiness:     ReadinessReadyToCreate,
 	}
 
 	contents, err := os.ReadFile(filepath.Join(appDir, resource.ComposePath))

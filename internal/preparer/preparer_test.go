@@ -55,7 +55,7 @@ func TestPlanBuildsDryRunActionsFromTopology(t *testing.T) {
 	if app.ProjectGroup == nil || app.ProjectGroup.Name != "web" || app.ProjectGroup.Environment != "production" {
 		t.Fatalf("unexpected project group: %#v", app.ProjectGroup)
 	}
-	if app.Resources.App.Type != "compose" || app.Resources.App.ComposePath != "compose.yaml" {
+	if app.Resources.App.Type != "compose" || app.Resources.App.ComposePath != "compose.yaml" || app.Resources.App.ComposeSource != ComposeSourceGenerated {
 		t.Fatalf("unexpected app resource: %#v", app.Resources.App)
 	}
 	if len(app.Resources.Domains) != 1 || app.Resources.Domains[0].Host != "web.example.com" || app.Resources.Domains[0].ServiceName != "web" || app.Resources.Domains[0].Port != "3000" {
@@ -179,6 +179,9 @@ func TestPlanSurfacesSourceControlAsNonBlockingAction(t *testing.T) {
 	app := result.Apps[0]
 	if app.Readiness != ReadinessReadyToCreate || app.Resources.SourceControl == nil || app.Resources.SourceControl.Auth != "coolify_github_app" {
 		t.Fatalf("expected source control to be non-blocking, got %#v", app)
+	}
+	if app.Resources.App.ComposeSource != ComposeSourceRaw {
+		t.Fatalf("expected raw compose provenance, got %#v", app.Resources.App)
 	}
 	if app.TargetResources == nil || app.TargetResources.Dokploy == nil || app.TargetResources.Dokploy.SourceControl == nil || app.TargetResources.Dokploy.SourceControl.Action != "connect_dokploy_source_after_cutover_if_needed" {
 		t.Fatalf("expected dokploy source-control action, got %#v", app.TargetResources)

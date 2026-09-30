@@ -1715,7 +1715,8 @@ func (c *Client) applyInstallGateway(ctx context.Context, actx *applyContext, st
 	if err != nil {
 		return err
 	}
-	route, err = resolveRouteForCompose(route, composeFile, sourceServicesForApp(actx.plan, step.App))
+	sourceServices, composeSource := routeServiceContextForApp(actx.plan, step.App)
+	route, err = resolveRouteForCompose(route, composeFile, sourceServices, composeSource)
 	if err != nil {
 		return err
 	}
@@ -1741,8 +1742,9 @@ func (c *Client) applyActivateRoutes(ctx context.Context, actx *applyContext, st
 	if err := c.validateNoActiveBortOverrides(ctx, entry.ComposeID); err != nil {
 		return err
 	}
+	sourceServices, composeSource := routeServiceContextForApp(actx.plan, step.App)
 	for _, route := range cutoverRoutesForApp(actx.plan.Cutover, step.App) {
-		resolved, err := resolveRouteForCompose(route, composeFile, sourceServicesForApp(actx.plan, step.App))
+		resolved, err := resolveRouteForCompose(route, composeFile, sourceServices, composeSource)
 		if err != nil {
 			return err
 		}
@@ -1809,15 +1811,15 @@ type composeServiceSummary struct {
 	Ports map[string]struct{}
 }
 
-func sourceServicesForApp(plan Plan, appName string) []preparer.SourceServiceRef {
+func routeServiceContextForApp(plan Plan, appName string) ([]preparer.SourceServiceRef, string) {
 	app, ok := findPrepareApp(plan.Prepare, appName)
 	if !ok {
-		return nil
+		return nil, ""
 	}
-	return app.Resources.SourceServices
+	return app.Resources.SourceServices, app.Resources.App.ComposeSource
 }
 
-func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServices []preparer.SourceServiceRef) (gateway.Route, error) {
+func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServices []preparer.SourceServiceRef, composeSource string) (gateway.Route, error) {
 	services, err := composeServiceSummaries(composeFile)
 	if err != nil {
 		return gateway.Route{}, err
@@ -1825,7 +1827,7 @@ func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServi
 	if len(services) == 0 {
 		return route, nil
 	}
-	if serviceName, ok := inferComposeServiceForRoute(route, services, sourceServices); ok {
+	if serviceName, ok := inferComposeServiceForRoute(route, services, sourceServices, composeSource); ok {
 		route.ServiceName = serviceName
 		return route, nil
 	}
@@ -1838,8 +1840,8 @@ func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServi
 		planutilFallback(route.Host, "unknown"), route.ServiceName, strings.Join(available, ", "))
 }
 
-func inferComposeServiceForRoute(route gateway.Route, services map[string]composeServiceSummary, sourceServices []preparer.SourceServiceRef) (string, bool) {
-	for _, candidate := range routeServiceNameCandidates(route, sourceServices) {
+func inferComposeServiceForRoute(route gateway.Route, services map[string]composeServiceSummary, sourceServices []preparer.SourceServiceRef, composeSource string) (string, bool) {
+	for _, candidate := range routeServiceNameCandidates(route, sourceServices, composeSource) {
 		if _, ok := services[candidate]; ok {
 			return candidate, true
 		}
@@ -1864,7 +1866,7 @@ func inferComposeServiceForRoute(route gateway.Route, services map[string]compos
 	return "", false
 }
 
-func routeServiceNameCandidates(route gateway.Route, sourceServices []preparer.SourceServiceRef) []string {
+func routeServiceNameCandidates(route gateway.Route, sourceServices []preparer.SourceServiceRef, composeSource string) []string {
 	candidates := []string{}
 	add := func(value string) {
 		value = strings.TrimSpace(value)
@@ -1877,6 +1879,9 @@ func routeServiceNameCandidates(route gateway.Route, sourceServices []preparer.S
 			}
 		}
 		candidates = append(candidates, value)
+	}
+	if composeSource != preparer.ComposeSourceRaw {
+		add(route.ServiceName)
 	}
 	for _, sourceService := range sourceServices {
 		if sourceService.ContainerName == route.ServiceName {

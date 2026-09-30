@@ -41,6 +41,9 @@ func TestExportWritesBundleForComposeApp(t *testing.T) {
 	if len(summary.Apps) != 1 {
 		t.Fatalf("expected one app summary, got %#v", summary.Apps)
 	}
+	if summary.Apps[0].ComposeSource != ComposeSourceRaw {
+		t.Fatalf("expected raw compose provenance, got %#v", summary.Apps[0])
+	}
 
 	appDir := filepath.Join(dir, "ghost-blog")
 	assertMode(t, appDir, privateDirMode)
@@ -113,8 +116,18 @@ func TestExportSkipsResolvedCompose(t *testing.T) {
 	if !strings.Contains(compose, "image: \"example/api\"") {
 		t.Fatalf("expected generated compose, got:\n%s", compose)
 	}
-	if len(summary.Apps) != 1 || !strings.Contains(strings.Join(summary.Apps[0].Warnings, "\n"), "skipped resolved compose") {
+	if len(summary.Apps) != 1 || summary.Apps[0].ComposeSource != ComposeSourceGenerated || !strings.Contains(strings.Join(summary.Apps[0].Warnings, "\n"), "skipped resolved compose") {
 		t.Fatalf("expected resolved compose warning, got %#v", summary.Apps)
+	}
+}
+
+func TestAppSummaryEffectiveComposeSourceSupportsLegacyIndexes(t *testing.T) {
+	generated := AppSummary{Warnings: []string{generatedComposeWarning}}
+	if got := generated.EffectiveComposeSource(); got != ComposeSourceGenerated {
+		t.Fatalf("expected legacy generated compose provenance, got %q", got)
+	}
+	if got := (AppSummary{}).EffectiveComposeSource(); got != ComposeSourceRaw {
+		t.Fatalf("expected legacy raw compose provenance, got %q", got)
 	}
 }
 
