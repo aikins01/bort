@@ -34,7 +34,7 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
 	fs.StringVar(&cutoverPlanPath, "from-cutover", "", "read a prior cutover JSON plan artifact")
 	fs.StringVar(&runRef, "run", "", "run name under .bort/runs, or a run directory path")
-	fs.BoolVar(&live, "live", false, "restart source containers and return traffic; performs a short settling check, not the stored observation window")
+	fs.BoolVar(&live, "live", false, "return stateless traffic to a healthy source when safe; stateful authority recovery is manual")
 	fs.StringVar(&confirm, "confirm", "", "confirm open rollback triggers with the exact phrase: rollback <run-name> (requires --live)")
 	fs.IntVar(&observationWindowSeconds, "observation-window", rollbackplan.DefaultObservationWindowSeconds, "observation window in seconds")
 
@@ -86,6 +86,12 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) e
 			return err
 		}
 		result = run.Rollback
+		blocker := automaticRollbackBlocker(ctx, run)
+		available := blocker == nil
+		if blocker != nil {
+			result.AutomaticBlocker = blocker.Error()
+		}
+		result.AutomaticAvailable = &available
 	} else if cutoverPlanPath != "" {
 		expect := artifactExpectations{AppName: appName}
 		if flagWasSet(fs, "bundle") {
@@ -120,7 +126,15 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) e
 
 func writeRollbackText(w io.Writer, result rollbackplan.Result) {
 	fmt.Fprintf(w, "Rollback plan: %s -> %s\n", result.BundleDir, result.Target)
-	fmt.Fprintf(w, "Status: %s\n\n", result.Status)
+	fmt.Fprintf(w, "Status: %s\n", result.Status)
+	if result.AutomaticAvailable != nil {
+		if *result.AutomaticAvailable {
+			fmt.Fprintln(w, "Automatic rollback: available")
+		} else {
+			fmt.Fprintf(w, "Automatic rollback: unavailable: %s\n", result.AutomaticBlocker)
+		}
+	}
+	fmt.Fprintln(w)
 
 	for _, app := range result.Apps {
 		fmt.Fprintf(w, "[%s] %s\n", app.Status, app.Name)
@@ -179,12 +193,46 @@ func applyRollbackFromArgs(ctx context.Context, runRef, confirm string, stderr i
 	if err != nil {
 		return err
 	}
+	if run.Run.RolledBackAt != nil {
+		plan, planErr := dokploy.PlanForRollback(run.Prepare, run.Sync, run.Cutover)
+		if planErr != nil || planRequiresDokployHostOwner(run, plan) {
+			if err := releaseDokployTrafficOwner(run.Run); err != nil {
+				return fmt.Errorf("release completed rollback traffic ownership: %w", err)
+			}
+		}
+		fmt.Fprintf(stderr, "rollback already complete for run %s: traffic is back on the source; start a fresh run to migrate again\n", run.Run.Name)
+		return nil
+	}
 	if err := validateRollbackApplyReady(run); err != nil {
 		return err
+	}
+	if err := validateApplyResumeAuthority(run.Applied); err != nil {
+		return fmt.Errorf("automatic rollback refused: %w; %s", err, authorityRecoveryInstruction(run))
+	}
+	plan, err := planAutomaticRollback(run)
+	if err != nil {
+		return fmt.Errorf("automatic rollback refused: %w; %s", err, authorityRecoveryInstruction(run))
+	}
+	if !dokployLiveOperationsSupported() {
+		return fmt.Errorf("automatic rollback is unavailable on this platform; continue on the Linux source host")
 	}
 	phrase := "rollback " + run.Run.Name
 	if confirm != "" && confirm != phrase {
 		return fmt.Errorf("rollback confirmation must be exactly %q", phrase)
+	}
+	if err := verifyLocalSourceRun(ctx, run); err != nil {
+		return fmt.Errorf("automatic rollback refused on an unverified Docker source: %w", err)
+	}
+	targetLock, err := acquireDokployLiveOperationLock()
+	if err != nil {
+		return fmt.Errorf("lock Dokploy live operations: %w", err)
+	}
+	defer targetLock.Release()
+	requiresHostOwner := planRequiresDokployHostOwner(run, plan)
+	if requiresHostOwner {
+		if err := ensureDokployTrafficTargetOwner(ctx, run, nil, run.Run.RollbackStartedAt != nil); err != nil {
+			return fmt.Errorf("automatic rollback refused: %w", err)
+		}
 	}
 	if decisions := rollbackTriggerDecisions(run); len(decisions) > 0 {
 		for _, decision := range decisions {
@@ -204,7 +252,7 @@ func applyRollbackFromArgs(ctx context.Context, runRef, confirm string, stderr i
 			return err
 		}
 	}
-	plan := dokploy.PlanForRollback(run.Prepare, run.Cutover)
+	client := &dokploy.Client{}
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
 	plan.ApprovedPrepareDecisions = approvedPrepareDecisions(run)
@@ -224,15 +272,78 @@ func applyRollbackFromArgs(ctx context.Context, runRef, confirm string, stderr i
 		return fmt.Errorf("record rollback start: %w", err)
 	}
 	fmt.Fprintf(stderr, "rollback live: run %s; planned %d step(s) to return traffic to the source\n", run.Run.Name, len(plan.Steps))
-	client := &dokploy.Client{}
 	if err := client.Apply(ctx, plan); err != nil {
 		return err
+	}
+	if planChangesDokployTraffic(plan) {
+		if err := client.ReconcileSourceTrafficAuthority(ctx); err != nil {
+			return fmt.Errorf("verify source traffic authority: %w", err)
+		}
+	}
+	if requiresHostOwner {
+		if err := markDokployTrafficSource(run.Run); err != nil {
+			return fmt.Errorf("rollback completed, but source authority could not be recorded: %w", err)
+		}
 	}
 	if err := markRunRolledBackLocked(run.Run); err != nil {
 		return fmt.Errorf("rollback completed, but its outcome could not be recorded: %w", err)
 	}
+	if requiresHostOwner {
+		if err := releaseDokployTrafficOwner(run.Run); err != nil {
+			return fmt.Errorf("rollback was recorded, but its Dokploy host ownership could not be released: %w", err)
+		}
+	}
 	writeRollbackAppliedSummary(stderr, run, plan)
 	return nil
+}
+
+func planAutomaticRollback(run loadedMigrationRun) (dokploy.Plan, error) {
+	if run.Run.ResolvedAuthority != "" {
+		return dokploy.Plan{}, fmt.Errorf("run %q used manual %s-authority recovery; automatic rollback cannot infer the manually established boundary", run.Run.Name, run.Run.ResolvedAuthority)
+	}
+	return dokploy.PlanForRollback(run.Prepare, run.Sync, run.Cutover)
+}
+
+func automaticRollbackBlocker(ctx context.Context, run loadedMigrationRun) error {
+	if err := validateRollbackApplyReady(run); err != nil {
+		return err
+	}
+	if err := validateApplyResumeAuthority(run.Applied); err != nil {
+		return err
+	}
+	plan, err := planAutomaticRollback(run)
+	if err != nil {
+		return err
+	}
+	if !dokployLiveOperationsSupported() {
+		return fmt.Errorf("automatic rollback is unavailable on this platform; continue on the Linux source host")
+	}
+	if err := verifyLocalSourceRun(ctx, run); err != nil {
+		return fmt.Errorf("source attestation failed: %w", err)
+	}
+	if planRequiresDokployHostOwner(run, plan) {
+		if err := validateCurrentDokployTrafficOwner(run, run.Run.RollbackStartedAt != nil); err != nil {
+			return err
+		}
+	}
+	hostOperationActive, err := dokployLiveOperationActive()
+	if err != nil {
+		return fmt.Errorf("host-wide Dokploy operation lock could not be verified: %w", err)
+	}
+	if hostOperationActive {
+		return fmt.Errorf("another process holds the host-wide Dokploy operation lock")
+	}
+	return nil
+}
+
+func incompleteRollbackRecovery(run loadedMigrationRun) string {
+	if runMayHaveAmbiguousAuthority(run) {
+		return authorityRecoveryInstruction(run)
+	}
+	if _, err := planAutomaticRollback(run); err != nil {
+		return authorityRecoveryInstruction(run)
+	}
+	return fmt.Sprintf("run `%s` to finish recovery", runScopedCommand(run, "rollback --live"))
 }
 
 func validateRollbackApplyReady(run loadedMigrationRun) error {
@@ -246,13 +357,15 @@ func validateRollbackApplyReady(run loadedMigrationRun) error {
 		return fmt.Errorf("rollback refused: run %q was already committed; its source containers were retired", run.Run.Name)
 	}
 	if run.Run.CommitStartedAt != nil {
-		return fmt.Errorf("rollback refused: source retirement started for run %q; run `%s` to finish acceptance", run.Run.Name, runScopedCommand(run, "commit --apply"))
+		return fmt.Errorf("rollback refused: source retirement started for run %q; %s", run.Run.Name, finishStartedAcceptanceAction(run))
 	}
 	if run.Run.RolledBackAt != nil {
 		return fmt.Errorf("rollback refused: run %q was already rolled back; start a fresh run to migrate again", run.Run.Name)
 	}
-	if err := requireLiveApplySucceeded(run); err != nil {
-		return fmt.Errorf("rollback requires a successful live apply: %w", err)
+	if !runMayHaveAmbiguousAuthority(run) {
+		if err := requireLiveApplySucceeded(run); err != nil {
+			return fmt.Errorf("rollback requires a successful live apply: %w", err)
+		}
 	}
 	active, err := applyRunActive(run.Run.RunDir)
 	if err != nil {

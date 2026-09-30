@@ -23,8 +23,9 @@ type ProxyArtifact struct {
 }
 
 type Source struct {
-	Platform string `json:"platform"`
-	Hostname string `json:"hostname,omitempty"`
+	Platform       string `json:"platform"`
+	Hostname       string `json:"hostname,omitempty"`
+	DockerEngineID string `json:"dockerEngineId,omitempty"`
 }
 
 type App struct {

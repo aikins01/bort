@@ -91,20 +91,20 @@ func (c *Client) CleanupStalePlatformProjects(ctx context.Context, opts StalePla
 	if runtime.GOOS != "linux" {
 		return StalePlatformCleanupResult{}, fmt.Errorf("Dokploy metadata cleanup is unavailable on %s; run cleanup --apply on the Linux Dokploy host", runtime.GOOS)
 	}
-	return c.cleanupStalePlatformProjects(ctx, opts)
-}
-
-func (c *Client) cleanupStalePlatformProjects(ctx context.Context, opts StalePlatformCleanupOptions) (StalePlatformCleanupResult, error) {
-	names := cleanupProjectNames(opts.ProjectNames)
-	if len(names) == 0 {
+	opts.ProjectNames = cleanupProjectNames(opts.ProjectNames)
+	if len(opts.ProjectNames) == 0 {
 		return StalePlatformCleanupResult{}, fmt.Errorf("at least one project name is required")
 	}
-	runner := c.dockerRunner()
-	pg, err := findDokployPostgresContainer(ctx, runner)
+	postgresContainerID, err := c.verifySameDockerHostAndDatabase(ctx)
 	if err != nil {
-		return StalePlatformCleanupResult{}, err
+		return StalePlatformCleanupResult{}, fmt.Errorf("verify cleanup API and database belong to the local Dokploy services: %w", err)
 	}
-	backup, err := backupDokployDatabase(ctx, runner, pg, opts.BackupDir, opts.BackupPrefix)
+	return c.cleanupStalePlatformProjects(ctx, opts, postgresContainerID)
+}
+
+func (c *Client) cleanupStalePlatformProjects(ctx context.Context, opts StalePlatformCleanupOptions, postgresContainerID string) (StalePlatformCleanupResult, error) {
+	runner := c.dockerRunner()
+	backup, err := backupDokployDatabase(ctx, runner, postgresContainerID, opts.BackupDir, opts.BackupPrefix)
 	if err != nil {
 		return StalePlatformCleanupResult{}, err
 	}
@@ -112,7 +112,7 @@ func (c *Client) cleanupStalePlatformProjects(ctx context.Context, opts StalePla
 	if err := backup.dir.ValidatePath(); err != nil {
 		return StalePlatformCleanupResult{}, fmt.Errorf("verify Dokploy database backup location %s before deleting metadata: %w", backup.path, err)
 	}
-	deleted, err := deleteStalePlatformProjects(ctx, runner, pg, names, opts.ProjectIDs)
+	deleted, err := deleteStalePlatformProjects(ctx, runner, postgresContainerID, opts.ProjectNames, opts.ProjectIDs)
 	if err != nil {
 		return StalePlatformCleanupResult{}, fmt.Errorf("delete stale Dokploy platform metadata after backup %s: %w", backup.path, err)
 	}
@@ -1057,20 +1057,6 @@ func cleanupProjectNames(names []string) []string {
 	}
 	sort.Strings(cleaned)
 	return cleaned
-}
-
-func findDokployPostgresContainer(ctx context.Context, runner dockerRunner) (string, error) {
-	out, err := runner.Output(ctx, "ps", "--format", "{{.Names}}")
-	if err != nil {
-		return "", fmt.Errorf("list docker containers for Dokploy postgres: %w", err)
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		name := strings.TrimSpace(line)
-		if name == "dokploy-postgres" || strings.HasPrefix(name, "dokploy-postgres.") || strings.HasPrefix(name, "dokploy-postgres-") {
-			return name, nil
-		}
-	}
-	return "", fmt.Errorf("dokploy postgres container was not found; cleanup must run on the Dokploy host")
 }
 
 type dokployDatabaseBackup struct {

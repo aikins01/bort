@@ -17,7 +17,7 @@ type applyLock struct {
 	file *os.File
 }
 
-func acquireApplyLock(path string) (*applyLock, error) {
+func tryAcquireApplyLock(path string) (*applyLock, error) {
 	file, err := openLockFile(path, unix.O_CREAT|unix.O_RDWR)
 	if err != nil {
 		return nil, err

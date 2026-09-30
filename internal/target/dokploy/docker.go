@@ -7,10 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
+
+	"github.com/aikins01/bort/internal/dockercli"
 )
 
 // dockerRunner is the small surface bort needs to drive the local docker
@@ -31,8 +35,38 @@ func (l localDockerRunner) binary() string {
 	return "docker"
 }
 
-func (l localDockerRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+// command mirrors the `env -i PATH HOME` Dokploy deploys compose projects
+// under, so staged compose interpolation cannot read Bort's shell; the local
+// daemon pin moves to --host because DOCKER_HOST would leak into that env.
+func (l localDockerRunner) command(ctx context.Context, args []string) (*exec.Cmd, error) {
+	env, err := dockercli.LocalEnvironment(os.Environ())
+	if err != nil {
+		return nil, err
+	}
+	if len(args) > 0 && args[0] == "compose" {
+		kept := make([]string, 0, 2)
+		for _, entry := range env {
+			key, _, _ := strings.Cut(entry, "=")
+			if runtime.GOOS == "windows" {
+				key = strings.ToUpper(key)
+			}
+			if key == "PATH" || key == "HOME" {
+				kept = append(kept, entry)
+			}
+		}
+		env = kept
+		args = append([]string{"--host", dockercli.LocalHost()}, args...)
+	}
 	cmd := exec.CommandContext(ctx, l.binary(), args...)
+	cmd.Env = env
+	return cmd, nil
+}
+
+func (l localDockerRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	cmd, err := l.command(ctx, args)
+	if err != nil {
+		return nil, err
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -47,7 +81,10 @@ func (l localDockerRunner) Output(ctx context.Context, args ...string) ([]byte, 
 }
 
 func (l localDockerRunner) Run(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {
-	cmd := exec.CommandContext(ctx, l.binary(), args...)
+	cmd, err := l.command(ctx, args)
+	if err != nil {
+		return err
+	}
 	if stdin != nil {
 		cmd.Stdin = stdin
 	}
@@ -181,11 +218,21 @@ type dockerContainer struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	State struct {
-		Status  string             `json:"Status"`
-		Running bool               `json:"Running"`
-		Health  *dockerHealthState `json:"Health"`
+		Status     string             `json:"Status"`
+		Running    bool               `json:"Running"`
+		StartedAt  string             `json:"StartedAt"`
+		FinishedAt string             `json:"FinishedAt"`
+		Health     *dockerHealthState `json:"Health"`
 	} `json:"State"`
+	HostConfig struct {
+		RestartPolicy dockerRestartPolicy `json:"RestartPolicy"`
+	} `json:"HostConfig"`
 	Mounts []dockerMount `json:"Mounts"`
+}
+
+type dockerRestartPolicy struct {
+	Name              string `json:"Name"`
+	MaximumRetryCount int    `json:"MaximumRetryCount"`
 }
 
 type dockerHealthState struct {
@@ -210,10 +257,15 @@ type dockerInspectRaw struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	State struct {
-		Status  string             `json:"Status"`
-		Running bool               `json:"Running"`
-		Health  *dockerHealthState `json:"Health"`
+		Status     string             `json:"Status"`
+		Running    bool               `json:"Running"`
+		StartedAt  string             `json:"StartedAt"`
+		FinishedAt string             `json:"FinishedAt"`
+		Health     *dockerHealthState `json:"Health"`
 	} `json:"State"`
+	HostConfig struct {
+		RestartPolicy dockerRestartPolicy `json:"RestartPolicy"`
+	} `json:"HostConfig"`
 	Mounts []dockerMount `json:"Mounts"`
 }
 
@@ -234,13 +286,42 @@ func inspectContainer(ctx context.Context, runner dockerRunner, ref string) (doc
 	}
 	r := raw[0]
 	return dockerContainer{
-		ID:     r.ID,
-		Name:   strings.TrimPrefix(r.Name, "/"),
-		Image:  r.Image,
-		Config: r.Config,
-		State:  r.State,
-		Mounts: r.Mounts,
+		ID:         r.ID,
+		Name:       strings.TrimPrefix(r.Name, "/"),
+		Image:      r.Image,
+		Config:     r.Config,
+		State:      r.State,
+		HostConfig: r.HostConfig,
+		Mounts:     r.Mounts,
 	}, nil
+}
+
+func inspectContainers(ctx context.Context, runner dockerRunner, refs []string) ([]dockerContainer, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	args := append([]string{"inspect", "--type", "container"}, refs...)
+	out, err := runner.Output(ctx, args...)
+	if err != nil {
+		return nil, fmt.Errorf("docker inspect ids=%v: %w", refs, err)
+	}
+	var decoded []dockerInspectRaw
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		return nil, fmt.Errorf("decode docker inspect batch: %w", err)
+	}
+	containers := make([]dockerContainer, 0, len(decoded))
+	for _, raw := range decoded {
+		containers = append(containers, dockerContainer{
+			ID:         raw.ID,
+			Name:       strings.TrimPrefix(raw.Name, "/"),
+			Image:      raw.Image,
+			Config:     raw.Config,
+			State:      raw.State,
+			HostConfig: raw.HostConfig,
+			Mounts:     raw.Mounts,
+		})
+	}
+	return containers, nil
 }
 
 func listContainersByLabel(ctx context.Context, runner dockerRunner, label string) ([]dockerContainer, error) {
@@ -258,43 +339,33 @@ func listContainersByLabel(ctx context.Context, runner dockerRunner, label strin
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	args := append([]string{"inspect", "--type", "container"}, ids...)
-	raw, err := runner.Output(ctx, args...)
-	if err != nil {
-		return nil, fmt.Errorf("docker inspect ids=%v: %w", ids, err)
-	}
-	var decoded []dockerInspectRaw
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return nil, fmt.Errorf("decode docker inspect batch: %w", err)
-	}
-	containers := make([]dockerContainer, 0, len(decoded))
-	for _, r := range decoded {
-		containers = append(containers, dockerContainer{
-			ID:     r.ID,
-			Name:   strings.TrimPrefix(r.Name, "/"),
-			Image:  r.Image,
-			Config: r.Config,
-			State:  r.State,
-			Mounts: r.Mounts,
-		})
-	}
-	return containers, nil
+	return inspectContainers(ctx, runner, ids)
 }
 
 func sourceContainer(ctx context.Context, runner dockerRunner, id, name string) (dockerContainer, error) {
 	if id != "" {
 		container, err := inspectContainer(ctx, runner, id)
-		if err == nil {
-			return container, nil
-		}
-		if name == "" {
+		if err != nil {
 			return dockerContainer{}, err
 		}
+		if !sourceContainerIDMatches(id, container.ID) {
+			return dockerContainer{}, fmt.Errorf("source container %q resolved to ID %q, want reviewed ID %q", name, container.ID, id)
+		}
+		if name != "" && strings.TrimPrefix(container.Name, "/") != strings.TrimPrefix(name, "/") {
+			return dockerContainer{}, fmt.Errorf("source container %s has name %q, want reviewed name %q", id, container.Name, name)
+		}
+		return container, nil
 	}
 	if name == "" {
 		return dockerContainer{}, fmt.Errorf("source container ref is empty")
 	}
 	return inspectContainer(ctx, runner, name)
+}
+
+func sourceContainerIDMatches(reviewed, inspected string) bool {
+	reviewed = strings.TrimSpace(reviewed)
+	inspected = strings.TrimSpace(inspected)
+	return reviewed != "" && inspected != "" && (reviewed == inspected || len(reviewed) >= 12 && strings.HasPrefix(inspected, reviewed))
 }
 
 func findMountByTarget(c dockerContainer, target string) (dockerMount, bool) {
@@ -343,7 +414,7 @@ func copyNamedVolume(ctx context.Context, runner dockerRunner, src, dst string) 
 		"-v", dst + ":/to",
 		volumeCopyImage,
 		"sh", "-c",
-		"rm -rf /to/* /to/.[!.]* /to/..?* 2>/dev/null; cd /from && tar cpf - . | tar xpf - -C /to",
+		"set -o pipefail; find /to -mindepth 1 -delete && cd /from && tar cpf - . | tar xpf - -C /to && find /to \\( -type f -o -type d \\) -print0 | xargs -0 fsync",
 	}
 	return runner.Run(ctx, nil, nil, args...)
 }

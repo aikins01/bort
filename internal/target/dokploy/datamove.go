@@ -39,6 +39,13 @@ func (c *Client) applySyncVolume(ctx context.Context, actx *applyContext, step S
 	}
 
 	runner := c.dockerRunner()
+	if appStateIsStaged(actx.plan, step.App) {
+		staged, ok := stagedVolumeFor(actx.plan, step.App, volume)
+		if !ok {
+			return fmt.Errorf("%w: %s volume %s for app %s cannot be staged; only named volumes are transferred before deploy", ErrNotImplemented, volume.Type, volumeRefLabel(volume), step.App)
+		}
+		return c.syncVolumeToStaging(ctx, runner, actx, step.App, app, staged)
+	}
 	target, err := c.targetContainerForService(ctx, runner, actx, step.App, volume.Service)
 	if err != nil {
 		return err
@@ -47,7 +54,9 @@ func (c *Client) applySyncVolume(ctx context.Context, actx *applyContext, step S
 	if err != nil {
 		return err
 	}
-	if err := withTargetStopped(ctx, runner, target, copy.Run); err != nil {
+	if err := withTargetStopped(ctx, runner, target, func() error {
+		return copy.Run()
+	}); err != nil {
 		return err
 	}
 	if copy.TargetVolumeName != "" {
@@ -60,6 +69,52 @@ func (c *Client) applySyncVolume(ctx context.Context, actx *applyContext, step S
 		}
 	}
 	return nil
+}
+
+// syncVolumeToStaging copies a stopped source volume into the Bort-owned
+// staging volume. Dokploy's compose does not reference that volume until
+// push_image, so the source snapshot is the only writer to guard: the
+// source container set is inspected before and after the copy and any
+// restart in between invalidates the transfer.
+func (c *Client) syncVolumeToStaging(ctx context.Context, runner dockerRunner, actx *applyContext, appName string, app preparer.AppPlan, staged stagedVolume) error {
+	if err := actx.forgetMigratedVolumeMount(appName, staged.Service, staged.Target); err != nil {
+		return err
+	}
+	if err := ensureStagingVolume(ctx, runner, actx.plan, appName, staged); err != nil {
+		return err
+	}
+	srcVolName, err := resolveSourceVolume(ctx, runner, staged.Source)
+	if err != nil {
+		return err
+	}
+	if err := requireStagingVolumeUnattached(ctx, runner, staged); err != nil {
+		return err
+	}
+	before, err := inspectSourceQuiesceTargets(ctx, runner, app)
+	if err != nil {
+		return err
+	}
+	if err := requireSourceQuiescent(before); err != nil {
+		return err
+	}
+	if err := copyNamedVolume(ctx, runner, srcVolName, staged.VolumeName); err != nil {
+		return err
+	}
+	after, err := inspectSourceQuiesceTargets(ctx, runner, app)
+	if err != nil {
+		return err
+	}
+	if err := requireSourceQuiesceUnchanged(before, after); err != nil {
+		return err
+	}
+	if err := requireStagingVolumeUnattached(ctx, runner, staged); err != nil {
+		return err
+	}
+	return actx.recordMigratedVolumeMount(appName, migratedVolumeMount{
+		Service:    staged.Service,
+		Target:     staged.Target,
+		VolumeName: staged.VolumeName,
+	})
 }
 
 type plannedVolumeCopy struct {
@@ -122,6 +177,29 @@ func (a *applyContext) recordMigratedVolumeMount(appName string, mount migratedV
 	return a.persistMigratedVolumeMounts()
 }
 
+func (a *applyContext) forgetMigratedVolumeMount(appName, service, target string) error {
+	if a == nil {
+		return nil
+	}
+	entry := a.entry(appName)
+	key := migratedMountKey(service, target)
+	if _, ok := entry.MigratedVolumeMounts[key]; !ok {
+		return nil
+	}
+	delete(entry.MigratedVolumeMounts, key)
+	return a.persistMigratedVolumeMounts()
+}
+
+func stagedVolumesRecorded(entry *appCache, staged []stagedVolume) bool {
+	for _, volume := range staged {
+		mount, ok := entry.MigratedVolumeMounts[migratedMountKey(volume.Service, volume.Target)]
+		if !ok || mount.VolumeName != volume.VolumeName {
+			return false
+		}
+	}
+	return true
+}
+
 func migratedMountKey(service, target string) string {
 	return strings.TrimSpace(service) + "\x00" + strings.TrimSpace(target)
 }
@@ -168,7 +246,7 @@ func (a *applyContext) persistMigratedVolumeMounts() error {
 		return fmt.Errorf("encode migrated volume state: %w", err)
 	}
 	contents = append(contents, '\n')
-	if err := os.WriteFile(path, contents, 0o600); err != nil {
+	if err := safepath.WriteFileAtomicNoFollow(path, contents, 0o600); err != nil {
 		return fmt.Errorf("write migrated volume state: %w", err)
 	}
 	return nil
@@ -256,7 +334,13 @@ func (c *Client) primeTargetWritersForResume(ctx context.Context, runner dockerR
 	return c.pauseTargetWritersWithMode(ctx, runner, actx, appName, targetWriterKeepServices(actx.plan, appName), true)
 }
 
+// appHasStateWork reports whether target writers must be paused around
+// state transfer. staged plans finish every copy before the target
+// exists, so they never need the pause.
 func appHasStateWork(plan Plan, appName string) bool {
+	if appStateIsStaged(plan, appName) {
+		return false
+	}
 	for _, step := range plan.Steps {
 		if step.App == appName && step.Kind == StepPauseSource {
 			return true
@@ -286,14 +370,17 @@ func (c *Client) pauseTargetWriters(ctx context.Context, runner dockerRunner, ac
 
 func (c *Client) pauseTargetWritersWithMode(ctx context.Context, runner dockerRunner, actx *applyContext, appName string, keepServices map[string]struct{}, recordAlreadyStopped bool) error {
 	entry := actx.entry(appName)
-	if len(entry.TargetWritersStopped) > 0 {
+	if len(entry.TargetWritersStopped) > 0 && !recordAlreadyStopped {
 		return nil
 	}
-	containers, err := c.targetWriterContainers(ctx, runner, actx, appName, keepServices, recordAlreadyStopped)
+	discoveryCtx, cancelDiscovery := context.WithTimeout(ctx, targetDiscoveryTimeout)
+	containers, err := c.targetWriterContainers(discoveryCtx, runner, actx, appName, keepServices, recordAlreadyStopped)
+	cancelDiscovery()
 	if err != nil {
 		return err
 	}
 	stopped := []dockerContainer{}
+	stoppedNow := []dockerContainer{}
 	for _, container := range containers {
 		service := container.Config.Labels[composeServiceLabel]
 		if _, keep := keepServices[service]; keep {
@@ -305,13 +392,17 @@ func (c *Client) pauseTargetWritersWithMode(ctx context.Context, runner dockerRu
 			}
 			continue
 		}
-		if err := stopContainer(ctx, runner, container.ID); err != nil {
-			for _, stoppedContainer := range stopped {
+		stopCtx, cancelStop := context.WithTimeout(ctx, dockerStopTimeout)
+		err := stopContainer(stopCtx, runner, container.ID)
+		cancelStop()
+		if err != nil {
+			for _, stoppedContainer := range stoppedNow {
 				_ = startContainer(context.Background(), runner, stoppedContainer.ID)
 			}
 			return fmt.Errorf("stop target writer container %s: %w", container.ID, err)
 		}
 		stopped = append(stopped, container)
+		stoppedNow = append(stoppedNow, container)
 	}
 	entry.TargetWritersStopped = stopped
 	return nil
@@ -331,7 +422,7 @@ func (c *Client) withTargetWritersStopped(ctx context.Context, runner dockerRunn
 	}
 	if err := c.applyResumeTarget(context.Background(), actx, Step{Kind: StepResumeTarget, App: appName, Ref: appName}); err != nil {
 		if opErr != nil {
-			return fmt.Errorf("%w (target writers also failed to restart: %v)", opErr, err)
+			return fmt.Errorf("%w (target writers also failed to restart: %w)", opErr, err)
 		}
 		return err
 	}
@@ -453,7 +544,7 @@ func (c *Client) applyResumeTarget(ctx context.Context, actx *applyContext, step
 			stopCtx, cancelStop := context.WithTimeout(context.Background(), targetDiscoveryTimeout)
 			defer cancelStop()
 			if stopErr := c.stopTargetComposeContainers(stopCtx, actx, step.App); stopErr != nil {
-				return fmt.Errorf("%w (also failed to stop unsafe target containers: %v)", err, stopErr)
+				return ambiguousMutationResponseError{err: unsafeSourceResumeError{err: fmt.Errorf("%w (also failed to stop unsafe target containers, so Bort will leave any paused source applications stopped: %v)", err, stopErr)}}
 			}
 		}
 		return err
@@ -483,7 +574,7 @@ func (c *Client) validateMigratedVolumeMountsAfterDeploy(ctx context.Context, ac
 			stopCtx, cancelStop := context.WithDeadline(context.Background(), operationDeadline)
 			defer cancelStop()
 			if stopErr := c.stopTargetComposeContainers(stopCtx, actx, appName); stopErr != nil {
-				return fmt.Errorf("%w (also failed to stop unsafe target containers: %v)", err, stopErr)
+				return ambiguousMutationResponseError{err: unsafeSourceResumeError{err: fmt.Errorf("%w (also failed to stop unsafe target containers, so Bort will leave any paused source applications stopped: %v)", err, stopErr)}}
 			}
 		}
 		return err
@@ -596,7 +687,6 @@ func (c *Client) stopTargetComposeContainers(ctx context.Context, actx *applyCon
 					continue
 				}
 				result = fmt.Errorf("stop target container %s: %w", container.ID, err)
-				continue
 			}
 		}
 		if hadStopError {
@@ -713,60 +803,267 @@ func (c *Client) applyRestoreDataStore(ctx context.Context, actx *applyContext, 
 	}
 
 	runner := c.dockerRunner()
+	if appStateIsStaged(actx.plan, step.App) {
+		return c.restoreDataStoreToStaging(ctx, runner, actx, app, step, store)
+	}
 	dst, err := c.targetContainerForService(ctx, runner, actx, step.App, store.Service)
 	if err != nil {
 		return err
 	}
-	creds := postgresCredsFromEnv(envMap(dst.Config.Env))
-
 	if err := c.withTargetWritersStopped(ctx, runner, actx, step.App, map[string]struct{}{store.Service: {}}, func() error {
-		if err := waitPostgresReady(ctx, runner, dst.ID, creds); err != nil {
-			return err
-		}
-
-		dumpPath, err := dataStoreDumpPath(actx.plan, step.App, step.Ref)
-		if err != nil {
-			return err
-		}
-		restoreListPath, cleanupRestoreList, err := preparePgRestoreList(ctx, runner, dst.ID, dumpPath, step.App, step.Ref)
-		if err != nil {
-			return err
-		}
-		defer cleanupRestoreList()
-
-		file, err := os.Open(dumpPath)
-		if err != nil {
-			return fmt.Errorf("open dump file %s: %w", dumpPath, err)
-		}
-		defer file.Close()
-
-		args := []string{"exec", "-i"}
-		if creds.Password != "" {
-			pgpassPath, cleanupPgpass, err := stageContainerPgpass(ctx, runner, dst.ID, filepath.Dir(dumpPath), creds.Password)
-			if err != nil {
-				return err
-			}
-			defer func() {
-				if err := cleanupPgpass(); err != nil {
-					fmt.Fprintf(os.Stderr, "warning: %v; the file holds the postgres database password, remove it manually\n", err)
-				}
-			}()
-			args = append(args, "-e", "PGPASSFILE="+pgpassPath)
-		}
-		args = append(args, dst.ID, "pg_restore", "-w",
-			"-U", creds.User,
-			"-d", creds.Database,
-			"--clean", "--if-exists", "--no-owner", "--no-acl",
-			"--single-transaction", "--exit-on-error",
-		)
-		if restoreListPath != "" {
-			args = append(args, "-L", restoreListPath)
-		}
-		return runner.Run(ctx, file, nil, args...)
+		return pgRestoreIntoContainer(ctx, runner, actx.plan, step, dst)
 	}); err != nil {
 		return err
 	}
 	return recordMigratedStoreMounts(actx, step.App, app, store.Service, dst)
+}
+
+// requireStagedRestoreLayout refuses layouts the reviewed plan itself
+// rules out; callers run it before stagingRestoreProject so those
+// refusals stay distinguishable from the repairable Dokploy settings
+// that stagingRestoreProject also reports as ErrNotImplemented.
+func requireStagedRestoreLayout(plan Plan, step Step, store preparer.DataStoreResource) ([]stagedVolume, error) {
+	staged := stagedVolumesForService(plan, step.App, store.Service)
+	if len(staged) == 0 {
+		return nil, fmt.Errorf("%w: data store %s for app %s has no named volume to stage", ErrNotImplemented, step.Ref, step.App)
+	}
+	composeFile, err := readComposeFile(plan, step.App)
+	if err != nil {
+		return nil, err
+	}
+	return staged, requireLiteralMountTargets(composeFile, step.App, store.Service)
+}
+
+func (c *Client) stagingRestoreProject(ctx context.Context, actx *applyContext, step Step, store preparer.DataStoreResource, staged []stagedVolume) (stagingProject, error) {
+	entry := actx.entry(step.App)
+	if strings.TrimSpace(entry.ComposeAppName) == "" {
+		return stagingProject{}, fmt.Errorf("missing compose app name for app %s; create_service must run first", step.App)
+	}
+	if actx.stagingEnvFormat == stagingEnvFormatUnresolved {
+		return stagingProject{}, fmt.Errorf("Dokploy .env format was not resolved before staging %s for app %s", store.Service, step.App)
+	}
+	if err := c.requireStagingCompatibleCompose(ctx, entry.ComposeID, step.App); err != nil {
+		return stagingProject{}, err
+	}
+	composeFile, err := c.composeFileForApply(ctx, actx, step.App)
+	if err != nil {
+		return stagingProject{}, err
+	}
+	stagingCompose, err := stagingComposeFile(composeFile, store.Service, staged)
+	if err != nil {
+		return stagingProject{}, err
+	}
+	envContent, err := readEnvContent(actx.plan, step.App)
+	if err != nil {
+		return stagingProject{}, err
+	}
+	return writeStagingProject(actx.plan, step.App, store.Service, stagingCompose, stagingEnvFileContent(entry.ComposeAppName, envContent, actx.stagingEnvFormat))
+}
+
+// preflightStagedRestores creates (without starting) each staged data
+// store container while the source still runs, so a PGDATA or mount
+// layout that only compose interpolation or the image decides is refused
+// before pause_source stops the source.
+func (c *Client) preflightStagedRestores(ctx context.Context, actx *applyContext, appName string) error {
+	if !appStateIsStaged(actx.plan, appName) {
+		return nil
+	}
+	app, ok := findPrepareApp(actx.plan.Prepare, appName)
+	if !ok {
+		return nil
+	}
+	runner := c.dockerRunner()
+	for _, step := range actx.plan.Steps {
+		if step.Kind != StepRestoreDataStore || step.App != appName || shouldSkipApplyStep(actx.plan, step) {
+			continue
+		}
+		store, ok := findPrepareDataStore(app, step.Ref)
+		if !ok || dataStoreMigrationKind(store) != dataStoreMigrationLogical {
+			continue
+		}
+		if err := c.preflightStagedRestore(ctx, runner, actx, app, step, store); err != nil {
+			return fmt.Errorf("staged restore preflight of %s for app %s failed, so pause_source did not stop the source: %w", store.Service, appName, err)
+		}
+	}
+	return nil
+}
+
+// stagedRestorePreflightError marks a refusal whose layout comes from the
+// plan itself, so no retry of this run can pass pause_source.
+type stagedRestorePreflightError struct {
+	err            error
+	requiresNewRun bool
+}
+
+func (e stagedRestorePreflightError) Error() string { return e.err.Error() }
+
+func (e stagedRestorePreflightError) Unwrap() error { return e.err }
+
+func stagedRestoreLayoutRefusal(err error, app string) error {
+	if !errors.Is(err, ErrNotImplemented) {
+		return err
+	}
+	return stagedRestorePreflightError{
+		err:            fmt.Errorf("%w; no retry of this run can pass pause_source for app %s because its reviewed plan is immutable: follow the recovery `bort status` shows to release this run, then choose a recreate or managed data store strategy or change the source compose and create a new run", err, app),
+		requiresNewRun: true,
+	}
+}
+
+func (c *Client) preflightStagedRestore(ctx context.Context, runner dockerRunner, actx *applyContext, app preparer.AppPlan, step Step, store preparer.DataStoreResource) error {
+	staged, err := requireStagedRestoreLayout(actx.plan, step, store)
+	if err != nil {
+		return stagedRestoreLayoutRefusal(err, step.App)
+	}
+	project, err := c.stagingRestoreProject(ctx, actx, step, store, staged)
+	if err != nil {
+		return err
+	}
+	if err := project.down(runner); err != nil {
+		return err
+	}
+	for _, volume := range staged {
+		if err := ensureStagingVolume(ctx, runner, actx.plan, step.App, volume); err != nil {
+			return err
+		}
+	}
+	checkErr := func() error {
+		if err := runner.Run(ctx, nil, nil, project.args("create", "--no-build", store.Service)...); err != nil {
+			return fmt.Errorf("create staging data store %s: %w", store.Service, err)
+		}
+		dst, err := project.serviceContainer(ctx, runner, store.Service)
+		if err != nil {
+			return err
+		}
+		if err := requireStagedPostgresDataDir(dst, staged); err != nil {
+			return fmt.Errorf("%w: %v", ErrNotImplemented, err)
+		}
+		return requireSourceMountsStageDataDir(app, store.Service, postgresDataDir(dst), staged)
+	}()
+	checkErr = stagedRestoreLayoutRefusal(checkErr, step.App)
+	if downErr := project.down(runner); downErr != nil {
+		if checkErr != nil {
+			return fmt.Errorf("%w (also failed to stop staging project: %v)", checkErr, downErr)
+		}
+		return downErr
+	}
+	return checkErr
+}
+
+// restoreDataStoreToStaging runs the data store service alone under a
+// Bort-owned compose project with only its staging volumes and read-only
+// init-script mounts, restores the dump into it, and stops it again. the
+// volumes are recreated first so a retry never restores on top of a
+// partial earlier attempt.
+func (c *Client) restoreDataStoreToStaging(ctx context.Context, runner dockerRunner, actx *applyContext, app preparer.AppPlan, step Step, store preparer.DataStoreResource) error {
+	staged, err := requireStagedRestoreLayout(actx.plan, step, store)
+	if err != nil {
+		return err
+	}
+	project, err := c.stagingRestoreProject(ctx, actx, step, store, staged)
+	if err != nil {
+		return err
+	}
+	for _, volume := range staged {
+		if err := actx.forgetMigratedVolumeMount(step.App, volume.Service, volume.Target); err != nil {
+			return err
+		}
+	}
+	if err := project.down(runner); err != nil {
+		return err
+	}
+	for _, volume := range staged {
+		if err := requireStagingVolumeUnattached(ctx, runner, volume); err != nil {
+			return err
+		}
+		if err := recreateStagingVolume(ctx, runner, actx.plan, step.App, volume); err != nil {
+			return err
+		}
+	}
+	if err := runner.Run(ctx, nil, nil, project.args("up", "-d", "--no-build", "--no-deps", store.Service)...); err != nil {
+		return fmt.Errorf("start staging data store %s: %w", store.Service, err)
+	}
+	restoreErr := func() error {
+		dst, err := project.serviceContainer(ctx, runner, store.Service)
+		if err != nil {
+			return err
+		}
+		if err := requireStagedPostgresDataDir(dst, staged); err != nil {
+			return err
+		}
+		if err := requireSourceMountsStageDataDir(app, store.Service, postgresDataDir(dst), staged); err != nil {
+			return err
+		}
+		return pgRestoreIntoContainer(ctx, runner, actx.plan, step, dst)
+	}()
+	if downErr := project.down(runner); downErr != nil {
+		if restoreErr != nil {
+			return fmt.Errorf("%w (also failed to stop staging project: %v)", restoreErr, downErr)
+		}
+		return downErr
+	}
+	if restoreErr != nil {
+		return restoreErr
+	}
+	for _, volume := range staged {
+		if err := requireStagingVolumeUnattached(ctx, runner, volume); err != nil {
+			return err
+		}
+		if err := actx.recordMigratedVolumeMount(step.App, migratedVolumeMount{
+			Service:    volume.Service,
+			Target:     volume.Target,
+			VolumeName: volume.VolumeName,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func pgRestoreIntoContainer(ctx context.Context, runner dockerRunner, plan Plan, step Step, dst dockerContainer) error {
+	creds := postgresCredsFromEnv(envMap(dst.Config.Env))
+	if err := waitPostgresReady(ctx, runner, dst.ID, creds); err != nil {
+		return err
+	}
+
+	dumpPath, err := dataStoreDumpPath(plan, step.App, step.Ref)
+	if err != nil {
+		return err
+	}
+	restoreListPath, cleanupRestoreList, err := preparePgRestoreList(ctx, runner, dst.ID, dumpPath, step.App, step.Ref)
+	if err != nil {
+		return err
+	}
+	defer cleanupRestoreList()
+
+	file, err := os.Open(dumpPath)
+	if err != nil {
+		return fmt.Errorf("open dump file %s: %w", dumpPath, err)
+	}
+	defer file.Close()
+
+	args := []string{"exec", "-i"}
+	if creds.Password != "" {
+		pgpassPath, cleanupPgpass, err := stageContainerPgpass(ctx, runner, dst.ID, filepath.Dir(dumpPath), creds.Password)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := cleanupPgpass(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: %v; the file holds the postgres database password, remove it manually\n", err)
+			}
+		}()
+		args = append(args, "-e", "PGPASSFILE="+pgpassPath)
+	}
+	args = append(args, dst.ID, "pg_restore", "-w",
+		"-U", creds.User,
+		"-d", creds.Database,
+		"--clean", "--if-exists", "--no-owner", "--no-acl",
+		"--single-transaction", "--exit-on-error",
+	)
+	if restoreListPath != "" {
+		args = append(args, "-L", restoreListPath)
+	}
+	return runner.Run(ctx, file, nil, args...)
 }
 
 func recordMigratedStoreMounts(actx *applyContext, appName string, app preparer.AppPlan, service string, container dockerContainer) error {
@@ -1077,17 +1374,19 @@ func isSupabaseRealtimePublicationListLine(fields []string) bool {
 	return len(fields) > 5 && fields[3] == "PUBLICATION" && fields[4] == "-" && fields[5] == "supabase_realtime"
 }
 
-// waitPostgresReady polls pg_isready inside the target container so the
-// restore step does not race compose.deploy bringing up the database.
+// waitPostgresReady polls pg_isready over loopback TCP inside the target
+// container. the postgres entrypoint runs init scripts against a
+// socket-only temporary server, so a socket probe would let the restore
+// race those scripts; only the final server accepts TCP.
 func waitPostgresReady(ctx context.Context, runner dockerRunner, containerID string, creds postgresCreds) error {
 	deadline := time.Now().Add(targetDiscoveryTimeout)
 	for {
-		args := []string{"exec", containerID, "pg_isready", "-q", "-U", creds.User, "-d", creds.Database}
+		args := []string{"exec", containerID, "pg_isready", "-q", "-h", "127.0.0.1", "-U", creds.User, "-d", creds.Database}
 		if err := runner.Run(ctx, nil, nil, args...); err == nil {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("target postgres %s was not ready after %s", containerID, targetDiscoveryTimeout)
+			return fmt.Errorf("target postgres %s did not accept TCP connections on 127.0.0.1 after %s; the restore needs the final server, not the entrypoint's socket-only init server", containerID, targetDiscoveryTimeout)
 		}
 		select {
 		case <-ctx.Done():

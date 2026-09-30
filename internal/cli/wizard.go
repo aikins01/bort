@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	neturl "net/url"
 	"os"
 	"sort"
 	"strings"
@@ -17,7 +18,7 @@ import (
 func runWizard(ctx context.Context, run loadedMigrationRun, stdin io.Reader, stdout, stderr io.Writer) error {
 	current := run
 	if len(current.Applied.Steps) > 0 || current.Run.LiveAppliedAt != nil || current.Run.CommitStartedAt != nil || current.Run.CommittedAt != nil || current.Run.RollbackStartedAt != nil || current.Run.RolledBackAt != nil || current.Run.PurgedAt != nil {
-		writeAppFirstCockpit(stdout, current)
+		writeAppFirstCockpitContext(ctx, stdout, current)
 		return nil
 	}
 	for {
@@ -51,8 +52,11 @@ func runWizard(ctx context.Context, run loadedMigrationRun, stdin io.Reader, std
 		current = refreshed
 	}
 
-	writeAppFirstCockpit(stdout, current)
-	fmt.Fprintf(stdout, "Live apply is explicit. Run `%s` when you are ready.\n", liveApplyCommand(current))
+	summary := summarizeMigrationRunContext(ctx, current)
+	writeAppFirstCockpitSummary(stdout, current, summary)
+	if migrationRunPhaseWithNext(current, summary.Next) == "ready" {
+		fmt.Fprintf(stdout, "Live apply is explicit. Run `%s` when you are ready.\n", liveApplyCommand(current))
+	}
 	return nil
 }
 
@@ -219,7 +223,12 @@ func markReviewDecisionDone(run loadedMigrationRun, decision runDecision, at tim
 
 var errDokploySetupSkipped = errors.New("dokploy setup skipped")
 
-func promptInstallAndBootstrapDokploy(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, defaultURL string, reason error) error {
+type dokploySetupLockOptions struct {
+	retain     **applyLock
+	revalidate func() error
+}
+
+func promptInstallAndBootstrapDokploy(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, defaultURL string, reason error, lockOptions dokploySetupLockOptions) error {
 	install := false
 	if strings.TrimSpace(defaultURL) == "" {
 		defaultURL = "http://127.0.0.1:3030"
@@ -240,7 +249,7 @@ func promptInstallAndBootstrapDokploy(ctx context.Context, stdin io.Reader, stdo
 		fmt.Fprintf(stdout, "Skipped Dokploy setup. Run `%s` again when you're ready.\n", bortCommand(""))
 		return errDokploySetupSkipped
 	}
-	return promptInlineInitTargetWithOptions(ctx, stdin, stdout, stderr, inlineInitTargetOptions{Install: true, DefaultURL: defaultURL})
+	return promptInlineInitTargetWithOptions(ctx, stdin, stdout, stderr, inlineInitTargetOptions{Install: true, DefaultURL: defaultURL, Lock: lockOptions})
 }
 
 func promptInlineInitTarget(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -250,10 +259,11 @@ func promptInlineInitTarget(ctx context.Context, stdin io.Reader, stdout, stderr
 type inlineInitTargetOptions struct {
 	Install    bool
 	DefaultURL string
+	Lock       dokploySetupLockOptions
 }
 
 func promptInlineInitTargetWithOptions(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, opts inlineInitTargetOptions) error {
-	var url, email string
+	var url, email, authSecretBackup string
 	if state, err := readBortState(defaultStatePath()); err == nil {
 		if creds, ok := state.Targets["dokploy"]; ok {
 			url = creds.URL
@@ -263,10 +273,24 @@ func promptInlineInitTargetWithOptions(ctx context.Context, stdin io.Reader, std
 	if strings.TrimSpace(opts.DefaultURL) != "" {
 		url = opts.DefaultURL
 	}
-	form := huh.NewForm(huh.NewGroup(
+	authSecretBackup = strings.TrimSpace(os.Getenv(envDokployAuthBackup))
+	fields := []huh.Field{
 		huh.NewInput().Title("Dokploy base URL").Placeholder("http://127.0.0.1:3030").Value(&url),
 		huh.NewInput().Title("Coolify admin email").Placeholder("press enter to choose from detected admins").Value(&email),
-	))
+	}
+	if opts.Install {
+		fields = append(fields, huh.NewInput().
+			Title("Authentication-secret backup path (encrypted/off-host; retain it)").
+			Placeholder("/mnt/encrypted-backup/dokploy-auth-secret").
+			Validate(func(path string) error {
+				if validateAuthSecretBackupPath(path) != nil {
+					return errors.New("Enter an absolute backup path")
+				}
+				return nil
+			}).
+			Value(&authSecretBackup))
+	}
+	form := huh.NewForm(huh.NewGroup(fields...))
 	if err := form.Run(); err != nil {
 		return err
 	}
@@ -276,12 +300,21 @@ func promptInlineInitTargetWithOptions(ctx context.Context, stdin io.Reader, std
 	}
 	if url != "" {
 		args = append(args, "--dokploy-url", url)
+		if parsed, err := neturl.Parse(url); opts.Install && err == nil && parsed.Port() != "" {
+			args = append(args, "--install-port", parsed.Port())
+		}
 	}
 	if email != "" {
 		args = append(args, "--coolify-email", email)
 	}
+	if authSecretBackup != "" {
+		args = append(args, "--auth-secret-backup", authSecretBackup)
+	}
 	fmt.Fprintln(stdout, "Setting up Dokploy...")
-	return runInitTarget(ctx, args, stdin, stdout, stderr)
+	deps := defaultInitTargetDeps(stderr)
+	deps.retainLiveOperationLock = opts.Lock.retain
+	deps.revalidateAfterTargetLock = opts.Lock.revalidate
+	return runInitTargetWith(ctx, args, stdin, stdout, stderr, deps)
 }
 
 type appStorePair struct {

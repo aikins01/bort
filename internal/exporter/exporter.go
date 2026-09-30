@@ -27,16 +27,18 @@ const (
 )
 
 type Summary struct {
-	OutputDir   string       `json:"outputDir"`
-	GeneratedAt time.Time    `json:"generatedAt"`
-	Source      string       `json:"source"`
-	EnvMode     string       `json:"envMode,omitempty"`
-	Apps        []AppSummary `json:"apps"`
+	OutputDir            string       `json:"outputDir"`
+	GeneratedAt          time.Time    `json:"generatedAt"`
+	Source               string       `json:"source"`
+	SourceDockerEngineID string       `json:"sourceDockerEngineId,omitempty"`
+	EnvMode              string       `json:"envMode,omitempty"`
+	Apps                 []AppSummary `json:"apps"`
 }
 
 type AppSummary struct {
 	Name             string        `json:"name"`
 	Directory        string        `json:"directory"`
+	Platform         string        `json:"platform,omitempty"`
 	Role             string        `json:"role,omitempty"`
 	ProjectGroup     *ProjectGroup `json:"projectGroup,omitempty"`
 	PrivateEnvValues bool          `json:"privateEnvValues,omitempty"`
@@ -68,10 +70,11 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 	}
 
 	summary := Summary{
-		OutputDir:   opts.OutputDir,
-		GeneratedAt: time.Now().UTC(),
-		Source:      m.Source.Platform,
-		EnvMode:     exportEnvMode(opts),
+		OutputDir:            opts.OutputDir,
+		GeneratedAt:          time.Now().UTC(),
+		Source:               m.Source.Platform,
+		SourceDockerEngineID: m.Source.DockerEngineID,
+		EnvMode:              exportEnvMode(opts),
 	}
 	projectGroups := projectGroupsForApps(m, apps)
 
@@ -92,6 +95,7 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 		summary.Apps = append(summary.Apps, AppSummary{
 			Name:             app.Name,
 			Directory:        filepath.ToSlash(dirName),
+			Platform:         app.Platform,
 			Role:             migrationRole(app),
 			ProjectGroup:     projectGroups[appKey(app)],
 			PrivateEnvValues: opts.IncludeEnvValues,
