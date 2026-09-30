@@ -88,9 +88,14 @@ func TestFixCommandOnlyReturnsCommandsThatPersistState(t *testing.T) {
 }
 
 func TestRouteIssueNextStepDistinguishesBlockedMappings(t *testing.T) {
-	blocked := appIssue{Kind: issueKindRoute, Items: []runDecisionItem{{Code: preparer.GateDomainServiceNotInCompose}}}
-	if got := blocked.NextStep(); got != "correct the source route-to-Compose-service mapping, then re-plan or scan a new run" {
-		t.Fatalf("unexpected blocked route guidance: %q", got)
+	wantBlocked := "correct the route-to-Compose-service mapping in the bundle and re-plan, or correct it at the source and scan a new run"
+	for _, blocked := range []appIssue{
+		{Kind: issueKindRoute, Items: []runDecisionItem{{Code: preparer.GateRoutesNone}, {Code: preparer.GateDomainServiceMissing}}},
+		{Kind: issueKindRoute, Items: []runDecisionItem{{Code: preparer.GateDomainServiceNotInCompose}}},
+	} {
+		if got := blocked.NextStep(); got != wantBlocked {
+			t.Fatalf("unexpected blocked route guidance: %q", got)
+		}
 	}
 	review := appIssue{Kind: issueKindRoute, Items: []runDecisionItem{{Code: preparer.GateRoutesNone}}}
 	if got := review.NextStep(); got != "confirm the route host and service in Dokploy before live apply" {

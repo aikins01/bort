@@ -99,7 +99,7 @@ func (i appIssue) NextStep() string {
 	case issueKindRoute:
 		for _, item := range i.Items {
 			if item.Code == preparer.GateDomainServiceMissing || item.Code == preparer.GateDomainServiceNotInCompose {
-				return "correct the source route-to-Compose-service mapping, then re-plan or scan a new run"
+				return "correct the route-to-Compose-service mapping in the bundle and re-plan, or correct it at the source and scan a new run"
 			}
 		}
 		return "confirm the route host and service in Dokploy before live apply"

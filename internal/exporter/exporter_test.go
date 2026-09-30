@@ -129,7 +129,11 @@ func TestAppSummaryEffectiveComposeSourceSupportsLegacyIndexes(t *testing.T) {
 	if got, err := generated.EffectiveComposeSource(); err != nil || got != ComposeSourceGenerated {
 		t.Fatalf("expected legacy generated compose provenance, got %q, error %v", got, err)
 	}
-	if got, err := (AppSummary{}).EffectiveComposeSource(); err != nil || got != ComposeSourceRaw {
+	var raw AppSummary
+	if err := json.Unmarshal([]byte(`{"warnings":["preserved Coolify service magic env vars for review: SERVICE_URL_API"]}`), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := raw.EffectiveComposeSource(); err != nil || got != ComposeSourceRaw {
 		t.Fatalf("expected legacy raw compose provenance, got %q, error %v", got, err)
 	}
 }

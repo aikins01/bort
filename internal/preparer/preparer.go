@@ -422,7 +422,6 @@ func composeServiceNames(contents []byte) (map[string]struct{}, error) {
 }
 
 func preparedServiceName(serviceName string, rawServiceNamesByContainer map[string]string, composeSource string, composeServices map[string]struct{}) (string, bool) {
-	serviceName = strings.TrimSpace(serviceName)
 	switch composeSource {
 	case ComposeSourceRaw, ComposeSourceGenerated:
 	default:
