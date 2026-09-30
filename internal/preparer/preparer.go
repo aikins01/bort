@@ -287,7 +287,10 @@ func planApp(bundleDir, target string, app exporter.AppSummary) (AppPlan, error)
 	}
 
 	plan := AppPlan{Name: app.Name, Directory: app.Directory, Platform: app.Platform, Role: app.Role, ProjectGroup: projectGroup(app.ProjectGroup), Status: StatusGreen, Readiness: ReadinessReadyToCreate}
-	plan.Resources = resourceSpecs(app, appDir, topology, composeSource)
+	plan.Resources, err = resourceSpecs(app, appDir, topology, composeSource)
+	if err != nil {
+		return AppPlan{}, fmt.Errorf("read compose services for %s: %w", app.Name, err)
+	}
 	addReadinessGates(&plan, topology)
 	plan.add(SeverityInfo, "compose", fmt.Sprintf("would create %s compose app from compose.yaml", target))
 	addSourceControlActions(&plan)
@@ -318,7 +321,7 @@ func projectGroup(group *exporter.ProjectGroup) *ProjectGroup {
 	return &ProjectGroup{Name: group.Name, Environment: group.Environment, Source: group.Source}
 }
 
-func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Topology, composeSource string) ResourceSpecs {
+func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Topology, composeSource string) (ResourceSpecs, error) {
 	resources := ResourceSpecs{
 		App:      appResource(app.Name, appDir, composeSource),
 		EnvFiles: envFileResources(appDir, app.PrivateEnvValues),
@@ -334,10 +337,35 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 			ContainerName: service.ContainerName,
 		})
 	}
-	composeServices := composeServiceNames(filepath.Join(appDir, resources.App.ComposePath))
+	composeServices := map[string]struct{}{}
+	if !resources.App.ComposeMissing {
+		var err error
+		composeServices, err = composeServiceNames(filepath.Join(appDir, resources.App.ComposePath))
+		if err != nil {
+			return ResourceSpecs{}, err
+		}
+	}
+	rawServiceNamesByContainer := make(map[string]string, len(resources.SourceServices))
+	for _, sourceService := range resources.SourceServices {
+		containerName := strings.TrimSpace(sourceService.ContainerName)
+		serviceName := strings.TrimSpace(sourceService.ServiceName)
+		if containerName == "" {
+			continue
+		}
+		if _, exists := rawServiceNamesByContainer[containerName]; exists {
+			continue
+		}
+		if _, exists := composeServices[serviceName]; exists {
+			rawServiceNamesByContainer[containerName] = serviceName
+		}
+	}
 
 	for _, route := range topology.Routes {
-		serviceName, serviceExists := preparedServiceName(route.ServiceName, resources.SourceServices, composeSource, composeServices)
+		serviceName := strings.TrimSpace(route.ServiceName)
+		serviceExists := true
+		if !resources.App.ComposeMissing {
+			serviceName, serviceExists = preparedServiceName(serviceName, rawServiceNamesByContainer, composeSource, composeServices)
+		}
 		readiness := ReadinessReadyToCreate
 		if strings.TrimSpace(route.Host) == "" {
 			readiness = ReadinessNeedsInput
@@ -374,45 +402,53 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 		resources.LinkedResources = append(resources.LinkedResources, linkedResourceCandidate(link))
 	}
 
-	return resources
+	return resources, nil
 }
 
-func composeServiceNames(path string) map[string]struct{} {
+func composeServiceNames(path string) (map[string]struct{}, error) {
 	contents, err := os.ReadFile(path)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var document struct {
 		Services map[string]yaml.Node `yaml:"services"`
 	}
 	if err := yaml.Unmarshal(contents, &document); err != nil {
-		return nil
+		return nil, err
 	}
 	names := make(map[string]struct{}, len(document.Services))
 	for name := range document.Services {
 		names[name] = struct{}{}
 	}
-	return names
+	return names, nil
 }
 
-func preparedServiceName(serviceName string, sourceServices []SourceServiceRef, composeSource string, composeServices map[string]struct{}) (string, bool) {
+func preparedServiceName(serviceName string, rawServiceNamesByContainer map[string]string, composeSource string, composeServices map[string]struct{}) (string, bool) {
 	serviceName = strings.TrimSpace(serviceName)
 	if serviceName == "" && len(composeServices) == 1 {
 		for name := range composeServices {
 			return name, true
 		}
 	}
+	if composeSource == ComposeSourceGenerated {
+		if _, ok := composeServices[serviceName]; ok {
+			return serviceName, true
+		}
+		generatedName := planutil.Slug(serviceName)
+		if generatedName == "" && serviceName != "" {
+			generatedName = "app"
+		}
+		if _, ok := composeServices[generatedName]; ok {
+			return generatedName, true
+		}
+		return serviceName, false
+	}
 	if composeSource != ComposeSourceRaw {
 		_, ok := composeServices[serviceName]
 		return serviceName, ok
 	}
-	for _, sourceService := range sourceServices {
-		if sourceService.ContainerName != serviceName {
-			continue
-		}
-		if _, ok := composeServices[sourceService.ServiceName]; ok {
-			return sourceService.ServiceName, true
-		}
+	if mappedService, ok := rawServiceNamesByContainer[serviceName]; ok {
+		return mappedService, true
 	}
 	_, ok := composeServices[serviceName]
 	return serviceName, ok

@@ -252,6 +252,47 @@ func TestPlanPersistsUniqueComposeServiceForEmptyRouteMapping(t *testing.T) {
 	assertNoGate(t, app, GateDomainServiceMissing)
 }
 
+func TestPlanPersistsSluggedGeneratedComposeService(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:     "blog",
+		Services: []manifest.Service{{Name: "Ghost Blog", Image: "example/blog"}},
+		Routes:   []manifest.Route{{Host: "blog.example.com", ServiceName: "Ghost Blog", Port: "3000"}},
+	}}}
+	if _, err := exporter.Export(m, exporter.Options{OutputDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := result.Apps[0]
+	if result.Status != StatusGreen || app.Readiness != ReadinessReadyToCreate || len(app.Resources.Domains) != 1 || app.Resources.Domains[0].ServiceName != "ghost-blog" {
+		t.Fatalf("expected generated Compose service name to be persisted, got %#v", app)
+	}
+}
+
+func TestPlanReportsMalformedCompose(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:     "api",
+		Compose:  &manifest.ComposeSource{Raw: "services:\n  api:\n    image: example/api\n"},
+		Services: []manifest.Service{{Name: "api", Image: "example/api"}},
+		Routes:   []manifest.Route{{Host: "api.example.com", ServiceName: "api", Port: "8080"}},
+	}}}
+	summary, err := exporter.Export(m, exporter.Options{OutputDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(dir, summary.Apps[0].Directory, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte("services:\n  api: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Plan(Options{BundleDir: dir, Target: "dokploy"}); err == nil || !strings.Contains(err.Error(), "read compose services for api") {
+		t.Fatalf("expected malformed Compose error, got %v", err)
+	}
+}
+
 func TestPlanBlocksEmptyRouteMappingWithMultipleComposeServices(t *testing.T) {
 	dir := t.TempDir()
 	m := manifest.Manifest{Apps: []manifest.App{{

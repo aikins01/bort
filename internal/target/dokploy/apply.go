@@ -1842,7 +1842,7 @@ func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServi
 		return route, nil
 	}
 	if composeSource == "" {
-		if serviceName, ok := inferComposeServiceForRoute(route, services, sourceServices, composeSource); ok {
+		if serviceName, ok := inferComposeServiceForRoute(route, services, sourceServices); ok {
 			route.ServiceName = serviceName
 			return route, nil
 		}
@@ -1852,12 +1852,16 @@ func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServi
 		available = append(available, name)
 	}
 	sort.Strings(available)
+	availableServices := strings.Join(available, ", ")
+	if availableServices == "" {
+		availableServices = "no services"
+	}
 	return gateway.Route{}, fmt.Errorf("route %s points at service %q, but the Dokploy Compose file has %s; rescan before retrying so Bort can refresh the route mapping",
-		planutilFallback(route.Host, "unknown"), route.ServiceName, strings.Join(available, ", "))
+		planutilFallback(route.Host, "unknown"), route.ServiceName, availableServices)
 }
 
-func inferComposeServiceForRoute(route gateway.Route, services map[string]composeServiceSummary, sourceServices []preparer.SourceServiceRef, composeSource string) (string, bool) {
-	for _, candidate := range routeServiceNameCandidates(route, sourceServices, composeSource) {
+func inferComposeServiceForRoute(route gateway.Route, services map[string]composeServiceSummary, sourceServices []preparer.SourceServiceRef) (string, bool) {
+	for _, candidate := range routeServiceNameCandidates(route, sourceServices) {
 		if _, ok := services[candidate]; ok {
 			return candidate, true
 		}
@@ -1882,7 +1886,7 @@ func inferComposeServiceForRoute(route gateway.Route, services map[string]compos
 	return "", false
 }
 
-func routeServiceNameCandidates(route gateway.Route, sourceServices []preparer.SourceServiceRef, composeSource string) []string {
+func routeServiceNameCandidates(route gateway.Route, sourceServices []preparer.SourceServiceRef) []string {
 	candidates := []string{}
 	add := func(value string) {
 		value = strings.TrimSpace(value)
@@ -1896,15 +1900,12 @@ func routeServiceNameCandidates(route gateway.Route, sourceServices []preparer.S
 		}
 		candidates = append(candidates, value)
 	}
-	if composeSource != preparer.ComposeSourceRaw {
-		add(route.ServiceName)
-	}
+	add(route.ServiceName)
 	for _, sourceService := range sourceServices {
 		if sourceService.ContainerName == route.ServiceName {
 			add(sourceService.ServiceName)
 		}
 	}
-	add(route.ServiceName)
 	add(stripCoolifyGeneratedServiceSuffix(route.ServiceName))
 	if fromSource := serviceNameFromTraefikRouterSource(route.Source); fromSource != "" {
 		add(fromSource)
