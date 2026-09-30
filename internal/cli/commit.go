@@ -233,7 +233,7 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 	if err := markRunCommitStartedLocked(run.Run); err != nil {
 		return fmt.Errorf("record source retirement start: %w", err)
 	}
-	fmt.Fprintf(stderr, "commit apply: run %s; planned %d step(s) to retire source\n", run.Run.Name, len(plan.Steps))
+	fmt.Fprintf(stderr, "commit apply: run %s; planned %s to retire source\n", run.Run.Name, pluralize(len(plan.Steps), "step", "steps"))
 	if err := client.Apply(ctx, plan); err != nil {
 		return err
 	}

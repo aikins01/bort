@@ -1278,7 +1278,7 @@ func TestResolveRouteForComposeUsesCurrentServiceByPort(t *testing.T) {
 		Port:        "8080",
 		Source:      "traefik.http.routers.https-0-stack-api.rule",
 	}
-	resolved, err := resolveRouteForCompose(route, compose)
+	resolved, err := resolveRouteForCompose(route, compose, nil)
 	if err != nil {
 		t.Fatalf("resolveRouteForCompose: %v", err)
 	}
@@ -1306,13 +1306,37 @@ func TestResolveRouteForComposeStripsGeneratedCoolifyServiceSuffix(t *testing.T)
 			Host:        "app.example.com",
 			ServiceName: tc.name,
 		}
-		resolved, err := resolveRouteForCompose(route, compose)
+		resolved, err := resolveRouteForCompose(route, compose, nil)
 		if err != nil {
 			t.Fatalf("resolveRouteForCompose(%s): %v", tc.name, err)
 		}
 		if resolved.ServiceName != tc.want {
 			t.Fatalf("expected generated service suffix stripped to %q, got %#v", tc.want, resolved)
 		}
+	}
+}
+
+func TestResolveRouteForComposeUsesReviewedSourceServiceMapping(t *testing.T) {
+	route := gateway.Route{Host: "stateless.example.com", ServiceName: "project-apiworker-1"}
+	sourceServices := []preparer.SourceServiceRef{{
+		ServiceName:   "apiworker",
+		ContainerName: "project-apiworker-1",
+	}}
+
+	resolved, err := resolveRouteForCompose(route, "services:\n  project:\n    image: example/project\n  apiworker:\n    image: example/worker\n", sourceServices)
+	if err != nil {
+		t.Fatalf("resolve route through source service mapping: %v", err)
+	}
+	if resolved.ServiceName != "apiworker" {
+		t.Fatalf("expected source container mapping to outrank generated-name heuristic, got %#v", resolved)
+	}
+
+	resolved, err = resolveRouteForCompose(route, "services:\n  project-apiworker-1:\n    image: example/worker\n", sourceServices)
+	if err != nil {
+		t.Fatalf("resolve exact generated Compose service: %v", err)
+	}
+	if resolved.ServiceName != "project-apiworker-1" {
+		t.Fatalf("expected exact Compose service to take precedence, got %#v", resolved)
 	}
 }
 

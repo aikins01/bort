@@ -1912,7 +1912,7 @@ func TestAttachProgressIncludesStandaloneProxyCleanup(t *testing.T) {
 	}
 	var output bytes.Buffer
 	writeAttachTextProgress(&output, progress, progress.Total, "recorded")
-	if !strings.Contains(output.String(), "2/2 step(s) recorded") {
+	if !strings.Contains(output.String(), "2 of 2 steps recorded") {
 		t.Fatalf("standalone cleanup rendered invalid progress: %q", output.String())
 	}
 	failed, ok := latestAttachFailure(steps, applied, now)

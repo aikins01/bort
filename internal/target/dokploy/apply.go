@@ -797,7 +797,7 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 		started := StepProgress{Index: index, Total: total, Step: step, Status: StepStatusStarted}
 		if plan.BeforeStep != nil {
 			if err := (*plan.BeforeStep)(started); err != nil {
-				stepErr := fmt.Errorf("before dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
+				stepErr := fmt.Errorf("before Dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
 				return errors.Join(stepErr, c.bestEffortResume(ctx, actx, plan, total, pausedApps, coolifyProxyStopped, false))
 			}
 		}
@@ -853,7 +853,7 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 			if isUnsafeSourceResumeError(err) {
 				resumePausedApps = nil
 			}
-			stepErr := fmt.Errorf("dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
+			stepErr := fmt.Errorf("Dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
 			cleanupErr := c.bestEffortResume(ctx, actx, plan, total, resumePausedApps, coolifyProxyStopped, isUnsafeTargetResumeError(err))
 			if requiresNewRun && sourceOwned && cleanupErr == nil {
 				refused.RequiresNewRun = true
@@ -1715,7 +1715,7 @@ func (c *Client) applyInstallGateway(ctx context.Context, actx *applyContext, st
 	if err != nil {
 		return err
 	}
-	route, err = resolveRouteForCompose(route, composeFile)
+	route, err = resolveRouteForCompose(route, composeFile, sourceServicesForApp(actx.plan, step.App))
 	if err != nil {
 		return err
 	}
@@ -1742,7 +1742,7 @@ func (c *Client) applyActivateRoutes(ctx context.Context, actx *applyContext, st
 		return err
 	}
 	for _, route := range cutoverRoutesForApp(actx.plan.Cutover, step.App) {
-		resolved, err := resolveRouteForCompose(route, composeFile)
+		resolved, err := resolveRouteForCompose(route, composeFile, sourceServicesForApp(actx.plan, step.App))
 		if err != nil {
 			return err
 		}
@@ -1809,7 +1809,15 @@ type composeServiceSummary struct {
 	Ports map[string]struct{}
 }
 
-func resolveRouteForCompose(route gateway.Route, composeFile string) (gateway.Route, error) {
+func sourceServicesForApp(plan Plan, appName string) []preparer.SourceServiceRef {
+	app, ok := findPrepareApp(plan.Prepare, appName)
+	if !ok {
+		return nil
+	}
+	return app.Resources.SourceServices
+}
+
+func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServices []preparer.SourceServiceRef) (gateway.Route, error) {
 	services, err := composeServiceSummaries(composeFile)
 	if err != nil {
 		return gateway.Route{}, err
@@ -1820,7 +1828,7 @@ func resolveRouteForCompose(route gateway.Route, composeFile string) (gateway.Ro
 	if _, ok := services[route.ServiceName]; ok {
 		return route, nil
 	}
-	if serviceName, ok := inferComposeServiceForRoute(route, services); ok {
+	if serviceName, ok := inferComposeServiceForRoute(route, services, sourceServices); ok {
 		route.ServiceName = serviceName
 		return route, nil
 	}
@@ -1833,8 +1841,8 @@ func resolveRouteForCompose(route gateway.Route, composeFile string) (gateway.Ro
 		planutilFallback(route.Host, "unknown"), route.ServiceName, strings.Join(available, ", "))
 }
 
-func inferComposeServiceForRoute(route gateway.Route, services map[string]composeServiceSummary) (string, bool) {
-	for _, candidate := range routeServiceNameCandidates(route) {
+func inferComposeServiceForRoute(route gateway.Route, services map[string]composeServiceSummary, sourceServices []preparer.SourceServiceRef) (string, bool) {
+	for _, candidate := range routeServiceNameCandidates(route, sourceServices) {
 		if _, ok := services[candidate]; ok {
 			return candidate, true
 		}
@@ -1859,7 +1867,7 @@ func inferComposeServiceForRoute(route gateway.Route, services map[string]compos
 	return "", false
 }
 
-func routeServiceNameCandidates(route gateway.Route) []string {
+func routeServiceNameCandidates(route gateway.Route, sourceServices []preparer.SourceServiceRef) []string {
 	candidates := []string{}
 	add := func(value string) {
 		value = strings.TrimSpace(value)
@@ -1874,6 +1882,11 @@ func routeServiceNameCandidates(route gateway.Route) []string {
 		candidates = append(candidates, value)
 	}
 	add(route.ServiceName)
+	for _, sourceService := range sourceServices {
+		if sourceService.ContainerName == route.ServiceName {
+			add(sourceService.ServiceName)
+		}
+	}
 	add(stripCoolifyGeneratedServiceSuffix(route.ServiceName))
 	if fromSource := serviceNameFromTraefikRouterSource(route.Source); fromSource != "" {
 		add(fromSource)

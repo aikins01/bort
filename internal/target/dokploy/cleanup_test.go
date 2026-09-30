@@ -961,13 +961,22 @@ func (r *cleanupDockerRunner) Output(ctx context.Context, args ...string) ([]byt
 	return r.fakeDockerRunner.Output(ctx, args...)
 }
 
-func TestDockerMissingResourceClassifierRejectsInfrastructureErrors(t *testing.T) {
-	if isDockerVolumeOrNetworkMissingErr(errors.New(`exec: "docker": executable file not found in $PATH`)) {
-		t.Fatal("missing Docker executable was classified as an absent resource")
+func TestDockerMissingResourceClassifier(t *testing.T) {
+	for _, err := range []error{
+		errors.New(`exec: "docker": executable file not found in $PATH`),
+		errors.New("Error response from daemon: plugin local not found"),
+		errors.New("Error response from daemon: volume api-data: error looking up volume plugin local: plugin local not found"),
+	} {
+		if isDockerVolumeOrNetworkMissingErr(err) {
+			t.Fatalf("non-resource failure was classified as an absent resource: %v", err)
+		}
 	}
 	for _, err := range []error{
 		errors.New("Error response from daemon: remove api-data: no such volume"),
+		errors.New("Error response from daemon: volume api-data not found"),
+		errors.New("exit status 1: Error response from daemon: volume api-data not found"),
 		errors.New("Error response from daemon: network api-net not found"),
+		errors.New("Error response from daemon: network not found"),
 	} {
 		if !isDockerVolumeOrNetworkMissingErr(err) {
 			t.Fatalf("expected missing Docker resource classification for %v", err)

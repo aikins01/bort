@@ -239,7 +239,14 @@ func TestAppliedFooterCountsOkAndError(t *testing.T) {
 		{Index: 2, Status: "skipped"},
 	}}
 	got := appliedFooter(applied)
-	if got != "Applied: 3 step(s) recorded · 2 ok · 1 failed" {
+	if got != "Applied: 3 steps recorded · 2 ok · 1 failed" {
+		t.Fatalf("unexpected footer: %q", got)
+	}
+}
+
+func TestAppliedFooterUsesSingularStep(t *testing.T) {
+	applied := runApplied{Steps: []appliedStep{{Index: 0, Status: "ok"}}}
+	if got := appliedFooter(applied); got != "Applied: 1 step recorded · 1 ok" {
 		t.Fatalf("unexpected footer: %q", got)
 	}
 }

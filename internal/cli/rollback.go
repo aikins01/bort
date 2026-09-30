@@ -271,7 +271,7 @@ func applyRollbackFromArgs(ctx context.Context, runRef, confirm string, stderr i
 	if err := markRunRollbackStartedLocked(run.Run); err != nil {
 		return fmt.Errorf("record rollback start: %w", err)
 	}
-	fmt.Fprintf(stderr, "rollback live: run %s; planned %d step(s) to return traffic to the source\n", run.Run.Name, len(plan.Steps))
+	fmt.Fprintf(stderr, "rollback live: run %s; planned %s to return traffic to the source\n", run.Run.Name, pluralize(len(plan.Steps), "step", "steps"))
 	if err := client.Apply(ctx, plan); err != nil {
 		return err
 	}

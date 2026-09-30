@@ -521,7 +521,7 @@ func appliedFooter(applied runApplied) string {
 			errs++
 		}
 	}
-	parts := []string{fmt.Sprintf("Applied: %d step(s) recorded", len(applied.Steps))}
+	parts := []string{fmt.Sprintf("Applied: %s recorded", pluralize(len(applied.Steps), "step", "steps"))}
 	if ok > 0 {
 		parts = append(parts, fmt.Sprintf("%d ok", ok))
 	}
