@@ -67,9 +67,9 @@ func TestRunWithoutArgsCreatesRunFromDefaultBundle(t *testing.T) {
 	workDir := t.TempDir()
 	t.Chdir(workDir)
 	writeTestBundle(t, filepath.Join(workDir, "bort-bundle"), manifest.Manifest{
-		Source: manifest.Source{Platform: "docker"},
+		Source: manifest.Source{Platform: "docker", DockerEngineID: "engine-reviewed"},
 		Apps: []manifest.App{
-			{Name: "api", Services: []manifest.Service{{Name: "api", Image: "example/api:latest"}}, Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "api"}}},
+			{Name: "api", Services: []manifest.Service{{ID: "0123456789ab", Name: "api", Image: "example/api:latest"}}, Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "api"}}},
 		},
 	})
 
@@ -80,12 +80,12 @@ func TestRunWithoutArgsCreatesRunFromDefaultBundle(t *testing.T) {
 	}
 
 	output := stdout.String()
-	for _, want := range []string{"local bundle → dokploy", "api", "READY", "workspace:"} {
+	for _, want := range []string{"local bundle → dokploy", "api", "INSPECTION ONLY", "imported bundle", "workspace:"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected guide output to contain %q, got:\n%s", want, output)
 		}
 	}
-	for _, notWant := range []string{"No migration run found", "Migration run created:", "Artifacts:"} {
+	for _, notWant := range []string{"No migration run found", "Migration run created:", "Artifacts:", "migrate --live"} {
 		if strings.Contains(output, notWant) {
 			t.Fatalf("did not expect guide output to contain %q, got:\n%s", notWant, output)
 		}
@@ -100,9 +100,9 @@ func TestRunWithoutArgsResumesLatestRun(t *testing.T) {
 	workDir := t.TempDir()
 	t.Chdir(workDir)
 	writeTestBundle(t, filepath.Join(workDir, "bort-bundle"), manifest.Manifest{
-		Source: manifest.Source{Platform: "docker"},
+		Source: manifest.Source{Platform: "docker", DockerEngineID: "engine-reviewed"},
 		Apps: []manifest.App{
-			{Name: "api", Services: []manifest.Service{{Name: "api", Image: "example/api:latest"}}, Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "api"}}},
+			{Name: "api", Services: []manifest.Service{{ID: "0123456789ab", Name: "api", Image: "example/api:latest"}}, Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "api"}}},
 		},
 	})
 	runCommand(t, runMigrate, []string{"--bundle", "bort-bundle", "--run", "demo-app", "--observation-window", "0", "--rollback-window", "0"})
@@ -114,7 +114,7 @@ func TestRunWithoutArgsResumesLatestRun(t *testing.T) {
 	}
 
 	output := stdout.String()
-	for _, want := range []string{"local bundle → dokploy", "READY"} {
+	for _, want := range []string{"local bundle → dokploy", "INSPECTION ONLY"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected resumed guide output to contain %q, got:\n%s", want, output)
 		}
@@ -209,7 +209,9 @@ func TestRunWithoutArgsDoesNotRestoreStaleCurrentRunAfterRefresh(t *testing.T) {
 	enteredPath := filepath.Join(workDir, "guide-entered")
 	releasePath := filepath.Join(workDir, "guide-release")
 	dockerScript := `#!/bin/sh
-if [ "$1" = "ps" ]; then
+if [ "$1" = "info" ]; then
+  printf 'engine-guide\n'
+elif [ "$1" = "ps" ]; then
   touch "$BORT_GUIDE_ENTERED"
   while [ ! -f "$BORT_GUIDE_RELEASE" ]; do sleep 0.01; done
   printf 'reviewed-container\n'
@@ -532,7 +534,9 @@ func prepareScannableGuideRun(t *testing.T, workDir, runName string) loadedMigra
 	binDir := t.TempDir()
 	dockerPath := filepath.Join(binDir, "docker")
 	dockerScript := `#!/bin/sh
-if [ "$1" = "ps" ]; then
+if [ "$1" = "info" ]; then
+  printf 'engine-guide\n'
+elif [ "$1" = "ps" ]; then
   printf 'reviewed-container\n'
 elif [ "$1" = "inspect" ]; then
   printf '%s\n' '[{"Id":"reviewed-container","Name":"/reviewed","Image":"sha256:reviewed","Config":{"Image":"example/reviewed:v2","Labels":{}},"State":{"Status":"running"},"Mounts":[],"NetworkSettings":{"Ports":{},"Networks":{}}}]'

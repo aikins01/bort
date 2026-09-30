@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 
 	commitplan "github.com/aikins01/bort/internal/commit"
@@ -33,7 +32,7 @@ func runCommit(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs.StringVar(&format, "format", "text", "output format: text, json")
 	fs.StringVar(&outputPath, "output", "-", "output path, or - for stdout")
 	fs.StringVar(&cutoverPlanPath, "from-cutover", "", "read a prior cutover JSON plan artifact")
-	fs.BoolVar(&apply, "apply", false, "execute commit cleanup (stop source containers and coolify-proxy)")
+	fs.BoolVar(&apply, "apply", false, "retire the exact reviewed source containers when no source orchestrator can recreate them; Coolify sources need manual retirement and recover-authority --source-retired")
 	fs.StringVar(&runRef, "run", "", "run name under .bort/runs, or a run directory path")
 	fs.IntVar(&rollbackWindowSeconds, "rollback-window", commitplan.DefaultRollbackWindowSeconds, "rollback window in seconds")
 
@@ -189,17 +188,45 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 	if run.Run.RolledBackAt != nil {
 		return fmt.Errorf("commit refused: run %q was rolled back; the source is serving traffic again", run.Run.Name)
 	}
-	if run.Run.RollbackStartedAt != nil {
-		return fmt.Errorf("commit refused: rollback started for run %q; run `%s` to finish recovery", run.Run.Name, runScopedCommand(run, "rollback --live"))
+	if authorityRecoveryPending(run) {
+		return fmt.Errorf("commit refused: manual %s-authority recovery is incomplete; run `%s` to finish it", run.Run.ResolvedAuthority, pendingAuthorityRecoveryCommand(run))
+	}
+	if run.Run.RollbackStartedAt != nil && run.Run.ResolvedAuthority != dokployTrafficTarget {
+		return fmt.Errorf("commit refused: rollback started for run %q; %s", run.Run.Name, incompleteRollbackRecovery(run))
 	}
 	if err := requireLiveApplySucceeded(run); err != nil {
 		return err
 	}
-	client, err := resolveDokployClient(ctx, run.Run.Target, os.Stdin, stderr)
-	if err != nil {
-		return err
+	if run.Run.CommittedAt == nil && coolifySourceRetirementRequired(run) {
+		return fmt.Errorf("commit --apply refused: Coolify can replace a stopped source container through a queued or future deployment, and Bort cannot durably fence that orchestrator; %s", manualCoolifySourceRetirementAction(run))
 	}
+	targetLock, err := acquireDokployLiveOperationLock()
+	if err != nil {
+		return fmt.Errorf("lock Dokploy live operations: %w", err)
+	}
+	defer targetLock.Release()
 	plan := dokploy.PlanForCommit(run.Prepare, run.Cutover)
+	requiresHostOwner := planRequiresDokployHostOwner(run, plan)
+	if run.Run.CommittedAt != nil {
+		if err := markRunCommittedLocked(run.Run); err != nil {
+			return fmt.Errorf("reconfirm completed commit metadata durability: %w", err)
+		}
+		if requiresHostOwner {
+			if err := releaseDokployTargetOwner(run.Run); err != nil {
+				return fmt.Errorf("release completed commit host ownership: %w", err)
+			}
+		}
+		return nil
+	}
+	if err := verifyLocalSourceRun(ctx, run); err != nil {
+		return fmt.Errorf("commit refused on an unverified Docker source: %w", err)
+	}
+	if requiresHostOwner {
+		if err := ensureDokployTrafficTargetOwner(ctx, run, nil, false); err != nil {
+			return fmt.Errorf("commit refused: %w", err)
+		}
+	}
+	client := &dokploy.Client{}
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
 	plan.ApprovedPrepareDecisions = approvedPrepareDecisions(run)
@@ -213,7 +240,46 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 	if err := markRunCommittedLocked(run.Run); err != nil {
 		return fmt.Errorf("source retirement completed, but migration commit metadata could not be recorded: %w", err)
 	}
+	if requiresHostOwner {
+		if err := releaseDokployTargetOwner(run.Run); err != nil {
+			return fmt.Errorf("commit was recorded, but its Dokploy host ownership could not be released: %w", err)
+		}
+	}
 	return nil
+}
+
+func coolifySourceRetirementRequired(run loadedMigrationRun) bool {
+	switch strings.ToLower(strings.TrimSpace(run.Prepare.Source)) {
+	case "coolify-local", "coolify-local-traefik", "coolify-local-caddy":
+		return true
+	}
+	for _, app := range run.Prepare.Apps {
+		if strings.EqualFold(strings.TrimSpace(app.Platform), "coolify") {
+			return true
+		}
+	}
+	return false
+}
+
+func manualCoolifySourceRetirementAction(run loadedMigrationRun) string {
+	targets := "every reviewed source app"
+	for _, step := range dokploy.PlanForCommit(run.Prepare, run.Cutover).Steps {
+		if step.Kind == dokploy.StepStopCoolifyProxy {
+			targets += " and the source proxy"
+			break
+		}
+	}
+	return fmt.Sprintf("manually disable future Coolify deployments for the reviewed apps, retire %s, verify they remain retired, then run `%s`", targets, authorityRecoverySourceRetiredCommand(run))
+}
+
+func finishStartedAcceptanceAction(run loadedMigrationRun) string {
+	if authorityRecoveryPending(run) {
+		return fmt.Sprintf("run `%s` to finish the recorded manual %s-authority recovery", pendingAuthorityRecoveryCommand(run), run.Run.ResolvedAuthority)
+	}
+	if coolifySourceRetirementRequired(run) {
+		return manualCoolifySourceRetirementAction(run)
+	}
+	return fmt.Sprintf("run `%s` to finish acceptance", runScopedCommand(run, "commit --apply"))
 }
 
 func requireLiveApplySucceeded(run loadedMigrationRun) error {
@@ -229,10 +295,13 @@ func requireLiveApplySucceededForApps(run loadedMigrationRun, apps map[string]st
 }
 
 func requireLiveApplySucceededForAppsSkipping(run loadedMigrationRun, apps map[string]struct{}, skipKinds map[dokploy.StepKind]struct{}) error {
+	if run.Run.ResolvedAuthority == dokployTrafficTarget && run.Run.AuthorityResolvedAt != nil && run.Run.LiveAppliedAt != nil {
+		return nil
+	}
 	if run.Run.ApplyOutcomeRequired && run.Applied.SucceededAt == nil {
 		return fmt.Errorf("run %q has no successful live-apply outcome recorded; run `%s` first", run.Run.Name, liveApplyCommand(run))
 	}
-	live := dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
+	live := livePlanForApplied(run, run.Applied)
 	if len(live.Steps) == 0 {
 		return fmt.Errorf("run %q has no live apply steps; nothing to commit", run.Run.Name)
 	}
@@ -267,6 +336,9 @@ func requireLiveApplySucceededForAppsSkipping(run loadedMigrationRun, apps map[s
 	}
 	if checked == 0 {
 		return fmt.Errorf("run %q has no live apply steps for the selected purge scope", run.Run.Name)
+	}
+	if runMayHaveAmbiguousAuthority(run) {
+		return fmt.Errorf("run %q cannot prove writer or traffic authority; %s", run.Run.Name, authorityRecoveryInstruction(run))
 	}
 	return nil
 }

@@ -17,7 +17,7 @@ type applyLock struct {
 	overlapped windows.Overlapped
 }
 
-func acquireApplyLock(path string) (*applyLock, error) {
+func tryAcquireApplyLock(path string) (*applyLock, error) {
 	file, err := openLockFile(path, windows.OPEN_ALWAYS)
 	if err != nil {
 		return nil, err

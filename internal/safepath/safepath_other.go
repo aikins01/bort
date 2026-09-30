@@ -163,6 +163,10 @@ func writePrivateFileAtomicNoFollow(*os.File, string, []byte, os.FileMode) error
 	return fmt.Errorf("secure private file replacement is unavailable on Windows")
 }
 
+func writePrivateFileAtomicNewNoFollow(*os.File, string, []byte, os.FileMode) error {
+	return fmt.Errorf("secure private file creation is unavailable on Windows")
+}
+
 func removePrivateFileNoFollow(*os.File, string) error {
 	return fmt.Errorf("secure private file removal is unavailable on Windows")
 }

@@ -380,11 +380,12 @@ func TestBortNoArgsRefreshesLatestRunAfterEnvCommand(t *testing.T) {
 	t.Chdir(workDir)
 	bundleDir := filepath.Join(workDir, "bort-bundle")
 	writePrivateTestBundle(t, bundleDir, manifest.Manifest{
-		Source: manifest.Source{Platform: "docker"},
+		Source: manifest.Source{Platform: "docker", DockerEngineID: "engine-reviewed"},
 		Apps: []manifest.App{
 			{
 				Name: "api",
 				Services: []manifest.Service{{
+					ID:    "0123456789ab",
 					Name:  "api",
 					Image: "example/api:latest",
 					Environment: []manifest.EnvVar{
@@ -408,10 +409,10 @@ func TestBortNoArgsRefreshesLatestRunAfterEnvCommand(t *testing.T) {
 		t.Fatalf("bort failed: %v\nstderr:\n%s", err, stderr.String())
 	}
 	output := stdout.String()
-	if strings.Contains(output, "Fill environment values") {
+	if strings.Contains(output, "Fill environment values") || strings.Contains(output, "missing values") {
 		t.Fatalf("expected no-arg bort to refresh the latest run after env state, got:\n%s", output)
 	}
-	if !strings.Contains(output, "All app inputs ready") {
-		t.Fatalf("expected refreshed app setup to be ready, got:\n%s", output)
+	if !strings.Contains(output, "✓  Env       1 file(s)") {
+		t.Fatalf("expected refreshed env inputs to be ready, got:\n%s", output)
 	}
 }

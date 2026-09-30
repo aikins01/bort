@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aikins01/bort/internal/dockercli"
 	"github.com/aikins01/bort/internal/manifest"
 	"github.com/aikins01/bort/internal/secrets"
 	"github.com/aikins01/bort/internal/source"
@@ -48,8 +49,12 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 		}
 	}
 
+	engineID, err := s.engineID(ctx)
+	if err != nil {
+		return manifest.Manifest{}, err
+	}
 	hostname, _ := os.Hostname()
-	result := manifest.New(manifest.Source{Platform: "docker", Hostname: hostname}, s.Now())
+	result := manifest.New(manifest.Source{Platform: "docker", Hostname: hostname, DockerEngineID: engineID}, s.Now())
 
 	containers, err := s.inspectContainers(ctx)
 	if err != nil {
@@ -134,6 +139,22 @@ func (s *Scanner) Scan(ctx context.Context, opts source.ScanOptions) (manifest.M
 	}
 
 	return result, nil
+}
+
+func DockerEngineID(ctx context.Context) (string, error) {
+	return NewScanner().engineID(ctx)
+}
+
+func (s *Scanner) engineID(ctx context.Context) (string, error) {
+	out, err := s.run(ctx, "info", "--format", "{{.ID}}")
+	if err != nil {
+		return "", fmt.Errorf("identify local Docker engine: %w", err)
+	}
+	id := strings.TrimSpace(string(out))
+	if id == "" {
+		return "", fmt.Errorf("local Docker engine has no stable ID")
+	}
+	return id, nil
 }
 
 func (s *Scanner) inspectContainers(ctx context.Context) ([]containerInspect, error) {
@@ -345,7 +366,12 @@ func (s *Scanner) run(ctx context.Context, args ...string) ([]byte, error) {
 		return s.runCommand(ctx, args...)
 	}
 
+	env, err := dockercli.LocalEnvironment(os.Environ())
+	if err != nil {
+		return nil, err
+	}
 	cmd := exec.CommandContext(ctx, s.DockerPath, args...)
+	cmd.Env = env
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -509,21 +535,29 @@ func isDokployTargetContainer(container containerInspect) bool {
 		return true
 	}
 	swarmService := labels["com.docker.swarm.service.name"]
-	if swarmService == "dokploy" || strings.HasPrefix(swarmService, "dokploy-") {
+	switch swarmService {
+	case "dokploy", "dokploy-postgres", "dokploy-redis", "dokploy-traefik", "dokploy-monitoring", "dokploy-forward-auth":
 		return true
 	}
 	name := strings.TrimPrefix(container.Name, "/")
-	return name == "dokploy" || strings.HasPrefix(name, "dokploy.") || strings.HasPrefix(name, "dokploy-")
+	switch name {
+	case "dokploy", "dokploy-traefik", "dokploy-monitoring":
+		return true
+	}
+	for _, prefix := range []string{"dokploy.", "dokploy-postgres.", "dokploy-redis.", "dokploy-traefik.", "dokploy-monitoring.", "dokploy-forward-auth."} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func detectPlatform(labels map[string]string) string {
-	for key, value := range labels {
-		combined := strings.ToLower(key + "=" + value)
-		switch {
-		case strings.Contains(combined, "coolify"):
-			return "coolify"
-		case strings.Contains(combined, "dokploy"):
-			return "dokploy"
+	for _, platform := range []string{"coolify", "dokploy"} {
+		for key, value := range labels {
+			if strings.Contains(strings.ToLower(key+"="+value), platform) {
+				return platform
+			}
 		}
 	}
 
