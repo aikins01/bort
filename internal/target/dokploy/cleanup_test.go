@@ -966,6 +966,7 @@ func TestDockerMissingResourceClassifier(t *testing.T) {
 		errors.New(`exec: "docker": executable file not found in $PATH`),
 		errors.New("Error response from daemon: plugin local not found"),
 		errors.New("Error response from daemon: volume api-data: error looking up volume plugin local: plugin local not found"),
+		errors.New("Error response from daemon: network api-net: error looking up network plugin local: plugin local not found"),
 	} {
 		if isDockerVolumeOrNetworkMissingErr(err) {
 			t.Fatalf("non-resource failure was classified as an absent resource: %v", err)

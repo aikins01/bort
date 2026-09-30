@@ -1038,17 +1038,21 @@ func isDockerVolumeOrNetworkMissingErr(err error) bool {
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "no such volume") ||
 		strings.Contains(message, "no such network") ||
-		dockerDaemonVolumeNotFound(message) ||
-		(strings.Contains(message, "error response from daemon: network ") && strings.Contains(message, " not found"))
+		dockerDaemonResourceNotFound(message, "volume") ||
+		dockerDaemonResourceNotFound(message, "network")
 }
 
-func dockerDaemonVolumeNotFound(message string) bool {
-	const marker = "error response from daemon: volume "
+func dockerDaemonResourceNotFound(message, resource string) bool {
+	marker := "error response from daemon: " + resource + " "
 	index := strings.LastIndex(message, marker)
 	if index < 0 {
 		return false
 	}
-	name, suffix, ok := strings.Cut(strings.TrimSpace(message[index+len(marker):]), " ")
+	detail := strings.TrimSpace(message[index+len(marker):])
+	if resource == "network" && detail == "not found" {
+		return true
+	}
+	name, suffix, ok := strings.Cut(detail, " ")
 	return ok && name != "" && suffix == "not found"
 }
 

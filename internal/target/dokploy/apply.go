@@ -1825,9 +1825,6 @@ func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServi
 	if len(services) == 0 {
 		return route, nil
 	}
-	if _, ok := services[route.ServiceName]; ok {
-		return route, nil
-	}
 	if serviceName, ok := inferComposeServiceForRoute(route, services, sourceServices); ok {
 		route.ServiceName = serviceName
 		return route, nil
@@ -1881,12 +1878,12 @@ func routeServiceNameCandidates(route gateway.Route, sourceServices []preparer.S
 		}
 		candidates = append(candidates, value)
 	}
-	add(route.ServiceName)
 	for _, sourceService := range sourceServices {
 		if sourceService.ContainerName == route.ServiceName {
 			add(sourceService.ServiceName)
 		}
 	}
+	add(route.ServiceName)
 	add(stripCoolifyGeneratedServiceSuffix(route.ServiceName))
 	if fromSource := serviceNameFromTraefikRouterSource(route.Source); fromSource != "" {
 		add(fromSource)

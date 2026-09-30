@@ -1331,12 +1331,29 @@ func TestResolveRouteForComposeUsesReviewedSourceServiceMapping(t *testing.T) {
 		t.Fatalf("expected source container mapping to outrank generated-name heuristic, got %#v", resolved)
 	}
 
-	resolved, err = resolveRouteForCompose(route, "services:\n  project-apiworker-1:\n    image: example/worker\n", sourceServices)
+	compose := "services:\n  project-apiworker-1:\n    image: example/runtime-name\n  apiworker:\n    image: example/worker\n"
+	resolved, err = resolveRouteForCompose(route, compose, sourceServices)
 	if err != nil {
-		t.Fatalf("resolve exact generated Compose service: %v", err)
+		t.Fatalf("resolve reviewed service when exact key also exists: %v", err)
+	}
+	if resolved.ServiceName != "apiworker" {
+		t.Fatalf("expected reviewed source mapping to outrank unrelated exact key, got %#v", resolved)
+	}
+
+	resolved, err = resolveRouteForCompose(route, compose, nil)
+	if err != nil {
+		t.Fatalf("resolve exact Compose service without source mapping: %v", err)
 	}
 	if resolved.ServiceName != "project-apiworker-1" {
-		t.Fatalf("expected exact Compose service to take precedence, got %#v", resolved)
+		t.Fatalf("expected exact Compose service without source mapping, got %#v", resolved)
+	}
+
+	resolved, err = resolveRouteForCompose(route, "services:\n  project-apiworker-1:\n    image: example/worker\n", sourceServices)
+	if err != nil {
+		t.Fatalf("resolve exact generated Compose service when mapped key is absent: %v", err)
+	}
+	if resolved.ServiceName != "project-apiworker-1" {
+		t.Fatalf("expected exact Compose service when mapped key is absent, got %#v", resolved)
 	}
 }
 
