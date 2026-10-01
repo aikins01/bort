@@ -13,6 +13,46 @@ import (
 	syncplan "github.com/aikins01/bort/internal/sync"
 )
 
+func TestCoolifyDeploymentFenceRequiresStoppedNoRestartControlPlane(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		running bool
+		policy  string
+		wantErr bool
+	}{
+		{name: "fenced", policy: "no"},
+		{name: "running", running: true, policy: "no", wantErr: true},
+		{name: "restart enabled", policy: "always", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeDockerRunner{outputs: map[string][]byte{
+				"inspect --type container coolify": []byte(fmt.Sprintf(`[{"Id":"coolify-id","Name":"/coolify","State":{"Running":%t,"Status":"exited"},"HostConfig":{"RestartPolicy":{"Name":"%s"}}}]`, tc.running, tc.policy)),
+			}}
+			err := requireCoolifyDeploymentFence(context.Background(), runner)
+			if tc.wantErr && (err == nil || !strings.Contains(err.Error(), "docker update --restart=no coolify")) {
+				t.Fatalf("expected actionable fence refusal, got %v", err)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("valid Coolify fence was refused: %v", err)
+			}
+		})
+	}
+}
+
+func TestStatefulCoolifyPlanRequiresDeploymentFence(t *testing.T) {
+	plan := Plan{
+		Prepare: preparer.Result{Source: "coolify-local"},
+		Steps:   []Step{{Kind: StepPauseSource, App: "api"}, {Kind: StepSyncVolume, App: "api"}, {Kind: StepPushImage, App: "api"}},
+	}
+	if !planRequiresCoolifyDeploymentFence(plan) {
+		t.Fatal("stateful Coolify plan did not require a deployment fence")
+	}
+	plan.Prepare.Source = "docker"
+	if planRequiresCoolifyDeploymentFence(plan) {
+		t.Fatal("plain Docker source unexpectedly required the Coolify control-plane fence")
+	}
+}
+
 func TestVerifySourceContainersBatchesReviewedIDs(t *testing.T) {
 	webID := strings.Repeat("a", 64)
 	workerID := strings.Repeat("b", 64)
@@ -233,7 +273,7 @@ func TestPlanFromArtifactsPausesBeforeDumpAndVolumeSync(t *testing.T) {
 		return kinds
 	}
 	staged := filter(PlanFromArtifacts(prepare, syncResult, gatewayResultEmpty()))
-	wantStaged := []StepKind{StepPauseSource, StepDumpDataStore, StepRestoreDataStore, StepSyncVolume, StepResumeSource, StepPushImage}
+	wantStaged := []StepKind{StepPauseSource, StepDumpDataStore, StepRestoreDataStore, StepSyncVolume, StepPushImage}
 	if !slices.Equal(staged, wantStaged) {
 		t.Fatalf("staged: expected %v, got %v", wantStaged, staged)
 	}
@@ -392,7 +432,7 @@ func TestPlanFromArtifactsCopiesVolumeStrategyDataStoreVolumes(t *testing.T) {
 			kinds = append(kinds, step.Kind)
 		}
 	}
-	want := []StepKind{StepPauseSource, StepSyncVolume, StepResumeSource}
+	want := []StepKind{StepPauseSource, StepSyncVolume}
 	if len(kinds) != len(want) {
 		t.Fatalf("expected %v, got %v", want, kinds)
 	}
@@ -1000,7 +1040,7 @@ func TestApplyRecordsCleanupResumeBeforeRestartingTransferredSource(t *testing.T
 		BeforeStep: &beforeStep,
 	}
 	err := client.Apply(context.Background(), plan)
-	if err == nil || !strings.Contains(err.Error(), "stays stopped") || !strings.Contains(err.Error(), "ledger unavailable") {
+	if err == nil || !strings.Contains(err.Error(), "remains stopped") || !strings.Contains(err.Error(), "bort status") || !strings.Contains(err.Error(), "ledger unavailable") {
 		t.Fatalf("expected refused restart when the cleanup cannot be recorded, got %v", err)
 	}
 	if runner.running["web-id"] {

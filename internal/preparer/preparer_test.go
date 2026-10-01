@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aikins01/bort/internal/analyzer"
 	"github.com/aikins01/bort/internal/exporter"
 	"github.com/aikins01/bort/internal/manifest"
 )
@@ -252,6 +253,54 @@ func TestPlanPersistsUniqueComposeServiceForEmptyRouteMapping(t *testing.T) {
 	assertNoGate(t, app, GateDomainServiceMissing)
 }
 
+func TestPlanMapsLegacyFQDNRouteToUniqueRawComposeService(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:    "api",
+		Compose: &manifest.ComposeSource{Raw: "services:\n  api:\n    image: example/api\n"},
+		Routes:  []manifest.Route{{Host: "api.example.com", ServiceName: "coolify-fqdn-target", Port: "8080", Source: "fqdn"}},
+	}}}
+	summary, err := exporter.Export(m, exporter.Options{OutputDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appDir := filepath.Join(dir, summary.Apps[0].Directory)
+	topologyPath := filepath.Join(appDir, "topology.json")
+	contents, err := os.ReadFile(topologyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var topology analyzer.Topology
+	if err := json.Unmarshal(contents, &topology); err != nil {
+		t.Fatal(err)
+	}
+	topology.Routes = append([]manifest.Route(nil), m.Apps[0].Routes...)
+	contents, err = json.MarshalIndent(topology, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(topologyPath, append(contents, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := json.MarshalIndent(m.Apps[0].Routes, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "routes.json"), append(routes, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := result.Apps[0]
+	if result.Status != StatusGreen || app.Readiness != ReadinessReadyToCreate || len(app.Resources.Domains) != 1 || app.Resources.Domains[0].ServiceName != "api" {
+		t.Fatalf("legacy FQDN route was not mapped to the unique raw Compose service: %#v", app)
+	}
+	assertNoGate(t, app, GateDomainServiceNotInCompose)
+}
+
 func TestPlanPersistsSluggedGeneratedComposeService(t *testing.T) {
 	dir := t.TempDir()
 	m := manifest.Manifest{Apps: []manifest.App{{
@@ -270,6 +319,27 @@ func TestPlanPersistsSluggedGeneratedComposeService(t *testing.T) {
 	if result.Status != StatusGreen || app.Readiness != ReadinessReadyToCreate || len(app.Resources.Domains) != 1 || app.Resources.Domains[0].ServiceName != "ghost-blog" {
 		t.Fatalf("expected generated Compose service name to be persisted, got %#v", app)
 	}
+}
+
+func TestPlanBlocksMismatchedGeneratedComposeService(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:     "blog",
+		Services: []manifest.Service{{Name: "Ghost Blog", Image: "example/blog"}},
+		Routes:   []manifest.Route{{Host: "blog.example.com", ServiceName: "Wrong Blog", Port: "3000"}},
+	}}}
+	if _, err := exporter.Export(m, exporter.Options{OutputDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := result.Apps[0]
+	if result.Status != StatusRed || app.Readiness != ReadinessBlocked || len(app.Resources.Domains) != 1 || app.Resources.Domains[0].ServiceName != "Wrong Blog" {
+		t.Fatalf("expected mismatched generated Compose service to block preparation, got %#v", app)
+	}
+	assertGate(t, app, GateDomainServiceNotInCompose)
 }
 
 func TestPlanReportsMalformedCompose(t *testing.T) {

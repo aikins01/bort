@@ -474,6 +474,16 @@ func TestCommitRetryRepublishesCompletedMetadataBeforeOwnerRelease(t *testing.T)
 	if err := markRunHostOwnerReleaseStartedLocked(run.Run); err != nil {
 		t.Fatal(err)
 	}
+	previous := releaseAuthorityStagingVolumePins
+	cleanupCalls := 0
+	releaseAuthorityStagingVolumePins = func(_ context.Context, plan dokploy.Plan, targetAuthority bool) error {
+		cleanupCalls++
+		if plan.RunName != run.Run.Name || plan.RunDir != run.Run.RunDir || plan.RunID == "" || !targetAuthority {
+			t.Fatalf("commit pin cleanup received incomplete target identity: plan=%#v target=%t", plan, targetAuthority)
+		}
+		return nil
+	}
+	t.Cleanup(func() { releaseAuthorityStagingVolumePins = previous })
 	path := filepath.Join(run.Run.RunDir, "run.json")
 	before, err := os.Stat(path)
 	if err != nil {
@@ -492,6 +502,42 @@ func TestCommitRetryRepublishesCompletedMetadataBeforeOwnerRelease(t *testing.T)
 	owner, found, err := readDokployTrafficOwner()
 	if err != nil || !found || owner.Authority != dokployTrafficReleased {
 		t.Fatalf("completed commit owner = %#v, found=%t err=%v", owner, found, err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("completed commit pin cleanup calls = %d, want 1", cleanupCalls)
+	}
+}
+
+func TestCommitRetryKeepsOwnerWhenPinCleanupFails(t *testing.T) {
+	run := writeAmbiguousAuthorityRun(t, "durable-commit-pin-cleanup")
+	if err := markRunAuthorityResolvedLocked(run.Run, dokployTrafficTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(run.Run, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunLiveAppliedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunCommitStartedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunCommittedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	previous := releaseAuthorityStagingVolumePins
+	releaseAuthorityStagingVolumePins = func(context.Context, dokploy.Plan, bool) error {
+		return errors.New("pin cleanup failed")
+	}
+	t.Cleanup(func() { releaseAuthorityStagingVolumePins = previous })
+
+	err := applyCommitFromArgs(context.Background(), run.Run.Name, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "host ownership remains held") || !strings.Contains(err.Error(), "pin cleanup failed") {
+		t.Fatalf("expected pin cleanup failure, got %v", err)
+	}
+	owner, found, err := readDokployTrafficOwner()
+	if err != nil || !found || owner.Authority != dokployTrafficTarget {
+		t.Fatalf("pin cleanup failure released owner: owner=%#v found=%t err=%v", owner, found, err)
 	}
 }
 

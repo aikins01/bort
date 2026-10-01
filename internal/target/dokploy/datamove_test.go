@@ -22,13 +22,15 @@ import (
 )
 
 type fakeDockerRunner struct {
-	outputs    map[string][]byte
-	outputErrs map[string]error
-	runOutputs map[string][]byte
-	outputArgs [][]string
-	runs       []fakeDockerRun
-	copies     []fakeDockerCopy
-	runErr     error
+	outputs               map[string][]byte
+	outputErrs            map[string]error
+	runOutputs            map[string][]byte
+	outputArgs            [][]string
+	runs                  []fakeDockerRun
+	copies                []fakeDockerCopy
+	runErr                error
+	activePins            map[string]dockerContainer
+	activeComposeProjects map[string][]string
 }
 
 type fakeDockerRun struct {
@@ -41,6 +43,31 @@ type fakeDockerCopy struct {
 	Source      string
 	Destination string
 	Contents    string
+}
+
+type detachAfterRemoveRunner struct {
+	fakeDockerRunner
+	volumeName       string
+	targetID         string
+	removed          bool
+	attachmentChecks int
+}
+
+func (r *detachAfterRemoveRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	key := strings.Join(args, " ")
+	if key == "ps -a --filter volume="+r.volumeName+" --format {{.ID}}" {
+		r.outputArgs = append(r.outputArgs, append([]string{}, args...))
+		r.attachmentChecks++
+		if r.removed {
+			return []byte("pin-id\n"), nil
+		}
+		return []byte("pin-id\n" + r.targetID + "\n"), nil
+	}
+	out, err := r.fakeDockerRunner.Output(ctx, args...)
+	if err == nil && key == "rm "+r.targetID {
+		r.removed = true
+	}
+	return out, err
 }
 
 func (f *fakeDockerRunner) Output(_ context.Context, args ...string) ([]byte, error) {
@@ -57,8 +84,182 @@ func (f *fakeDockerRunner) Output(_ context.Context, args ...string) ([]byte, er
 	if err, ok := f.outputErrs[key]; ok {
 		return nil, err
 	}
+	if len(args) >= 3 && args[0] == "volume" && args[1] == "create" {
+		ownerKey := "volume inspect --format {{index .Labels \"bort.run-id\"}} " + args[len(args)-1]
+		delete(f.outputErrs, ownerKey)
+	}
+	if len(args) > 1 && args[0] == "run" && args[1] == "-d" && slices.Contains(args, "--label") && slices.Contains(args, stagingVolumePinLabel+"=true") {
+		id := "pin-id"
+		if data, ok := f.outputs[key]; ok {
+			id = strings.TrimSpace(string(data))
+		}
+		if f.activePins == nil {
+			f.activePins = map[string]dockerContainer{}
+		}
+		pin := dockerContainer{ID: id}
+		pin.State.Running = true
+		pin.State.Status = "running"
+		pin.HostConfig.RestartPolicy.Name = "unless-stopped"
+		for index := 1; index < len(args); index++ {
+			switch args[index] {
+			case "--name":
+				index++
+				pin.Name = args[index]
+			case "--label":
+				index++
+				name, value, _ := strings.Cut(args[index], "=")
+				if pin.Config.Labels == nil {
+					pin.Config.Labels = map[string]string{}
+				}
+				pin.Config.Labels[name] = value
+			case "-v":
+				index++
+				parts := strings.Split(args[index], ":")
+				pin.Mounts = append(pin.Mounts, dockerMount{Type: "volume", Name: parts[0], Destination: parts[1], RW: len(parts) < 3 || parts[2] != "ro"})
+			}
+		}
+		for _, existing := range f.activePins {
+			if existing.Name == pin.Name {
+				return nil, errors.New("Error response from daemon: Conflict. The container name is already in use")
+			}
+		}
+		f.activePins[id] = pin
+		return []byte(id + "\n"), nil
+	}
+	if len(args) == 2 && args[0] == "start" {
+		pin, ok := f.activePins[args[1]]
+		if ok {
+			pin.State.Running = true
+			pin.State.Status = "running"
+			f.activePins[args[1]] = pin
+			return []byte(args[1] + "\n"), nil
+		}
+	}
+	if len(args) == 3 && args[0] == "rm" && args[1] == "-f" {
+		if _, ok := f.activePins[args[2]]; ok {
+			delete(f.activePins, args[2])
+			return []byte(args[2] + "\n"), nil
+		}
+	}
+	if len(args) >= 5 && args[0] == "ps" && args[1] == "-a" && args[len(args)-2] == "--format" && args[len(args)-1] == "{{.ID}}" && slices.Contains(args, "label="+stagingVolumePinLabel+"=true") {
+		labels := map[string]string{}
+		for index := 2; index+1 < len(args)-2; index += 2 {
+			name, value, _ := strings.Cut(strings.TrimPrefix(args[index+1], "label="), "=")
+			labels[name] = value
+		}
+		ids := make([]string, 0, len(f.activePins))
+		for id, pin := range f.activePins {
+			matches := true
+			for name, value := range labels {
+				if pin.Config.Labels[name] != value {
+					matches = false
+					break
+				}
+			}
+			if matches {
+				ids = append(ids, id)
+			}
+		}
+		slices.Sort(ids)
+		return []byte(strings.Join(ids, "\n")), nil
+	}
+	if len(args) >= 4 && args[0] == "inspect" && args[1] == "--type" && args[2] == "container" {
+		if data, ok := f.outputs[key]; ok {
+			return data, nil
+		}
+		containers := make([]dockerContainer, 0, len(args)-3)
+		for _, id := range args[3:] {
+			pin, ok := f.activePins[id]
+			if ok {
+				containers = append(containers, pin)
+				continue
+			}
+			data, ok := f.outputs["inspect --type container "+id]
+			if !ok {
+				containers = nil
+				break
+			}
+			var inspected []dockerContainer
+			if err := json.Unmarshal(data, &inspected); err != nil || len(inspected) != 1 {
+				containers = nil
+				break
+			}
+			containers = append(containers, inspected[0])
+		}
+		if len(containers) > 0 {
+			return json.Marshal(containers)
+		}
+	}
+	if len(args) >= 5 && args[0] == "ps" && args[1] == "-a" && args[len(args)-2] == "--format" && args[len(args)-1] == "{{.ID}}" {
+		volumes := map[string]struct{}{}
+		for index := 2; index+1 < len(args); index += 2 {
+			volumes[strings.TrimPrefix(args[index+1], "volume=")] = struct{}{}
+		}
+		ids := map[string]struct{}{}
+		for id, pin := range f.activePins {
+			if containerMountsAnyVolume(pin, volumes) {
+				ids[id] = struct{}{}
+			}
+		}
+		for _, projectIDs := range f.activeComposeProjects {
+			for _, id := range projectIDs {
+				data, ok := f.outputs["inspect --type container "+id]
+				if !ok {
+					continue
+				}
+				var containers []dockerContainer
+				if json.Unmarshal(data, &containers) == nil && len(containers) == 1 && containerMountsAnyVolume(containers[0], volumes) {
+					ids[id] = struct{}{}
+				}
+			}
+		}
+		for prefix, data := range f.outputs {
+			if strings.HasPrefix(key, prefix) {
+				for _, id := range strings.Fields(string(data)) {
+					ids[id] = struct{}{}
+				}
+				break
+			}
+		}
+		ordered := make([]string, 0, len(ids))
+		for id := range ids {
+			ordered = append(ordered, id)
+		}
+		slices.Sort(ordered)
+		return []byte(strings.Join(ordered, "\n")), nil
+	}
+	if len(args) == 3 && args[0] == "volume" && args[1] == "inspect" {
+		ownerKey := "volume inspect --format {{index .Labels \"bort.run-id\"}} " + args[2]
+		if err, ok := f.outputErrs[ownerKey]; ok {
+			return nil, err
+		}
+		if owner, ok := f.outputs[ownerKey]; ok {
+			if data, exists := f.outputs[key]; exists && strings.Contains(string(data), `"Labels"`) {
+				return data, nil
+			}
+			return []byte(fmt.Sprintf(`[{"Name":%q,"Labels":{%q:%q}}]`, args[2], stagingVolumeRunIDLabel, strings.TrimSpace(string(owner)))), nil
+		}
+	}
 	if data, ok := f.outputs[key]; ok {
 		return data, nil
+	}
+	if len(args) > 3 && args[0] == "volume" && args[1] == "inspect" {
+		states := []stagingVolumeState{}
+		for _, name := range args[2:] {
+			data, ok := f.outputs["volume inspect "+name]
+			if !ok {
+				return nil, errors.New("docker output not stubbed: " + key)
+			}
+			var decoded []stagingVolumeState
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				return nil, err
+			}
+			states = append(states, decoded...)
+		}
+		return json.Marshal(states)
+	}
+	if key == "rm -f pin-id" {
+		return []byte("pin-id\n"), nil
 	}
 	if key == "ps --filter label=com.docker.swarm.service.name=dokploy-postgres --filter status=running --format {{.ID}}" {
 		for _, name := range strings.Fields(string(f.outputs["ps --format {{.Names}}"])) {
@@ -112,6 +313,37 @@ func (f *fakeDockerRunner) Run(_ context.Context, stdin io.Reader, stdout io.Wri
 		run.Output = string(output)
 	}
 	f.runs = append(f.runs, run)
+	if strings.Contains(key, "find /volume -mindepth 1 -delete && sync") {
+		volumeName := ""
+		for index := 0; index+1 < len(args); index++ {
+			if args[index] == "-v" && strings.HasSuffix(args[index+1], ":/volume") {
+				volumeName = strings.TrimSuffix(args[index+1], ":/volume")
+				break
+			}
+		}
+		pinned := false
+		for _, pin := range f.activePins {
+			if pin.State.Running && containerMountsAnyVolume(pin, map[string]struct{}{volumeName: {}}) {
+				pinned = true
+				break
+			}
+		}
+		if volumeName == "" || !pinned {
+			return errors.New("test rejected staging-volume clear without its running app-wide pin")
+		}
+	}
+	if f.runErr == nil && len(args) > 2 && args[0] == "compose" && args[1] == "-p" {
+		project := args[2]
+		switch {
+		case slices.Contains(args, "up"):
+			if f.activeComposeProjects == nil {
+				f.activeComposeProjects = map[string][]string{}
+			}
+			f.activeComposeProjects[project] = strings.Fields(string(f.outputs["compose -p "+project]))
+		case slices.Contains(args, "down"):
+			delete(f.activeComposeProjects, project)
+		}
+	}
 	return f.runErr
 }
 
@@ -1350,8 +1582,13 @@ func TestResolveRouteForComposeRejectsReviewedServiceMismatch(t *testing.T) {
 		{name: "generated", serviceName: "project-apiworker-1", compose: "services:\n  apiworker:\n    image: example/worker\n", composeSource: preparer.ComposeSourceGenerated},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			route := gateway.Route{Host: "stateless.example.com", ServiceName: tc.serviceName}
-			if _, err := resolveRouteForCompose(route, tc.compose, nil, tc.composeSource); err == nil || !strings.Contains(err.Error(), "points at service") {
+			route := gateway.Route{Host: "stateless.example.com", ServiceName: tc.serviceName, Port: "8080"}
+			tc.compose = strings.Replace(tc.compose, "    image:", "    expose:\n      - \"8080\"\n    image:", 1)
+			if _, err := resolveRouteForCompose(route, tc.compose, nil, tc.composeSource); err == nil ||
+				!strings.Contains(err.Error(), "points at service") ||
+				!strings.Contains(err.Error(), "run status guidance") ||
+				!strings.Contains(err.Error(), "source configuration or the bundle used to create the next run") ||
+				!strings.Contains(err.Error(), "create a new run") {
 				t.Fatalf("expected reviewed service mismatch, got %v", err)
 			}
 		})
@@ -1736,6 +1973,25 @@ func TestValidateMigratedVolumeMountsDoesNotRedeployForDiscovery(t *testing.T) {
 	}
 }
 
+func TestValidateMigratedVolumeMountsRejectsTwoRunningContainersForService(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("old-web\nnew-web\n"),
+		"inspect --type container new-web old-web":                                 []byte(`[{"Id":"new-web","Name":"/new-web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]},{"Id":"old-web","Name":"/old-web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"migrated-vol","Destination":"/data","RW":true}]}]`),
+	}}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{}}
+	entry := actx.entry("api")
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+
+	err := client.validateMigratedVolumeMounts(context.Background(), actx, "api")
+	if err == nil || !isUnsafeTargetResumeError(err) || !strings.Contains(err.Error(), "2 running containers for migrated service web") {
+		t.Fatalf("expected both running replicas to block single-writer validation, got %v", err)
+	}
+}
+
 func TestStopTargetComposeContainersWaitsForLatePostDeployTarget(t *testing.T) {
 	runner := &latePostDeployTargetRunner{emptyFirst: true}
 	client := &Client{Docker: runner}
@@ -1750,6 +2006,38 @@ func TestStopTargetComposeContainersWaitsForLatePostDeployTarget(t *testing.T) {
 	}
 	if !fakeOutputCalled(&fakeDockerRunner{outputArgs: runner.outputArgs}, "stop", "web-id") {
 		t.Fatalf("expected late post-deploy target to stop, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestRemoveStoppedTargetAttachmentsDetachesFailedDeployment(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	const targetID = "abcdef123456"
+	runner := &detachAfterRemoveRunner{
+		fakeDockerRunner: fakeDockerRunner{outputs: map[string][]byte{
+			"volume inspect " + staged.VolumeName:                                      ownedStagingVolumeInspect(plan, staged),
+			"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte(targetID + "\n"),
+			"inspect --type container " + targetID:                                     []byte(`[{"Id":"` + targetID + `","Name":"/web","Config":{"Labels":{"com.docker.compose.project":"stack-1"}},"State":{"Running":false,"Status":"exited"}}]`),
+			"rm " + targetID:                                                           []byte(targetID + "\n"),
+		}},
+		volumeName: staged.VolumeName,
+		targetID:   targetID,
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	actx.entry("api").ComposeAppName = "stack-1"
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil {
+		t.Fatalf("acquireStagingVolumePin: %v", err)
+	}
+
+	if err := client.removeStoppedTargetAttachments(context.Background(), actx, "api", []stagedVolume{staged}, pin.containerID); err != nil {
+		t.Fatalf("removeStoppedTargetAttachments: %v", err)
+	}
+	if !fakeOutputCalled(&runner.fakeDockerRunner, "rm", targetID) {
+		t.Fatalf("expected stopped failed-deployment container removal, calls=%#v", runner.outputArgs)
+	}
+	if !runner.removed || runner.attachmentChecks != 2 {
+		t.Fatalf("post-removal attachment validation did not observe the removal: removed=%v checks=%d calls=%#v", runner.removed, runner.attachmentChecks, runner.outputArgs)
 	}
 }
 

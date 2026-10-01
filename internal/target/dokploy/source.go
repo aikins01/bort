@@ -13,6 +13,33 @@ import (
 	"github.com/aikins01/bort/internal/safepath"
 )
 
+const coolifyControlPlaneContainer = "coolify"
+
+func planRequiresCoolifyDeploymentFence(plan Plan) bool {
+	source := strings.ToLower(strings.TrimSpace(plan.Prepare.Source))
+	if source != "coolify-local" && source != "coolify-local-traefik" && source != "coolify-local-caddy" {
+		return false
+	}
+	for _, step := range plan.Steps {
+		if (step.Kind == StepRestoreDataStore || step.Kind == StepSyncVolume) && !shouldSkipApplyStep(plan, step) {
+			return true
+		}
+	}
+	return false
+}
+
+func requireCoolifyDeploymentFence(ctx context.Context, runner dockerRunner) error {
+	container, err := inspectContainer(ctx, runner, coolifyControlPlaneContainer)
+	if err != nil {
+		return fmt.Errorf("stateful live apply requires a durable Coolify deployment fence, but Bort could not inspect the %s control-plane container: %w; record its current restart policy, run `docker update --restart=no %s && docker stop %s`, then retry", coolifyControlPlaneContainer, err, coolifyControlPlaneContainer, coolifyControlPlaneContainer)
+	}
+	policy := normalizedRestartPolicyName(container.HostConfig.RestartPolicy.Name)
+	if container.State.Running || policy != "no" {
+		return fmt.Errorf("stateful live apply requires the Coolify control-plane container %s to be stopped with restart policy no (running=%t, restart=%s); record its current restart policy, run `docker update --restart=no %s && docker stop %s`, then retry; restore the control plane only after source or target authority is finalized", coolifyControlPlaneContainer, container.State.Running, policy, coolifyControlPlaneContainer, coolifyControlPlaneContainer)
+	}
+	return nil
+}
+
 func (c *Client) applyPauseSource(ctx context.Context, actx *applyContext, step Step) error {
 	app, ok := findPrepareApp(actx.plan.Prepare, step.App)
 	if !ok {

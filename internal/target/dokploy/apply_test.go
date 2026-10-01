@@ -217,6 +217,35 @@ func TestLegacyPlanPreservesV1Alpha1RoutedStateOrder(t *testing.T) {
 	}
 }
 
+func TestLegacyPlanPreservesV1Alpha3UnroutedStateOrder(t *testing.T) {
+	app := preparer.AppPlan{
+		Name: "api",
+		TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{
+			ComposeApp: preparer.DokployComposeApp{Name: "api"},
+		}},
+	}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", Name: "data", Target: "/data"}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{app}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{{Name: "api", Steps: []syncplan.Step{{
+		ResourceType: "volume",
+		ResourceRef:  "volume:web -> /data",
+		Strategy:     syncplan.StrategyDockerVolumeArchive,
+	}}}}}
+	legacy := LegacyPlanFromArtifactsV1Alpha3(prepare, sync, gateway.Result{})
+	current := PlanFromArtifacts(prepare, sync, gateway.Result{})
+
+	legacyKinds := stepKinds(legacy.Steps)
+	syncIndex := slices.Index(legacyKinds, StepSyncVolume)
+	pushIndex := slices.Index(legacyKinds, StepPushImage)
+	resumeIndex := slices.Index(legacyKinds, StepResumeSource)
+	if syncIndex < 0 || resumeIndex != syncIndex+1 || pushIndex != resumeIndex+1 {
+		t.Fatalf("legacy v1alpha3 order changed: %v", legacyKinds)
+	}
+	if slices.Contains(stepKinds(current.Steps), StepResumeSource) {
+		t.Fatalf("current staged plan resumed an unrouted source writer: %v", stepKinds(current.Steps))
+	}
+}
+
 func TestNewClientFromEnvRejectsRemoteHTTP(t *testing.T) {
 	t.Setenv(EnvBaseURL, "http://dokploy.example")
 	t.Setenv(EnvToken, "secret")
@@ -1391,7 +1420,7 @@ func TestApplyLeavesPausedSourceStoppedWhenGuardedDeploymentCannotBeQuiesced(t *
 		},
 		Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}},
 	})
-	if err == nil || !strings.Contains(err.Error(), "leave any paused source applications stopped") {
+	if err == nil || !strings.Contains(err.Error(), "paused source applications remain stopped") || !strings.Contains(err.Error(), "bort status") {
 		t.Fatalf("expected fail-closed guarded deployment error, got %v", err)
 	}
 	if !mutationResponseMayHaveSucceeded(err) {

@@ -509,6 +509,133 @@ func TestExportRunbookIncludesLinkedResources(t *testing.T) {
 	}
 }
 
+func TestExportUsesReviewedComposeServiceInRouteArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:    "api",
+		Compose: &manifest.ComposeSource{Raw: "services:\n  apiworker:\n    image: example/api\n"},
+		Services: []manifest.Service{{
+			Name:   "project-apiworker-1",
+			Image:  "example/api",
+			Labels: map[string]string{"com.docker.compose.service": "apiworker"},
+		}},
+		Routes: []manifest.Route{{Host: "api.example.com", ServiceName: "project-apiworker-1", Port: "8080"}},
+	}}}
+	if _, err := Export(m, Options{OutputDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	appDir := filepath.Join(dir, "api")
+	var routes []manifest.Route
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(appDir, "routes.json"))), &routes); err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].ServiceName != "apiworker" {
+		t.Fatalf("expected routes.json to use the reviewed Compose service, got %#v", routes)
+	}
+	var topology analyzer.Topology
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(appDir, "topology.json"))), &topology); err != nil {
+		t.Fatal(err)
+	}
+	if len(topology.Routes) != 1 || topology.Routes[0].ServiceName != "apiworker" {
+		t.Fatalf("expected topology route to use the reviewed Compose service, got %#v", topology.Routes)
+	}
+	report := readFile(t, filepath.Join(appDir, "migration-report.md"))
+	if !strings.Contains(report, "-> `apiworker`") || strings.Contains(report, "-> `project-apiworker-1`") {
+		t.Fatalf("expected migration report to use the reviewed Compose service, got:\n%s", report)
+	}
+	runbook := readFile(t, filepath.Join(appDir, "migration-runbook.md"))
+	if !strings.Contains(runbook, "for service `apiworker`") || strings.Contains(runbook, "for service `project-apiworker-1`") {
+		t.Fatalf("expected runbook to use the reviewed Compose service, got:\n%s", runbook)
+	}
+}
+
+func TestExportMapsCoolifyApplicationFQDNToSoleRawComposeService(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:     "prod-api",
+		Compose:  &manifest.ComposeSource{Raw: "services:\n  web:\n    image: example/api\n"},
+		Services: []manifest.Service{{Name: "prod-api", Image: "example/api"}},
+		Routes:   []manifest.Route{{Host: "api.example.com", ServiceName: "prod-api", Source: "fqdn"}},
+	}}}
+	if _, err := Export(m, Options{OutputDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	appDir := filepath.Join(dir, "prod-api")
+	var topology analyzer.Topology
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(appDir, "topology.json"))), &topology); err != nil {
+		t.Fatal(err)
+	}
+	if len(topology.Routes) != 1 || topology.Routes[0].ServiceName != "web" {
+		t.Fatalf("expected application-level fqdn to resolve to sole raw Compose service, got %#v", topology.Routes)
+	}
+}
+
+func TestExportMapsRoutesThroughAliasedRawComposeServices(t *testing.T) {
+	for name, compose := range map[string]string{
+		"direct alias": "x-services: &app-services\n  web:\n    image: example/api\nservices: *app-services\n",
+		"merge key":    "x-services: &app-services\n  web:\n    image: example/api\nservices:\n  <<: *app-services\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			m := manifest.Manifest{Apps: []manifest.App{{
+				Name:     "prod-api",
+				Compose:  &manifest.ComposeSource{Raw: compose},
+				Services: []manifest.Service{{Name: "prod-api", Image: "example/api"}},
+				Routes:   []manifest.Route{{Host: "api.example.com", ServiceName: "prod-api", Source: "fqdn"}},
+			}}}
+			if _, err := Export(m, Options{OutputDir: dir}); err != nil {
+				t.Fatal(err)
+			}
+			var topology analyzer.Topology
+			if err := json.Unmarshal([]byte(readFile(t, filepath.Join(dir, "prod-api", "topology.json"))), &topology); err != nil {
+				t.Fatal(err)
+			}
+			if len(topology.Routes) != 1 || topology.Routes[0].ServiceName != "web" {
+				t.Fatalf("expected alias-expanded sole Compose service web, got %#v", topology.Routes)
+			}
+		})
+	}
+}
+
+func TestExportUsesGeneratedComposeServiceInRouteArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:     "blog",
+		Services: []manifest.Service{{Name: "Ghost Blog", Image: "example/blog"}},
+		Routes:   []manifest.Route{{Host: "blog.example.com", ServiceName: "Ghost Blog", Port: "3000"}},
+	}}}
+	if _, err := Export(m, Options{OutputDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	appDir := filepath.Join(dir, "blog")
+	compose := readFile(t, filepath.Join(appDir, "compose.yaml"))
+	if !strings.Contains(compose, "  ghost-blog:") {
+		t.Fatalf("expected generated Compose service ghost-blog, got:\n%s", compose)
+	}
+	var routes []manifest.Route
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(appDir, "routes.json"))), &routes); err != nil {
+		t.Fatal(err)
+	}
+	var topology analyzer.Topology
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(appDir, "topology.json"))), &topology); err != nil {
+		t.Fatal(err)
+	}
+	for name, artifactRoutes := range map[string][]manifest.Route{"routes.json": routes, "topology.json": topology.Routes} {
+		if len(artifactRoutes) != 1 || artifactRoutes[0].ServiceName != "ghost-blog" {
+			t.Fatalf("expected %s to use generated Compose service, got %#v", name, artifactRoutes)
+		}
+	}
+	for _, name := range []string{"migration-report.md", "migration-runbook.md"} {
+		contents := readFile(t, filepath.Join(appDir, name))
+		if !strings.Contains(contents, "`ghost-blog`") || strings.Contains(contents, "`Ghost Blog`") {
+			t.Fatalf("expected %s to use generated Compose service, got:\n%s", name, contents)
+		}
+	}
+}
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	contents, err := os.ReadFile(path)

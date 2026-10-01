@@ -1136,6 +1136,42 @@ func TestCockpitBlocksPlanLiveApplyWouldRefuse(t *testing.T) {
 	}
 }
 
+func TestMissingStagingPinStatusRequiresAuthorityRecovery(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	now := time.Now().UTC()
+	meta := persistRunFixture(t, migrationRun{
+		Name:         "missing-pin",
+		RunDir:       filepath.Join(t.TempDir(), "missing-pin"),
+		Target:       "dokploy",
+		CreatedAt:    now,
+		BundleDigest: "missing-pin-digest",
+	})
+	run := loadedMigrationRun{Run: meta, Applied: runApplied{
+		APIVersion:       appliedAPIVersion,
+		RecoveryProtocol: appliedRecoveryProtocol,
+		PlanVersion:      appliedPlanCurrent,
+		Steps: []appliedStep{{
+			Index:                     2,
+			Kind:                      string(dokploy.StepRestoreDataStore),
+			App:                       "api",
+			Ref:                       "postgres",
+			Status:                    string(dokploy.StepStatusError),
+			Error:                     "required staging volume pin is missing after state transfer",
+			AuthorityRecoveryRequired: true,
+		}},
+	}}
+	if err := claimDokployHostOwnership(run.Run, "http://127.0.0.1:3030", "cred-1"); err != nil {
+		t.Fatal(err)
+	}
+	if phase := migrationRunPhase(run); phase != "authority-ambiguous" {
+		t.Fatalf("missing-pin phase = %q, want authority-ambiguous", phase)
+	}
+	next := nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "recover-authority --authority source") || !strings.Contains(next.Action, "recover-authority --authority target") || strings.Contains(next.Action, "migrate --live") || strings.Contains(next.Action, "resume") {
+		t.Fatalf("missing-pin status offered an impossible retry: %#v", next)
+	}
+}
+
 func TestStagedTransferRefusalGatesPlannedPostgresDataDirOnApplyHistory(t *testing.T) {
 	bundleDir := t.TempDir()
 	appDir := filepath.Join(bundleDir, "api")

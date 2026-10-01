@@ -211,12 +211,25 @@ Bort's safety model defaults to “look first.”
 - **State moves before the target exists:** for apps with named volumes or a
   Postgres database, Bort stops the source app, copies each volume and restores
   each dump into volumes it owns and labels with the run name, verifies the
-  source stayed stopped and nothing else attached those volumes, and only then
-  deploys the Dokploy compose with those volumes declared as external. Bort
-  does not deploy the compose until state is staged and refuses the transfer
-  if the source restarts or any container attaches to a staging volume; do not
-  deploy the app manually in Dokploy during live apply. Routed apps stay
-  stopped until traffic moves; unrouted apps restart the source after the copy.
+  source stayed stopped, and keeps one read-only `bort-pin-*` container attached
+  to those volumes until the Dokploy target mounts them exactly. Bort does not
+  deploy the compose until state is staged and refuses unexpected attachments;
+  do not deploy the app manually in Dokploy during live apply. If handoff is
+  unsafe, Bort keeps the source stopped, reports whether it reverified the pin,
+  and directs recovery through `bort status`. A retryable failure before
+  handoff can restart the source, but keeps the pin for the next attempt. Do not
+  remove a `bort-pin-*` container manually. Source recovery and final target
+  acceptance validate the authority-specific attachments, even if a pin is
+  already absent, and remove any verified pin before releasing host ownership.
+  The source stays stopped while the target becomes the writer, including for
+  unrouted apps.
+- **Coolify stays fenced during stateful moves:** before a stateful live apply
+  from Coolify, run
+  `sudo docker update --restart=no coolify && sudo docker stop coolify` so
+  Coolify cannot redeploy a paused source app. Bort refuses to start, pause a
+  source, deploy a target, or move routes while the `coolify` container is
+  running or would restart. Restore it only after `recover-authority` finalizes
+  the run; see the [migration guide](docs/migration-guide.md#apply-the-selected-run).
 - **Known current run:** `.bort/state.json` identifies the current run. Commands
   that make changes do not guess based on which file was modified most recently.
 - **Plans are locked during live work:** once live execution begins, changing
@@ -274,21 +287,24 @@ Bort's safety model defaults to “look first.”
   <store> --recreate` or `--managed` for a data store volume and re-plan with
   `bort migrate --run <run>`, or change the source compose and scan a new run.
 - A migrated Postgres store must keep its data directory (`PGDATA`) on a named
-  volume the service mounts, with no writable bind mount inside it.
+  volume the service mounts, with no writable bind mount inside it and no named
+  volume outside it. A logical dump cannot restore an auxiliary volume such as
+  `/backups`.
   Live apply refuses other layouts before the source pauses (a run already
   past that app's `pause_source` when this check was added refuses at the
   restore step and restarts the source during cleanup). When the service
   mounts no named volume, sets `PGDATA` in its compose `environment` to a
-  literal path that breaks this rule, or interpolates a mount target, Bort
-  refuses before live apply starts (`PLAN BLOCKED`): choose `bort data <app>
-  <store> --recreate` or `--managed` and re-plan with `bort migrate --run
-  <run>`, or change the source compose and scan a new run. When the image or
-  interpolation decides `PGDATA`, only the created staged container reveals
-  the directory, so the refusal comes at `pause_source` (`NEW RUN REQUIRED`) with
-  that app's source still running and none of its state transferred, and the
-  run cannot be re-planned: follow the recovery `bort status` shows (releasing
-  the run when no other app's source was paused or handed off), then choose a
-  strategy or change the source compose and create a new run.
+  literal path that breaks this rule, interpolates a mount target, or declares
+  Compose `secrets` or `configs`, Bort refuses before live apply starts (`PLAN
+  BLOCKED`): choose `bort data <app> <store> --recreate` or `--managed` and
+  re-plan with `bort migrate --run <run>`, or change the source compose and
+  scan a new run. When the image or interpolation decides `PGDATA`, only the
+  created staged container reveals the directory, so the refusal comes at
+  `pause_source` (`NEW RUN REQUIRED`) with that app's source still running and
+  none of its state transferred, and the run cannot be re-planned: follow the
+  recovery `bort status` shows (releasing the run when no other app's source
+  was paused or handed off), then choose a strategy or change the source
+  compose and create a new run.
 - Runs created by older Bort versions whose plan copied state into an already
   deployed target remain refused (`MANUAL STATE`). Dokploy v0.30.7 cannot
   durably prevent queued or future deployments from restarting a target writer

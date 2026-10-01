@@ -135,6 +135,7 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts Options) (string, []string, error) {
 	warnings := []string{}
 	compose, composeSource, composeWarnings, serviceEnvFiles := composeForApp(app, opts.IncludeEnvValues)
+	topology.Routes = routesForCompose(topology.Routes, topology.SourceServices, composeSource, compose)
 	warnings = append(warnings, composeWarnings...)
 	if names := analyzer.CoolifyServiceMagicEnvNames(app); len(names) > 0 {
 		warnings = append(warnings, "preserved Coolify service magic env vars for review: "+strings.Join(names, ", "))
@@ -144,7 +145,7 @@ func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts
 	files := map[string][]byte{
 		"compose.yaml":         []byte(compose),
 		".env.example":         []byte(envExample(appEnvironment, false)),
-		"migration-report.md":  []byte(report(app, warnings)),
+		"migration-report.md":  []byte(report(app, topology.Routes, warnings)),
 		"migration-runbook.md": []byte(runbook(app, topology, warnings)),
 	}
 	for _, envFile := range serviceEnvFilesForMode(app.Services, false) {
@@ -165,7 +166,7 @@ func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts
 		}
 	}
 
-	if err := writeJSON(filepath.Join(appDir, "routes.json"), app.Routes); err != nil {
+	if err := writeJSON(filepath.Join(appDir, "routes.json"), topology.Routes); err != nil {
 		return "", nil, err
 	}
 	if err := writeJSON(filepath.Join(appDir, "storages.json"), app.Storages); err != nil {
@@ -176,6 +177,69 @@ func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts
 	}
 
 	return composeSource, warnings, nil
+}
+
+func routesForCompose(routes []manifest.Route, sourceServices []analyzer.SourceService, composeSource, compose string) []manifest.Route {
+	composeServices := composeServiceNameSet(compose)
+	rawServiceNamesByContainer := make(map[string]string, len(sourceServices))
+	for _, sourceService := range sourceServices {
+		containerName := strings.TrimSpace(sourceService.ContainerName)
+		serviceName := strings.TrimSpace(sourceService.ServiceName)
+		if containerName == "" {
+			continue
+		}
+		if _, exists := rawServiceNamesByContainer[containerName]; exists {
+			continue
+		}
+		if _, exists := composeServices[serviceName]; exists {
+			rawServiceNamesByContainer[containerName] = serviceName
+		}
+	}
+
+	result := append([]manifest.Route(nil), routes...)
+	for index := range result {
+		serviceName := strings.TrimSpace(result[index].ServiceName)
+		if len(composeServices) == 1 && (serviceName == "" || composeSource == ComposeSourceRaw && result[index].Source == "fqdn") {
+			for name := range composeServices {
+				result[index].ServiceName = name
+			}
+			continue
+		}
+		if composeSource == ComposeSourceGenerated {
+			if _, exists := composeServices[serviceName]; exists {
+				result[index].ServiceName = serviceName
+				continue
+			}
+			generatedName := planutil.Slug(serviceName)
+			if generatedName == "" && serviceName != "" {
+				generatedName = "app"
+			}
+			if _, exists := composeServices[generatedName]; exists {
+				result[index].ServiceName = generatedName
+			}
+			continue
+		}
+		if mappedService, exists := rawServiceNamesByContainer[serviceName]; exists {
+			result[index].ServiceName = mappedService
+		} else {
+			result[index].ServiceName = serviceName
+		}
+	}
+	return result
+}
+
+func composeServiceNameSet(compose string) map[string]struct{} {
+	var document struct {
+		Services map[string]any `yaml:"services"`
+	}
+	if err := yaml.Unmarshal([]byte(compose), &document); err != nil || document.Services == nil {
+		return nil
+	}
+	names := make(map[string]struct{}, len(document.Services))
+	for name := range document.Services {
+		names[strings.TrimSpace(name)] = struct{}{}
+	}
+	return names
 }
 
 func exportEnvMode(opts Options) string {
@@ -588,7 +652,7 @@ func envExample(envs []manifest.EnvVar, includePrivateValues bool) string {
 	return builder.String()
 }
 
-func report(app manifest.App, warnings []string) string {
+func report(app manifest.App, routes []manifest.Route, warnings []string) string {
 	var builder strings.Builder
 	builder.WriteString("# migration report\n\n")
 	builder.WriteString(fmt.Sprintf("app: `%s`\n\n", app.Name))
@@ -608,10 +672,10 @@ func report(app manifest.App, warnings []string) string {
 	}
 
 	builder.WriteString("## routes\n\n")
-	if len(app.Routes) == 0 {
+	if len(routes) == 0 {
 		builder.WriteString("no routes detected.\n\n")
 	} else {
-		for _, route := range app.Routes {
+		for _, route := range routes {
 			builder.WriteString(fmt.Sprintf("- `%s` -> `%s`", route.Host, planutil.Fallback(route.ServiceName, app.Name)))
 			if route.Port != "" {
 				builder.WriteString(fmt.Sprintf(" port `%s`", route.Port))

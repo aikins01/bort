@@ -95,11 +95,26 @@ func (i appIssue) FixCommand(app string) string {
 }
 
 func (i appIssue) NextStep() string {
+	return i.nextStep(bortCommand("status"), bortCommand("migrate --run <run>"), "the run's bundle")
+}
+
+func (i appIssue) NextStepForRun(run loadedMigrationRun) string {
+	return i.nextStep(runScopedCommand(run, "status"), runScopedCommand(run, "migrate"), "`"+replanBundleDir(run.Run)+"`")
+}
+
+func replanBundleDir(run migrationRun) string {
+	if strings.TrimSpace(run.Source) == "" && strings.TrimSpace(run.SourceBundleDir) != "" {
+		return run.SourceBundleDir
+	}
+	return run.BundleDir
+}
+
+func (i appIssue) nextStep(statusCommand, migrateCommand, bundle string) string {
 	switch i.Kind {
 	case issueKindRoute:
 		for _, item := range i.Items {
 			if item.Code == preparer.GateDomainServiceMissing || item.Code == preparer.GateDomainServiceNotInCompose {
-				return "correct the route-to-Compose-service mapping in the bundle and re-plan, or correct it at the source and scan a new run"
+				return fmt.Sprintf("if live execution has started, run `%s`, complete the required recovery, then correct the source or input bundle and create a new run; otherwise correct the route-to-Compose-service mapping in the app's topology.json in %s, keep its routes.json consistent, and re-plan with `%s`", statusCommand, bundle, migrateCommand)
 			}
 		}
 		return "confirm the route host and service in Dokploy before live apply"

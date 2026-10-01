@@ -366,7 +366,7 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 		serviceName := strings.TrimSpace(route.ServiceName)
 		serviceExists := true
 		if !resources.App.ComposeMissing {
-			serviceName, serviceExists = preparedServiceName(serviceName, rawServiceNamesByContainer, composeSource, composeServices)
+			serviceName, serviceExists = preparedServiceName(serviceName, route.Source, rawServiceNamesByContainer, composeSource, composeServices)
 		}
 		readiness := ReadinessReadyToCreate
 		if strings.TrimSpace(route.Host) == "" {
@@ -421,18 +421,14 @@ func composeServiceNames(contents []byte) (map[string]struct{}, error) {
 	return names, nil
 }
 
-func preparedServiceName(serviceName string, rawServiceNamesByContainer map[string]string, composeSource string, composeServices map[string]struct{}) (string, bool) {
-	switch composeSource {
-	case ComposeSourceRaw, ComposeSourceGenerated:
-	default:
-		return serviceName, false
-	}
-	if serviceName == "" && len(composeServices) == 1 {
+func preparedServiceName(serviceName, routeSource string, rawServiceNamesByContainer map[string]string, composeSource string, composeServices map[string]struct{}) (string, bool) {
+	if len(composeServices) == 1 && (serviceName == "" || (composeSource == ComposeSourceRaw && routeSource == "fqdn")) {
 		for name := range composeServices {
 			return name, true
 		}
 	}
-	if composeSource == ComposeSourceGenerated {
+	switch composeSource {
+	case ComposeSourceGenerated:
 		if _, ok := composeServices[serviceName]; ok {
 			return serviceName, true
 		}
@@ -444,12 +440,15 @@ func preparedServiceName(serviceName string, rawServiceNamesByContainer map[stri
 			return generatedName, true
 		}
 		return serviceName, false
+	case ComposeSourceRaw:
+		if mappedService, ok := rawServiceNamesByContainer[serviceName]; ok {
+			return mappedService, true
+		}
+		_, ok := composeServices[serviceName]
+		return serviceName, ok
+	default:
+		return serviceName, false
 	}
-	if mappedService, ok := rawServiceNamesByContainer[serviceName]; ok {
-		return mappedService, true
-	}
-	_, ok := composeServices[serviceName]
-	return serviceName, ok
 }
 
 func appResource(name, composeSource string, contents []byte, composeErr error) AppResource {

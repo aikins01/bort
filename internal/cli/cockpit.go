@@ -92,7 +92,7 @@ func writeAppFirstCockpitSummary(w io.Writer, run loadedMigrationRun, summary mi
 				}
 				if fix := issue.FixCommand(app.Name); fix != "" {
 					fmt.Fprintf(w, "          %s\n", st.fix(fix))
-				} else if next := issue.NextStep(); next != "" {
+				} else if next := issue.NextStepForRun(run); next != "" {
 					fmt.Fprintf(w, "          %s\n", st.muted("next: "+next))
 				}
 			}

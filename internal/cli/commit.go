@@ -212,6 +212,9 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 			return fmt.Errorf("reconfirm completed commit metadata durability: %w", err)
 		}
 		if requiresHostOwner {
+			if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, true); err != nil {
+				return fmt.Errorf("remove target-authority staging-volume pins after completed source retirement; host ownership remains held so this commit can be retried: %w", err)
+			}
 			if err := releaseDokployTargetOwner(run.Run); err != nil {
 				return fmt.Errorf("release completed commit host ownership: %w", err)
 			}
@@ -229,6 +232,7 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 	client := &dokploy.Client{}
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
+	plan.RecoveryCommand = runScopedCommand(run, "status")
 	plan.ApprovedPrepareDecisions = approvedPrepareDecisions(run)
 	if err := markRunCommitStartedLocked(run.Run); err != nil {
 		return fmt.Errorf("record source retirement start: %w", err)
@@ -241,6 +245,9 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 		return fmt.Errorf("source retirement completed, but migration commit metadata could not be recorded: %w", err)
 	}
 	if requiresHostOwner {
+		if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, true); err != nil {
+			return fmt.Errorf("commit was recorded, but target-authority staging-volume pins could not be removed; host ownership remains held so this commit can be retried: %w", err)
+		}
 		if err := releaseDokployTargetOwner(run.Run); err != nil {
 			return fmt.Errorf("commit was recorded, but its Dokploy host ownership could not be released: %w", err)
 		}

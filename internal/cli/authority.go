@@ -10,6 +10,10 @@ import (
 	"github.com/aikins01/bort/internal/target/dokploy"
 )
 
+var releaseAuthorityStagingVolumePins = func(ctx context.Context, plan dokploy.Plan, targetAuthority bool) error {
+	return (&dokploy.Client{}).ReleaseStagingVolumePins(ctx, plan, targetAuthority)
+}
+
 func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("recover-authority", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -84,8 +88,16 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 	}
 	if !found {
 		if authority == dokployTrafficSource && run.Run.AuthorityFinalizedAt == nil {
+			if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, false); err != nil {
+				return fmt.Errorf("remove source-authority staging-volume pins before finalization: %w", err)
+			}
 			if err := markRunAuthorityFinalizedLocked(run.Run); err != nil {
 				return fmt.Errorf("record source-authority finalization: %w", err)
+			}
+		}
+		if authority == dokployTrafficTarget && run.Run.CommittedAt != nil {
+			if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, true); err != nil {
+				return fmt.Errorf("remove target-authority staging-volume pins after source retirement: %w", err)
 			}
 		}
 		fmt.Fprintf(stdout, "Authority recovery already complete for run %s: %s authority.\n", run.Run.Name, authority)
@@ -123,6 +135,9 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 		if err := markRunRolledBackLocked(run.Run); err != nil {
 			return fmt.Errorf("record manual source recovery completion: %w", err)
 		}
+		if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, false); err != nil {
+			return fmt.Errorf("source authority was recorded, but staging-volume pins could not be removed; host ownership remains held so this recovery can be retried: %w", err)
+		}
 		if err := releaseDokployTrafficOwner(run.Run); err != nil {
 			return fmt.Errorf("release source-authority host ownership: %w", err)
 		}
@@ -148,6 +163,9 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 		if err := markRunCommittedLocked(run.Run); err != nil {
 			return fmt.Errorf("record manual source retirement completion: %w", err)
 		}
+		if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, true); err != nil {
+			return fmt.Errorf("target authority and source retirement were recorded, but staging-volume pins could not be removed; host ownership remains held so this recovery can be retried: %w", err)
+		}
 		if err := releaseDokployTargetOwner(run.Run); err != nil {
 			return fmt.Errorf("release target-authority host ownership: %w", err)
 		}
@@ -160,6 +178,20 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 	}
 	fmt.Fprintf(stdout, "Authority recovery complete for run %s: target authority recorded. Run `%s` when ready to retire the source.\n", run.Run.Name, runScopedCommand(run, "commit --apply"))
 	return nil
+}
+
+func releaseRecoveredAuthorityStagingVolumePins(ctx context.Context, run loadedMigrationRun, targetAuthority bool) error {
+	plan := livePlanForApplied(run, run.Applied)
+	plan.RunName = run.Run.Name
+	plan.RunDir = run.Run.RunDir
+	runID, err := dokployTrafficRunID(run.Run)
+	if err != nil {
+		return err
+	}
+	plan.RunID = runID
+	plan.TargetIdentities = appliedTargetIdentities(run.Applied)
+	plan.StagingTransferApps = appliedStagingTransferApps(run.Applied)
+	return releaseAuthorityStagingVolumePins(ctx, plan, targetAuthority)
 }
 
 func recordOwnerlessSourceRetirement(run loadedMigrationRun, stdout io.Writer) error {

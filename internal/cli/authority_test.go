@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -120,6 +121,82 @@ func TestRecoverAuthorityFinalizesSourceAndReleasesHost(t *testing.T) {
 	}
 	if phase := migrationRunPhase(completed); phase != "rolled back" {
 		t.Fatalf("source recovery phase=%q, want rolled back", phase)
+	}
+}
+
+func TestRecoverAuthorityKeepsHostOwnershipWhenPinCleanupFails(t *testing.T) {
+	for _, authority := range []string{dokployTrafficSource, dokployTrafficTarget} {
+		t.Run(authority, func(t *testing.T) {
+			run := writeAmbiguousAuthorityRun(t, "pin-cleanup-"+authority)
+			previous := releaseAuthorityStagingVolumePins
+			calls := 0
+			releaseAuthorityStagingVolumePins = func(_ context.Context, plan dokploy.Plan, targetAuthority bool) error {
+				calls++
+				if plan.RunName != run.Run.Name || plan.RunDir != run.Run.RunDir || plan.RunID == "" || targetAuthority != (authority == dokployTrafficTarget) {
+					t.Fatalf("pin cleanup received incomplete recovery identity: plan=%#v target=%t", plan, targetAuthority)
+				}
+				if calls == 1 {
+					return errors.New("pin cleanup failed")
+				}
+				return nil
+			}
+			t.Cleanup(func() { releaseAuthorityStagingVolumePins = previous })
+
+			args := []string{"--run", run.Run.Name, "--authority", authority, "--confirm", authorityRecoveryConfirmation(run.Run, authority)}
+			if authority == dokployTrafficTarget {
+				args = []string{"--run", run.Run.Name, "--authority", authority, "--source-retired", "--confirm", authorityRecoverySourceRetiredConfirmation(run.Run)}
+			}
+			err := runRecoverAuthority(context.Background(), args, io.Discard, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), "host ownership remains held") || !strings.Contains(err.Error(), "pin cleanup failed") {
+				t.Fatalf("expected pin cleanup failure to retain host ownership, got %v", err)
+			}
+			owner, found, err := readDokployTrafficOwner()
+			if err != nil || !found || owner.Authority != authority {
+				t.Fatalf("pin cleanup failure released or changed owner: owner=%#v found=%t err=%v", owner, found, err)
+			}
+			interrupted, err := loadMigrationRun(run.Run.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if authority == dokployTrafficSource && (interrupted.Run.RolledBackAt == nil || interrupted.Run.AuthorityFinalizedAt != nil) {
+				t.Fatalf("source recovery did not stop at pin cleanup boundary: %#v", interrupted.Run)
+			}
+			if authority == dokployTrafficTarget && interrupted.Run.CommittedAt == nil {
+				t.Fatalf("target recovery did not record retirement before pin cleanup: %#v", interrupted.Run)
+			}
+
+			if err := runRecoverAuthority(context.Background(), args, io.Discard, io.Discard); err != nil {
+				t.Fatalf("pin cleanup retry did not finish recovery: %v", err)
+			}
+			owner, found, err = readDokployTrafficOwner()
+			if err != nil || !found || owner.Authority != dokployTrafficReleased || calls != 2 {
+				t.Fatalf("recovery retry did not release owner: owner=%#v found=%t calls=%d err=%v", owner, found, calls, err)
+			}
+		})
+	}
+}
+
+func TestAuthorityRecoveryCarriesAppliedTransferEvidenceIntoPinCleanup(t *testing.T) {
+	run := writeAmbiguousAuthorityRun(t, "transfer-evidence")
+	run.Applied.PlanVersion = appliedPlanV1Alpha3
+	run.Applied.Steps = []appliedStep{{
+		Index:  1,
+		Kind:   string(dokploy.StepRestoreDataStore),
+		App:    "api",
+		Ref:    "postgres:db",
+		Status: string(dokploy.StepStatusError),
+	}}
+	previous := releaseAuthorityStagingVolumePins
+	releaseAuthorityStagingVolumePins = func(_ context.Context, plan dokploy.Plan, targetAuthority bool) error {
+		if !targetAuthority || len(plan.StagingTransferApps) != 1 || plan.StagingTransferApps[0] != "api" {
+			t.Fatalf("pin cleanup did not receive transfer evidence: plan=%#v target=%t", plan, targetAuthority)
+		}
+		return nil
+	}
+	t.Cleanup(func() { releaseAuthorityStagingVolumePins = previous })
+
+	if err := releaseRecoveredAuthorityStagingVolumePins(context.Background(), run, true); err != nil {
+		t.Fatal(err)
 	}
 }
 

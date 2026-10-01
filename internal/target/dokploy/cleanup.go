@@ -1035,26 +1035,39 @@ func isDockerResourceMissingErr(err error, resource, name string) bool {
 	if err == nil {
 		return false
 	}
-	message := strings.ToLower(err.Error())
+	message := err.Error()
+	name = strings.TrimSpace(name)
+	legacyPrefix := "error: no such " + resource + ": "
+	if index := strings.LastIndex(strings.ToLower(message), legacyPrefix); index >= 0 && dockerMessageNamesResource(strings.TrimSpace(message[index:]), legacyPrefix, name, "") {
+		return resource == "volume" || resource == "network"
+	}
 	marker := "error response from daemon: "
-	index := strings.LastIndex(message, marker)
+	index := strings.LastIndex(strings.ToLower(message), marker)
 	if index < 0 {
 		return false
 	}
 	detail := strings.TrimSpace(message[index+len(marker):])
-	name = strings.ToLower(strings.TrimSpace(name))
 	switch resource {
 	case "volume":
-		return detail == "get "+name+": no such volume" ||
-			detail == "remove "+name+": no such volume" ||
-			detail == "volume "+name+" not found"
+		return dockerMessageNamesResource(detail, "get ", name, ": no such volume") ||
+			dockerMessageNamesResource(detail, "remove ", name, ": no such volume") ||
+			dockerMessageNamesResource(detail, "volume ", name, " not found")
 	case "network":
-		return detail == "network not found" ||
-			detail == "network "+name+" not found" ||
-			detail == "no such network: "+name
+		return strings.EqualFold(detail, "network not found") ||
+			dockerMessageNamesResource(detail, "network ", name, " not found") ||
+			dockerMessageNamesResource(detail, "no such network: ", name, "")
 	default:
 		return false
 	}
+}
+
+func dockerMessageNamesResource(message, prefix, name, suffix string) bool {
+	if len(message) < len(prefix)+len(name)+len(suffix) ||
+		!strings.EqualFold(message[:len(prefix)], prefix) ||
+		!strings.EqualFold(message[len(message)-len(suffix):], suffix) {
+		return false
+	}
+	return message[len(prefix):len(message)-len(suffix)] == name
 }
 
 func cleanupProjectNames(names []string) []string {

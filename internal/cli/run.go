@@ -615,7 +615,7 @@ func recoverInterruptedStatefulSources(ctx context.Context, run loadedMigrationR
 			onProgress(item)
 		}
 	}
-	plan := dokploy.Plan{Steps: steps, Prepare: prepare, RunDir: run.Run.RunDir, BeforeStep: &beforeStep, OnProgress: &progress}
+	plan := dokploy.Plan{Steps: steps, Prepare: prepare, RunDir: run.Run.RunDir, RecoveryCommand: runScopedCommand(run, "status"), BeforeStep: &beforeStep, OnProgress: &progress}
 	client := &dokploy.Client{}
 	if err := client.AdoptHistoricalSourcePause(ctx, plan, appNames); err != nil {
 		return errors.Join(refusal, fmt.Errorf("record historical source pause ownership: %w", err))
@@ -845,6 +845,7 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 	}
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
+	plan.RecoveryCommand = runScopedCommand(run, "status")
 	if plan.RunID, err = dokployTrafficRunID(run.Run); err != nil {
 		return err
 	}
