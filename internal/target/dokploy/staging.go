@@ -1063,7 +1063,7 @@ func requireSourceMountsStageDataDir(app preparer.AppPlan, service, dataDir stri
 		if candidate.Service != service || candidate.Type != "volume" || path.Clean(candidate.Target) == path.Clean(mount.Target) || mountCoversPath(dataDir, candidate.Target) {
 			continue
 		}
-		return fmt.Errorf("%w: named volume %q at %s for service %s in app %s is outside postgres data directory %s, so a logical restore cannot preserve its contents; choose a recreate or managed data store strategy or change the source compose before live apply", ErrNotImplemented, firstNonEmpty(candidate.Name, candidate.Source), candidate.Target, service, app.Name, dataDir)
+		return fmt.Errorf("%w: named volume %q at %s for service %s in app %s is outside postgres data directory %s, so a logical restore cannot preserve its contents", ErrNotImplemented, firstNonEmpty(candidate.Name, candidate.Source), candidate.Target, service, app.Name, dataDir)
 	}
 	return nil
 }
