@@ -28,9 +28,11 @@ source retirement starts, even if commit is interrupted. Rerun `commit --apply`
 to finish an interrupted acceptance.
 
 For a Coolify source, `commit --apply` refuses because Bort cannot disable
-queued or future Coolify deployments. Keep the Coolify control plane stopped
-(`sudo docker update --restart=no coolify && sudo docker stop coolify` if it is
-running), remove the reviewed source app containers (and the source proxy
+queued or future Coolify deployments. Record the Coolify control plane's restart
+policy with
+`sudo docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify`,
+then run `sudo docker update --restart=no coolify && sudo docker stop coolify`
+even if it is already stopped. Remove the reviewed source app containers (and the source proxy
 container when the cutover moved routes) with the exact `sudo docker rm -f ...`
 command Bort prints, and verify they stay removed.
 Then run the exact

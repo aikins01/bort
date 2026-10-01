@@ -1094,12 +1094,12 @@ func (e stagedRestorePreflightError) Error() string { return e.err.Error() }
 
 func (e stagedRestorePreflightError) Unwrap() error { return e.err }
 
-func stagedRestoreLayoutRefusal(err error, app string) error {
+func stagedRestoreLayoutRefusal(err error, plan Plan, app string) error {
 	if !errors.Is(err, ErrNotImplemented) {
 		return err
 	}
 	return stagedRestorePreflightError{
-		err:            fmt.Errorf("%w; no retry of this run can pass pause_source for app %s because its reviewed plan is immutable: follow the run status guidance to release this run, then choose a recreate or managed data store strategy or change the source compose and create a new run", err, app),
+		err:            fmt.Errorf("%w; no retry of this run can pass pause_source for app %s because its reviewed plan is immutable: follow the recovery `%s` shows to release this run, then choose a recreate or managed data store strategy or change the source compose and create a new run", err, app, recoveryStatusCommand(plan)),
 		requiresNewRun: true,
 	}
 }
@@ -1107,7 +1107,7 @@ func stagedRestoreLayoutRefusal(err error, app string) error {
 func (c *Client) preflightStagedRestore(ctx context.Context, runner dockerRunner, actx *applyContext, app preparer.AppPlan, step Step, store preparer.DataStoreResource) error {
 	staged, err := requireStagedRestoreLayout(actx.plan, step, store)
 	if err != nil {
-		return stagedRestoreLayoutRefusal(err, step.App)
+		return stagedRestoreLayoutRefusal(err, actx.plan, step.App)
 	}
 	project, err := c.stagingRestoreProject(ctx, actx, step, store, staged)
 	if err != nil {
@@ -1137,7 +1137,7 @@ func (c *Client) preflightStagedRestore(ctx context.Context, runner dockerRunner
 		}
 		return requireSourceMountsStageDataDir(app, store.Service, postgresDataDir(dst), staged)
 	}()
-	checkErr = stagedRestoreLayoutRefusal(checkErr, step.App)
+	checkErr = stagedRestoreLayoutRefusal(checkErr, actx.plan, step.App)
 	if downErr := project.down(runner); downErr != nil {
 		if checkErr != nil {
 			return fmt.Errorf("%w (also failed to stop staging project: %v)", checkErr, downErr)

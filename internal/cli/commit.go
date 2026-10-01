@@ -283,7 +283,7 @@ func manualCoolifySourceRetirementAction(run loadedMigrationRun) string {
 		}
 		removal = fmt.Sprintf("remove the reviewed source containers with `%s`", dockerCommand("rm -f "+strings.Join(quoted, " ")))
 	}
-	return fmt.Sprintf("keep the Coolify control plane stopped (if it is running, record its restart policy with `%s`, then run `%s && %s`; this pauses Coolify for every app on the host), %s, verify they stay removed, then run `%s`; leave Coolify stopped afterwards if you can, because starting it again can recreate its proxy and redeploy the removed apps; if other apps need it, restore the recorded restart policy, start it, and immediately delete the migrated apps in Coolify", dockerCommand("inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify"), dockerCommand("update --restart=no coolify"), dockerCommand("stop coolify"), removal, authorityRecoverySourceRetiredCommand(run))
+	return fmt.Sprintf("record the Coolify control plane's restart policy with `%s`, then run `%s && %s` even if it is already stopped (this pauses Coolify for every app on the host), %s, verify they stay removed, then run `%s`; leave Coolify stopped afterwards if you can, because starting it again can recreate its proxy and redeploy the removed apps; if other apps need it, restore the recorded restart policy, start it, and immediately delete the migrated apps in Coolify", dockerCommand("inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify"), dockerCommand("update --restart=no coolify"), dockerCommand("stop coolify"), removal, authorityRecoverySourceRetiredCommand(run))
 }
 
 func finishStartedAcceptanceAction(run loadedMigrationRun) string {

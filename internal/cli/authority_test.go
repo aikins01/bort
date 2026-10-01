@@ -236,7 +236,7 @@ func TestRecoverAuthorityFinalizesTargetForCommitAndRefusesAutomaticRollback(t *
 	if phase := migrationRunPhase(completed); phase != "applied" {
 		t.Fatalf("target recovery phase=%q, want applied", phase)
 	}
-	if next := nextSafeStep(completed, nil); !strings.Contains(next.Action, "--source-retired") || !strings.Contains(next.Action, "keep the Coolify control plane stopped") || strings.Contains(next.Action, "commit --apply") || strings.Contains(next.Action, "rollback --live") {
+	if next := nextSafeStep(completed, nil); !strings.Contains(next.Action, "--source-retired") || !strings.Contains(next.Action, "even if it is already stopped") || strings.Contains(next.Action, "commit --apply") || strings.Contains(next.Action, "rollback --live") {
 		t.Fatalf("target recovery next step is unsafe: %#v", next)
 	}
 	if err := runRecoverAuthority(context.Background(), args, io.Discard, io.Discard); err != nil {

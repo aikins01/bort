@@ -3130,29 +3130,6 @@ func TestIncompleteStagingTransfersRequiresEveryStagedVolumeRecord(t *testing.T)
 	}
 }
 
-func TestRequireSourceMountsStageDataDirAllowsEmptyAnonymousImageVolume(t *testing.T) {
-	anonymous := strings.Repeat("ab", 32)
-	for _, tc := range []struct {
-		name  string
-		extra preparer.VolumeResource
-		want  bool
-	}{
-		{name: "empty anonymous image volume", extra: preparer.VolumeResource{Service: "db", Type: "volume", Name: anonymous, Target: "/var/lib/postgresql/data", ReadWrite: true}},
-		{name: "anonymous volume with scanned content", extra: preparer.VolumeResource{Service: "db", Type: "volume", Name: anonymous, Target: "/var/lib/postgresql/data", ReadWrite: true, FileCount: 3}, want: true},
-		{name: "named compose volume", extra: preparer.VolumeResource{Service: "db", Type: "volume", Name: "backups", Target: "/backups", ReadWrite: true}, want: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			app := preparer.AppPlan{Name: "api"}
-			app.Resources.Volumes = []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "pgdata", Target: "/pgdata", ReadWrite: true}, tc.extra}
-			staged := []stagedVolume{{Service: "db", Target: "/pgdata", VolumeName: "bort-pgdata"}, {Service: "db", Target: tc.extra.Target, VolumeName: "bort-extra"}}
-			err := requireSourceMountsStageDataDir(app, "db", "/pgdata", staged)
-			if tc.want != (err != nil) {
-				t.Fatalf("refused=%t, want %t: %v", err != nil, tc.want, err)
-			}
-		})
-	}
-}
-
 func TestValidateTargetAuthorityRequiresHandoffEvidenceWhenPinIsMissing(t *testing.T) {
 	_, plan, _, staged := stagedSyncFixture(t)
 	plan.StagingTransferApps = []string{"api"}
@@ -3176,5 +3153,17 @@ func TestValidateTargetAuthorityRequiresHandoffEvidenceWhenPinIsMissing(t *testi
 	plan.HandedOffApps = []string{"api"}
 	if err := client.ValidateStagingVolumePins(context.Background(), plan, true); err != nil {
 		t.Fatalf("target validation refused a recorded handoff whose pin was released: %v", err)
+	}
+}
+
+func TestRequireSourceMountsStageDataDirRefusesUnmeasuredAnonymousVolume(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "db", Type: "volume", Name: "pgdata", Target: "/pgdata", ReadWrite: true},
+		{Service: "db", Type: "volume", Name: strings.Repeat("ab", 32), Target: "/var/lib/postgresql/data", ReadWrite: true},
+	}
+	staged := []stagedVolume{{Service: "db", Target: "/pgdata", VolumeName: "bort-pgdata"}, {Service: "db", Target: "/var/lib/postgresql/data", VolumeName: "bort-anon"}}
+	if err := requireSourceMountsStageDataDir(app, "db", "/pgdata", staged); err == nil || !errors.Is(err, ErrNotImplemented) {
+		t.Fatalf("anonymous volume outside PGDATA with unknown contents was accepted: %v", err)
 	}
 }

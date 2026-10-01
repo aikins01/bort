@@ -1060,25 +1060,12 @@ func requireSourceMountsStageDataDir(app preparer.AppPlan, service, dataDir stri
 		return fmt.Errorf("%w: postgres data directory %s for service %s in app %s is mounted from %s %q at %s, not a named volume, so the restore would be lost when the staging container stops", ErrNotImplemented, dataDir, service, app.Name, mount.Type, firstNonEmpty(mount.Name, mount.Source), mount.Target)
 	}
 	for _, candidate := range app.Resources.Volumes {
-		if candidate.Service != service || candidate.Type != "volume" || path.Clean(candidate.Target) == path.Clean(mount.Target) || mountCoversPath(dataDir, candidate.Target) || emptyAnonymousVolume(candidate) {
+		if candidate.Service != service || candidate.Type != "volume" || path.Clean(candidate.Target) == path.Clean(mount.Target) || mountCoversPath(dataDir, candidate.Target) {
 			continue
 		}
 		return fmt.Errorf("%w: named volume %q at %s for service %s in app %s is outside postgres data directory %s, so a logical restore cannot preserve its contents; choose a recreate or managed data store strategy or change the source compose before live apply", ErrNotImplemented, firstNonEmpty(candidate.Name, candidate.Source), candidate.Target, service, app.Name, dataDir)
 	}
 	return nil
-}
-
-func emptyAnonymousVolume(volume preparer.VolumeResource) bool {
-	name := firstNonEmpty(volume.Name, volume.Source)
-	if len(name) != 64 || volume.SizeBytes != 0 || volume.FileCount != 0 {
-		return false
-	}
-	for _, r := range name {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
-			return false
-		}
-	}
-	return true
 }
 
 func stagedVolumeMount(mount preparer.VolumeResource, staged []stagedVolume) bool {

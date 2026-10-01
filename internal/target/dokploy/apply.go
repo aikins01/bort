@@ -1864,7 +1864,7 @@ func (c *Client) applyInstallGateway(ctx context.Context, actx *applyContext, st
 	sourceServices, composeSource := routeServiceContextForApp(actx.plan, step.App)
 	route, err = resolveRouteForCompose(route, composeFile, sourceServices, composeSource)
 	if err != nil {
-		return err
+		return withRecoveryStatusCommand(err, actx.plan)
 	}
 	return c.ensureRouteDomain(ctx, entry.ComposeID, route)
 }
@@ -1892,7 +1892,7 @@ func (c *Client) applyActivateRoutes(ctx context.Context, actx *applyContext, st
 	for _, route := range cutoverRoutesForApp(actx.plan.Cutover, step.App) {
 		resolved, err := resolveRouteForCompose(route, composeFile, sourceServices, composeSource)
 		if err != nil {
-			return err
+			return withRecoveryStatusCommand(err, actx.plan)
 		}
 		if err := c.ensureRouteDomain(ctx, entry.ComposeID, resolved); err != nil {
 			return err
@@ -1968,6 +1968,13 @@ func routeServiceContextForApp(plan Plan, appName string) ([]preparer.SourceServ
 	return app.Resources.SourceServices, app.Resources.App.ComposeSource
 }
 
+func withRecoveryStatusCommand(err error, plan Plan) error {
+	if !requiresAuthorityRecovery(err) {
+		return err
+	}
+	return authorityRecoveryRequiredError{err: fmt.Errorf("%w; run `%s` for the exact recovery commands", err, recoveryStatusCommand(plan))}
+}
+
 func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServices []preparer.SourceServiceRef, composeSource string) (gateway.Route, error) {
 	services, err := composeServiceSummaries(composeFile)
 	if err != nil {
@@ -2002,7 +2009,7 @@ func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServi
 	if availableServices == "" {
 		availableServices = "no services"
 	}
-	return gateway.Route{}, authorityRecoveryRequiredError{err: fmt.Errorf("route %s points at service %q, but the Dokploy Compose file has %s; no retry of this immutable run can pass this step, so follow the run status guidance to record source or target authority with recover-authority, then correct the source configuration or the bundle used to create the next run and create a new run",
+	return gateway.Route{}, authorityRecoveryRequiredError{err: fmt.Errorf("route %s points at service %q, but the Dokploy Compose file has %s; no retry of this immutable run can pass this step, so follow the run status guidance (`bort status`) to record source or target authority with recover-authority, then correct the source configuration or the bundle used to create the next run and create a new run",
 		planutilFallback(route.Host, "unknown"), route.ServiceName, availableServices)}
 }
 
