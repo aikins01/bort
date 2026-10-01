@@ -547,6 +547,25 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 	return nil
 }
 
+func IncompleteStagingTransfers(plan Plan) ([]string, error) {
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	if err := actx.loadMigratedVolumeMounts(); err != nil {
+		return nil, err
+	}
+	for _, app := range plan.StagingTransferApps {
+		actx.entry(app).StagingTransferStarted = true
+	}
+	incomplete := []string{}
+	for _, app := range plan.Prepare.Apps {
+		volumes := stagedVolumesForApp(plan, app.Name)
+		entry := actx.entry(app.Name)
+		if len(volumes) > 0 && stagingTransferStarted(entry) && !stagedVolumesRecorded(entry, volumes) {
+			incomplete = append(incomplete, app.Name)
+		}
+	}
+	return incomplete, nil
+}
+
 func reconcileStagingVolumePinsWithTimeout(runner dockerRunner, plan Plan, appName string, volumes []stagedVolume, expectedName string) (stagingVolumePin, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dockerStopTimeout)
 	defer cancel()

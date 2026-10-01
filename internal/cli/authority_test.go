@@ -607,3 +607,55 @@ func TestAuthorityRecoveryClientBindsTargetCredentialsToRunOrigin(t *testing.T) 
 		t.Fatalf("target recovery accepted credentials for another Dokploy origin: %v", err)
 	}
 }
+
+func TestRecoverAuthorityRefusesTargetForUnfinishedStagedTransfer(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	t.Chdir(t.TempDir())
+	writeTestBundle(t, "bundle", manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local", DockerEngineID: "engine-reviewed"},
+		Apps: []manifest.App{{
+			Name: "api",
+			Services: []manifest.Service{{
+				ID: "source-id", Name: "web", Image: "example/api:latest",
+				Mounts: []manifest.Mount{{Type: "volume", Name: "api-data", Target: "/data"}},
+			}},
+		}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", "bundle", "--run", "unfinished", "--observation-window", "0", "--rollback-window", "0"})
+	markRunLocallyScanned(t, "unfinished", "coolify-local")
+	run, err := loadMigrationRun("unfinished")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := newRunApplied(run.Run)
+	applied.Steps = []appliedStep{{Index: 1, Kind: string(dokploy.StepSyncVolume), App: "api", Ref: "volume:web -> /data", Status: string(dokploy.StepStatusError), UpdatedAt: time.Now().UTC(), Error: "copy interrupted"}}
+	if err := writeRunApplied(runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied), applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimDokployHostOwnership(run.Run, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+		t.Fatal(err)
+	}
+	if run, err = loadMigrationRun("unfinished"); err != nil {
+		t.Fatal(err)
+	}
+	if incomplete, err := incompleteStagingTransferApps(run); err != nil || len(incomplete) != 1 || incomplete[0] != "api" {
+		t.Fatalf("unfinished staged transfer was not detected: %v %v", incomplete, err)
+	}
+
+	err = runRecoverAuthority(context.Background(), []string{"--run", "unfinished", "--authority", "target", "--confirm", authorityRecoveryConfirmation(run.Run, dokployTrafficTarget)}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "did not finish") || !strings.Contains(err.Error(), "--authority source") {
+		t.Fatalf("target recovery accepted an unfinished staged transfer: %v", err)
+	}
+	after, err := loadMigrationRun("unfinished")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Run.ResolvedAuthority != "" || after.Run.CommittedAt != nil {
+		t.Fatalf("refused target recovery recorded authority: %#v", after.Run)
+	}
+	var status bytes.Buffer
+	writeAuthorityRecoveryGuidance(&status, newStyler(&status), after, "")
+	if strings.Contains(status.String(), "--authority target") || !strings.Contains(status.String(), "--authority source") {
+		t.Fatalf("status offered target recovery for an unfinished transfer:\n%s", status.String())
+	}
+}

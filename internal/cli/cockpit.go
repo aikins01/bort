@@ -472,12 +472,19 @@ func writeAuthorityRecoveryGuidance(w io.Writer, st *styler, run loadedMigration
 		fmt.Fprintln(w, st.muted(prefix+" Inspect and preserve both sides, establish authority manually, and start a fresh migration run."))
 		return
 	}
-	fmt.Fprintln(w, st.muted(prefix+" After manually fencing the other side and verifying the chosen writer and traffic authority, finish this owner-bound run with one of:"))
+	incomplete, incompleteErr := incompleteStagingTransferApps(run)
+	if incompleteErr == nil && len(incomplete) > 0 {
+		fmt.Fprintln(w, st.muted(prefix+" The staged state transfer for "+strings.Join(incomplete, ", ")+" did not finish, so only source recovery is available. After restoring the source writers and traffic, finish this owner-bound run with:"))
+	} else {
+		fmt.Fprintln(w, st.muted(prefix+" After manually fencing the other side and verifying the chosen writer and traffic authority, finish this owner-bound run with one of:"))
+	}
 	if len(appliedStagingTransferApps(run.Applied)) > 0 {
 		fmt.Fprintln(w, st.muted("  Before source recovery, remove (not just stop) every target container attached to the transferred bort staging volumes. Do not remove the bort-pin-* containers."))
 	}
 	fmt.Fprintf(w, "%s\n", st.muted("  source: `"+authorityRecoveryCommand(run, dokployTrafficSource)+"`"))
-	fmt.Fprintf(w, "%s\n", st.muted("  target: `"+authorityRecoveryCommand(run, dokployTrafficTarget)+"`"))
+	if incompleteErr != nil || len(incomplete) == 0 {
+		fmt.Fprintf(w, "%s\n", st.muted("  target: `"+authorityRecoveryCommand(run, dokployTrafficTarget)+"`"))
+	}
 }
 
 func writeManualRollbackRecoveryCommands(w io.Writer, st *styler, run loadedMigrationRun) {

@@ -121,6 +121,15 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 		fmt.Fprintf(stdout, "Authority recovery already complete for run %s: %s authority.\n", run.Run.Name, authority)
 		return nil
 	}
+	if authority == dokployTrafficTarget {
+		incomplete, err := incompleteStagingTransferApps(run)
+		if err != nil {
+			return fmt.Errorf("check staged transfers before recording target authority: %w", err)
+		}
+		if len(incomplete) > 0 {
+			return fmt.Errorf("target authority was not recorded: the staged state transfer for app(s) %s did not finish, so the target cannot hold the complete source state; restore the source and run `%s`", strings.Join(incomplete, ", "), authorityRecoveryCommand(run, dokployTrafficSource))
+		}
+	}
 	if authority == dokployTrafficTarget && !sourceRetired {
 		var sourceAttestationErr error
 		if err := validateLocalSourceAttestation(run); err != nil {
@@ -199,17 +208,36 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 }
 
 func releaseRecoveredAuthorityStagingVolumePins(ctx context.Context, run loadedMigrationRun, targetAuthority bool) error {
+	plan, err := authorityRecoveryPlan(run)
+	if err != nil {
+		return err
+	}
+	return releaseAuthorityStagingVolumePins(ctx, run, plan, targetAuthority)
+}
+
+func authorityRecoveryPlan(run loadedMigrationRun) (dokploy.Plan, error) {
 	plan := livePlanForApplied(run, run.Applied)
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
 	runID, err := dokployTrafficRunID(run.Run)
 	if err != nil {
-		return err
+		return dokploy.Plan{}, err
 	}
 	plan.RunID = runID
 	plan.TargetIdentities = appliedTargetIdentities(run.Applied)
 	plan.StagingTransferApps = appliedStagingTransferApps(run.Applied)
-	return releaseAuthorityStagingVolumePins(ctx, run, plan, targetAuthority)
+	return plan, nil
+}
+
+func incompleteStagingTransferApps(run loadedMigrationRun) ([]string, error) {
+	if len(appliedStagingTransferApps(run.Applied)) == 0 {
+		return nil, nil
+	}
+	plan, err := authorityRecoveryPlan(run)
+	if err != nil {
+		return nil, err
+	}
+	return dokploy.IncompleteStagingTransfers(plan)
 }
 
 func recordOwnerlessSourceRetirement(run loadedMigrationRun, stdout io.Writer) error {

@@ -3108,3 +3108,18 @@ func TestReleaseTargetAuthorityWithoutPinSkipsLiveAttachmentChecks(t *testing.T)
 		}
 	}
 }
+
+func TestIncompleteStagingTransfersRequiresEveryStagedVolumeRecord(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	plan.StagingTransferApps = []string{"api"}
+	if incomplete, err := IncompleteStagingTransfers(plan); err != nil || len(incomplete) != 1 || incomplete[0] != "api" {
+		t.Fatalf("started transfer without a durable record = %v, %v; want [api]", incomplete, err)
+	}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	if err := actx.recordMigratedVolumeMount("api", migratedVolumeMount{Service: staged.Service, Target: staged.Target, VolumeName: staged.VolumeName}); err != nil {
+		t.Fatal(err)
+	}
+	if incomplete, err := IncompleteStagingTransfers(plan); err != nil || len(incomplete) != 0 {
+		t.Fatalf("recorded transfer reported incomplete: %v, %v", incomplete, err)
+	}
+}
