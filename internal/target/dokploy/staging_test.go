@@ -3110,16 +3110,22 @@ func TestReleaseTargetAuthorityWithoutPinSkipsLiveAttachmentChecks(t *testing.T)
 }
 
 func TestIncompleteStagingTransfersRequiresEveryStagedVolumeRecord(t *testing.T) {
-	_, plan, _, staged := stagedSyncFixture(t)
+	app, plan, firstStep, _ := stagedSyncFixture(t)
+	app.Resources.Volumes = append(app.Resources.Volumes, preparer.VolumeResource{Service: "worker", Type: "volume", Name: "worker-data", Target: "/work"})
+	plan = stagedPlan(t, app, plan.RunDir, Step{Kind: StepPauseSource, App: "api"}, firstStep, Step{Kind: StepSyncVolume, App: "api", Ref: "volume:worker -> /work"})
 	plan.StagingTransferApps = []string{"api"}
-	if incomplete, err := IncompleteStagingTransfers(plan); err != nil || len(incomplete) != 1 || incomplete[0] != "api" {
-		t.Fatalf("started transfer without a durable record = %v, %v; want [api]", incomplete, err)
-	}
+	first, _ := stagedVolumeFor(plan, "api", app.Resources.Volumes[0])
+	second, _ := stagedVolumeFor(plan, "api", app.Resources.Volumes[1])
 	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
-	if err := actx.recordMigratedVolumeMount("api", migratedVolumeMount{Service: staged.Service, Target: staged.Target, VolumeName: staged.VolumeName}); err != nil {
-		t.Fatal(err)
+	for i, volume := range []stagedVolume{first, second} {
+		if incomplete, err := IncompleteStagingTransfers(plan); err != nil || len(incomplete) != 1 || incomplete[0] != "api" {
+			t.Fatalf("after %d of 2 volume records: incomplete = %v, %v; want [api]", i, incomplete, err)
+		}
+		if err := actx.recordMigratedVolumeMount("api", migratedVolumeMount{Service: volume.Service, Target: volume.Target, VolumeName: volume.VolumeName}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if incomplete, err := IncompleteStagingTransfers(plan); err != nil || len(incomplete) != 0 {
-		t.Fatalf("recorded transfer reported incomplete: %v, %v", incomplete, err)
+		t.Fatalf("fully recorded transfer reported incomplete: %v, %v", incomplete, err)
 	}
 }

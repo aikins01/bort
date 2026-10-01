@@ -230,9 +230,6 @@ func authorityRecoveryPlan(run loadedMigrationRun) (dokploy.Plan, error) {
 }
 
 func incompleteStagingTransferApps(run loadedMigrationRun) ([]string, error) {
-	if len(appliedStagingTransferApps(run.Applied)) == 0 {
-		return nil, nil
-	}
 	plan, err := authorityRecoveryPlan(run)
 	if err != nil {
 		return nil, err

@@ -1031,18 +1031,29 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
 func isDockerResourceMissingErr(err error, resource, name string) bool {
 	if err == nil {
 		return false
 	}
 	message := err.Error()
+	lower := asciiLower(message)
 	name = strings.TrimSpace(name)
 	legacyPrefix := "error: no such " + resource + ": "
-	if index := strings.LastIndex(strings.ToLower(message), legacyPrefix); index >= 0 && dockerMessageNamesResource(strings.TrimSpace(message[index:]), legacyPrefix, name, "") {
+	if index := strings.LastIndex(lower, legacyPrefix); index >= 0 && dockerMessageNamesResource(strings.TrimSpace(message[index:]), legacyPrefix, name, "") {
 		return resource == "volume" || resource == "network"
 	}
 	marker := "error response from daemon: "
-	index := strings.LastIndex(strings.ToLower(message), marker)
+	index := strings.LastIndex(lower, marker)
 	if index < 0 {
 		return false
 	}

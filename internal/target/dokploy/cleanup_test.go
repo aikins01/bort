@@ -989,6 +989,7 @@ func TestDockerMissingResourceClassifier(t *testing.T) {
 		{name: "network error during volume inspect", resource: "volume", ref: "api-data", err: errors.New("Error response from daemon: network not found")},
 		{name: "volume error during network inspect", resource: "network", ref: "api-net", err: errors.New("Error response from daemon: get api-data: no such volume")},
 		{name: "unknown resource", resource: "secret", ref: "api-key", err: errors.New("Error response from daemon: secret api-key not found")},
+		{name: "invalid UTF-8 before the daemon marker", resource: "volume", ref: "api-data", err: errors.New(strings.Repeat("\xff", 40) + " Error response from daemon: volume api-data not found"), want: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -809,9 +809,11 @@ never copies data into a deployed target. Instead it:
    pin only when the target holds exactly the recorded attachments. When no pin
    remains, Bort does not recheck target attachments; verify them yourself
    before accepting.
-   Plain `recover-authority --authority target` only records target authority
-   and keeps the pins. Host ownership remains held if validation or removal
-   fails, so the command can be retried.
+   Plain `recover-authority --authority target` records target authority and
+   keeps the pins. Every `--authority target` form refuses when a staged
+   transfer did not finish, because the target cannot hold the complete source
+   state; only source recovery is available then. Host ownership remains held
+   if validation or removal fails, so the command can be retried.
 
 Routed apps stay stopped from step 2 until the proxy handoff moves traffic;
 plan for that downtime. Unrouted apps also keep the source stopped while target
@@ -1006,7 +1008,10 @@ recovery through that run:
     --confirm 'recover <run-name> as target'
   ```
 
-  When source attestation still passes, Bort records target authority. For a
+  If `bort status` reports that a staged state transfer did not finish, only
+  source recovery is available: Bort refuses every `--authority target` form.
+  Otherwise, when source attestation still passes, Bort records target
+  authority. For a
   source without an external orchestrator, `commit --apply` can then retire the
   exact reviewed containers. For Coolify, keep the control plane stopped and
   remove the reviewed source containers with the `docker rm -f` command Bort
@@ -1095,7 +1100,7 @@ Ordinary cleanup and destructive source purge are separate operations. See the
 | Stateless live apply was interrupted at a safe completed boundary | Run `sudo bort status`, then rerun `sudo bort migrate --live` to resume from the saved progress. |
 | Live apply reports `MANUAL STATE` for a stateful run | The run was applied with an older plan version that copied state into a deployed target. The blocked run cannot continue. Complete recovery with the guidance shown by `bort status`, then create a new run. |
 | Stateful live apply refuses because the Coolify control plane is running or would restart, or a Coolify deployment helper is still running deployment commands | Wait until no Coolify deployment is queued or running, record the `coolify` container's restart policy, run `sudo docker update --restart=no coolify && sudo docker stop coolify`, wait until no `coolify-helper` container is still deploying, then rerun `sudo bort migrate --live`. Restore the policy and start Coolify only after source-authority recovery succeeds; after target acceptance, start it only if other apps need it, and immediately delete the migrated apps in Coolify. |
-| A staged state transfer fails (source restarted, foreign-owned volume, or unexpected attachment) | Run `sudo bort status` and follow its recovery. Do not remove a `bort-pin-*` container manually. Bort may restart the source after a retryable pre-handoff failure, but it keeps the pin for the next attempt. If handoff may have started, Bort keeps the source stopped and reports whether it reverified the pin. Source recovery checks that no target container is attached, even if the pin is absent. Final target acceptance requires a durable record that each transfer into staging completed and removes a remaining pin only when the target holds exactly the recorded attachments; when no pin remains, verify the target's attachments yourself before accepting. Host ownership is released only after these checks pass. |
+| A staged state transfer fails (source restarted, foreign-owned volume, or unexpected attachment) | Run `sudo bort status` and follow its recovery. If the transfer did not finish, only source recovery is available. Do not remove a `bort-pin-*` container manually. Bort may restart the source after a retryable pre-handoff failure, but it keeps the pin for the next attempt. If handoff may have started, Bort keeps the source stopped and reports whether it reverified the pin. Source recovery checks that no target container is attached, even if the pin is absent. Final target acceptance requires a durable record that each transfer into staging completed and removes a remaining pin only when the target holds exactly the recorded attachments; when no pin remains, verify the target's attachments yourself before accepting. Host ownership is released only after these checks pass. |
 | A stateful plan needs a bind-mount copy | Bort refuses before pausing the source. Re-plan with `bort migrate --run <run>`; current plans keep same-host bind mounts at their existing paths, and the run stays editable because nothing live has started. |
 | A named volume is mounted by more than one compose service | Bort refuses before changing Dokploy or pausing the source. For a data store volume, choose `bort data <app> <store> --recreate` or `--managed` and re-plan with `bort migrate --run <run>`; otherwise change the source compose so one service mounts the volume and scan a new run. |
 | A Postgres data directory is not on a named volume the service mounts, a writable bind mount sits inside it, or the service declares Compose secrets/configs | When the service mounts no named volume, sets `PGDATA` in its compose `environment` to a literal path that breaks this rule, interpolates a mount target, or declares Compose `secrets` or `configs`, Bort refuses before live apply (`PLAN BLOCKED`): choose `bort data <app> <store> --recreate` or `--managed` and re-plan with `bort migrate --run <run>`, or change the source compose and scan a new run. When the image or interpolation decides `PGDATA`, only the created staged container reveals the directory, so Bort refuses at `pause_source` (`NEW RUN REQUIRED`) with that app's source still running and none of its state transferred; the run cannot be re-planned. If no other app's source was paused or handed off, delete or reconcile the Dokploy resources the run created, run the exact `recover-authority --authority source` command `bort status` shows to release host ownership, then choose a strategy or change the source compose and create a new run; otherwise restore the earlier apps' source writers and traffic manually, release host ownership with the source-authority command `bort status` shows, then create a new run. |

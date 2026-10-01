@@ -658,4 +658,32 @@ func TestRecoverAuthorityRefusesTargetForUnfinishedStagedTransfer(t *testing.T) 
 	if strings.Contains(status.String(), "--authority target") || !strings.Contains(status.String(), "--authority source") {
 		t.Fatalf("status offered target recovery for an unfinished transfer:\n%s", status.String())
 	}
+
+	retried := newRunApplied(after.Run)
+	if err := writeRunApplied(runArtifactPath(after.Run.RunDir, after.Run.Artifacts.Applied), retried); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(after.Run.RunDir, "migrated-volumes.json"), []byte(`{"apiVersion":"bort.migrated-volumes/v1alpha2","startedApps":["api"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if after, err = loadMigrationRun("unfinished"); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"--run", "unfinished", "--authority", "target", "--confirm", authorityRecoveryConfirmation(after.Run, dokployTrafficTarget)},
+		{"--run", "unfinished", "--authority", "target", "--source-retired", "--confirm", authorityRecoverySourceRetiredConfirmation(after.Run)},
+	} {
+		err := runRecoverAuthority(context.Background(), args, io.Discard, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "did not finish") {
+			t.Fatalf("target recovery ignored durable transfer evidence after the ledger was trimmed (%v): %v", args, err)
+		}
+	}
+	final, err := loadMigrationRun("unfinished")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, found, err := readDokployTrafficOwner()
+	if final.Run.ResolvedAuthority != "" || final.Run.CommittedAt != nil || err != nil || !found || owner.Authority != dokployTrafficPending {
+		t.Fatalf("refused target recovery changed run or owner state: run=%#v owner=%#v err=%v", final.Run, owner, err)
+	}
 }
