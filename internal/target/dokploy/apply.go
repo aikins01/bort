@@ -1441,6 +1441,15 @@ func (c *Client) applyPushImage(ctx context.Context, actx *applyContext, step St
 		return c.pauseTargetWritersForState(ctx, c.dockerRunner(), actx, step.App)
 	}
 	runner := c.dockerRunner()
+	if _, cached := actx.stagingVolumePins[step.App]; !cached {
+		completed, err := c.stagingHandoffCompleted(ctx, runner, actx, step.App, staged)
+		if err != nil {
+			return err
+		}
+		if completed {
+			return c.pauseTargetWritersForState(ctx, runner, actx, step.App)
+		}
+	}
 	staged, pin, err := ensureAppStagingVolumePin(ctx, runner, actx, step.App, false)
 	if err != nil {
 		return err

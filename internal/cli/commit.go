@@ -269,14 +269,16 @@ func coolifySourceRetirementRequired(run loadedMigrationRun) bool {
 }
 
 func manualCoolifySourceRetirementAction(run loadedMigrationRun) string {
-	containers := "every reviewed source app container"
-	for _, step := range dokploy.PlanForCommit(run.Prepare, run.Cutover).Steps {
-		if step.Kind == dokploy.StepStopCoolifyProxy {
-			containers += " and the source proxy container"
-			break
+	refs := dokploy.SourceRetirementContainers(dokploy.PlanForCommit(run.Prepare, run.Cutover))
+	removal := "remove every reviewed source app container (and the source proxy container when routes moved) with Docker"
+	if len(refs) > 0 {
+		quoted := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			quoted = append(quoted, shellQuote(ref))
 		}
+		removal = fmt.Sprintf("remove the reviewed source containers with `%s`", dockerCommand("rm -f "+strings.Join(quoted, " ")))
 	}
-	return fmt.Sprintf("keep the Coolify control plane stopped (run `%s && %s` if it is running; this pauses Coolify for every app on the host), remove %s with `%s`, verify they stay removed, then run `%s`; leave Coolify stopped afterwards if you can, because starting it again can recreate its proxy and redeploy the removed apps until you delete them in Coolify", dockerCommand("update --restart=no coolify"), dockerCommand("stop coolify"), containers, dockerCommand("rm -f"), authorityRecoverySourceRetiredCommand(run))
+	return fmt.Sprintf("keep the Coolify control plane stopped (run `%s && %s` if it is running; this pauses Coolify for every app on the host), %s, verify they stay removed, then run `%s`; leave Coolify stopped afterwards if you can, because starting it again can recreate its proxy and redeploy the removed apps until you delete them in Coolify", dockerCommand("update --restart=no coolify"), dockerCommand("stop coolify"), removal, authorityRecoverySourceRetiredCommand(run))
 }
 
 func finishStartedAcceptanceAction(run loadedMigrationRun) string {

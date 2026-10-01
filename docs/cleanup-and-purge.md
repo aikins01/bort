@@ -29,9 +29,10 @@ to finish an interrupted acceptance.
 
 For a Coolify source, `commit --apply` refuses because Bort cannot disable
 queued or future Coolify deployments. Keep the Coolify control plane stopped
-(`docker update --restart=no coolify && docker stop coolify` if it is running),
-remove every reviewed source app container (and the source proxy container when
-the cutover moved routes) with `docker rm -f`, and verify they stay removed.
+(`sudo docker update --restart=no coolify && sudo docker stop coolify` if it is
+running), remove the reviewed source app containers (and the source proxy
+container when the cutover moved routes) with the exact `sudo docker rm -f ...`
+command Bort prints, and verify they stay removed.
 Then run the exact
 `recover-authority --authority target --source-retired --confirm ...` command
 Bort prints. This records acceptance without mutating source resources. Leave

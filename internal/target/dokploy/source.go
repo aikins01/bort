@@ -40,10 +40,16 @@ func requireCoolifyDeploymentFence(ctx context.Context, runner dockerRunner) err
 	if err == nil {
 		policy := normalizedRestartPolicyName(container.HostConfig.RestartPolicy.Name)
 		if container.State.Running || policy != "no" {
-			return fmt.Errorf("stateful live apply requires the Coolify control-plane container %s to be stopped with restart policy no (running=%t, restart=%s); finish or cancel in-progress Coolify deployments, record its current restart policy, run `%s`, then retry; restart Coolify only after source authority is finalized; after target acceptance, restart it only if other apps need it and immediately delete the migrated apps in Coolify", coolifyControlPlaneContainer, container.State.Running, policy, coolifyFenceCommand())
+			return fmt.Errorf("stateful live apply requires the Coolify control-plane container %s to be stopped with restart policy no (running=%t, restart=%s); wait until no Coolify deployment is queued or running (a cancelled deployment can keep running, so confirm it has ended), record its current restart policy, run `%s`, then retry; restart Coolify only after source authority is finalized; after target acceptance, restart it only if other apps need it and immediately delete the migrated apps in Coolify", coolifyControlPlaneContainer, container.State.Running, policy, coolifyFenceCommand())
 		}
 	}
-	helpers, err := activeCoolifyDeploymentHelpers(ctx, runner)
+	helperRepositories := []string{coolifyHelperImageRepository}
+	if err == nil {
+		if custom := imageRepository(envMap(container.Config.Env)["HELPER_IMAGE"]); custom != "" {
+			helperRepositories = append(helperRepositories, custom)
+		}
+	}
+	helpers, err := activeCoolifyDeploymentHelpers(ctx, runner, helperRepositories)
 	if err != nil {
 		return fmt.Errorf("stateful live apply requires a durable Coolify deployment fence, but Bort could not inspect Coolify deployment helpers: %w", err)
 	}
@@ -63,40 +69,42 @@ func coolifyFenceCommand() string {
 
 const coolifyHelperImageRepository = "coollabsio/coolify-helper"
 
-func activeCoolifyDeploymentHelpers(ctx context.Context, runner dockerRunner) ([]string, error) {
-	out, err := runner.Output(ctx, "ps", "--no-trunc", "--format", "{{.Names}} {{.Image}}")
+func activeCoolifyDeploymentHelpers(ctx context.Context, runner dockerRunner, helperRepositories []string) ([]string, error) {
+	out, err := runner.Output(ctx, "ps", "-q", "--no-trunc")
 	if err != nil {
 		return nil, err
 	}
-	helpers := []string{}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		repository, _, _ := strings.Cut(fields[1], "@")
-		if colon := strings.LastIndex(repository, ":"); colon > strings.LastIndex(repository, "/") {
-			repository = repository[:colon]
-		}
-		if repository == coolifyHelperImageRepository || strings.HasSuffix(repository, "/"+coolifyHelperImageRepository) {
-			helpers = append(helpers, fields[0])
-		}
-	}
-	if len(helpers) == 0 {
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
 		return nil, nil
 	}
-	out, err = runner.Output(ctx, append([]string{"inspect", "--type", "container", "--format", "{{.Name}} {{len .ExecIDs}}"}, helpers...)...)
+	out, err = runner.Output(ctx, append([]string{"inspect", "--type", "container", "--format", "{{.Name}} {{.Config.Image}} {{len .ExecIDs}}"}, ids...)...)
 	if err != nil {
 		return nil, err
 	}
 	active := []string{}
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[1] != "0" {
-			active = append(active, strings.TrimPrefix(fields[0], "/"))
+		if len(fields) != 3 || fields[2] == "0" {
+			continue
+		}
+		repository := imageRepository(fields[1])
+		for _, helper := range helperRepositories {
+			if repository == helper || strings.HasSuffix(repository, "/"+helper) || strings.HasSuffix(helper, "/"+repository) {
+				active = append(active, strings.TrimPrefix(fields[0], "/"))
+				break
+			}
 		}
 	}
 	return active, nil
+}
+
+func imageRepository(image string) string {
+	repository, _, _ := strings.Cut(strings.TrimSpace(image), "@")
+	if colon := strings.LastIndex(repository, ":"); colon > strings.LastIndex(repository, "/") {
+		repository = repository[:colon]
+	}
+	return repository
 }
 
 func (c *Client) applyPauseSource(ctx context.Context, actx *applyContext, step Step) error {
@@ -599,6 +607,33 @@ func sourceCommitTargets(app preparer.AppPlan) []commitTargetRef {
 			seenName[name] = struct{}{}
 		}
 		refs = append(refs, ref)
+	}
+	return refs
+}
+
+func SourceRetirementContainers(plan Plan) []string {
+	refs := []string{}
+	seen := map[string]struct{}{}
+	add := func(ref string) {
+		if _, dup := seen[ref]; ref != "" && !dup {
+			seen[ref] = struct{}{}
+			refs = append(refs, ref)
+		}
+	}
+	for _, step := range plan.Steps {
+		if shouldSkipApplyStep(plan, step) {
+			continue
+		}
+		switch step.Kind {
+		case StepStopSourceApp:
+			if app, ok := findPrepareApp(plan.Prepare, step.App); ok {
+				for _, ref := range sourceCommitTargets(app) {
+					add(firstNonEmpty(ref.name, ref.id))
+				}
+			}
+		case StepStopCoolifyProxy:
+			add(coolifyProxyContainer)
+		}
 	}
 	return refs
 }

@@ -752,8 +752,9 @@ Coolify's proxy or your apps, but it pauses Coolify's management of every app
 on the host, including apps outside this run.
 
 Bort cannot detect every in-progress deployment. Coolify runs Service and
-database starts directly on the host rather than in a helper, and Bort cannot
-recognize helpers built from a custom helper image. Draining deployments before
+database starts directly on the host rather than in a helper, and Bort
+recognizes a custom helper image only through the `coolify` container's
+`HELPER_IMAGE` setting. Draining deployments before
 you stop Coolify is what keeps those from restarting a source app during the
 transfer.
 
@@ -990,10 +991,10 @@ recovery through that run:
   When source attestation still passes, Bort records target authority. For a
   source without an external orchestrator, `commit --apply` can then retire the
   exact reviewed containers. For Coolify, keep the control plane stopped and
-  remove every reviewed source app container (and the source proxy container
-  when the cutover moved routes) with Docker instead; `commit --apply` refuses
-  because Bort cannot durably fence Coolify. Leave Coolify stopped after the
-  `--source-retired` command below succeeds. If the
+  remove the reviewed source containers with the `docker rm -f` command Bort
+  prints instead; `commit --apply` refuses
+  because Bort cannot durably fence Coolify. Keep Coolify stopped at least until
+  the `--source-retired` command below succeeds. If the
   reviewed source daemon or containers are no longer attestable, the recovery
   command also refuses without recording the authority decision. In either
   manual-retirement case, run the second command Bort prints with
@@ -1047,8 +1048,9 @@ For a Coolify source, `commit --apply` refuses before source mutation because a
 queued or future deployment could replace a stopped container. Keep the Coolify
 control plane stopped; if it is running, run
 `sudo docker update --restart=no coolify && sudo docker stop coolify`. Remove
-every reviewed source app container and the source proxy container with
-`sudo docker rm -f`, and verify they stay removed. Then run the exact
+the reviewed source app containers and the source proxy container with the
+exact `sudo docker rm -f ...` command Bort prints, and verify they stay
+removed. Then run the exact
 `recover-authority --authority target --source-retired --confirm ...` command
 Bort prints. That command records permanent target acceptance without mutating
 the source. Leave Coolify stopped afterwards when nothing else on the host needs

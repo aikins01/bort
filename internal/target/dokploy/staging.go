@@ -603,6 +603,35 @@ func removeSupersededStagingVolumePins(ctx context.Context, runner dockerRunner,
 	return nil
 }
 
+func (c *Client) stagingHandoffCompleted(ctx context.Context, runner dockerRunner, actx *applyContext, appName string, volumes []stagedVolume) (bool, error) {
+	pin, err := findStagingVolumePin(ctx, runner, actx.plan, volumes, stagingVolumePinName(actx.plan, volumes))
+	if err != nil || pin.containerID != "" || !stagedVolumesRecorded(actx.entry(appName), volumes) {
+		return false, err
+	}
+	if err := requireStagingVolumesOwned(ctx, runner, actx.plan, appName, volumes); err != nil {
+		return false, nil
+	}
+	attached, err := stagingVolumeAttachmentSets(ctx, runner, volumes)
+	if err != nil {
+		return false, nil
+	}
+	for _, volume := range volumes {
+		if len(attached[volume.VolumeName]) == 0 {
+			return false, nil
+		}
+	}
+	targetIDsByVolume, err := c.migratedVolumeAttachmentIDs(ctx, actx, appName)
+	if err != nil {
+		return false, nil
+	}
+	for _, volume := range volumes {
+		if len(targetIDsByVolume[volume.VolumeName]) == 0 {
+			return false, nil
+		}
+	}
+	return requireStagingVolumeAttachmentSets(ctx, runner, volumes, targetIDsByVolume) == nil, nil
+}
+
 func findStagingVolumePin(ctx context.Context, runner dockerRunner, plan Plan, volumes []stagedVolume, expectedName string) (stagingVolumePin, error) {
 	containers, err := listContainersByLabels(ctx, runner, stagingVolumePinLabel+"=true", stagingVolumeRunIDLabel+"="+stagingOwner(plan))
 	if err != nil {
