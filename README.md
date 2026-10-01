@@ -224,8 +224,9 @@ Bort's safety model defaults to “look first.”
   handoff can restart the source, but keeps the pin for the next attempt. Do not
   remove a `bort-pin-*` container manually. Source recovery checks that no
   target container is attached, even if a pin is already absent. Final target
-  acceptance requires a durable record of the target's mounts and removes a
-  remaining pin only when the target holds exactly those attachments.
+  acceptance requires a durable record that each transfer into staging
+  completed and removes a remaining pin only when the target holds exactly the
+  recorded attachments.
   The source stays stopped while the target becomes the writer, including for
   unrouted apps.
 - **Coolify stays fenced during stateful moves:** before a stateful live apply

@@ -526,6 +526,9 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 			}
 		}
 		if err := requireStagingVolumeAttachmentSets(ctx, runner, volumes, allowedIDsByVolume); err != nil {
+			if !targetAuthority {
+				return fmt.Errorf("verify attachments for app %s before source-authority finalization: %w; remove every non-pin container attached to these staging volumes (stopping is not enough because a stopped container keeps its mounts), keep the bort-pin-* container, then rerun this command", want.app, err)
+			}
 			return fmt.Errorf("verify attachments for app %s before authority finalization: %w", want.app, err)
 		}
 		if hasPin {

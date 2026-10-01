@@ -246,7 +246,7 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 	}
 	if requiresHostOwner {
 		if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, true); err != nil {
-			return fmt.Errorf("commit was recorded, but target-authority staging-volume pins could not be removed; host ownership remains held so this commit can be retried: %w", err)
+			return fmt.Errorf("commit was recorded, but target-authority staging-volume validation or pin removal failed; host ownership remains held so this commit can be retried: %w", err)
 		}
 		if err := releaseDokployTargetOwner(run.Run); err != nil {
 			return fmt.Errorf("commit was recorded, but its Dokploy host ownership could not be released: %w", err)

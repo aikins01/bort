@@ -154,7 +154,7 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 			return fmt.Errorf("record manual source recovery completion: %w", err)
 		}
 		if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, false); err != nil {
-			return fmt.Errorf("source authority was recorded, but staging-volume pins could not be removed; host ownership remains held so this recovery can be retried: %w", err)
+			return fmt.Errorf("source authority was recorded, but staging-volume validation or pin removal failed; host ownership remains held so this recovery can be retried: %w", err)
 		}
 		if err := releaseDokployTrafficOwner(run.Run); err != nil {
 			return fmt.Errorf("release source-authority host ownership: %w", err)
@@ -182,7 +182,7 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 			return fmt.Errorf("record manual source retirement completion: %w", err)
 		}
 		if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, true); err != nil {
-			return fmt.Errorf("target authority and source retirement were recorded, but staging-volume pins could not be removed; host ownership remains held so this recovery can be retried: %w", err)
+			return fmt.Errorf("target authority and source retirement were recorded, but staging-volume validation or pin removal failed; host ownership remains held so this recovery can be retried: %w", err)
 		}
 		if err := releaseDokployTargetOwner(run.Run); err != nil {
 			return fmt.Errorf("release target-authority host ownership: %w", err)

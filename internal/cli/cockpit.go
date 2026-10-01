@@ -473,6 +473,9 @@ func writeAuthorityRecoveryGuidance(w io.Writer, st *styler, run loadedMigration
 		return
 	}
 	fmt.Fprintln(w, st.muted(prefix+" After manually fencing the other side and verifying the chosen writer and traffic authority, finish this owner-bound run with one of:"))
+	if len(appliedStagingTransferApps(run.Applied)) > 0 {
+		fmt.Fprintln(w, st.muted("  Before source recovery, remove (not just stop) every target container attached to the transferred bort staging volumes. Do not remove the bort-pin-* containers."))
+	}
 	fmt.Fprintf(w, "%s\n", st.muted("  source: `"+authorityRecoveryCommand(run, dokployTrafficSource)+"`"))
 	fmt.Fprintf(w, "%s\n", st.muted("  target: `"+authorityRecoveryCommand(run, dokployTrafficTarget)+"`"))
 }
