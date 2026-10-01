@@ -416,13 +416,38 @@ func validateCachedStagingVolumePin(ctx context.Context, runner dockerRunner, ac
 	return requireStagingVolumeAttachments(ctx, runner, volumes, []string{pin.containerID})
 }
 
+type releasableStagingPin struct {
+	pin     stagingVolumePin
+	volumes []stagedVolume
+}
+
+func (c *Client) ValidateStagingVolumePins(ctx context.Context, plan Plan, targetAuthority bool) error {
+	ctx, cancel := context.WithTimeout(ctx, targetDiscoveryTimeout)
+	defer cancel()
+	_, err := c.validatedStagingVolumePins(ctx, plan, targetAuthority)
+	return err
+}
+
 func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, targetAuthority bool) error {
 	ctx, cancel := context.WithTimeout(ctx, targetDiscoveryTimeout)
 	defer cancel()
+	pins, err := c.validatedStagingVolumePins(ctx, plan, targetAuthority)
+	if err != nil {
+		return err
+	}
+	for _, item := range pins {
+		if err := releaseStagingVolumePin(ctx, c.dockerRunner(), plan, item.volumes, item.pin); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) validatedStagingVolumePins(ctx context.Context, plan Plan, targetAuthority bool) ([]releasableStagingPin, error) {
 	runner := c.dockerRunner()
 	containers, err := listContainersByLabels(ctx, runner, stagingVolumePinLabel+"=true", stagingVolumeRunIDLabel+"="+stagingOwner(plan))
 	if err != nil {
-		return fmt.Errorf("find staging volume pins for recovery: %w", err)
+		return nil, fmt.Errorf("find staging volume pins for recovery: %w", err)
 	}
 
 	type expectedPin struct {
@@ -440,7 +465,7 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 
 	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
 	if err := actx.loadMigratedVolumeMounts(); err != nil {
-		return err
+		return nil, err
 	}
 	for _, app := range plan.StagingTransferApps {
 		actx.entry(app).StagingTransferStarted = true
@@ -451,22 +476,19 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 	for _, container := range containers {
 		want, ok := expected[container.Name]
 		if !ok {
-			return fmt.Errorf("run %q owns unexpected staging volume pin %s; refusing to remove an unverified container", plan.RunName, container.Name)
+			return nil, fmt.Errorf("run %q owns unexpected staging volume pin %s; refusing to remove an unverified container", plan.RunName, container.Name)
 		}
 		if _, duplicate := discovered[container.Name]; duplicate {
-			return fmt.Errorf("run %q has more than one staging volume pin named %s", plan.RunName, container.Name)
+			return nil, fmt.Errorf("run %q has more than one staging volume pin named %s", plan.RunName, container.Name)
 		}
 		pin := stagingVolumePin{name: container.Name, containerID: container.ID}
 		if err := validateStagingVolumePinIdentity(plan, want.volumes, pin, container); err != nil {
-			return err
+			return nil, err
 		}
 		discovered[container.Name] = pin
 	}
 
-	pins := make([]struct {
-		pin     stagingVolumePin
-		volumes []stagedVolume
-	}, 0, len(discovered))
+	pins := make([]releasableStagingPin, 0, len(discovered))
 	for name, want := range expected {
 		entry := actx.entry(want.app)
 		pin, hasPin := discovered[name]
@@ -474,14 +496,14 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 			continue
 		}
 		if targetAuthority && !stagedVolumesRecorded(entry, want.volumes) {
-			return fmt.Errorf("run %q has no complete durable migrated-volume record for app %s; refusing target-authority finalization", plan.RunName, want.app)
+			return nil, fmt.Errorf("run %q has no complete durable migrated-volume record for app %s; refusing target-authority finalization", plan.RunName, want.app)
 		}
 		if targetAuthority && !hasPin {
 			continue
 		}
 		if targetAuthority && !targetIdentitiesVerified {
 			if err := c.hydratePersistedTargetIdentities(ctx, actx); err != nil {
-				return fmt.Errorf("verify persisted target identities before authority finalization: %w", err)
+				return nil, fmt.Errorf("verify persisted target identities before authority finalization: %w", err)
 			}
 			targetIdentitiesVerified = true
 		}
@@ -491,7 +513,7 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 			for _, volume := range want.volumes {
 				exists, err := stagingVolumeExists(ctx, runner, plan, want.app, volume)
 				if err != nil {
-					return fmt.Errorf("verify staging volume %s for app %s before source-authority finalization: %w", volume.VolumeName, want.app, err)
+					return nil, fmt.Errorf("verify staging volume %s for app %s before source-authority finalization: %w", volume.VolumeName, want.app, err)
 				}
 				if exists {
 					volumes = append(volumes, volume)
@@ -502,7 +524,7 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 			}
 		}
 		if err := requireStagingVolumesOwned(ctx, runner, plan, want.app, volumes); err != nil {
-			return fmt.Errorf("verify staging volumes for app %s before authority finalization: %w", want.app, err)
+			return nil, fmt.Errorf("verify staging volumes for app %s before authority finalization: %w", want.app, err)
 		}
 		allowedIDsByVolume := make(map[string][]string, len(volumes))
 		for _, volume := range volumes {
@@ -515,36 +537,28 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 		if targetAuthority {
 			targetIDsByVolume, err := c.migratedVolumeAttachmentIDs(ctx, actx, want.app)
 			if err != nil {
-				return fmt.Errorf("verify target attachments for app %s before authority finalization: %w", want.app, err)
+				return nil, fmt.Errorf("verify target attachments for app %s before authority finalization: %w", want.app, err)
 			}
 			for _, volume := range want.volumes {
 				targetIDs := targetIDsByVolume[volume.VolumeName]
 				if len(targetIDs) == 0 {
-					return fmt.Errorf("verify target attachments for app %s before authority finalization: migrated volume %s has no target container", want.app, volume.VolumeName)
+					return nil, fmt.Errorf("verify target attachments for app %s before authority finalization: migrated volume %s has no target container", want.app, volume.VolumeName)
 				}
 				allowedIDsByVolume[volume.VolumeName] = append(allowedIDsByVolume[volume.VolumeName], targetIDs...)
 			}
 		}
 		if err := requireStagingVolumeAttachmentSets(ctx, runner, volumes, allowedIDsByVolume); err != nil {
 			if !targetAuthority {
-				return fmt.Errorf("verify attachments for app %s before source-authority finalization: %w; remove every non-pin container attached to these staging volumes (stopping is not enough because a stopped container keeps its mounts), keep the bort-pin-* container, then rerun this command", want.app, err)
+				return nil, fmt.Errorf("verify attachments for app %s before source-authority finalization: %w; remove every container attached to these staging volumes other than a bort-pin-* container (stopping is not enough because a stopped container keeps its mounts), then rerun this command", want.app, err)
 			}
-			return fmt.Errorf("verify attachments for app %s before authority finalization: %w", want.app, err)
+			return nil, fmt.Errorf("verify attachments for app %s before authority finalization: %w", want.app, err)
 		}
 		if hasPin {
-			pins = append(pins, struct {
-				pin     stagingVolumePin
-				volumes []stagedVolume
-			}{pin: pin, volumes: want.volumes})
+			pins = append(pins, releasableStagingPin{pin: pin, volumes: want.volumes})
 		}
 	}
 
-	for _, item := range pins {
-		if err := releaseStagingVolumePin(ctx, runner, plan, item.volumes, item.pin); err != nil {
-			return err
-		}
-	}
-	return nil
+	return pins, nil
 }
 
 func IncompleteStagingTransfers(plan Plan) ([]string, error) {

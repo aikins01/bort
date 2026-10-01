@@ -2688,7 +2688,7 @@ func appliedRequiresNewRun(applied runApplied) bool {
 
 func authorityRecoveryNextStep(run loadedMigrationRun, reason string) runNextStep {
 	return runNextStep{
-		Action: fmt.Sprintf("manually fence the other side and verify authority, then run `%s` for source or `%s` for target", authorityRecoveryCommand(run, dokployTrafficSource), authorityRecoveryCommand(run, dokployTrafficTarget)),
+		Action: authorityRecoveryChoice(run),
 		Reason: reason,
 	}
 }

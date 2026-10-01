@@ -491,6 +491,9 @@ func writeManualRollbackRecoveryCommands(w io.Writer, st *styler, run loadedMigr
 	if run.Run.ResolvedAuthority != "" || !authorityRecoveryAvailable(run) {
 		return
 	}
+	if len(appliedStagingTransferApps(run.Applied)) > 0 {
+		fmt.Fprintln(w, st.muted("  Before source recovery, remove (not just stop) every target container attached to the transferred bort staging volumes; the volumes and their data remain."))
+	}
 	fmt.Fprintln(w, st.muted("  After manually restoring and verifying source authority, record it with:"))
 	fmt.Fprintf(w, "%s\n", st.muted("  source: `"+authorityRecoveryCommand(run, dokployTrafficSource)+"`"))
 }

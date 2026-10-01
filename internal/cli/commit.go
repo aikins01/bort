@@ -229,6 +229,11 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 			return fmt.Errorf("commit refused: %w", err)
 		}
 	}
+	if requiresHostOwner {
+		if err := validateRecoveredTargetAuthority(ctx, run); err != nil {
+			return fmt.Errorf("commit refused before retiring the source because the transferred staging volumes do not match the target: %w", err)
+		}
+	}
 	client := &dokploy.Client{}
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir

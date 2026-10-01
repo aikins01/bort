@@ -18,6 +18,22 @@ var releaseAuthorityStagingVolumePins = func(ctx context.Context, run loadedMigr
 	return client.ReleaseStagingVolumePins(ctx, plan, targetAuthority)
 }
 
+var validateAuthorityStagingVolumePins = func(ctx context.Context, run loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
+	client, err := authorityRecoveryDokployClient(run, targetAuthority)
+	if err != nil {
+		return err
+	}
+	return client.ValidateStagingVolumePins(ctx, plan, targetAuthority)
+}
+
+func validateRecoveredTargetAuthority(ctx context.Context, run loadedMigrationRun) error {
+	plan, err := authorityRecoveryPlan(run)
+	if err != nil {
+		return err
+	}
+	return validateAuthorityStagingVolumePins(ctx, run, plan, true)
+}
+
 func authorityRecoveryDokployClient(run loadedMigrationRun, targetAuthority bool) (*dokploy.Client, error) {
 	if !targetAuthority {
 		return &dokploy.Client{}, nil
@@ -128,6 +144,9 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 		}
 		if len(incomplete) > 0 {
 			return fmt.Errorf("target authority was not recorded: the staged state transfer for app(s) %s did not finish, so the target cannot hold the complete source state; restore the source and run `%s`", strings.Join(incomplete, ", "), authorityRecoveryCommand(run, dokployTrafficSource))
+		}
+		if err := validateRecoveredTargetAuthority(ctx, run); err != nil {
+			return fmt.Errorf("target authority was not recorded because the transferred staging volumes do not match the target: %w", err)
 		}
 	}
 	if authority == dokployTrafficTarget && !sourceRetired {
@@ -371,7 +390,14 @@ func pendingAuthorityRecoveryCommand(run loadedMigrationRun) string {
 
 func authorityRecoveryInstruction(run loadedMigrationRun) string {
 	if authorityRecoveryAvailable(run) {
-		return fmt.Sprintf("inspect and preserve both sides, manually fence the other side and verify authority, then run `%s` for source or `%s` for target", authorityRecoveryCommand(run, dokployTrafficSource), authorityRecoveryCommand(run, dokployTrafficTarget))
+		return "inspect and preserve both sides, " + authorityRecoveryChoice(run)
 	}
 	return "inspect and preserve both sides, establish writer and traffic authority manually, then start a fresh migration run"
+}
+
+func authorityRecoveryChoice(run loadedMigrationRun) string {
+	if incomplete, err := incompleteStagingTransferApps(run); err == nil && len(incomplete) > 0 {
+		return fmt.Sprintf("restore and verify the source (the staged state transfer for %s did not finish, so target recovery is unavailable; remove, not just stop, any target container attached to the bort staging volumes), then run `%s`", strings.Join(incomplete, ", "), authorityRecoveryCommand(run, dokployTrafficSource))
+	}
+	return fmt.Sprintf("manually fence the other side and verify authority, then run `%s` for source or `%s` for target", authorityRecoveryCommand(run, dokployTrafficSource), authorityRecoveryCommand(run, dokployTrafficTarget))
 }

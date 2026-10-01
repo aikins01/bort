@@ -811,3 +811,56 @@ func TestManualCoolifySourceRetirementActionScopesProxyToRoutedCutovers(t *testi
 		t.Fatalf("routed retirement hint omitted the proxy handoff: %q", action)
 	}
 }
+
+func TestCommitValidatesStagingVolumesBeforeRetiringSource(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	t.Chdir(t.TempDir())
+	writeTestBundle(t, "bundle", manifest.Manifest{
+		Source: manifest.Source{Platform: "docker", DockerEngineID: "engine-reviewed"},
+		Apps: []manifest.App{{
+			Name:     "api",
+			Services: []manifest.Service{{ID: "source-id", Name: "web", Image: "example/api:latest"}},
+			Routes:   []manifest.Route{{Host: "api.example.com", ServiceName: "web", Port: "3000"}},
+		}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", "bundle", "--run", "docker-commit", "--observation-window", "0", "--rollback-window", "0"})
+	markRunLocallyScanned(t, "docker-commit", "docker")
+	run, err := loadMigrationRun("docker-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := newRunApplied(run.Run)
+	applied.Steps = []appliedStep{{Index: 0, Kind: string(dokploy.StepPushImage), App: "api", Ref: "example/api:latest", Status: string(dokploy.StepStatusError), UpdatedAt: time.Now().UTC(), Error: "outcome unknown"}}
+	if err := writeRunApplied(runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied), applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimDokployHostOwnership(run.Run, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunAuthorityResolvedLocked(run.Run, dokployTrafficTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(run.Run, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunLiveAppliedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	previous := validateAuthorityStagingVolumePins
+	validateAuthorityStagingVolumePins = func(context.Context, loadedMigrationRun, dokploy.Plan, bool) error {
+		return errors.New("migrated volume bort-v has no target container")
+	}
+	t.Cleanup(func() { validateAuthorityStagingVolumePins = previous })
+
+	err = applyCommitFromArgs(context.Background(), "docker-commit", io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "before retiring the source") {
+		t.Fatalf("commit did not validate staging volumes before retiring the source: %v", err)
+	}
+	after, err := loadMigrationRun("docker-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Run.CommitStartedAt != nil || after.Run.CommittedAt != nil {
+		t.Fatalf("refused commit recorded source retirement: %#v", after.Run)
+	}
+}
