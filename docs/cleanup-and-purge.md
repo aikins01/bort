@@ -34,9 +34,9 @@ remove every reviewed source app container (and the source proxy container when
 the cutover moved routes) with `docker rm -f`, and verify they stay removed.
 Then run the exact
 `recover-authority --authority target --source-retired --confirm ...` command
-Bort prints. This records acceptance without mutating source resources. Only
-then restore Coolify's restart policy, start it, and stop or delete those apps
-in Coolify so it cannot redeploy them.
+Bort prints. This records acceptance without mutating source resources. Leave
+Coolify stopped afterwards: starting it again can recreate its proxy and
+redeploy the removed apps.
 
 Do not accept the target until you have independently checked it. Bort does not
 measure the rollback window or block acceptance when the window has not passed.

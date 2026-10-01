@@ -348,10 +348,11 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 		}
 	}
 	rawServiceNamesByContainer := make(map[string]string, len(resources.SourceServices))
+	routesNameContainers := strings.TrimSpace(app.ComposeSource) == ""
 	for _, sourceService := range resources.SourceServices {
 		containerName := strings.TrimSpace(sourceService.ContainerName)
 		serviceName := strings.TrimSpace(sourceService.ServiceName)
-		if containerName == "" {
+		if !routesNameContainers || containerName == "" {
 			continue
 		}
 		if _, exists := rawServiceNamesByContainer[containerName]; exists {

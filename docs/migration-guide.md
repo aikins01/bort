@@ -740,11 +740,19 @@ sudo docker update --restart=no coolify && sudo docker stop coolify
 ```
 
 Live apply refuses to start unless the `coolify` container is stopped with
-restart policy `no`. It checks again before pausing each source app, deploying
-each target, and moving routes. Keep the control plane stopped until the run's
-source or target authority is finalized with the `recover-authority` command
-`bort status` shows. Then restore the recorded restart policy and start the
-container. Stopping it does not stop Coolify's proxy or your apps.
+restart policy `no` and no `coolify-helper` deployment container is still
+running. A deployment that began before you stopped Coolify keeps running in
+its helper container; wait for the helper to exit on its own, then retry. Bort
+checks the fence again before pausing each source app, deploying each target,
+and moving routes. Stopping the control plane does not stop Coolify's proxy or
+your apps. If you set a custom Coolify helper image, Bort cannot recognize its
+containers; wait for in-progress deployments to finish before you stop Coolify.
+
+Keep the control plane stopped until the run finishes. If you recover source
+authority, restore the recorded restart policy and start Coolify after the
+`recover-authority --authority source` command succeeds. If you accept the
+target, leave Coolify stopped: starting it again can recreate its proxy and
+redeploy the source apps.
 
 For an app with named volumes or a Postgres database, live apply moves the
 state before the Dokploy compose is deployed. Dokploy v0.30.7 cannot durably
@@ -772,14 +780,16 @@ never copies data into a deployed target. Instead it:
    target attachment is unsafe or cannot be proved, Bort keeps the source
    stopped and reports whether it reverified the pin. A retryable failure before
    handoff can restart the source, but preserves the pin for the next attempt.
-   Do not remove the pin manually. Follow `bort status`. Before Bort removes a
-   pin and releases host ownership, it validates every transferred app, even
-   one whose pin is already absent: source recovery requires no target
-   attachment, and target acceptance (`commit --apply` or
-   `recover-authority --authority target --source-retired`) requires the exact
-   recorded target attachments. Plain `recover-authority --authority target`
-   only records target authority and keeps the pins. Host ownership remains
-   held if validation or removal fails, so the command can be retried.
+   Do not remove the pin manually. Follow `bort status`. Before Bort releases
+   host ownership, source recovery checks every transferred app, even one
+   whose pin is already absent, and requires that no target container is
+   attached. Target acceptance (`commit --apply` or
+   `recover-authority --authority target --source-retired`) requires a durable
+   record that the target mounted each transferred volume, and removes a
+   remaining pin only when the target holds exactly the recorded attachments.
+   Plain `recover-authority --authority target` only records target authority
+   and keeps the pins. Host ownership remains held if validation or removal
+   fails, so the command can be retried.
 
 Routed apps stay stopped from step 2 until the proxy handoff moves traffic;
 plan for that downtime. Unrouted apps also keep the source stopped while target
@@ -970,7 +980,7 @@ recovery through that run:
   exact reviewed containers. For Coolify, keep the control plane stopped and
   remove every reviewed source app container (and the source proxy container
   when the cutover moved routes) with Docker instead; `commit --apply` refuses
-  because Bort cannot durably fence Coolify. Start Coolify again only after the
+  because Bort cannot durably fence Coolify. Leave Coolify stopped after the
   `--source-retired` command below succeeds. If the
   reviewed source daemon or containers are no longer attestable, the recovery
   command also refuses without recording the authority decision. In either
@@ -1029,9 +1039,8 @@ every reviewed source app container and the source proxy container with
 `sudo docker rm -f`, and verify they stay removed. Then run the exact
 `recover-authority --authority target --source-retired --confirm ...` command
 Bort prints. That command records permanent target acceptance without mutating
-the source. Only then restore Coolify's restart policy, start it, and
-immediately stop or delete those apps and the proxy in Coolify so it cannot
-redeploy them.
+the source. Leave Coolify stopped afterwards: starting it again can recreate its
+proxy and redeploy the removed apps.
 
 ## Audit and clean up
 
@@ -1051,8 +1060,8 @@ Ordinary cleanup and destructive source purge are separate operations. See the
 | Bort cannot find the expected run | Return to the original working directory and original OS user. Do not create a replacement workspace accidentally. |
 | Stateless live apply was interrupted at a safe completed boundary | Run `sudo bort status`, then rerun `sudo bort migrate --live` to resume from the saved progress. |
 | Live apply reports `MANUAL STATE` for a stateful run | The run was applied with an older plan version that copied state into a deployed target. The blocked run cannot continue. Complete recovery with the guidance shown by `bort status`, then create a new run. |
-| Stateful live apply refuses because the Coolify control plane is running or would restart | Record the `coolify` container's restart policy, run `sudo docker update --restart=no coolify && sudo docker stop coolify`, then rerun `sudo bort migrate --live`. Restore the policy and start Coolify only after `recover-authority` finalizes source or target authority. |
-| A staged state transfer fails (source restarted, foreign-owned volume, or unexpected attachment) | Run `sudo bort status` and follow its recovery. Do not remove a `bort-pin-*` container manually. Bort may restart the source after a retryable pre-handoff failure, but it keeps the pin for the next attempt. If handoff may have started, Bort keeps the source stopped and reports whether it reverified the pin. Source recovery and final target acceptance validate the chosen authority's exact attachment set, even if the pin is absent, before removing any verified pin and releasing host ownership. |
+| Stateful live apply refuses because the Coolify control plane is running or would restart, or a Coolify deployment helper is still running | Record the `coolify` container's restart policy, run `sudo docker update --restart=no coolify && sudo docker stop coolify`, wait for any `coolify-helper` container to exit on its own, then rerun `sudo bort migrate --live`. Restore the policy and start Coolify only after source-authority recovery succeeds; after target acceptance, leave it stopped. |
+| A staged state transfer fails (source restarted, foreign-owned volume, or unexpected attachment) | Run `sudo bort status` and follow its recovery. Do not remove a `bort-pin-*` container manually. Bort may restart the source after a retryable pre-handoff failure, but it keeps the pin for the next attempt. If handoff may have started, Bort keeps the source stopped and reports whether it reverified the pin. Source recovery checks that no target container is attached, even if the pin is absent. Final target acceptance requires a durable record of the target's mounts and removes a remaining pin only when the target holds exactly those attachments. Host ownership is released only after these checks pass. |
 | A stateful plan needs a bind-mount copy | Bort refuses before pausing the source. Re-plan with `bort migrate --run <run>`; current plans keep same-host bind mounts at their existing paths, and the run stays editable because nothing live has started. |
 | A named volume is mounted by more than one compose service | Bort refuses before changing Dokploy or pausing the source. For a data store volume, choose `bort data <app> <store> --recreate` or `--managed` and re-plan with `bort migrate --run <run>`; otherwise change the source compose so one service mounts the volume and scan a new run. |
 | A Postgres data directory is not on a named volume the service mounts, a writable bind mount sits inside it, or the service declares Compose secrets/configs | When the service mounts no named volume, sets `PGDATA` in its compose `environment` to a literal path that breaks this rule, interpolates a mount target, or declares Compose `secrets` or `configs`, Bort refuses before live apply (`PLAN BLOCKED`): choose `bort data <app> <store> --recreate` or `--managed` and re-plan with `bort migrate --run <run>`, or change the source compose and scan a new run. When the image or interpolation decides `PGDATA`, only the created staged container reveals the directory, so Bort refuses at `pause_source` (`NEW RUN REQUIRED`) with that app's source still running and none of its state transferred; the run cannot be re-planned. If no other app's source was paused or handed off, delete or reconcile the Dokploy resources the run created, run the exact `recover-authority --authority source` command `bort status` shows to release host ownership, then choose a strategy or change the source compose and create a new run; otherwise restore the earlier apps' source writers and traffic manually, release host ownership with the source-authority command `bort status` shows, then create a new run. |

@@ -548,3 +548,68 @@ func assertNoGate(t *testing.T, app AppPlan, code string) {
 		}
 	}
 }
+
+func TestPlanKeepsExportedRawRouteServiceWhenAnotherContainerShadowsIt(t *testing.T) {
+	m := manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify"},
+		Apps: []manifest.App{{
+			Name:    "shop",
+			Compose: &manifest.ComposeSource{Raw: "services:\n  web:\n    image: example/web\n  api:\n    image: example/api\n    container_name: web\n"},
+			Services: []manifest.Service{
+				{Name: "proj-web-1", Image: "example/web", Labels: map[string]string{"com.docker.compose.service": "web"}},
+				{Name: "web", Image: "example/api", Labels: map[string]string{"com.docker.compose.service": "api"}},
+			},
+		}},
+	}
+	for _, tc := range []struct {
+		name   string
+		route  string
+		legacy bool
+		want   string
+	}{
+		{name: "exported route already names the Compose service", route: "proj-web-1", want: "web"},
+		{name: "legacy bundle maps the api container name", route: "web", legacy: true, want: "api"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			m.Apps[0].Routes = []manifest.Route{{Host: "shop.example.com", ServiceName: tc.route, Port: "8080"}}
+			if tc.legacy {
+				exportWithLegacyRoutes(t, dir, m)
+				indexPath := filepath.Join(dir, "index.json")
+				var index map[string]any
+				if err := json.Unmarshal([]byte(mustReadFile(t, indexPath)), &index); err != nil {
+					t.Fatal(err)
+				}
+				for _, app := range index["apps"].([]any) {
+					delete(app.(map[string]any), "composeSource")
+				}
+				contents, err := json.Marshal(index)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(indexPath, contents, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := exporter.Export(m, exporter.Options{OutputDir: dir}); err != nil {
+				t.Fatal(err)
+			}
+			result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			app := result.Apps[0]
+			if len(app.Resources.Domains) != 1 || app.Resources.Domains[0].ServiceName != tc.want {
+				t.Fatalf("route service = %#v, want %s", app.Resources.Domains, tc.want)
+			}
+		})
+	}
+}
+
+func mustReadFile(t *testing.T, path string) string {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(contents)
+}

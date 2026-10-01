@@ -269,15 +269,14 @@ func coolifySourceRetirementRequired(run loadedMigrationRun) bool {
 }
 
 func manualCoolifySourceRetirementAction(run loadedMigrationRun) string {
-	containers, apps := "every reviewed source app container", "those apps"
+	containers := "every reviewed source app container"
 	for _, step := range dokploy.PlanForCommit(run.Prepare, run.Cutover).Steps {
 		if step.Kind == dokploy.StepStopCoolifyProxy {
 			containers += " and the source proxy container"
-			apps += " and the proxy"
 			break
 		}
 	}
-	return fmt.Sprintf("keep the Coolify control plane stopped (run `docker update --restart=no coolify && docker stop coolify` if it is running), remove %s with `docker rm -f`, verify they stay removed, then run `%s`; only then restore Coolify's restart policy, start it, and immediately stop or delete %s in Coolify so it cannot redeploy them", containers, authorityRecoverySourceRetiredCommand(run), apps)
+	return fmt.Sprintf("keep the Coolify control plane stopped (run `docker update --restart=no coolify && docker stop coolify` if it is running), remove %s with `docker rm -f`, verify they stay removed, then run `%s`; leave Coolify stopped afterwards, because starting it again can recreate its proxy and redeploy the removed apps", containers, authorityRecoverySourceRetiredCommand(run))
 }
 
 func finishStartedAcceptanceAction(run loadedMigrationRun) string {

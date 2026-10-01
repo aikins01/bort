@@ -179,9 +179,9 @@ For a Coolify source, keep the Coolify control plane stopped, remove the
 reviewed source app and proxy containers with Docker, and record permanent
 target authority with the exact
 `recover-authority --authority target --source-retired` command Bort prints.
-Only then start Coolify again and stop or delete those apps in it.
-`commit --apply` refuses because stopping containers cannot fence Coolify
-itself.
+Leave Coolify stopped afterwards: starting it again can recreate its proxy and
+redeploy the removed apps. `commit --apply` refuses because stopping containers
+cannot fence Coolify itself.
 
 For owner-bound current runs, `cleanup --apply` can remove only eligible unused
 records from the bound local Dokploy database, and only after making a database
@@ -220,9 +220,10 @@ Bort's safety model defaults to “look first.”
   unsafe, Bort keeps the source stopped, reports whether it reverified the pin,
   and directs recovery through `bort status`. A retryable failure before
   handoff can restart the source, but keeps the pin for the next attempt. Do not
-  remove a `bort-pin-*` container manually. Source recovery and final target
-  acceptance validate the authority-specific attachments, even if a pin is
-  already absent, and remove any verified pin before releasing host ownership.
+  remove a `bort-pin-*` container manually. Source recovery checks that no
+  target container is attached, even if a pin is already absent. Final target
+  acceptance requires a durable record of the target's mounts and removes a
+  remaining pin only when the target holds exactly those attachments.
   The source stays stopped while the target becomes the writer, including for
   unrouted apps.
 - **Coolify stays fenced during stateful moves:** before a stateful live apply
@@ -230,8 +231,10 @@ Bort's safety model defaults to “look first.”
   `sudo docker update --restart=no coolify && sudo docker stop coolify` so
   Coolify cannot redeploy a paused source app. Bort refuses to start, pause a
   source, deploy a target, or move routes while the `coolify` container is
-  running or would restart. Restore it only after `recover-authority` finalizes
-  the run; see the [migration guide](docs/migration-guide.md#apply-the-selected-run).
+  running or would restart, or while a Coolify deployment helper is still
+  running. Restart Coolify only after source authority is finalized; after
+  target acceptance, leave it stopped. See the
+  [migration guide](docs/migration-guide.md#apply-the-selected-run).
 - **Known current run:** `.bort/state.json` identifies the current run. Commands
   that make changes do not guess based on which file was modified most recently.
 - **Plans are locked during live work:** once live execution begins, changing
@@ -253,8 +256,8 @@ Bort's safety model defaults to “look first.”
   only when no external orchestrator can recreate them. It refuses Coolify
   sources. With the Coolify control plane stopped, remove the reviewed source
   app and proxy containers, verify they stay removed, then use confirmed
-  target-authority recovery with `--source-retired` to record acceptance
-  before starting Coolify again.
+  target-authority recovery with `--source-retired` to record acceptance.
+  Leave Coolify stopped after acceptance.
   Destructive source purge requires either accepted state.
 - **Separate destructive purge:** purge requires selected apps or projects, a
   successful live apply or completed manual target-authority

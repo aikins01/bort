@@ -3061,3 +3061,41 @@ func TestReleaseTargetAuthorityPinsSkipsDokployAPIWithoutStagedState(t *testing.
 		t.Fatalf("target finalization without staged state needed the Dokploy API: %v", err)
 	}
 }
+
+func TestRequireSourceMountsStageDataDirRefusesAuxiliaryVolumeWithDefaultPGDATA(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "db", Type: "volume", Name: "pgdata", Target: "/var/lib/postgresql/data", ReadWrite: true},
+		{Service: "db", Type: "volume", Name: "backups", Target: "/backups", ReadWrite: true},
+	}
+	staged := []stagedVolume{
+		{Service: "db", Target: "/var/lib/postgresql/data", VolumeName: "bort-pgdata"},
+		{Service: "db", Target: "/backups", VolumeName: "bort-backups"},
+	}
+	err := requireSourceMountsStageDataDir(app, "db", postgresDataDir(dockerContainer{}), staged)
+	if !errors.Is(err, ErrNotImplemented) || !strings.Contains(err.Error(), `"backups" at /backups`) {
+		t.Fatalf("default-PGDATA layout must refuse the auxiliary volume before pause_source, got %v", err)
+	}
+}
+
+func TestReleaseTargetAuthorityWithoutPinSkipsLiveAttachmentChecks(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	plan.StagingTransferApps = []string{"api"}
+	plan.TargetIdentities = map[string]TargetIdentity{"api": {ProjectID: "project-1", EnvironmentID: "env-1", ComposeID: "compose-1", ComposeAppName: "stack-1"}}
+	state := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	if err := state.recordMigratedVolumeMount("api", migratedVolumeMount{Service: "web", Target: "/data", VolumeName: staged.VolumeName}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter label=bort.staging-pin=true --filter label=bort.run-id=run1 --format {{.ID}}": nil,
+	}}
+
+	if err := (&Client{Docker: runner}).ReleaseStagingVolumePins(context.Background(), plan, true); err != nil {
+		t.Fatalf("target finalization with no pin left depended on live target state: %v", err)
+	}
+	for _, args := range runner.outputArgs {
+		if len(args) > 0 && args[0] != "ps" || strings.Contains(strings.Join(args, " "), "volume=") {
+			t.Fatalf("target finalization with no pin left inspected live attachments: %v", runner.outputArgs)
+		}
+	}
+}

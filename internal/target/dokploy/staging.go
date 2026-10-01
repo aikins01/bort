@@ -473,6 +473,12 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 		if !hasPin && !stagingTransferStarted(entry) {
 			continue
 		}
+		if targetAuthority && !stagedVolumesRecorded(entry, want.volumes) {
+			return fmt.Errorf("run %q has no complete durable migrated-volume record for app %s; refusing target-authority finalization", plan.RunName, want.app)
+		}
+		if targetAuthority && !hasPin {
+			continue
+		}
 		if targetAuthority && !targetIdentitiesVerified {
 			if err := c.hydratePersistedTargetIdentities(ctx, actx); err != nil {
 				return fmt.Errorf("verify persisted target identities before authority finalization: %w", err)
@@ -507,9 +513,6 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 			}
 		}
 		if targetAuthority {
-			if !stagedVolumesRecorded(entry, want.volumes) {
-				return fmt.Errorf("run %q has no complete durable migrated-volume record for app %s; refusing target-authority finalization", plan.RunName, want.app)
-			}
 			targetIDsByVolume, err := c.migratedVolumeAttachmentIDs(ctx, actx, want.app)
 			if err != nil {
 				return fmt.Errorf("verify target attachments for app %s before authority finalization: %w", want.app, err)

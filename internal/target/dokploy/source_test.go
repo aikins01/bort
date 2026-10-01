@@ -18,18 +18,23 @@ func TestCoolifyDeploymentFenceRequiresStoppedNoRestartControlPlane(t *testing.T
 		name    string
 		running bool
 		policy  string
+		ps      string
+		want    string
 		wantErr bool
 	}{
-		{name: "fenced", policy: "no"},
-		{name: "running", running: true, policy: "no", wantErr: true},
-		{name: "restart enabled", policy: "always", wantErr: true},
+		{name: "fenced", policy: "no", ps: "dokploy-traefik traefik:v3.6\napi-helper-cache coollabsio/coolify-helper-cache:1\n"},
+		{name: "running", running: true, policy: "no", want: "docker update --restart=no coolify", wantErr: true},
+		{name: "restart enabled", policy: "always", want: "docker update --restart=no coolify", wantErr: true},
+		{name: "docker hub helper still deploying", policy: "no", ps: "x8k2 docker.io/coollabsio/coolify-helper:1.0.17\n", want: "helper container(s) x8k2", wantErr: true},
+		{name: "registry helper pinned by digest", policy: "no", ps: "x9 registry.local:5000/coollabsio/coolify-helper@sha256:abc\n", want: "helper container(s) x9", wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runner := &fakeDockerRunner{outputs: map[string][]byte{
-				"inspect --type container coolify": []byte(fmt.Sprintf(`[{"Id":"coolify-id","Name":"/coolify","State":{"Running":%t,"Status":"exited"},"HostConfig":{"RestartPolicy":{"Name":"%s"}}}]`, tc.running, tc.policy)),
+				"inspect --type container coolify":             []byte(fmt.Sprintf(`[{"Id":"coolify-id","Name":"/coolify","State":{"Running":%t,"Status":"exited"},"HostConfig":{"RestartPolicy":{"Name":"%s"}}}]`, tc.running, tc.policy)),
+				"ps --no-trunc --format {{.Names}} {{.Image}}": []byte(tc.ps),
 			}}
 			err := requireCoolifyDeploymentFence(context.Background(), runner)
-			if tc.wantErr && (err == nil || !strings.Contains(err.Error(), "docker update --restart=no coolify")) {
+			if tc.wantErr && (err == nil || !strings.Contains(err.Error(), tc.want)) {
 				t.Fatalf("expected actionable fence refusal, got %v", err)
 			}
 			if !tc.wantErr && err != nil {
