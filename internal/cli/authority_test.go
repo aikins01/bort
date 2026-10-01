@@ -187,7 +187,9 @@ func TestAuthorityRecoveryCarriesAppliedTransferEvidenceIntoPinCleanup(t *testin
 		Status: string(dokploy.StepStatusError),
 	}}
 	previous := releaseAuthorityStagingVolumePins
+	called := false
 	releaseAuthorityStagingVolumePins = func(_ context.Context, _ loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
+		called = true
 		if !targetAuthority || len(plan.StagingTransferApps) != 1 || plan.StagingTransferApps[0] != "api" {
 			t.Fatalf("pin cleanup did not receive transfer evidence: plan=%#v target=%t", plan, targetAuthority)
 		}
@@ -197,6 +199,9 @@ func TestAuthorityRecoveryCarriesAppliedTransferEvidenceIntoPinCleanup(t *testin
 
 	if err := releaseRecoveredAuthorityStagingVolumePins(context.Background(), run, true); err != nil {
 		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("pin cleanup was not invoked")
 	}
 }
 

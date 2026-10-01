@@ -35,12 +35,12 @@ func planRequiresCoolifyDeploymentFence(plan Plan) bool {
 func requireCoolifyDeploymentFence(ctx context.Context, runner dockerRunner) error {
 	container, err := inspectContainer(ctx, runner, coolifyControlPlaneContainer)
 	if err != nil && !isContainerMissingErr(err) {
-		return fmt.Errorf("stateful live apply requires a durable Coolify deployment fence, but Bort could not inspect the %s control-plane container: %w; record its current restart policy, run `docker update --restart=no %s && docker stop %s`, then retry", coolifyControlPlaneContainer, err, coolifyControlPlaneContainer, coolifyControlPlaneContainer)
+		return fmt.Errorf("stateful live apply requires a durable Coolify deployment fence, but Bort could not inspect the %s control-plane container: %w; record its current restart policy, run `%s`, then retry", coolifyControlPlaneContainer, err, coolifyFenceCommand())
 	}
 	if err == nil {
 		policy := normalizedRestartPolicyName(container.HostConfig.RestartPolicy.Name)
 		if container.State.Running || policy != "no" {
-			return fmt.Errorf("stateful live apply requires the Coolify control-plane container %s to be stopped with restart policy no (running=%t, restart=%s); finish or cancel in-progress Coolify deployments, record its current restart policy, run `docker update --restart=no %s && docker stop %s`, then retry; restart Coolify only after source authority is finalized, and leave it stopped after target acceptance", coolifyControlPlaneContainer, container.State.Running, policy, coolifyControlPlaneContainer, coolifyControlPlaneContainer)
+			return fmt.Errorf("stateful live apply requires the Coolify control-plane container %s to be stopped with restart policy no (running=%t, restart=%s); finish or cancel in-progress Coolify deployments, record its current restart policy, run `%s`, then retry; restart Coolify only after source authority is finalized; after target acceptance, restart it only if other apps need it and immediately delete the migrated apps in Coolify", coolifyControlPlaneContainer, container.State.Running, policy, coolifyFenceCommand())
 		}
 	}
 	helpers, err := activeCoolifyDeploymentHelpers(ctx, runner)
@@ -51,6 +51,14 @@ func requireCoolifyDeploymentFence(ctx context.Context, runner dockerRunner) err
 		return fmt.Errorf("stateful live apply requires in-flight Coolify deployments to finish, but helper container(s) %s are still running deployment commands that started before the control plane stopped; wait until they finish, then retry", strings.Join(helpers, ", "))
 	}
 	return nil
+}
+
+func coolifyFenceCommand() string {
+	docker := "docker"
+	if strings.TrimSpace(os.Getenv("SUDO_UID")) != "" {
+		docker = "sudo docker"
+	}
+	return docker + " update --restart=no " + coolifyControlPlaneContainer + " && " + docker + " stop " + coolifyControlPlaneContainer
 }
 
 const coolifyHelperImageRepository = "coollabsio/coolify-helper"

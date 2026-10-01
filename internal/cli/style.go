@@ -19,6 +19,13 @@ func bortCommand(args string) string {
 	return command + " " + args
 }
 
+func dockerCommand(args string) string {
+	if strings.TrimSpace(os.Getenv("SUDO_UID")) != "" {
+		return "sudo docker " + args
+	}
+	return "docker " + args
+}
+
 type styler struct {
 	color bool
 

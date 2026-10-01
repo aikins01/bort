@@ -276,7 +276,7 @@ func manualCoolifySourceRetirementAction(run loadedMigrationRun) string {
 			break
 		}
 	}
-	return fmt.Sprintf("keep the Coolify control plane stopped (run `docker update --restart=no coolify && docker stop coolify` if it is running), remove %s with `docker rm -f`, verify they stay removed, then run `%s`; leave Coolify stopped afterwards, because starting it again can recreate its proxy and redeploy the removed apps", containers, authorityRecoverySourceRetiredCommand(run))
+	return fmt.Sprintf("keep the Coolify control plane stopped (run `%s && %s` if it is running; this pauses Coolify for every app on the host), remove %s with `%s`, verify they stay removed, then run `%s`; leave Coolify stopped afterwards if you can, because starting it again can recreate its proxy and redeploy the removed apps until you delete them in Coolify", dockerCommand("update --restart=no coolify"), dockerCommand("stop coolify"), containers, dockerCommand("rm -f"), authorityRecoverySourceRetiredCommand(run))
 }
 
 func finishStartedAcceptanceAction(run loadedMigrationRun) string {

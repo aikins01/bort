@@ -179,9 +179,11 @@ For a Coolify source, keep the Coolify control plane stopped, remove the
 reviewed source app and proxy containers with Docker, and record permanent
 target authority with the exact
 `recover-authority --authority target --source-retired` command Bort prints.
-Leave Coolify stopped afterwards: starting it again can recreate its proxy and
-redeploy the removed apps. `commit --apply` refuses because stopping containers
-cannot fence Coolify itself.
+Stopping Coolify pauses it for every app on the host. Leave it stopped
+afterwards when nothing else needs it, because starting it again can recreate
+its proxy and redeploy the removed apps; otherwise start it and immediately
+delete the migrated apps in Coolify. `commit --apply` refuses because stopping
+containers cannot fence Coolify itself.
 
 For owner-bound current runs, `cleanup --apply` can remove only eligible unused
 records from the bound local Dokploy database, and only after making a database
@@ -232,8 +234,9 @@ Bort's safety model defaults to “look first.”
   Coolify cannot redeploy a paused source app. Bort refuses to start, pause a
   source, deploy a target, or move routes while the `coolify` container is
   running or would restart, or while a Coolify deployment helper is still
-  running deployment commands. Restart Coolify only after source authority is
-  finalized; after target acceptance, leave it stopped. See the
+  running deployment commands. Stopping it pauses Coolify for every app on the
+  host. Restart Coolify only after source authority is finalized; after target
+  acceptance, follow the restart guidance in the
   [migration guide](docs/migration-guide.md#apply-the-selected-run).
 - **Known current run:** `.bort/state.json` identifies the current run. Commands
   that make changes do not guess based on which file was modified most recently.
@@ -257,7 +260,8 @@ Bort's safety model defaults to “look first.”
   sources. With the Coolify control plane stopped, remove the reviewed source
   app and proxy containers, verify they stay removed, then use confirmed
   target-authority recovery with `--source-retired` to record acceptance.
-  Leave Coolify stopped after acceptance.
+  Afterwards, restart Coolify only if other apps need it, and then delete the
+  migrated apps in Coolify immediately.
   Destructive source purge requires either accepted state.
 - **Separate destructive purge:** purge requires selected apps or projects, a
   successful live apply or completed manual target-authority

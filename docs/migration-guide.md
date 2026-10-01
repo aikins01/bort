@@ -731,10 +731,10 @@ sudo bort migrate --live
 
 Before a stateful live apply from a Coolify source, stop Coolify's control
 plane so it cannot redeploy a source app while Bort copies its state. Bort does
-not stop it for you. First let every queued or in-progress deployment in the
-Coolify dashboard finish, or cancel it, so no deployment is still running when
-the control plane stops. Then record the current restart policy so you can
-restore it later, and stop the control plane:
+not stop it for you. First wait until no deployment is queued or running in the
+Coolify dashboard; a cancelled deployment can keep running, so confirm it has
+ended. Then record the current restart policy so you can restore it later, and
+stop the control plane:
 
 ```sh
 sudo docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify
@@ -748,7 +748,8 @@ stopped Coolify keeps running in its helper container; wait until it finishes,
 then retry. An idle helper left behind by a stopped deployment does not block
 the run. Bort checks the fence again before pausing each source app, deploying
 each target, and moving routes. Stopping the control plane does not stop
-Coolify's proxy or your apps.
+Coolify's proxy or your apps, but it pauses Coolify's management of every app
+on the host, including apps outside this run.
 
 Bort cannot detect every in-progress deployment. Coolify runs Service and
 database starts directly on the host rather than in a helper, and Bort cannot
@@ -759,8 +760,11 @@ transfer.
 Keep the control plane stopped until the run finishes. If you recover source
 authority, restore the recorded restart policy and start Coolify after the
 `recover-authority --authority source` command succeeds. If you accept the
-target, leave Coolify stopped: starting it again can recreate its proxy and
-redeploy the source apps.
+target, leave Coolify stopped when nothing else on the host needs it: starting
+it again can recreate its proxy and redeploy the migrated apps. If other apps
+still need Coolify, start it only after acceptance and immediately delete the
+migrated apps in Coolify; until you do, a Git push or scheduled deployment can
+restart them from their old source data.
 
 For an app with named volumes or a Postgres database, live apply moves the
 state before the Dokploy compose is deployed. Dokploy v0.30.7 cannot durably
@@ -1047,8 +1051,10 @@ every reviewed source app container and the source proxy container with
 `sudo docker rm -f`, and verify they stay removed. Then run the exact
 `recover-authority --authority target --source-retired --confirm ...` command
 Bort prints. That command records permanent target acceptance without mutating
-the source. Leave Coolify stopped afterwards: starting it again can recreate its
-proxy and redeploy the removed apps.
+the source. Leave Coolify stopped afterwards when nothing else on the host needs
+it: starting it again can recreate its proxy and redeploy the removed apps. If
+other apps still need Coolify, start it and immediately delete the migrated
+apps in Coolify.
 
 ## Audit and clean up
 
@@ -1068,7 +1074,7 @@ Ordinary cleanup and destructive source purge are separate operations. See the
 | Bort cannot find the expected run | Return to the original working directory and original OS user. Do not create a replacement workspace accidentally. |
 | Stateless live apply was interrupted at a safe completed boundary | Run `sudo bort status`, then rerun `sudo bort migrate --live` to resume from the saved progress. |
 | Live apply reports `MANUAL STATE` for a stateful run | The run was applied with an older plan version that copied state into a deployed target. The blocked run cannot continue. Complete recovery with the guidance shown by `bort status`, then create a new run. |
-| Stateful live apply refuses because the Coolify control plane is running or would restart, or a Coolify deployment helper is still running deployment commands | Let queued and in-progress Coolify deployments finish or cancel them, record the `coolify` container's restart policy, run `sudo docker update --restart=no coolify && sudo docker stop coolify`, wait until no `coolify-helper` container is still deploying, then rerun `sudo bort migrate --live`. Restore the policy and start Coolify only after source-authority recovery succeeds; after target acceptance, leave it stopped. |
+| Stateful live apply refuses because the Coolify control plane is running or would restart, or a Coolify deployment helper is still running deployment commands | Wait until no Coolify deployment is queued or running, record the `coolify` container's restart policy, run `sudo docker update --restart=no coolify && sudo docker stop coolify`, wait until no `coolify-helper` container is still deploying, then rerun `sudo bort migrate --live`. Restore the policy and start Coolify only after source-authority recovery succeeds; after target acceptance, start it only if other apps need it, and immediately delete the migrated apps in Coolify. |
 | A staged state transfer fails (source restarted, foreign-owned volume, or unexpected attachment) | Run `sudo bort status` and follow its recovery. Do not remove a `bort-pin-*` container manually. Bort may restart the source after a retryable pre-handoff failure, but it keeps the pin for the next attempt. If handoff may have started, Bort keeps the source stopped and reports whether it reverified the pin. Source recovery checks that no target container is attached, even if the pin is absent. Final target acceptance requires a durable record of the target's mounts and removes a remaining pin only when the target holds exactly those attachments. Host ownership is released only after these checks pass. |
 | A stateful plan needs a bind-mount copy | Bort refuses before pausing the source. Re-plan with `bort migrate --run <run>`; current plans keep same-host bind mounts at their existing paths, and the run stays editable because nothing live has started. |
 | A named volume is mounted by more than one compose service | Bort refuses before changing Dokploy or pausing the source. For a data store volume, choose `bort data <app> <store> --recreate` or `--managed` and re-plan with `bort migrate --run <run>`; otherwise change the source compose so one service mounts the volume and scan a new run. |
