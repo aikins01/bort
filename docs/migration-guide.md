@@ -760,9 +760,16 @@ transfer.
 
 Keep the control plane stopped until the run finishes. If you recover source
 authority, restore the recorded restart policy and start Coolify after the
-`recover-authority --authority source` command succeeds. If you accept the
-target, leave Coolify stopped when nothing else on the host needs it: starting
-it again can recreate its proxy and redeploy the migrated apps. If other apps
+`recover-authority --authority source` command succeeds, replacing `<policy>`
+with the value you recorded:
+
+```sh
+sudo docker update --restart=<policy> coolify && sudo docker start coolify
+```
+
+If you accept the target, leave Coolify stopped when nothing else on the host
+needs it: starting it again can recreate its proxy and redeploy the migrated
+apps. If other apps
 still need Coolify, start it only after acceptance and immediately delete the
 migrated apps in Coolify; until you do, a Git push or scheduled deployment can
 restart them from their old source data.
@@ -960,8 +967,12 @@ service creation, env upload, compose deploy, gateway install, or route
 activation) was interrupted or returned an ambiguous result. In ledgers written
 by older Bort versions it also covers an in-place volume copy, database restore,
 or handoff whose boundary cannot be proven. Bort refuses retry without mutating
-either side. Staged copies and restores in current runs are not affected: rerun
-`migrate --live` and the transfer restarts.
+either side. A staged copy or restore in a current run whose `bort-pin-*`
+container is still present can be retried: rerun `migrate --live` and the
+transfer restarts. If the pin is missing after state transfer started,
+including after an interrupted target handoff, Bort cannot prove the staging
+volumes stayed protected and requires the `recover-authority` command
+`bort status` shows.
 
 When the durable Dokploy owner still identifies the same run, finish manual
 recovery through that run:

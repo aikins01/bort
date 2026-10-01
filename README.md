@@ -229,7 +229,10 @@ Bort's safety model defaults to “look first.”
   The source stays stopped while the target becomes the writer, including for
   unrouted apps.
 - **Coolify stays fenced during stateful moves:** before a stateful live apply
-  from Coolify, let in-progress Coolify deployments finish, then run
+  from Coolify, let in-progress Coolify deployments finish, record the
+  `coolify` container's restart policy with
+  `sudo docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify`,
+  then run
   `sudo docker update --restart=no coolify && sudo docker stop coolify` so
   Coolify cannot redeploy a paused source app. Bort refuses to start, pause a
   source, deploy a target, or move routes while the `coolify` container is

@@ -70,17 +70,23 @@ func coolifyFenceCommand() string {
 const coolifyHelperImageRepository = "coollabsio/coolify-helper"
 
 func activeCoolifyDeploymentHelpers(ctx context.Context, runner dockerRunner, helperRepositories []string) ([]string, error) {
-	out, err := runner.Output(ctx, "ps", "-q", "--no-trunc")
-	if err != nil {
-		return nil, err
-	}
-	ids := strings.Fields(string(out))
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	out, err = runner.Output(ctx, append([]string{"inspect", "--type", "container", "--format", "{{.Name}} {{.Config.Image}} {{len .ExecIDs}}"}, ids...)...)
-	if err != nil {
-		return nil, err
+	var out []byte
+	for attempt := 0; ; attempt++ {
+		listed, err := runner.Output(ctx, "ps", "-q", "--no-trunc")
+		if err != nil {
+			return nil, err
+		}
+		ids := strings.Fields(string(listed))
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		out, err = runner.Output(ctx, append([]string{"inspect", "--type", "container", "--format", "{{.Name}} {{.Config.Image}} {{len .ExecIDs}}"}, ids...)...)
+		if err == nil {
+			break
+		}
+		if attempt == 2 || !isContainerMissingErr(err) {
+			return nil, err
+		}
 	}
 	active := []string{}
 	for _, line := range strings.Split(string(out), "\n") {
@@ -628,7 +634,7 @@ func SourceRetirementContainers(plan Plan) []string {
 		case StepStopSourceApp:
 			if app, ok := findPrepareApp(plan.Prepare, step.App); ok {
 				for _, ref := range sourceCommitTargets(app) {
-					add(firstNonEmpty(ref.name, ref.id))
+					add(ref.label())
 				}
 			}
 		case StepStopCoolifyProxy:

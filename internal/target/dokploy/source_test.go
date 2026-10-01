@@ -1232,3 +1232,34 @@ func TestRouteActivationGateRechecksEveryHandedOffAppPerStep(t *testing.T) {
 		t.Fatalf("a handed-off source that ran must block every later activation, not only its own, got %v", err)
 	}
 }
+
+type vanishingContainerRunner struct {
+	*fakeDockerRunner
+	listed int
+}
+
+func (r *vanishingContainerRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	key := strings.Join(args, " ")
+	if key == "ps -q --no-trunc" {
+		r.listed++
+		if r.listed == 1 {
+			return []byte("short-lived\nx8k2\n"), nil
+		}
+		return []byte("x8k2\n"), nil
+	}
+	if strings.HasSuffix(key, "short-lived x8k2") {
+		return nil, errors.New("Error: No such container: short-lived")
+	}
+	return r.fakeDockerRunner.Output(ctx, args...)
+}
+
+func TestCoolifyDeploymentFenceRelistsWhenAnUnrelatedContainerExits(t *testing.T) {
+	runner := &vanishingContainerRunner{fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container coolify": []byte(`[{"Id":"coolify-id","Name":"/coolify","State":{"Running":false,"Status":"exited"},"HostConfig":{"RestartPolicy":{"Name":"no"}}}]`),
+		"inspect --type container --format {{.Name}} {{.Config.Image}} {{len .ExecIDs}} x8k2": []byte("/x8k2 coollabsio/coolify-helper:1.0.17 1\n"),
+	}}}
+	err := requireCoolifyDeploymentFence(context.Background(), runner)
+	if err == nil || !strings.Contains(err.Error(), "helper container(s) x8k2") || runner.listed != 2 {
+		t.Fatalf("fence did not re-list after a container exited mid-check: listed=%d err=%v", runner.listed, err)
+	}
+}

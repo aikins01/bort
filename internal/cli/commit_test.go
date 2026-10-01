@@ -803,11 +803,11 @@ func TestManualCoolifySourceRetirementActionScopesProxyToRoutedCutovers(t *testi
 		Run:     migrationRun{Name: "coolify-run"},
 		Prepare: preparer.Result{Source: "coolify-local", Apps: []preparer.AppPlan{app}},
 	}
-	if action := manualCoolifySourceRetirementAction(run); !strings.Contains(action, "`"+dockerCommand("rm -f web-x1y2 db-id")+"`") || !strings.Contains(action, "--source-retired") {
+	if action := manualCoolifySourceRetirementAction(run); !strings.Contains(action, "`"+dockerCommand("rm -f web-id db-id")+"`") || !strings.Contains(action, "--source-retired") {
 		t.Fatalf("route-free retirement hint did not name exactly the reviewed containers: %q", action)
 	}
 	run.Cutover = gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}}}}
-	if action := manualCoolifySourceRetirementAction(run); !strings.Contains(action, "`"+dockerCommand("rm -f web-x1y2 db-id coolify-proxy")+"`") {
+	if action := manualCoolifySourceRetirementAction(run); !strings.Contains(action, "`"+dockerCommand("rm -f web-id db-id coolify-proxy")+"`") {
 		t.Fatalf("routed retirement hint omitted the proxy handoff: %q", action)
 	}
 }

@@ -1056,6 +1056,7 @@ func TestReleaseStagingVolumePinsBoundsDockerCallsByCallerDeadline(t *testing.T)
 	if _, err := acquireStagingVolumePin(context.Background(), &base, plan, "api", []stagedVolume{staged}, true); err != nil {
 		t.Fatal(err)
 	}
+	base.outputArgs = nil
 	runner := &deadlineRecordingRunner{fakeDockerRunner: base}
 	deadline := time.Now().Add(5 * time.Second)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
@@ -3105,43 +3106,5 @@ func TestReleaseTargetAuthorityWithoutPinSkipsLiveAttachmentChecks(t *testing.T)
 		if len(args) > 0 && args[0] != "ps" || strings.Contains(strings.Join(args, " "), "volume=") {
 			t.Fatalf("target finalization with no pin left inspected live attachments: %v", runner.outputArgs)
 		}
-	}
-}
-
-func TestStagingHandoffCompletedRequiresExactTargetAttachmentWithoutPin(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		extra bool
-		want  bool
-	}{
-		{name: "pin released after exact handoff", want: true},
-		{name: "another container shares the staged volume", extra: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, plan, _, staged := stagedSyncFixture(t)
-			const targetID = "target-id"
-			mounts := fmt.Sprintf(`[{"Type":"volume","Name":"%s","Destination":"/data","RW":true}]`, staged.VolumeName)
-			runner := &fakeDockerRunner{outputs: map[string][]byte{
-				"volume inspect " + staged.VolumeName:                                      ownedStagingVolumeInspect(plan, staged),
-				"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte(targetID + "\n"),
-				"inspect --type container " + targetID:                                     []byte(fmt.Sprintf(`[{"Id":"%s","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":%s}]`, targetID, mounts)),
-				"inspect --type container stray-id":                                        []byte(fmt.Sprintf(`[{"Id":"stray-id","Name":"/stray","State":{"Running":true,"Status":"running"},"Mounts":%s}]`, mounts)),
-			}, activeComposeProjects: map[string][]string{"stack-1": {targetID}}}
-			attached := targetID + "\n"
-			if tc.extra {
-				attached += "stray-id\n"
-			}
-			runner.outputs["ps -a --filter volume="+staged.VolumeName+" --format {{.ID}}"] = []byte(attached)
-			actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
-			if err := actx.recordMigratedVolumeMount("api", migratedVolumeMount{Service: "web", Target: "/data", VolumeName: staged.VolumeName}); err != nil {
-				t.Fatal(err)
-			}
-			actx.entry("api").ComposeAppName = "stack-1"
-
-			completed, err := (&Client{Docker: runner}).stagingHandoffCompleted(context.Background(), runner, actx, "api", []stagedVolume{staged})
-			if err != nil || completed != tc.want {
-				t.Fatalf("stagingHandoffCompleted = %t, %v; want %t", completed, err, tc.want)
-			}
-		})
 	}
 }
