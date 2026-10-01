@@ -28,12 +28,15 @@ source retirement starts, even if commit is interrupted. Rerun `commit --apply`
 to finish an interrupted acceptance.
 
 For a Coolify source, `commit --apply` refuses because Bort cannot disable
-queued or future Coolify deployments. Disable future deployments in Coolify for
-the reviewed apps, manually retire every reviewed source app (and the source
-proxy when the cutover moved routes), and verify they remain retired. Then run
-the exact
+queued or future Coolify deployments. Keep the Coolify control plane stopped
+(`docker update --restart=no coolify && docker stop coolify` if it is running),
+remove every reviewed source app container (and the source proxy container when
+the cutover moved routes) with `docker rm -f`, and verify they stay removed.
+Then run the exact
 `recover-authority --authority target --source-retired --confirm ...` command
-Bort prints. This records acceptance without mutating source resources.
+Bort prints. This records acceptance without mutating source resources. Only
+then restore Coolify's restart policy, start it, and stop or delete those apps
+in Coolify so it cannot redeploy them.
 
 Do not accept the target until you have independently checked it. Bort does not
 measure the rollback window or block acceptance when the window has not passed.

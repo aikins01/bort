@@ -445,11 +445,7 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 	for _, app := range plan.StagingTransferApps {
 		actx.entry(app).StagingTransferStarted = true
 	}
-	if targetAuthority {
-		if err := c.hydratePersistedTargetIdentities(ctx, actx); err != nil {
-			return fmt.Errorf("verify persisted target identities before authority finalization: %w", err)
-		}
-	}
+	targetIdentitiesVerified := false
 
 	discovered := map[string]stagingVolumePin{}
 	for _, container := range containers {
@@ -476,6 +472,12 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 		pin, hasPin := discovered[name]
 		if !hasPin && !stagingTransferStarted(entry) {
 			continue
+		}
+		if targetAuthority && !targetIdentitiesVerified {
+			if err := c.hydratePersistedTargetIdentities(ctx, actx); err != nil {
+				return fmt.Errorf("verify persisted target identities before authority finalization: %w", err)
+			}
+			targetIdentitiesVerified = true
 		}
 		volumes := want.volumes
 		if !targetAuthority && !hasPin {

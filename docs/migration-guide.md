@@ -967,10 +967,11 @@ recovery through that run:
 
   When source attestation still passes, Bort records target authority. For a
   source without an external orchestrator, `commit --apply` can then retire the
-  exact reviewed containers. For Coolify, disable future deployments for the
-  reviewed apps and manually retire every reviewed source app (and the source
-  proxy when the cutover moved routes) instead; `commit --apply` refuses
-  because Bort cannot durably fence Coolify. If the
+  exact reviewed containers. For Coolify, keep the control plane stopped and
+  remove every reviewed source app container (and the source proxy container
+  when the cutover moved routes) with Docker instead; `commit --apply` refuses
+  because Bort cannot durably fence Coolify. Start Coolify again only after the
+  `--source-retired` command below succeeds. If the
   reviewed source daemon or containers are no longer attestable, the recovery
   command also refuses without recording the authority decision. In either
   manual-retirement case, run the second command Bort prints with
@@ -1021,12 +1022,16 @@ retirement starts, automated rollback is no longer available, even if commit is
 interrupted; rerun `commit --apply` to finish acceptance.
 
 For a Coolify source, `commit --apply` refuses before source mutation because a
-queued or future deployment could replace a stopped container. Disable future
-deployments in Coolify, manually retire every reviewed source app and the source
-proxy, and verify they remain retired. Then run the exact
+queued or future deployment could replace a stopped container. Keep the Coolify
+control plane stopped; if it is running, run
+`sudo docker update --restart=no coolify && sudo docker stop coolify`. Remove
+every reviewed source app container and the source proxy container with
+`sudo docker rm -f`, and verify they stay removed. Then run the exact
 `recover-authority --authority target --source-retired --confirm ...` command
 Bort prints. That command records permanent target acceptance without mutating
-the source.
+the source. Only then restore Coolify's restart policy, start it, and
+immediately stop or delete those apps and the proxy in Coolify so it cannot
+redeploy them.
 
 ## Audit and clean up
 

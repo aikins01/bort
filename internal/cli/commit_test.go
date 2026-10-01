@@ -476,7 +476,7 @@ func TestCommitRetryRepublishesCompletedMetadataBeforeOwnerRelease(t *testing.T)
 	}
 	previous := releaseAuthorityStagingVolumePins
 	cleanupCalls := 0
-	releaseAuthorityStagingVolumePins = func(_ context.Context, plan dokploy.Plan, targetAuthority bool) error {
+	releaseAuthorityStagingVolumePins = func(_ context.Context, _ loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
 		cleanupCalls++
 		if plan.RunName != run.Run.Name || plan.RunDir != run.Run.RunDir || plan.RunID == "" || !targetAuthority {
 			t.Fatalf("commit pin cleanup received incomplete target identity: plan=%#v target=%t", plan, targetAuthority)
@@ -526,7 +526,7 @@ func TestCommitRetryKeepsOwnerWhenPinCleanupFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	previous := releaseAuthorityStagingVolumePins
-	releaseAuthorityStagingVolumePins = func(context.Context, dokploy.Plan, bool) error {
+	releaseAuthorityStagingVolumePins = func(context.Context, loadedMigrationRun, dokploy.Plan, bool) error {
 		return errors.New("pin cleanup failed")
 	}
 	t.Cleanup(func() { releaseAuthorityStagingVolumePins = previous })

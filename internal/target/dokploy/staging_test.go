@@ -3050,3 +3050,14 @@ func testApplyPreflightRefusal(t *testing.T, tc applyPreflightRefusalCase) {
 		t.Fatalf("source restart after refusal = %v (resume progress %v), want %v/%v: calls=%v", fakeOutputCalled(runner, "start", "web-id"), resumed, tc.earlierPartialPause, wantResumed, runner.outputArgs)
 	}
 }
+
+func TestReleaseTargetAuthorityPinsSkipsDokployAPIWithoutStagedState(t *testing.T) {
+	_, plan, _, _ := stagedSyncFixture(t)
+	plan.TargetIdentities = map[string]TargetIdentity{"api": {ProjectID: "project-1", EnvironmentID: "env-1", ComposeID: "compose-1", ComposeAppName: "stack-1"}}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter label=bort.staging-pin=true --filter label=bort.run-id=run1 --format {{.ID}}": nil,
+	}}
+	if err := (&Client{Docker: runner}).ReleaseStagingVolumePins(context.Background(), plan, true); err != nil {
+		t.Fatalf("target finalization without staged state needed the Dokploy API: %v", err)
+	}
+}

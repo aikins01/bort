@@ -29,7 +29,7 @@ func TestMain(m *testing.M) {
 	verifyLocalSourceEngine = func(context.Context, loadedMigrationRun) error { return nil }
 	verifyLocalDokployClient = func(context.Context, *dokploy.Client) error { return nil }
 	verifyLocalDokployCleanupHost = func(context.Context, *dokploy.Client) error { return nil }
-	releaseAuthorityStagingVolumePins = func(context.Context, dokploy.Plan, bool) error { return nil }
+	releaseAuthorityStagingVolumePins = func(context.Context, loadedMigrationRun, dokploy.Plan, bool) error { return nil }
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)

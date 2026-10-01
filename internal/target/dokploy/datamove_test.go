@@ -1585,6 +1585,7 @@ func TestResolveRouteForComposeRejectsReviewedServiceMismatch(t *testing.T) {
 			route := gateway.Route{Host: "stateless.example.com", ServiceName: tc.serviceName, Port: "8080"}
 			tc.compose = strings.Replace(tc.compose, "    image:", "    expose:\n      - \"8080\"\n    image:", 1)
 			if _, err := resolveRouteForCompose(route, tc.compose, nil, tc.composeSource); err == nil ||
+				!requiresAuthorityRecovery(err) ||
 				!strings.Contains(err.Error(), "points at service") ||
 				!strings.Contains(err.Error(), "run status guidance") ||
 				!strings.Contains(err.Error(), "source configuration or the bundle used to create the next run") ||

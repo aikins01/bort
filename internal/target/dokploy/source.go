@@ -17,11 +17,15 @@ const coolifyControlPlaneContainer = "coolify"
 
 func planRequiresCoolifyDeploymentFence(plan Plan) bool {
 	source := strings.ToLower(strings.TrimSpace(plan.Prepare.Source))
-	if source != "coolify-local" && source != "coolify-local-traefik" && source != "coolify-local-caddy" {
-		return false
-	}
+	coolifySource := source == "coolify-local" || source == "coolify-local-traefik" || source == "coolify-local-caddy"
 	for _, step := range plan.Steps {
-		if (step.Kind == StepRestoreDataStore || step.Kind == StepSyncVolume) && !shouldSkipApplyStep(plan, step) {
+		if (step.Kind != StepRestoreDataStore && step.Kind != StepSyncVolume) || shouldSkipApplyStep(plan, step) {
+			continue
+		}
+		if coolifySource {
+			return true
+		}
+		if app, ok := findPrepareApp(plan.Prepare, step.App); ok && strings.EqualFold(strings.TrimSpace(app.Platform), "coolify") {
 			return true
 		}
 	}

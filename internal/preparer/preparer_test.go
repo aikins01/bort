@@ -239,9 +239,7 @@ func TestPlanPersistsUniqueComposeServiceForEmptyRouteMapping(t *testing.T) {
 		Services: []manifest.Service{{Name: "api", Image: "example/api"}},
 		Routes:   []manifest.Route{{Host: "api.example.com", Port: "8080"}},
 	}}}
-	if _, err := exporter.Export(m, exporter.Options{OutputDir: dir}); err != nil {
-		t.Fatal(err)
-	}
+	exportWithLegacyRoutes(t, dir, m)
 	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
 	if err != nil {
 		t.Fatal(err)
@@ -260,6 +258,40 @@ func TestPlanMapsLegacyFQDNRouteToUniqueRawComposeService(t *testing.T) {
 		Compose: &manifest.ComposeSource{Raw: "services:\n  api:\n    image: example/api\n"},
 		Routes:  []manifest.Route{{Host: "api.example.com", ServiceName: "coolify-fqdn-target", Port: "8080", Source: "fqdn"}},
 	}}}
+	exportWithLegacyRoutes(t, dir, m)
+
+	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := result.Apps[0]
+	if result.Status != StatusGreen || app.Readiness != ReadinessReadyToCreate || len(app.Resources.Domains) != 1 || app.Resources.Domains[0].ServiceName != "api" {
+		t.Fatalf("legacy FQDN route was not mapped to the unique raw Compose service: %#v", app)
+	}
+	assertNoGate(t, app, GateDomainServiceNotInCompose)
+}
+
+func TestPlanPersistsSluggedGeneratedComposeService(t *testing.T) {
+	dir := t.TempDir()
+	m := manifest.Manifest{Apps: []manifest.App{{
+		Name:     "blog",
+		Services: []manifest.Service{{Name: "Ghost Blog", Image: "example/blog"}},
+		Routes:   []manifest.Route{{Host: "blog.example.com", ServiceName: "Ghost Blog", Port: "3000"}},
+	}}}
+	exportWithLegacyRoutes(t, dir, m)
+	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := result.Apps[0]
+	if result.Status != StatusGreen || app.Readiness != ReadinessReadyToCreate || len(app.Resources.Domains) != 1 || app.Resources.Domains[0].ServiceName != "ghost-blog" {
+		t.Fatalf("expected generated Compose service name to be persisted, got %#v", app)
+	}
+	assertNoGate(t, app, GateDomainServiceNotInCompose)
+}
+
+func exportWithLegacyRoutes(t *testing.T, dir string, m manifest.Manifest) {
+	t.Helper()
 	summary, err := exporter.Export(m, exporter.Options{OutputDir: dir})
 	if err != nil {
 		t.Fatal(err)
@@ -288,36 +320,6 @@ func TestPlanMapsLegacyFQDNRouteToUniqueRawComposeService(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(appDir, "routes.json"), append(routes, '\n'), 0o600); err != nil {
 		t.Fatal(err)
-	}
-
-	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	app := result.Apps[0]
-	if result.Status != StatusGreen || app.Readiness != ReadinessReadyToCreate || len(app.Resources.Domains) != 1 || app.Resources.Domains[0].ServiceName != "api" {
-		t.Fatalf("legacy FQDN route was not mapped to the unique raw Compose service: %#v", app)
-	}
-	assertNoGate(t, app, GateDomainServiceNotInCompose)
-}
-
-func TestPlanPersistsSluggedGeneratedComposeService(t *testing.T) {
-	dir := t.TempDir()
-	m := manifest.Manifest{Apps: []manifest.App{{
-		Name:     "blog",
-		Services: []manifest.Service{{Name: "Ghost Blog", Image: "example/blog"}},
-		Routes:   []manifest.Route{{Host: "blog.example.com", ServiceName: "Ghost Blog", Port: "3000"}},
-	}}}
-	if _, err := exporter.Export(m, exporter.Options{OutputDir: dir}); err != nil {
-		t.Fatal(err)
-	}
-	result, err := Plan(Options{BundleDir: dir, Target: "dokploy"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	app := result.Apps[0]
-	if result.Status != StatusGreen || app.Readiness != ReadinessReadyToCreate || len(app.Resources.Domains) != 1 || app.Resources.Domains[0].ServiceName != "ghost-blog" {
-		t.Fatalf("expected generated Compose service name to be persisted, got %#v", app)
 	}
 }
 

@@ -130,7 +130,7 @@ func TestRecoverAuthorityKeepsHostOwnershipWhenPinCleanupFails(t *testing.T) {
 			run := writeAmbiguousAuthorityRun(t, "pin-cleanup-"+authority)
 			previous := releaseAuthorityStagingVolumePins
 			calls := 0
-			releaseAuthorityStagingVolumePins = func(_ context.Context, plan dokploy.Plan, targetAuthority bool) error {
+			releaseAuthorityStagingVolumePins = func(_ context.Context, _ loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
 				calls++
 				if plan.RunName != run.Run.Name || plan.RunDir != run.Run.RunDir || plan.RunID == "" || targetAuthority != (authority == dokployTrafficTarget) {
 					t.Fatalf("pin cleanup received incomplete recovery identity: plan=%#v target=%t", plan, targetAuthority)
@@ -187,7 +187,7 @@ func TestAuthorityRecoveryCarriesAppliedTransferEvidenceIntoPinCleanup(t *testin
 		Status: string(dokploy.StepStatusError),
 	}}
 	previous := releaseAuthorityStagingVolumePins
-	releaseAuthorityStagingVolumePins = func(_ context.Context, plan dokploy.Plan, targetAuthority bool) error {
+	releaseAuthorityStagingVolumePins = func(_ context.Context, _ loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
 		if !targetAuthority || len(plan.StagingTransferApps) != 1 || plan.StagingTransferApps[0] != "api" {
 			t.Fatalf("pin cleanup did not receive transfer evidence: plan=%#v target=%t", plan, targetAuthority)
 		}
@@ -230,7 +230,7 @@ func TestRecoverAuthorityFinalizesTargetForCommitAndRefusesAutomaticRollback(t *
 	if phase := migrationRunPhase(completed); phase != "applied" {
 		t.Fatalf("target recovery phase=%q, want applied", phase)
 	}
-	if next := nextSafeStep(completed, nil); !strings.Contains(next.Action, "--source-retired") || !strings.Contains(next.Action, "disable future Coolify deployments") || strings.Contains(next.Action, "commit --apply") || strings.Contains(next.Action, "rollback --live") {
+	if next := nextSafeStep(completed, nil); !strings.Contains(next.Action, "--source-retired") || !strings.Contains(next.Action, "keep the Coolify control plane stopped") || strings.Contains(next.Action, "commit --apply") || strings.Contains(next.Action, "rollback --live") {
 		t.Fatalf("target recovery next step is unsafe: %#v", next)
 	}
 	if err := runRecoverAuthority(context.Background(), args, io.Discard, io.Discard); err != nil {
@@ -576,5 +576,29 @@ func TestRecoverAuthorityAcceptsDefiniteFailureWhileHostOwnerIsPending(t *testin
 	run.Run.AuthorityFinalizedAt = nil
 	if err := validateAuthorityRecovery(run, dokployTrafficSource, false); err == nil || !strings.Contains(err.Error(), "authority recovery refused") {
 		t.Fatalf("definite failure without host ownership must still be refused, got %v", err)
+	}
+}
+
+func TestAuthorityRecoveryClientBindsTargetCredentialsToRunOrigin(t *testing.T) {
+	origin, err := dokploy.NormalizeTokenBaseURL("http://127.0.0.1:3030")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(dokploy.EnvBaseURL, "http://127.0.0.1:3030")
+	t.Setenv(dokploy.EnvToken, "token-1")
+
+	source, err := authorityRecoveryDokployClient(loadedMigrationRun{}, false)
+	if err != nil || source.BaseURL != "" {
+		t.Fatalf("source recovery should not need Dokploy credentials: client=%#v err=%v", source, err)
+	}
+	target, err := authorityRecoveryDokployClient(loadedMigrationRun{Applied: runApplied{TargetOrigin: origin}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.BaseURL != origin || target.Token != "token-1" {
+		t.Fatalf("target recovery client is not configured for the run origin: %#v", target)
+	}
+	if _, err := authorityRecoveryDokployClient(loadedMigrationRun{Applied: runApplied{TargetOrigin: "http://127.0.0.1:4040"}}, true); err == nil || !strings.Contains(err.Error(), "bound to Dokploy origin") {
+		t.Fatalf("target recovery accepted credentials for another Dokploy origin: %v", err)
 	}
 }

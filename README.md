@@ -175,11 +175,13 @@ sudo bort commit --apply  # accept the target when no source orchestrator can re
 sudo bort cleanup         # audit leftovers without deleting source resources
 ```
 
-For a Coolify source, first disable future deployments and manually retire the
-reviewed source apps and proxy. Then record permanent target authority with the
-exact `recover-authority --authority target --source-retired` command Bort
-prints; `commit --apply` refuses because stopping containers cannot fence
-Coolify itself.
+For a Coolify source, keep the Coolify control plane stopped, remove the
+reviewed source app and proxy containers with Docker, and record permanent
+target authority with the exact
+`recover-authority --authority target --source-retired` command Bort prints.
+Only then start Coolify again and stop or delete those apps in it.
+`commit --apply` refuses because stopping containers cannot fence Coolify
+itself.
 
 For owner-bound current runs, `cleanup --apply` can remove only eligible unused
 records from the bound local Dokploy database, and only after making a database
@@ -249,9 +251,10 @@ Bort's safety model defaults to “look first.”
   private permissions.
 - **Separate acceptance:** `commit --apply` retires source application containers
   only when no external orchestrator can recreate them. It refuses Coolify
-  sources. Disable future Coolify deployments, manually retire the reviewed
-  source apps and proxy, verify they remain retired, then use confirmed
-  target-authority recovery with `--source-retired` to record acceptance.
+  sources. With the Coolify control plane stopped, remove the reviewed source
+  app and proxy containers, verify they stay removed, then use confirmed
+  target-authority recovery with `--source-retired` to record acceptance
+  before starting Coolify again.
   Destructive source purge requires either accepted state.
 - **Separate destructive purge:** purge requires selected apps or projects, a
   successful live apply or completed manual target-authority

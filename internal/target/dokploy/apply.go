@@ -2001,8 +2001,8 @@ func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServi
 	if availableServices == "" {
 		availableServices = "no services"
 	}
-	return gateway.Route{}, fmt.Errorf("route %s points at service %q, but the Dokploy Compose file has %s; follow the run status guidance to release this immutable run, then correct the source configuration or the bundle used to create the next run and create a new run",
-		planutilFallback(route.Host, "unknown"), route.ServiceName, availableServices)
+	return gateway.Route{}, authorityRecoveryRequiredError{err: fmt.Errorf("route %s points at service %q, but the Dokploy Compose file has %s; no retry of this immutable run can pass this step, so follow the run status guidance to record source or target authority with recover-authority, then correct the source configuration or the bundle used to create the next run and create a new run",
+		planutilFallback(route.Host, "unknown"), route.ServiceName, availableServices)}
 }
 
 func inferComposeServiceForRoute(route gateway.Route, services map[string]composeServiceSummary, sourceServices []preparer.SourceServiceRef) (string, bool) {

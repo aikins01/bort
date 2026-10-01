@@ -48,8 +48,13 @@ func TestStatefulCoolifyPlanRequiresDeploymentFence(t *testing.T) {
 		t.Fatal("stateful Coolify plan did not require a deployment fence")
 	}
 	plan.Prepare.Source = "docker"
+	plan.Prepare.Apps = []preparer.AppPlan{{Name: "api", Platform: "docker"}, {Name: "worker", Platform: "coolify"}}
 	if planRequiresCoolifyDeploymentFence(plan) {
 		t.Fatal("plain Docker source unexpectedly required the Coolify control-plane fence")
+	}
+	plan.Steps = append(plan.Steps, Step{Kind: StepSyncVolume, App: "worker"})
+	if !planRequiresCoolifyDeploymentFence(plan) {
+		t.Fatal("Docker-scanned Coolify app did not require the deployment fence")
 	}
 }
 

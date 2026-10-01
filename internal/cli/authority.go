@@ -10,8 +10,26 @@ import (
 	"github.com/aikins01/bort/internal/target/dokploy"
 )
 
-var releaseAuthorityStagingVolumePins = func(ctx context.Context, plan dokploy.Plan, targetAuthority bool) error {
-	return (&dokploy.Client{}).ReleaseStagingVolumePins(ctx, plan, targetAuthority)
+var releaseAuthorityStagingVolumePins = func(ctx context.Context, run loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
+	client, err := authorityRecoveryDokployClient(run, targetAuthority)
+	if err != nil {
+		return err
+	}
+	return client.ReleaseStagingVolumePins(ctx, plan, targetAuthority)
+}
+
+func authorityRecoveryDokployClient(run loadedMigrationRun, targetAuthority bool) (*dokploy.Client, error) {
+	if !targetAuthority {
+		return &dokploy.Client{}, nil
+	}
+	client, err := lookupDokployClient(run.Run.Target)
+	if err != nil {
+		return nil, fmt.Errorf("load Dokploy credentials to verify target attachments: %w", err)
+	}
+	if err := validateAppliedTargetOrigin(run.Applied, client.BaseURL); err != nil {
+		return nil, fmt.Errorf("verify target attachments: %w", err)
+	}
+	return client, nil
 }
 
 func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -191,7 +209,7 @@ func releaseRecoveredAuthorityStagingVolumePins(ctx context.Context, run loadedM
 	plan.RunID = runID
 	plan.TargetIdentities = appliedTargetIdentities(run.Applied)
 	plan.StagingTransferApps = appliedStagingTransferApps(run.Applied)
-	return releaseAuthorityStagingVolumePins(ctx, plan, targetAuthority)
+	return releaseAuthorityStagingVolumePins(ctx, run, plan, targetAuthority)
 }
 
 func recordOwnerlessSourceRetirement(run loadedMigrationRun, stdout io.Writer) error {
