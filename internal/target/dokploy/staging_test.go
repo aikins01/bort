@@ -3129,3 +3129,52 @@ func TestIncompleteStagingTransfersRequiresEveryStagedVolumeRecord(t *testing.T)
 		t.Fatalf("fully recorded transfer reported incomplete: %v, %v", incomplete, err)
 	}
 }
+
+func TestRequireSourceMountsStageDataDirAllowsEmptyAnonymousImageVolume(t *testing.T) {
+	anonymous := strings.Repeat("ab", 32)
+	for _, tc := range []struct {
+		name  string
+		extra preparer.VolumeResource
+		want  bool
+	}{
+		{name: "empty anonymous image volume", extra: preparer.VolumeResource{Service: "db", Type: "volume", Name: anonymous, Target: "/var/lib/postgresql/data", ReadWrite: true}},
+		{name: "anonymous volume with scanned content", extra: preparer.VolumeResource{Service: "db", Type: "volume", Name: anonymous, Target: "/var/lib/postgresql/data", ReadWrite: true, FileCount: 3}, want: true},
+		{name: "named compose volume", extra: preparer.VolumeResource{Service: "db", Type: "volume", Name: "backups", Target: "/backups", ReadWrite: true}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := preparer.AppPlan{Name: "api"}
+			app.Resources.Volumes = []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "pgdata", Target: "/pgdata", ReadWrite: true}, tc.extra}
+			staged := []stagedVolume{{Service: "db", Target: "/pgdata", VolumeName: "bort-pgdata"}, {Service: "db", Target: tc.extra.Target, VolumeName: "bort-extra"}}
+			err := requireSourceMountsStageDataDir(app, "db", "/pgdata", staged)
+			if tc.want != (err != nil) {
+				t.Fatalf("refused=%t, want %t: %v", err != nil, tc.want, err)
+			}
+		})
+	}
+}
+
+func TestValidateTargetAuthorityRequiresHandoffEvidenceWhenPinIsMissing(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	plan.StagingTransferApps = []string{"api"}
+	plan.RunID = "run-digest"
+	staged, _ = stagedVolumeFor(plan, "api", plan.Prepare.Apps[0].Resources.Volumes[0])
+	const targetID = "target-id"
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName:                                      ownedStagingVolumeInspect(plan, staged),
+		"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte(targetID + "\n"),
+		"inspect --type container " + targetID:                                     []byte(`[{"Id":"` + targetID + `","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-data","Destination":"/data","RW":true}]}]`),
+	}, activeComposeProjects: map[string][]string{"stack-1": {targetID}}}
+	client := targetAuthorityTestClient(t, runner, &plan)
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	if err := actx.recordMigratedVolumeMount("api", migratedVolumeMount{Service: "web", Target: "/data", VolumeName: staged.VolumeName}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.ValidateStagingVolumePins(context.Background(), plan, true); err == nil || !strings.Contains(err.Error(), "fresh-data") {
+		t.Fatalf("target validation accepted a missing pin without handoff evidence while the target mounts fresh state: %v", err)
+	}
+	plan.HandedOffApps = []string{"api"}
+	if err := client.ValidateStagingVolumePins(context.Background(), plan, true); err != nil {
+		t.Fatalf("target validation refused a recorded handoff whose pin was released: %v", err)
+	}
+}

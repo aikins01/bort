@@ -11,7 +11,7 @@ import (
 )
 
 var releaseAuthorityStagingVolumePins = func(ctx context.Context, run loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
-	client, err := authorityRecoveryDokployClient(run, targetAuthority)
+	client, err := authorityRecoveryDokployClient(run, plan, targetAuthority)
 	if err != nil {
 		return err
 	}
@@ -19,7 +19,7 @@ var releaseAuthorityStagingVolumePins = func(ctx context.Context, run loadedMigr
 }
 
 var validateAuthorityStagingVolumePins = func(ctx context.Context, run loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
-	client, err := authorityRecoveryDokployClient(run, targetAuthority)
+	client, err := authorityRecoveryDokployClient(run, plan, targetAuthority)
 	if err != nil {
 		return err
 	}
@@ -34,8 +34,8 @@ func validateRecoveredTargetAuthority(ctx context.Context, run loadedMigrationRu
 	return validateAuthorityStagingVolumePins(ctx, run, plan, true)
 }
 
-func authorityRecoveryDokployClient(run loadedMigrationRun, targetAuthority bool) (*dokploy.Client, error) {
-	if !targetAuthority {
+func authorityRecoveryDokployClient(run loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) (*dokploy.Client, error) {
+	if !targetAuthority || !dokploy.PlanStagesVolumes(plan) {
 		return &dokploy.Client{}, nil
 	}
 	client, err := lookupDokployClient(run.Run.Target)
@@ -245,6 +245,7 @@ func authorityRecoveryPlan(run loadedMigrationRun) (dokploy.Plan, error) {
 	plan.RunID = runID
 	plan.TargetIdentities = appliedTargetIdentities(run.Applied)
 	plan.StagingTransferApps = appliedStagingTransferApps(run.Applied)
+	plan.HandedOffApps = appliedHandedOffApps(run.Applied)
 	return plan, nil
 }
 

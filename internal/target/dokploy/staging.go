@@ -424,14 +424,14 @@ type releasableStagingPin struct {
 func (c *Client) ValidateStagingVolumePins(ctx context.Context, plan Plan, targetAuthority bool) error {
 	ctx, cancel := context.WithTimeout(ctx, targetDiscoveryTimeout)
 	defer cancel()
-	_, err := c.validatedStagingVolumePins(ctx, plan, targetAuthority)
+	_, err := c.validatedStagingVolumePins(ctx, plan, targetAuthority, true)
 	return err
 }
 
 func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, targetAuthority bool) error {
 	ctx, cancel := context.WithTimeout(ctx, targetDiscoveryTimeout)
 	defer cancel()
-	pins, err := c.validatedStagingVolumePins(ctx, plan, targetAuthority)
+	pins, err := c.validatedStagingVolumePins(ctx, plan, targetAuthority, false)
 	if err != nil {
 		return err
 	}
@@ -443,7 +443,7 @@ func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, target
 	return nil
 }
 
-func (c *Client) validatedStagingVolumePins(ctx context.Context, plan Plan, targetAuthority bool) ([]releasableStagingPin, error) {
+func (c *Client) validatedStagingVolumePins(ctx context.Context, plan Plan, targetAuthority, requireHandoff bool) ([]releasableStagingPin, error) {
 	runner := c.dockerRunner()
 	containers, err := listContainersByLabels(ctx, runner, stagingVolumePinLabel+"=true", stagingVolumeRunIDLabel+"="+stagingOwner(plan))
 	if err != nil {
@@ -498,7 +498,7 @@ func (c *Client) validatedStagingVolumePins(ctx context.Context, plan Plan, targ
 		if targetAuthority && !stagedVolumesRecorded(entry, want.volumes) {
 			return nil, fmt.Errorf("run %q has no complete durable migrated-volume record for app %s; refusing target-authority finalization", plan.RunName, want.app)
 		}
-		if targetAuthority && !hasPin {
+		if targetAuthority && !hasPin && (!requireHandoff || slices.Contains(plan.HandedOffApps, want.app)) {
 			continue
 		}
 		if targetAuthority && !targetIdentitiesVerified {
@@ -559,6 +559,15 @@ func (c *Client) validatedStagingVolumePins(ctx context.Context, plan Plan, targ
 	}
 
 	return pins, nil
+}
+
+func PlanStagesVolumes(plan Plan) bool {
+	for _, app := range plan.Prepare.Apps {
+		if len(stagedVolumesForApp(plan, app.Name)) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func IncompleteStagingTransfers(plan Plan) ([]string, error) {
@@ -1051,12 +1060,25 @@ func requireSourceMountsStageDataDir(app preparer.AppPlan, service, dataDir stri
 		return fmt.Errorf("%w: postgres data directory %s for service %s in app %s is mounted from %s %q at %s, not a named volume, so the restore would be lost when the staging container stops", ErrNotImplemented, dataDir, service, app.Name, mount.Type, firstNonEmpty(mount.Name, mount.Source), mount.Target)
 	}
 	for _, candidate := range app.Resources.Volumes {
-		if candidate.Service != service || candidate.Type != "volume" || path.Clean(candidate.Target) == path.Clean(mount.Target) || mountCoversPath(dataDir, candidate.Target) {
+		if candidate.Service != service || candidate.Type != "volume" || path.Clean(candidate.Target) == path.Clean(mount.Target) || mountCoversPath(dataDir, candidate.Target) || emptyAnonymousVolume(candidate) {
 			continue
 		}
 		return fmt.Errorf("%w: named volume %q at %s for service %s in app %s is outside postgres data directory %s, so a logical restore cannot preserve its contents; choose a recreate or managed data store strategy or change the source compose before live apply", ErrNotImplemented, firstNonEmpty(candidate.Name, candidate.Source), candidate.Target, service, app.Name, dataDir)
 	}
 	return nil
+}
+
+func emptyAnonymousVolume(volume preparer.VolumeResource) bool {
+	name := firstNonEmpty(volume.Name, volume.Source)
+	if len(name) != 64 || volume.SizeBytes != 0 || volume.FileCount != 0 {
+		return false
+	}
+	for _, r := range name {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func stagedVolumeMount(mount preparer.VolumeResource, staged []stagedVolume) bool {

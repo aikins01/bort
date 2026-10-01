@@ -181,9 +181,10 @@ target authority with the exact
 `recover-authority --authority target --source-retired` command Bort prints.
 Stopping Coolify pauses it for every app on the host. Leave it stopped
 afterwards when nothing else needs it, because starting it again can recreate
-its proxy and redeploy the removed apps; otherwise start it and immediately
-delete the migrated apps in Coolify. `commit --apply` refuses because stopping
-containers cannot fence Coolify itself.
+its proxy and redeploy the removed apps; otherwise restore its recorded restart
+policy, start it, and immediately delete the migrated apps in Coolify.
+`commit --apply` refuses because stopping containers cannot fence Coolify
+itself.
 
 For owner-bound current runs, `cleanup --apply` can remove only eligible unused
 records from the bound local Dokploy database, and only after making a database
@@ -264,8 +265,8 @@ Bort's safety model defaults to “look first.”
   sources. With the Coolify control plane stopped, remove the reviewed source
   app and proxy containers, verify they stay removed, then use confirmed
   target-authority recovery with `--source-retired` to record acceptance.
-  Afterwards, restart Coolify only if other apps need it, and then delete the
-  migrated apps in Coolify immediately.
+  Afterwards, restart Coolify with its recorded restart policy only if other
+  apps need it, and then delete the migrated apps in Coolify immediately.
   Destructive source purge requires either accepted state.
 - **Separate destructive purge:** purge requires selected apps or projects, a
   successful live apply or completed manual target-authority

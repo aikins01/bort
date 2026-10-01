@@ -118,6 +118,7 @@ type Plan struct {
 	ResumeFrom               int
 	TargetIdentities         map[string]TargetIdentity
 	StagingTransferApps      []string
+	HandedOffApps            []string
 	BeforeStep               *func(StepProgress) error
 	OnProgress               *func(StepProgress)
 	stepTimeout              time.Duration

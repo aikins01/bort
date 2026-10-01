@@ -38,7 +38,8 @@ Then run the exact
 Bort prints. This records acceptance without mutating source resources. Leave
 Coolify stopped afterwards when nothing else on the host needs it: starting it
 again can recreate its proxy and redeploy the removed apps. If other apps still
-need Coolify, start it and immediately delete the migrated apps in Coolify.
+need Coolify, restore its recorded restart policy, start it, and immediately
+delete the migrated apps in Coolify.
 
 Do not accept the target until you have independently checked it. Bort does not
 measure the rollback window or block acceptance when the window has not passed.

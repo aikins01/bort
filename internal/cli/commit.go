@@ -225,13 +225,13 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 		return fmt.Errorf("commit refused on an unverified Docker source: %w", err)
 	}
 	if requiresHostOwner {
-		if err := ensureDokployTrafficTargetOwner(ctx, run, nil, false); err != nil {
-			return fmt.Errorf("commit refused: %w", err)
+		if err := validateRecoveredTargetAuthority(ctx, run); err != nil {
+			return fmt.Errorf("commit refused before retiring the source because the transferred staging volumes do not match the target: %w", err)
 		}
 	}
 	if requiresHostOwner {
-		if err := validateRecoveredTargetAuthority(ctx, run); err != nil {
-			return fmt.Errorf("commit refused before retiring the source because the transferred staging volumes do not match the target: %w", err)
+		if err := ensureDokployTrafficTargetOwner(ctx, run, nil, false); err != nil {
+			return fmt.Errorf("commit refused: %w", err)
 		}
 	}
 	client := &dokploy.Client{}
@@ -283,7 +283,7 @@ func manualCoolifySourceRetirementAction(run loadedMigrationRun) string {
 		}
 		removal = fmt.Sprintf("remove the reviewed source containers with `%s`", dockerCommand("rm -f "+strings.Join(quoted, " ")))
 	}
-	return fmt.Sprintf("keep the Coolify control plane stopped (run `%s && %s` if it is running; this pauses Coolify for every app on the host), %s, verify they stay removed, then run `%s`; leave Coolify stopped afterwards if you can, because starting it again can recreate its proxy and redeploy the removed apps until you delete them in Coolify", dockerCommand("update --restart=no coolify"), dockerCommand("stop coolify"), removal, authorityRecoverySourceRetiredCommand(run))
+	return fmt.Sprintf("keep the Coolify control plane stopped (if it is running, record its restart policy with `%s`, then run `%s && %s`; this pauses Coolify for every app on the host), %s, verify they stay removed, then run `%s`; leave Coolify stopped afterwards if you can, because starting it again can recreate its proxy and redeploy the removed apps; if other apps need it, restore the recorded restart policy, start it, and immediately delete the migrated apps in Coolify", dockerCommand("inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify"), dockerCommand("update --restart=no coolify"), dockerCommand("stop coolify"), removal, authorityRecoverySourceRetiredCommand(run))
 }
 
 func finishStartedAcceptanceAction(run loadedMigrationRun) string {

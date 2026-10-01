@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/preparer"
 	"github.com/aikins01/bort/internal/target/dokploy"
 )
 
@@ -592,18 +593,28 @@ func TestAuthorityRecoveryClientBindsTargetCredentialsToRunOrigin(t *testing.T) 
 	t.Setenv(dokploy.EnvBaseURL, "http://127.0.0.1:3030")
 	t.Setenv(dokploy.EnvToken, "token-1")
 
-	source, err := authorityRecoveryDokployClient(loadedMigrationRun{}, false)
+	source, err := authorityRecoveryDokployClient(loadedMigrationRun{}, dokploy.Plan{}, false)
 	if err != nil || source.BaseURL != "" {
 		t.Fatalf("source recovery should not need Dokploy credentials: client=%#v err=%v", source, err)
 	}
-	target, err := authorityRecoveryDokployClient(loadedMigrationRun{Applied: runApplied{TargetOrigin: origin}}, true)
+	stateless, err := authorityRecoveryDokployClient(loadedMigrationRun{}, dokploy.Plan{}, true)
+	if err != nil || stateless.BaseURL != "" {
+		t.Fatalf("target recovery without staged volumes should not need Dokploy credentials: client=%#v err=%v", stateless, err)
+	}
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", Name: "api-data", Target: "/data"}}
+	staged := dokploy.Plan{
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{app}},
+		Steps:   []dokploy.Step{{Kind: dokploy.StepSyncVolume, App: "api", Ref: "volume:web -> /data"}, {Kind: dokploy.StepPushImage, App: "api"}},
+	}
+	target, err := authorityRecoveryDokployClient(loadedMigrationRun{Applied: runApplied{TargetOrigin: origin}}, staged, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if target.BaseURL != origin || target.Token != "token-1" {
 		t.Fatalf("target recovery client is not configured for the run origin: %#v", target)
 	}
-	if _, err := authorityRecoveryDokployClient(loadedMigrationRun{Applied: runApplied{TargetOrigin: "http://127.0.0.1:4040"}}, true); err == nil || !strings.Contains(err.Error(), "bound to Dokploy origin") {
+	if _, err := authorityRecoveryDokployClient(loadedMigrationRun{Applied: runApplied{TargetOrigin: "http://127.0.0.1:4040"}}, staged, true); err == nil || !strings.Contains(err.Error(), "bound to Dokploy origin") {
 		t.Fatalf("target recovery accepted credentials for another Dokploy origin: %v", err)
 	}
 }
