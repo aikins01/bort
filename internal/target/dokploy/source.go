@@ -34,26 +34,28 @@ func planRequiresCoolifyDeploymentFence(plan Plan) bool {
 
 func requireCoolifyDeploymentFence(ctx context.Context, runner dockerRunner) error {
 	container, err := inspectContainer(ctx, runner, coolifyControlPlaneContainer)
-	if err != nil {
+	if err != nil && !isContainerMissingErr(err) {
 		return fmt.Errorf("stateful live apply requires a durable Coolify deployment fence, but Bort could not inspect the %s control-plane container: %w; record its current restart policy, run `docker update --restart=no %s && docker stop %s`, then retry", coolifyControlPlaneContainer, err, coolifyControlPlaneContainer, coolifyControlPlaneContainer)
 	}
-	policy := normalizedRestartPolicyName(container.HostConfig.RestartPolicy.Name)
-	if container.State.Running || policy != "no" {
-		return fmt.Errorf("stateful live apply requires the Coolify control-plane container %s to be stopped with restart policy no (running=%t, restart=%s); record its current restart policy, run `docker update --restart=no %s && docker stop %s`, then retry; restart Coolify only after source authority is finalized, and leave it stopped after target acceptance", coolifyControlPlaneContainer, container.State.Running, policy, coolifyControlPlaneContainer, coolifyControlPlaneContainer)
+	if err == nil {
+		policy := normalizedRestartPolicyName(container.HostConfig.RestartPolicy.Name)
+		if container.State.Running || policy != "no" {
+			return fmt.Errorf("stateful live apply requires the Coolify control-plane container %s to be stopped with restart policy no (running=%t, restart=%s); finish or cancel in-progress Coolify deployments, record its current restart policy, run `docker update --restart=no %s && docker stop %s`, then retry; restart Coolify only after source authority is finalized, and leave it stopped after target acceptance", coolifyControlPlaneContainer, container.State.Running, policy, coolifyControlPlaneContainer, coolifyControlPlaneContainer)
+		}
 	}
-	helpers, err := runningCoolifyDeploymentHelpers(ctx, runner)
+	helpers, err := activeCoolifyDeploymentHelpers(ctx, runner)
 	if err != nil {
-		return fmt.Errorf("stateful live apply requires a durable Coolify deployment fence, but Bort could not list running containers: %w", err)
+		return fmt.Errorf("stateful live apply requires a durable Coolify deployment fence, but Bort could not inspect Coolify deployment helpers: %w", err)
 	}
 	if len(helpers) > 0 {
-		return fmt.Errorf("stateful live apply requires in-flight Coolify deployments to finish, but helper container(s) %s are still running a deployment that started before the control plane stopped; wait for them to exit on their own, then retry", strings.Join(helpers, ", "))
+		return fmt.Errorf("stateful live apply requires in-flight Coolify deployments to finish, but helper container(s) %s are still running deployment commands that started before the control plane stopped; wait until they finish, then retry", strings.Join(helpers, ", "))
 	}
 	return nil
 }
 
 const coolifyHelperImageRepository = "coollabsio/coolify-helper"
 
-func runningCoolifyDeploymentHelpers(ctx context.Context, runner dockerRunner) ([]string, error) {
+func activeCoolifyDeploymentHelpers(ctx context.Context, runner dockerRunner) ([]string, error) {
 	out, err := runner.Output(ctx, "ps", "--no-trunc", "--format", "{{.Names}} {{.Image}}")
 	if err != nil {
 		return nil, err
@@ -72,7 +74,21 @@ func runningCoolifyDeploymentHelpers(ctx context.Context, runner dockerRunner) (
 			helpers = append(helpers, fields[0])
 		}
 	}
-	return helpers, nil
+	if len(helpers) == 0 {
+		return nil, nil
+	}
+	out, err = runner.Output(ctx, append([]string{"inspect", "--type", "container", "--format", "{{.Name}} {{len .ExecIDs}}"}, helpers...)...)
+	if err != nil {
+		return nil, err
+	}
+	active := []string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] != "0" {
+			active = append(active, strings.TrimPrefix(fields[0], "/"))
+		}
+	}
+	return active, nil
 }
 
 func (c *Client) applyPauseSource(ctx context.Context, actx *applyContext, step Step) error {

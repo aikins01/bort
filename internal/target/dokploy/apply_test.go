@@ -2437,3 +2437,17 @@ func TestApplyActivateRoutesDetectsMigratedVolumeDriftAfterDeploy(t *testing.T) 
 		t.Fatalf("expected drifted target container to stop, calls=%#v", runner.outputArgs)
 	}
 }
+
+func TestResolveRouteForComposeExpandsServiceAliases(t *testing.T) {
+	for name, compose := range map[string]string{
+		"direct alias": "x-services: &app-services\n  web:\n    image: example/api\n    expose:\n      - \"8080\"\nservices: *app-services\n",
+		"merge key":    "x-services: &app-services\n  web:\n    image: example/api\n    expose:\n      - \"8080\"\nservices:\n  <<: *app-services\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			route, err := resolveRouteForCompose(gateway.Route{Host: "api.example.com", ServiceName: "web", Port: "8080"}, compose, nil, preparer.ComposeSourceRaw)
+			if err != nil || route.ServiceName != "web" {
+				t.Fatalf("aliased Compose service was not resolved at apply time: route=%#v err=%v", route, err)
+			}
+		})
+	}
+}

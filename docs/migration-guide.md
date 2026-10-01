@@ -731,8 +731,10 @@ sudo bort migrate --live
 
 Before a stateful live apply from a Coolify source, stop Coolify's control
 plane so it cannot redeploy a source app while Bort copies its state. Bort does
-not stop it for you. Record the current restart policy first so you can restore
-it later:
+not stop it for you. First let every queued or in-progress deployment in the
+Coolify dashboard finish, or cancel it, so no deployment is still running when
+the control plane stops. Then record the current restart policy so you can
+restore it later, and stop the control plane:
 
 ```sh
 sudo docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify
@@ -740,13 +742,19 @@ sudo docker update --restart=no coolify && sudo docker stop coolify
 ```
 
 Live apply refuses to start unless the `coolify` container is stopped with
-restart policy `no` and no `coolify-helper` deployment container is still
-running. A deployment that began before you stopped Coolify keeps running in
-its helper container; wait for the helper to exit on its own, then retry. Bort
-checks the fence again before pausing each source app, deploying each target,
-and moving routes. Stopping the control plane does not stop Coolify's proxy or
-your apps. If you set a custom Coolify helper image, Bort cannot recognize its
-containers; wait for in-progress deployments to finish before you stop Coolify.
+restart policy `no` (or is absent) and no `coolify-helper` container is still
+running deployment commands. An application deployment that began before you
+stopped Coolify keeps running in its helper container; wait until it finishes,
+then retry. An idle helper left behind by a stopped deployment does not block
+the run. Bort checks the fence again before pausing each source app, deploying
+each target, and moving routes. Stopping the control plane does not stop
+Coolify's proxy or your apps.
+
+Bort cannot detect every in-progress deployment. Coolify runs Service and
+database starts directly on the host rather than in a helper, and Bort cannot
+recognize helpers built from a custom helper image. Draining deployments before
+you stop Coolify is what keeps those from restarting a source app during the
+transfer.
 
 Keep the control plane stopped until the run finishes. If you recover source
 authority, restore the recorded restart policy and start Coolify after the
@@ -1060,7 +1068,7 @@ Ordinary cleanup and destructive source purge are separate operations. See the
 | Bort cannot find the expected run | Return to the original working directory and original OS user. Do not create a replacement workspace accidentally. |
 | Stateless live apply was interrupted at a safe completed boundary | Run `sudo bort status`, then rerun `sudo bort migrate --live` to resume from the saved progress. |
 | Live apply reports `MANUAL STATE` for a stateful run | The run was applied with an older plan version that copied state into a deployed target. The blocked run cannot continue. Complete recovery with the guidance shown by `bort status`, then create a new run. |
-| Stateful live apply refuses because the Coolify control plane is running or would restart, or a Coolify deployment helper is still running | Record the `coolify` container's restart policy, run `sudo docker update --restart=no coolify && sudo docker stop coolify`, wait for any `coolify-helper` container to exit on its own, then rerun `sudo bort migrate --live`. Restore the policy and start Coolify only after source-authority recovery succeeds; after target acceptance, leave it stopped. |
+| Stateful live apply refuses because the Coolify control plane is running or would restart, or a Coolify deployment helper is still running deployment commands | Let queued and in-progress Coolify deployments finish or cancel them, record the `coolify` container's restart policy, run `sudo docker update --restart=no coolify && sudo docker stop coolify`, wait until no `coolify-helper` container is still deploying, then rerun `sudo bort migrate --live`. Restore the policy and start Coolify only after source-authority recovery succeeds; after target acceptance, leave it stopped. |
 | A staged state transfer fails (source restarted, foreign-owned volume, or unexpected attachment) | Run `sudo bort status` and follow its recovery. Do not remove a `bort-pin-*` container manually. Bort may restart the source after a retryable pre-handoff failure, but it keeps the pin for the next attempt. If handoff may have started, Bort keeps the source stopped and reports whether it reverified the pin. Source recovery checks that no target container is attached, even if the pin is absent. Final target acceptance requires a durable record of the target's mounts and removes a remaining pin only when the target holds exactly those attachments. Host ownership is released only after these checks pass. |
 | A stateful plan needs a bind-mount copy | Bort refuses before pausing the source. Re-plan with `bort migrate --run <run>`; current plans keep same-host bind mounts at their existing paths, and the run stays editable because nothing live has started. |
 | A named volume is mounted by more than one compose service | Bort refuses before changing Dokploy or pausing the source. For a data store volume, choose `bort data <app> <store> --recreate` or `--managed` and re-plan with `bort migrate --run <run>`; otherwise change the source compose so one service mounts the volume and scan a new run. |

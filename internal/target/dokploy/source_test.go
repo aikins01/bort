@@ -14,30 +14,41 @@ import (
 )
 
 func TestCoolifyDeploymentFenceRequiresStoppedNoRestartControlPlane(t *testing.T) {
+	const inspectHelpers = "inspect --type container --format {{.Name}} {{len .ExecIDs}} "
 	for _, tc := range []struct {
 		name    string
+		missing bool
 		running bool
 		policy  string
 		ps      string
+		execs   map[string]string
 		want    string
-		wantErr bool
 	}{
 		{name: "fenced", policy: "no", ps: "dokploy-traefik traefik:v3.6\napi-helper-cache coollabsio/coolify-helper-cache:1\n"},
-		{name: "running", running: true, policy: "no", want: "docker update --restart=no coolify", wantErr: true},
-		{name: "restart enabled", policy: "always", want: "docker update --restart=no coolify", wantErr: true},
-		{name: "docker hub helper still deploying", policy: "no", ps: "x8k2 docker.io/coollabsio/coolify-helper:1.0.17\n", want: "helper container(s) x8k2", wantErr: true},
-		{name: "registry helper pinned by digest", policy: "no", ps: "x9 registry.local:5000/coollabsio/coolify-helper@sha256:abc\n", want: "helper container(s) x9", wantErr: true},
+		{name: "control plane removed", missing: true},
+		{name: "running", running: true, policy: "no", want: "docker update --restart=no coolify"},
+		{name: "restart enabled", policy: "always", want: "docker update --restart=no coolify"},
+		{name: "idle helper left by a stopped deployment", policy: "no", ps: "x8k2 docker.io/coollabsio/coolify-helper:1.0.17\n", execs: map[string]string{"x8k2": "/x8k2 0\n"}},
+		{name: "helper still running deployment commands", policy: "no", ps: "x8k2 docker.io/coollabsio/coolify-helper:1.0.17\n", execs: map[string]string{"x8k2": "/x8k2 1\n"}, want: "helper container(s) x8k2"},
+		{name: "registry helper pinned by digest", policy: "no", ps: "x9 registry.local:5000/coollabsio/coolify-helper@sha256:abc\n", execs: map[string]string{"x9": "/x9 2\n"}, want: "helper container(s) x9"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runner := &fakeDockerRunner{outputs: map[string][]byte{
-				"inspect --type container coolify":             []byte(fmt.Sprintf(`[{"Id":"coolify-id","Name":"/coolify","State":{"Running":%t,"Status":"exited"},"HostConfig":{"RestartPolicy":{"Name":"%s"}}}]`, tc.running, tc.policy)),
 				"ps --no-trunc --format {{.Names}} {{.Image}}": []byte(tc.ps),
-			}}
+			}, outputErrs: map[string]error{}}
+			if tc.missing {
+				runner.outputErrs["inspect --type container coolify"] = errors.New("Error: No such object: coolify")
+			} else {
+				runner.outputs["inspect --type container coolify"] = []byte(fmt.Sprintf(`[{"Id":"coolify-id","Name":"/coolify","State":{"Running":%t,"Status":"exited"},"HostConfig":{"RestartPolicy":{"Name":"%s"}}}]`, tc.running, tc.policy))
+			}
+			for name, out := range tc.execs {
+				runner.outputs[inspectHelpers+name] = []byte(out)
+			}
 			err := requireCoolifyDeploymentFence(context.Background(), runner)
-			if tc.wantErr && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+			if tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
 				t.Fatalf("expected actionable fence refusal, got %v", err)
 			}
-			if !tc.wantErr && err != nil {
+			if tc.want == "" && err != nil {
 				t.Fatalf("valid Coolify fence was refused: %v", err)
 			}
 		})

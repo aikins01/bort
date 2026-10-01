@@ -2133,6 +2133,10 @@ func composeServiceSummaries(contents string) (map[string]composeServiceSummary,
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
 		root = doc.Content[0]
 	}
+	root, err := selfContainedNode(root, map[*yaml.Node]bool{})
+	if err != nil {
+		return nil, err
+	}
 	services := mappingValue(root, "services")
 	if services == nil || services.Kind != yaml.MappingNode {
 		return nil, nil
