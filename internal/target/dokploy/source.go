@@ -16,7 +16,9 @@ import (
 
 const coolifyControlPlaneContainer = "coolify"
 
-func planRequiresCoolifyDeploymentFence(plan Plan) bool {
+// RequiresCoolifyDeploymentFence reports whether applying plan needs the
+// Coolify control plane durably stopped first.
+func RequiresCoolifyDeploymentFence(plan Plan) bool {
 	source := strings.ToLower(strings.TrimSpace(plan.Prepare.Source))
 	coolifySource := source == "coolify-local" || source == "coolify-local-traefik" || source == "coolify-local-caddy"
 	for _, step := range plan.Steps {

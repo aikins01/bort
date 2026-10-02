@@ -1068,10 +1068,14 @@ retirement starts, automated rollback is no longer available, even if commit is
 interrupted; rerun `commit --apply` to finish acceptance.
 
 For a Coolify source, `commit --apply` refuses before source mutation because a
-queued or future deployment could replace a stopped container. Record the
-Coolify control plane's restart policy with
-`sudo docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify`,
-then run `sudo docker update --restart=no coolify && sudo docker stop coolify`
+queued or future deployment could replace a stopped container. If live apply
+already fenced Coolify for a stateful move, keep the restart policy you
+recorded before that fence: the container's policy now reads `no`, so do not
+record it again. Otherwise, record the Coolify control plane's restart policy
+with
+`sudo docker --host unix:///var/run/docker.sock inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify`,
+then run
+`sudo docker --host unix:///var/run/docker.sock update --restart=no coolify && sudo docker --host unix:///var/run/docker.sock stop coolify`
 even if it is already stopped. Remove
 the reviewed source app containers and the source proxy container with the
 exact `sudo docker rm -f ...` command Bort prints, and verify they stay
@@ -1080,8 +1084,8 @@ removed. Then run the exact
 Bort prints. That command records permanent target acceptance without mutating
 the source. Leave Coolify stopped afterwards when nothing else on the host needs
 it: starting it again can recreate its proxy and redeploy the removed apps. If
-other apps still need Coolify, restore its recorded restart policy, start it,
-and immediately delete the migrated apps in Coolify.
+other apps still need Coolify, restore the restart policy you recorded before
+fencing, start it, and immediately delete the migrated apps in Coolify.
 
 ## Audit and clean up
 

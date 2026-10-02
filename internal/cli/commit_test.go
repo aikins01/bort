@@ -17,6 +17,7 @@ import (
 	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/manifest"
 	"github.com/aikins01/bort/internal/preparer"
+	syncplan "github.com/aikins01/bort/internal/sync"
 	"github.com/aikins01/bort/internal/target/dokploy"
 )
 
@@ -809,6 +810,20 @@ func TestManualCoolifySourceRetirementActionScopesProxyToRoutedCutovers(t *testi
 	run.Cutover = gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}}}}
 	if action := manualCoolifySourceRetirementAction(run); !strings.Contains(action, "`"+dockerCommand("rm -f web-id db-id coolify-proxy")+"`") {
 		t.Fatalf("routed retirement hint omitted the proxy handoff: %q", action)
+	}
+	applied := time.Now().UTC()
+	run.Run.ResolvedAuthority = dokployTrafficTarget
+	run.Run.AuthorityResolvedAt = &applied
+	run.Run.LiveAppliedAt = &applied
+	run.Sync = syncplan.Result{Apps: []syncplan.AppPlan{{
+		Name:  "api",
+		Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "data", Strategy: syncplan.StrategyVolumeSync}},
+	}}}
+	action := manualCoolifySourceRetirementAction(run)
+	if !strings.Contains(action, "do not record it again") ||
+		!strings.Contains(action, "restore the restart policy you recorded before fencing") ||
+		strings.Contains(action, "record the Coolify control plane's restart policy with") {
+		t.Fatalf("retirement hint after a live-apply fence did not keep the pre-fence policy record: %q", action)
 	}
 }
 

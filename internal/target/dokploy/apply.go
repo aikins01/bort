@@ -793,7 +793,7 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 	if err := validatePlanReadyForLiveApply(plan); err != nil {
 		return err
 	}
-	if planRequiresCoolifyDeploymentFence(plan) {
+	if RequiresCoolifyDeploymentFence(plan) {
 		if err := requireCoolifyDeploymentFence(ctx, c.dockerRunner()); err != nil {
 			return err
 		}
@@ -976,7 +976,7 @@ func (p pausedSources) observeCompleted(step Step, handedOff map[string]struct{}
 }
 
 func (c *Client) requireTransferredSourceStillPaused(ctx context.Context, actx *applyContext, step Step, pausedApps pausedSources, handedOff map[string]struct{}) error {
-	if planRequiresCoolifyDeploymentFence(actx.plan) &&
+	if RequiresCoolifyDeploymentFence(actx.plan) &&
 		(step.Kind == StepPauseSource || step.Kind == StepPushImage || step.Kind == StepActivateRoutes) {
 		if err := requireCoolifyDeploymentFence(ctx, c.dockerRunner()); err != nil {
 			return err
