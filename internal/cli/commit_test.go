@@ -819,11 +819,21 @@ func TestManualCoolifySourceRetirementActionScopesProxyToRoutedCutovers(t *testi
 		Name:  "api",
 		Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "data", Strategy: syncplan.StrategyVolumeSync}},
 	}}}
+	run.Applied.Steps = []appliedStep{{Index: 0, Kind: string(dokploy.StepSyncVolume), App: "api", Ref: "data", Status: string(dokploy.StepStatusOK), UpdatedAt: applied}}
 	action := manualCoolifySourceRetirementAction(run)
 	if !strings.Contains(action, "do not record it again") ||
 		!strings.Contains(action, "restore the restart policy you recorded before fencing") ||
 		strings.Contains(action, "record the Coolify control plane's restart policy with") {
 		t.Fatalf("retirement hint after a live-apply fence did not keep the pre-fence policy record: %q", action)
+	}
+	run.Run.ResolvedAuthority = ""
+	run.Run.AuthorityResolvedAt = nil
+	run.Run.LiveAppliedAt = nil
+	run.Applied.Steps[0].Status = string(dokploy.StepStatusError)
+	action = manualCoolifySourceRetirementAction(run)
+	if !strings.Contains(action, "do not record it again") ||
+		strings.Contains(action, "record the Coolify control plane's restart policy with") {
+		t.Fatalf("retirement hint after an interrupted fenced live apply re-recorded the fence policy: %q", action)
 	}
 }
 

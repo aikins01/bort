@@ -285,7 +285,7 @@ func manualCoolifySourceRetirementAction(run loadedMigrationRun) string {
 	}
 	fence := fmt.Sprintf("run `%s && %s` even if it is already stopped (this pauses Coolify for every app on the host)", dockerCommand("update --restart=no coolify"), dockerCommand("stop coolify"))
 	keepStopped := "leave Coolify stopped afterwards if you can, because starting it again can recreate its proxy and redeploy the removed apps"
-	if liveApplySucceeded(run) && dokploy.RequiresCoolifyDeploymentFence(livePlanForApplied(run, run.Applied)) {
+	if appliedHasHistory(run.Applied) && dokploy.RequiresCoolifyDeploymentFence(livePlanForApplied(run, run.Applied)) {
 		return fmt.Sprintf("retain the restart policy you recorded before fencing Coolify for live apply (its policy now reads `no`; do not record it again), %s, %s, verify they stay removed, then run `%s`; %s; if other apps need it, restore the restart policy you recorded before fencing, start it, and immediately delete the migrated apps in Coolify", fence, removal, authorityRecoverySourceRetiredCommand(run), keepStopped)
 	}
 	return fmt.Sprintf("record the Coolify control plane's restart policy with `%s`, then %s, %s, verify they stay removed, then run `%s`; %s; if other apps need it, restore the recorded restart policy, start it, and immediately delete the migrated apps in Coolify", dockerCommand("inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify"), fence, removal, authorityRecoverySourceRetiredCommand(run), keepStopped)
