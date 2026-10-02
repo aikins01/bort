@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/aikins01/bort/internal/dockercli"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -20,10 +21,11 @@ func bortCommand(args string) string {
 }
 
 func dockerCommand(args string) string {
+	command := "docker --host " + dockercli.LocalHost()
 	if strings.TrimSpace(os.Getenv("SUDO_UID")) != "" {
-		return "sudo docker " + args
+		command = "sudo " + command
 	}
-	return "docker " + args
+	return command + " " + args
 }
 
 type styler struct {

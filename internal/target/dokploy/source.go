@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aikins01/bort/internal/dockercli"
 	"github.com/aikins01/bort/internal/preparer"
 	"github.com/aikins01/bort/internal/safepath"
 )
@@ -60,9 +61,9 @@ func requireCoolifyDeploymentFence(ctx context.Context, runner dockerRunner) err
 }
 
 func coolifyFenceCommand() string {
-	docker := "docker"
+	docker := "docker --host " + dockercli.LocalHost()
 	if strings.TrimSpace(os.Getenv("SUDO_UID")) != "" {
-		docker = "sudo docker"
+		docker = "sudo " + docker
 	}
 	return docker + " update --restart=no " + coolifyControlPlaneContainer + " && " + docker + " stop " + coolifyControlPlaneContainer
 }

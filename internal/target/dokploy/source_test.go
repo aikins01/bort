@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aikins01/bort/internal/dockercli"
 	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/preparer"
 	syncplan "github.com/aikins01/bort/internal/sync"
@@ -26,8 +27,8 @@ func TestCoolifyDeploymentFenceRequiresStoppedNoRestartControlPlane(t *testing.T
 	}{
 		{name: "fenced", policy: "no", listed: "/dokploy-traefik traefik:v3.6 0\n/cache coollabsio/coolify-helper-cache:1 3\n"},
 		{name: "control plane removed", missing: true},
-		{name: "running", running: true, policy: "no", want: "docker update --restart=no coolify"},
-		{name: "restart enabled", policy: "always", want: "docker update --restart=no coolify"},
+		{name: "running", running: true, policy: "no", want: "docker --host " + dockercli.LocalHost() + " update --restart=no coolify"},
+		{name: "restart enabled", policy: "always", want: "docker --host " + dockercli.LocalHost() + " update --restart=no coolify"},
 		{name: "idle helper left by a stopped deployment", policy: "no", listed: "/x8k2 docker.io/coollabsio/coolify-helper:1.0.17 0\n"},
 		{name: "helper still running deployment commands", policy: "no", listed: "/x8k2 docker.io/coollabsio/coolify-helper:1.0.17 1\n", want: "helper container(s) x8k2"},
 		{name: "registry helper pinned by digest", policy: "no", listed: "/x9 registry.local:5000/coollabsio/coolify-helper@sha256:abc 2\n", want: "helper container(s) x9"},

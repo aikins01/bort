@@ -737,8 +737,8 @@ ended. Then record the current restart policy so you can restore it later, and
 stop the control plane:
 
 ```sh
-sudo docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify
-sudo docker update --restart=no coolify && sudo docker stop coolify
+sudo docker --host unix:///var/run/docker.sock inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify
+sudo docker --host unix:///var/run/docker.sock update --restart=no coolify && sudo docker --host unix:///var/run/docker.sock stop coolify
 ```
 
 Live apply refuses to start unless the `coolify` container is stopped with
@@ -764,7 +764,7 @@ authority, restore the recorded restart policy and start Coolify after the
 with the value you recorded:
 
 ```sh
-sudo docker update --restart=<policy> coolify && sudo docker start coolify
+sudo docker --host unix:///var/run/docker.sock update --restart=<policy> coolify && sudo docker --host unix:///var/run/docker.sock start coolify
 ```
 
 If you accept the target, leave Coolify stopped when nothing else on the host
@@ -1101,7 +1101,7 @@ Ordinary cleanup and destructive source purge are separate operations. See the
 | Bort cannot find the expected run | Return to the original working directory and original OS user. Do not create a replacement workspace accidentally. |
 | Stateless live apply was interrupted at a safe completed boundary | Run `sudo bort status`, then rerun `sudo bort migrate --live` to resume from the saved progress. |
 | Live apply reports `MANUAL STATE` for a stateful run | The run was applied with an older plan version that copied state into a deployed target. The blocked run cannot continue. Complete recovery with the guidance shown by `bort status`, then create a new run. |
-| Stateful live apply refuses because the Coolify control plane is running or would restart, or a Coolify deployment helper is still running deployment commands | Wait until no Coolify deployment is queued or running, record the `coolify` container's restart policy, run `sudo docker update --restart=no coolify && sudo docker stop coolify`, wait until no `coolify-helper` container is still deploying, then rerun `sudo bort migrate --live`. Restore the policy and start Coolify only after source-authority recovery succeeds; after target acceptance, restore the policy and start it only if other apps need it, then immediately delete the migrated apps in Coolify. |
+| Stateful live apply refuses because the Coolify control plane is running or would restart, or a Coolify deployment helper is still running deployment commands | Wait until no Coolify deployment is queued or running, record the `coolify` container's restart policy, run `sudo docker --host unix:///var/run/docker.sock update --restart=no coolify && sudo docker --host unix:///var/run/docker.sock stop coolify`, wait until no `coolify-helper` container is still deploying, then rerun `sudo bort migrate --live`. Restore the policy and start Coolify only after source-authority recovery succeeds; after target acceptance, restore the policy and start it only if other apps need it, then immediately delete the migrated apps in Coolify. |
 | A staged state transfer fails (source restarted, foreign-owned volume, or unexpected attachment) | Run `sudo bort status` and follow its recovery. If it offers `migrate --live`, rerun it; the transfer restarts and reuses the preserved pin. If it requires authority recovery and reports that the staged transfer did not finish, only source recovery is available. Do not remove a `bort-pin-*` container manually. Bort may restart the source after a retryable pre-handoff failure, but it keeps the pin for the next attempt. If handoff may have started, Bort keeps the source stopped and reports whether it reverified the pin. Source recovery checks that no target container is attached, even if the pin is absent. Final target acceptance requires a durable record that each transfer into staging completed and removes a remaining pin only when the target holds exactly the recorded attachments; when no pin remains, verify the target's attachments yourself before accepting. Host ownership is released only after these checks pass. |
 | A stateful plan needs a bind-mount copy | Bort refuses before pausing the source. Re-plan with `bort migrate --run <run>`; current plans keep same-host bind mounts at their existing paths, and the run stays editable because nothing live has started. |
 | A named volume is mounted by more than one compose service | Bort refuses before changing Dokploy or pausing the source. For a data store volume, choose `bort data <app> <store> --recreate` or `--managed` and re-plan with `bort migrate --run <run>`; otherwise change the source compose so one service mounts the volume and scan a new run. |
