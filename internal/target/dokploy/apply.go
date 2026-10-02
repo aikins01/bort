@@ -2141,7 +2141,7 @@ func composeServiceSummaries(contents string) (map[string]composeServiceSummary,
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
 		root = doc.Content[0]
 	}
-	root, err := selfContainedNode(root, map[*yaml.Node]bool{})
+	root, err := selfContainedNode(root)
 	if err != nil {
 		return nil, err
 	}

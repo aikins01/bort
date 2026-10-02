@@ -957,7 +957,7 @@ func resolvedComposeServiceNode(composeFile, service string) *yaml.Node {
 	if entry == nil {
 		return nil
 	}
-	if entry, err = selfContainedNode(entry, map[*yaml.Node]bool{}); err != nil {
+	if entry, err = selfContainedNode(entry); err != nil {
 		return nil
 	}
 	return entry
@@ -1227,13 +1227,23 @@ func composeServiceInitBindMounts(entry *yaml.Node) ([]*yaml.Node, error) {
 			return nil, fmt.Errorf("init script mount %s -> %s must use an absolute host path so the staged restore runs the same scripts as the deploy", source, target)
 		}
 		if item.Kind == yaml.MappingNode {
-			ensureMappingBool(item, "read_only", true)
-			mounts = append(mounts, item)
+			mount := cloneNode(item)
+			ensureMappingBool(mount, "read_only", true)
+			mounts = append(mounts, mount)
 			continue
 		}
 		mounts = append(mounts, stringNode(source+":"+target+":"+strings.Join(append(withoutAccessMode(options), "ro"), ",")))
 	}
 	return mounts, nil
+}
+
+func cloneNode(node *yaml.Node) *yaml.Node {
+	copied := *node
+	copied.Content = make([]*yaml.Node, len(node.Content))
+	for i, child := range node.Content {
+		copied.Content[i] = cloneNode(child)
+	}
+	return &copied
 }
 
 func withoutAccessMode(options []string) []string {
@@ -1315,7 +1325,7 @@ func stagingComposeFile(composeFile, service string, staged []stagedVolume) (str
 	services := mappingValue(root, "services")
 	entry := mappingValue(services, service)
 	if entry != nil {
-		if entry, err = selfContainedNode(entry, map[*yaml.Node]bool{}); err != nil {
+		if entry, err = selfContainedNode(entry); err != nil {
 			return "", fmt.Errorf("compose service %s: %w", service, err)
 		}
 	}
@@ -1360,21 +1370,38 @@ func stagingComposeFile(composeFile, service string, staged []stagedVolume) (str
 
 // selfContainedNode copies a subtree with every alias expanded and every
 // merge key applied, so it stays valid after the anchors it referenced are
-// pruned from the document.
-func selfContainedNode(node *yaml.Node, expanding map[*yaml.Node]bool) (*yaml.Node, error) {
+// pruned from the document. Expansions of one anchor are shared between its
+// reference sites, so callers may edit the returned root but must treat
+// nodes nested inside it as read-only.
+func selfContainedNode(node *yaml.Node) (*yaml.Node, error) {
+	return expandSelfContained(node, map[*yaml.Node]bool{}, map[*yaml.Node]*yaml.Node{})
+}
+
+func expandSelfContained(node *yaml.Node, expanding map[*yaml.Node]bool, memo map[*yaml.Node]*yaml.Node) (*yaml.Node, error) {
 	if node.Kind == yaml.AliasNode {
-		if node.Alias == nil || expanding[node.Alias] {
+		if node.Alias == nil {
+			return nil, fmt.Errorf("alias *%s cannot be expanded", node.Value)
+		}
+		if expanded, ok := memo[node.Alias]; ok {
+			return expanded, nil
+		}
+		if expanding[node.Alias] {
 			return nil, fmt.Errorf("alias *%s cannot be expanded", node.Value)
 		}
 		expanding[node.Alias] = true
 		defer delete(expanding, node.Alias)
-		return selfContainedNode(node.Alias, expanding)
+		expanded, err := expandSelfContained(node.Alias, expanding, memo)
+		if err != nil {
+			return nil, err
+		}
+		memo[node.Alias] = expanded
+		return expanded, nil
 	}
 	copied := *node
 	copied.Anchor = ""
 	copied.Content = nil
 	for _, child := range node.Content {
-		resolved, err := selfContainedNode(child, expanding)
+		resolved, err := expandSelfContained(child, expanding, memo)
 		if err != nil {
 			return nil, err
 		}

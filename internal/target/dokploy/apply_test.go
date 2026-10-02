@@ -2451,3 +2451,23 @@ func TestResolveRouteForComposeExpandsServiceAliases(t *testing.T) {
 		})
 	}
 }
+
+func TestComposeServiceSummariesExpandsSharedAliasChainsWithoutExponentialCost(t *testing.T) {
+	var compose strings.Builder
+	compose.WriteString("x-base: &level0\n  image: example/api\n  expose:\n    - \"8080\"\n")
+	for i := 1; i < 30; i++ {
+		fmt.Fprintf(&compose, "x-level%d: &level%d\n  <<: *level%d\n  back: *level%d\n", i, i, i-1, i-1)
+	}
+	compose.WriteString("services:\n  api:\n    <<: *level29\n")
+	summaries, err := composeServiceSummaries(compose.String())
+	if err != nil {
+		t.Fatalf("composeServiceSummaries: %v", err)
+	}
+	summary, ok := summaries["api"]
+	if !ok {
+		t.Fatalf("expected an api service summary, got %#v", summaries)
+	}
+	if _, ok := summary.Ports["8080"]; !ok {
+		t.Fatalf("port exposed through 30 levels of shared anchors was lost: %#v", summary.Ports)
+	}
+}
