@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -478,14 +477,18 @@ func appliedStagingTransferApps(applied runApplied) []string {
 }
 
 func appliedHandedOffApps(applied runApplied) []string {
-	apps := []string{}
+	apps := map[string]struct{}{}
 	for _, recorded := range applied.Steps {
-		if recorded.App != "" && dokploy.StepKind(recorded.Kind) == dokploy.StepPushImage && appliedStepCompleted(recorded) && !slices.Contains(apps, recorded.App) {
-			apps = append(apps, recorded.App)
+		if recorded.App != "" && dokploy.StepKind(recorded.Kind) == dokploy.StepPushImage && appliedStepCompleted(recorded) {
+			apps[recorded.App] = struct{}{}
 		}
 	}
-	sort.Strings(apps)
-	return apps
+	result := make([]string, 0, len(apps))
+	for app := range apps {
+		result = append(result, app)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func appliedStepMutatesDokploy(kind string) bool {
