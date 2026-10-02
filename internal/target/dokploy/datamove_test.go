@@ -1993,6 +1993,44 @@ func TestValidateMigratedVolumeMountsRejectsTwoRunningContainersForService(t *te
 	}
 }
 
+func stoppedAndRunningTargetContainersFixture(stoppedVolume, runningVolume string) map[string][]byte {
+	return map[string][]byte{
+		"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte("old-web\nweb-id\n"),
+		"inspect --type container old-web web-id":                                  []byte(`[{"Id":"old-web","Name":"/old-web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":false,"Status":"exited"},"Mounts":[{"Type":"volume","Name":"` + stoppedVolume + `","Destination":"/data","RW":true}]},{"Id":"web-id","Name":"/web-id","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"` + runningVolume + `","Destination":"/data","RW":true}]}]`),
+	}
+}
+
+func TestValidateMigratedVolumeMountsValidatesRunningReplacementNotStoppedPredecessor(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: stoppedAndRunningTargetContainersFixture("migrated-vol", "fresh-vol")}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{}}
+	entry := actx.entry("api")
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+
+	err := client.validateMigratedVolumeMounts(context.Background(), actx, "api")
+	if err == nil || !isUnsafeTargetResumeError(err) || !strings.Contains(err.Error(), "changed from migrated volume migrated-vol to fresh-vol") {
+		t.Fatalf("expected the running replacement's fresh volume to fail validation, got %v", err)
+	}
+}
+
+func TestValidateMigratedVolumeMountsAcceptsRunningReplacementWithDivergedStoppedPredecessor(t *testing.T) {
+	runner := &fakeDockerRunner{outputs: stoppedAndRunningTargetContainersFixture("fresh-vol", "migrated-vol")}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{}}
+	entry := actx.entry("api")
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: "migrated-vol"},
+	}
+
+	if err := client.validateMigratedVolumeMounts(context.Background(), actx, "api"); err != nil {
+		t.Fatalf("expected the stopped predecessor's stale volume to be ignored, got %v", err)
+	}
+}
+
 func TestStopTargetComposeContainersWaitsForLatePostDeployTarget(t *testing.T) {
 	runner := &latePostDeployTargetRunner{emptyFirst: true}
 	client := &Client{Docker: runner}
