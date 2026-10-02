@@ -554,7 +554,7 @@ func (c *Client) requireStagingCompatibleCompose(ctx context.Context, composeID,
 var stagingComposeProjectNamePattern = regexp.MustCompile(`\$\{?COMPOSE_PROJECT_NAME\b`)
 
 func hasUnescapedComposeProjectName(value string) bool {
-	return stagingComposeProjectNamePattern.MatchString(strings.ReplaceAll(value, "$$", ""))
+	return stagingComposeProjectNamePattern.MatchString(strings.ReplaceAll(value, "$$", "\x00"))
 }
 
 func appDecisionCodesApproved(plan Plan, app preparer.AppPlan) bool {

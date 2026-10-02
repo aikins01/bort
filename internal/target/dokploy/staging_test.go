@@ -371,11 +371,12 @@ func TestValidatePlanReadyForLiveApplyRefusesComposeProjectNameInStagedDataStore
 		compose string
 		refuse  bool
 	}{
-		"braced reference in db":     {compose: strings.Replace(original, "${DB_PASSWORD}", "${COMPOSE_PROJECT_NAME}_db", 1), refuse: true},
-		"bare reference in db":       {compose: strings.Replace(original, "${DB_PASSWORD}", "$COMPOSE_PROJECT_NAME", 1), refuse: true},
-		"escaped reference in db":    {compose: strings.Replace(original, "${DB_PASSWORD}", "$${COMPOSE_PROJECT_NAME}_db", 1), refuse: false},
-		"longer variable name in db": {compose: strings.Replace(original, "${DB_PASSWORD}", "${COMPOSE_PROJECT_NAME_SUFFIX}", 1), refuse: false},
-		"reference in other service": {compose: strings.Replace(original, "image: example/web\n", "image: example/web\n    environment:\n      APP: ${COMPOSE_PROJECT_NAME}\n", 1), refuse: false},
+		"braced reference in db":                {compose: strings.Replace(original, "${DB_PASSWORD}", "${COMPOSE_PROJECT_NAME}_db", 1), refuse: true},
+		"bare reference in db":                  {compose: strings.Replace(original, "${DB_PASSWORD}", "$COMPOSE_PROJECT_NAME", 1), refuse: true},
+		"escaped reference in db":               {compose: strings.Replace(original, "${DB_PASSWORD}", "$${COMPOSE_PROJECT_NAME}_db", 1), refuse: false},
+		"reference before escaped dollar in db": {compose: strings.Replace(original, "${DB_PASSWORD}", "$COMPOSE_PROJECT_NAME$$archive", 1), refuse: true},
+		"longer variable name in db":            {compose: strings.Replace(original, "${DB_PASSWORD}", "${COMPOSE_PROJECT_NAME_SUFFIX}", 1), refuse: false},
+		"reference in other service":            {compose: strings.Replace(original, "image: example/web\n", "image: example/web\n    environment:\n      APP: ${COMPOSE_PROJECT_NAME}\n", 1), refuse: false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if tc.compose == original {
