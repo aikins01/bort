@@ -951,8 +951,9 @@ sudo bort rollback --live
 ```
 
 The command is available only when the run transferred no database or volume
-state. In that case the source applications remained running, and rollback
-stops the Dokploy proxy and starts the Coolify proxy. An interrupted stateless
+state. Routed source applications are paused when the cutover takes traffic
+and stay stopped until retirement, so rollback restarts them, then stops the
+Dokploy proxy and starts the Coolify proxy. An interrupted stateless
 rollback can be re-run.
 
 An interrupted stateful run with the current plan version resumes from its

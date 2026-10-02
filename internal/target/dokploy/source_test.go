@@ -386,6 +386,81 @@ func TestPlanFromArtifactsDeploysRoutedStatefulTargetAfterStateTransfer(t *testi
 	}
 }
 
+func TestPlanFromArtifactsPausesRoutedStatelessSourceAtCutover(t *testing.T) {
+	routed := preparer.AppPlan{Name: "web"}
+	unrouted := preparer.AppPlan{Name: "worker"}
+	stateful := preparer.AppPlan{Name: "db"}
+	stateful.Resources.Volumes = []preparer.VolumeResource{{Service: "db", Type: "volume", Target: "/data"}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{routed, unrouted, stateful}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{
+		{Name: "web"},
+		{Name: "worker"},
+		{Name: "db", Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "volume:db -> /data", Strategy: syncplan.StrategyDockerVolumeArchive}}},
+	}}
+	cutover := gateway.Result{Apps: []gateway.AppPlan{
+		{Name: "web", Routes: []gateway.Route{{Host: "web.example.com"}}},
+		{Name: "db", Routes: []gateway.Route{{Host: "db.example.com"}}},
+	}}
+	plan := PlanFromArtifacts(prepare, sync, cutover)
+	pauseCount := map[string]int{}
+	webPause, stopProxy, webActivate, startProxy := -1, -1, -1, -1
+	for index, step := range plan.Steps {
+		if step.Kind == StepPauseSource {
+			pauseCount[step.App]++
+			if step.App == "web" {
+				webPause = index
+			}
+		}
+		if step.Kind == StepResumeSource && step.App == "web" {
+			t.Fatalf("routed stateless source must stay paused until retirement, got plan=%v", stepKinds(plan.Steps))
+		}
+		if step.Kind == StepStopCoolifyProxy {
+			stopProxy = index
+		}
+		if step.Kind == StepActivateRoutes && step.App == "web" {
+			webActivate = index
+		}
+		if step.Kind == StepStartDokployProxy {
+			startProxy = index
+		}
+	}
+	if pauseCount["web"] != 1 || pauseCount["db"] != 1 || pauseCount["worker"] != 0 {
+		t.Fatalf("expected one pause per routed app and none for the unrouted stateless app, got %v plan=%v", pauseCount, stepKinds(plan.Steps))
+	}
+	if webPause < 0 || stopProxy < 0 || webActivate < 0 || startProxy < 0 || !(webPause < stopProxy && stopProxy < webActivate && webActivate < startProxy) {
+		t.Fatalf("expected pause < stop proxy < activate < start proxy, got plan=%v", stepKinds(plan.Steps))
+	}
+}
+
+func TestPlanFromArtifactsPausesRoutedStatelessSourceInEveryPlanOrder(t *testing.T) {
+	prepare := preparer.Result{Apps: []preparer.AppPlan{{Name: "web"}}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{{Name: "web"}}}
+	cutover := gateway.Result{Apps: []gateway.AppPlan{{Name: "web", Routes: []gateway.Route{{Host: "web.example.com"}}}}}
+	builders := []struct {
+		name string
+		plan Plan
+	}{
+		{"v1alpha4", PlanFromArtifacts(prepare, sync, cutover)},
+		{"v1alpha3", LegacyPlanFromArtifactsV1Alpha3(prepare, sync, cutover)},
+		{"v1alpha2", PlanFromArtifactsV1Alpha2(prepare, sync, cutover)},
+		{"v1alpha1", LegacyPlanFromArtifactsV1Alpha1(prepare, sync, cutover)},
+	}
+	for _, builder := range builders {
+		pause, activate := -1, -1
+		for index, step := range builder.plan.Steps {
+			if step.Kind == StepPauseSource && step.App == "web" {
+				pause = index
+			}
+			if step.Kind == StepActivateRoutes && step.App == "web" {
+				activate = index
+			}
+		}
+		if pause < 0 || activate < 0 || pause > activate {
+			t.Fatalf("%s: expected routed stateless pause before route activation, got %v", builder.name, stepKinds(builder.plan.Steps))
+		}
+	}
+}
+
 func TestPlanFromArtifactsV1Alpha2StartsRoutedStatefulTargetDuringFinalProxyHandoff(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
 	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", Target: "/data"}}
@@ -612,6 +687,47 @@ func TestApplyResumeSourceStartsOnlyOwnedStoppedContainers(t *testing.T) {
 	}
 	if !entry.SourcePauseRecorded || !slices.Equal(entry.SourcePausedContainers, []sourcePausedContainer{{ID: "web-id", Stopped: true}, {ID: "worker-id"}}) {
 		t.Fatalf("resume cleared source ownership before terminal progress was durable: %#v", entry)
+	}
+}
+
+func TestApplyResumeSourceWithoutRecordNoOpsWhenEverythingRuns(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "web", Type: "volume", SourceContainerID: "web-id"},
+	}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"inspect --type container web-id": []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	if err := client.applyResumeSource(context.Background(), actx, Step{Kind: StepResumeSource, App: "api"}); err != nil {
+		t.Fatalf("applyResumeSource: %v", err)
+	}
+	if fakeOutputCalled(runner, "start", "web-id") {
+		t.Fatalf("resume without recorded ownership must not start a running container, calls=%v", runner.outputArgs)
+	}
+}
+
+func TestApplyResumeSourceWithoutRecordRefusesStoppedContainer(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "web", Type: "volume", SourceContainerID: "web-id"},
+	}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"inspect --type container web-id": []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":false,"Status":"exited"}}]`),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	err := client.applyResumeSource(context.Background(), actx, Step{Kind: StepResumeSource, App: "api"})
+	if !isUnsafeSourceResumeError(err) || !strings.Contains(err.Error(), "was not durably recorded") {
+		t.Fatalf("expected ownership refusal for a stopped source without recorded ownership, got %v", err)
+	}
+	if fakeOutputCalled(runner, "start", "web-id") {
+		t.Fatalf("resume without recorded ownership started a stopped container, calls=%v", runner.outputArgs)
 	}
 }
 
@@ -1231,6 +1347,33 @@ func TestRouteActivationGateRechecksEveryHandedOffAppPerStep(t *testing.T) {
 	err := client.requireTransferredSourceStillPaused(context.Background(), actx, second, pausedSources{}, handedOff)
 	if err == nil || !strings.Contains(err.Error(), "source app worker ran after its state was handed") || !isUnsafeSourceResumeError(err) {
 		t.Fatalf("a handed-off source that ran must block every later activation, not only its own, got %v", err)
+	}
+}
+
+func TestRouteActivationRefusesPausedStatelessSourceThatRan(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "web", Type: "volume", SourceContainerID: "web-id"},
+	}
+	runner := &sourceOwnershipRunner{
+		running:    map[string]bool{"web-id": true},
+		startedAt:  map[string]string{"web-id": "started-9"},
+		finishedAt: map[string]string{"web-id": "stopped-10"},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{
+		plan:  Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}},
+		cache: map[string]*appCache{},
+	}
+	actx.entry("api").SourcePauseRecorded = true
+	actx.entry("api").SourcePausedContainers = []sourcePausedContainer{{ID: "web-id", Stopped: true, StartedAt: "started-0", FinishedAt: "stopped-1"}}
+	step := Step{Kind: StepActivateRoutes, App: "api", Ref: "routes"}
+	err := client.requireTransferredSourceStillPaused(context.Background(), actx, step, pausedSources{"api": false}, map[string]struct{}{})
+	if !isUnsafeSourceResumeError(err) || !strings.Contains(err.Error(), "compete with the activated target routes") {
+		t.Fatalf("expected route-shadowing refusal for a restarted paused source, got %v", err)
+	}
+	if fakeOutputCalled(&runner.fakeDockerRunner, "start", "web-id") {
+		t.Fatalf("refusal restarted the source, calls=%v", runner.outputArgs)
 	}
 }
 

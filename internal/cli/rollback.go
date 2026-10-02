@@ -289,6 +289,9 @@ func applyRollbackFromArgs(ctx context.Context, runRef, confirm string, stderr i
 	if err := client.Apply(ctx, plan); err != nil {
 		return err
 	}
+	if err := client.FinalizeSourceResumes(plan); err != nil {
+		return fmt.Errorf("rollback completed, but its source resume state could not be finalized: %w", err)
+	}
 	if planChangesDokployTraffic(plan) {
 		if err := client.ReconcileSourceTrafficAuthority(ctx); err != nil {
 			return fmt.Errorf("verify source traffic authority: %w", err)

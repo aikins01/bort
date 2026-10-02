@@ -276,14 +276,26 @@ func (c *Client) applyResumeSource(ctx context.Context, actx *applyContext, step
 	if !ok {
 		return fmt.Errorf("app %s not found in prepare result", step.App)
 	}
-	entry := actx.entry(step.App)
-	if !entry.SourcePauseRecorded {
-		return unsafeSourceResumeError{err: fmt.Errorf("source pause ownership for app %s was not durably recorded; refusing to start stopped containers", step.App)}
-	}
 	runner := c.dockerRunner()
 	containers, err := inspectSourceQuiesceTargets(ctx, runner, app)
 	if err != nil {
 		return err
+	}
+	entry := actx.entry(step.App)
+	if !entry.SourcePauseRecorded {
+		// a rollback of a run applied before cutover pauses existed, or an
+		// apply that failed before its pause step, has no recorded ownership;
+		// resuming is only a no-op when nothing needs starting.
+		stopped := []string{}
+		for _, container := range containers {
+			if !container.State.Running {
+				stopped = append(stopped, container.ID)
+			}
+		}
+		if len(stopped) > 0 {
+			return unsafeSourceResumeError{err: fmt.Errorf("source pause ownership for app %s was not durably recorded and source container(s) %s are stopped; verify they should run, start them with `docker start %s`, then retry", step.App, strings.Join(stopped, ", "), strings.Join(stopped, " "))}
+		}
+		return nil
 	}
 	byID := make(map[string]dockerContainer, len(containers))
 	for _, container := range containers {

@@ -2309,6 +2309,7 @@ func TestPrimeResumeStateRecordsAlreadyStoppedTargetWriters(t *testing.T) {
 		t.Fatalf("write compose: %v", err)
 	}
 	app := preparer.AppPlan{Name: "api", Directory: "api"}
+	app.Resources.DataStores = []preparer.DataStoreResource{{Kind: "postgres", Service: "db", Strategy: "migrate"}}
 	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
 	runner := &fakeDockerRunner{outputs: map[string][]byte{
 		"ps -a --filter label=com.docker.compose.project=stack-api --format {{.ID}}": []byte("web-id\n"),
@@ -2317,7 +2318,7 @@ func TestPrimeResumeStateRecordsAlreadyStoppedTargetWriters(t *testing.T) {
 	}}
 	client := &Client{Docker: runner}
 	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{
-		Steps:   []Step{{Kind: StepPauseSource, App: "api", Ref: "api"}, {Kind: StepResumeTarget, App: "api", Ref: "api"}},
+		Steps:   []Step{{Kind: StepPauseSource, App: "api", Ref: "api"}, {Kind: StepDumpDataStore, App: "api", Ref: "postgres:db"}, {Kind: StepRestoreDataStore, App: "api", Ref: "postgres:db"}, {Kind: StepResumeTarget, App: "api", Ref: "api"}},
 		Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}},
 	}}
 	actx.entry("api").ComposeAppName = "stack-api"
@@ -2382,6 +2383,7 @@ func TestPrimeResumeStateDoesNotRedeployCompletedPush(t *testing.T) {
 			{Kind: StepUploadEnv, App: "api", Ref: "api"},
 			{Kind: StepPushImage, App: "api", Ref: "api"},
 			{Kind: StepPauseSource, App: "api", Ref: "api"},
+			{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"},
 		},
 		Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}},
 	}
@@ -2413,7 +2415,7 @@ func TestTargetWriterReconciliationDoesNotRestartPreviouslyStoppedWriterOnFailur
 	}}
 	client := &Client{Docker: runner}
 	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{
-		Steps: []Step{{Kind: StepPauseSource, App: "api", Ref: "api"}},
+		Steps: []Step{{Kind: StepPauseSource, App: "api", Ref: "api"}, {Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"}},
 	}}
 	entry := actx.entry("api")
 	entry.ComposeAppName = "stack-api"

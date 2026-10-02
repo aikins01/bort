@@ -387,7 +387,11 @@ func appHasStateWork(plan Plan, appName string) bool {
 		return false
 	}
 	for _, step := range plan.Steps {
-		if step.App == appName && step.Kind == StepPauseSource {
+		if step.App != appName || shouldSkipApplyStep(plan, step) {
+			continue
+		}
+		switch step.Kind {
+		case StepDumpDataStore, StepRestoreDataStore, StepSyncVolume:
 			return true
 		}
 	}

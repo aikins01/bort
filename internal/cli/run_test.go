@@ -1759,6 +1759,10 @@ func prepareCompletedPrefixProxyRun(t *testing.T) (loadedMigrationRun, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pauseState := []byte(`{"apiVersion":"bort.source-pause/v1alpha1","apps":{"api":[{"id":"source-id","stopped":true}]}}` + "\n")
+	if err := os.WriteFile(filepath.Join(run.Run.RunDir, "source-pause.json"), pauseState, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	target := dokploy.TargetIdentity{ProjectID: "project-1", EnvironmentID: "environment-1", ComposeID: "compose-1", ComposeAppName: "stack-api"}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -1784,12 +1788,15 @@ func prepareCompletedPrefixProxyRun(t *testing.T) (loadedMigrationRun, string) {
 if [ "$1" = inspect ] && [ "$2" = --type ]; then
   running=false
   policy=no
+  id="$4-id"
+  name="$4"
   case "$4" in
     coolify-proxy) [ ! -f coolify-stopped ] && running=true ;;
     dokploy-traefik) [ -f dokploy-started ] && running=true ;;
+    source-id) id="source-id" name="web" ;;
   esac
   [ ! -f "$4-unless" ] || policy=unless-stopped
-  echo '[{"Id":"'"$4"'-id","Name":"/'"$4"'","State":{"Running":'"$running"',"Status":"running"},"HostConfig":{"RestartPolicy":{"Name":"'"$policy"'"}}}]'
+  echo '[{"Id":"'"$id"'","Name":"/'"$name"'","State":{"Running":'"$running"',"Status":"running"},"HostConfig":{"RestartPolicy":{"Name":"'"$policy"'"}}}]'
 elif [ "$1" = stop ]; then
   touch coolify-stopped
 elif [ "$1" = start ]; then

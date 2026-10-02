@@ -283,6 +283,20 @@ func planFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 	// only swap proxies when something actually depends on :80/:443 —
 	// keeps no-route migrations from disturbing a healthy coolify host.
 	if hasRoutes {
+		// a routed source container keeps its Coolify Traefik labels, which
+		// collide with the activated target router on the same host; a stopped
+		// container's labels drop out of Traefik's docker provider, so routed
+		// stateless sources pause at the cutover boundary and stay stopped
+		// until retirement, like routed stateful ones.
+		for _, appName := range routedApps {
+			if _, routed := routedAppNames[appName]; !routed {
+				continue
+			}
+			if _, stateful := statefulApps[appName]; stateful {
+				continue
+			}
+			plan.Steps = append(plan.Steps, Step{Kind: StepPauseSource, App: appName, Ref: appName})
+		}
 		if legacyOrder {
 			for _, appName := range routedApps {
 				plan.Steps = append(plan.Steps, Step{Kind: StepActivateRoutes, App: appName, Ref: "routes"})
@@ -995,8 +1009,11 @@ func (c *Client) requireTransferredSourceStillPaused(ctx context.Context, actx *
 			return fmt.Errorf("source app %s ran after its state was transferred, which invalidated the transfer; retry the live apply to pause and transfer it again", step.App)
 		}
 	case StepActivateRoutes:
-		apps := make([]string, 0, len(handedOff))
+		apps := make([]string, 0, len(handedOff)+len(pausedApps))
 		for app := range handedOff {
+			apps = append(apps, app)
+		}
+		for app := range pausedApps {
 			apps = append(apps, app)
 		}
 		sort.Strings(apps)
@@ -1004,9 +1021,13 @@ func (c *Client) requireTransferredSourceStillPaused(ctx context.Context, actx *
 		if err != nil {
 			return fmt.Errorf("verify handed-off source apps stayed paused before activating target routes: %w", err)
 		}
-		if ran != "" {
+		if ran == "" {
+			return nil
+		}
+		if _, off := handedOff[ran]; off || pausedApps[ran] {
 			return unsafeSourceResumeError{err: staleStagedHandoffError(ran)}
 		}
+		return unsafeSourceResumeError{err: fmt.Errorf("source app %s ran after its cutover pause, so its source routes would compete with the activated target routes; retry the live apply to pause it again before activating routes", ran)}
 	}
 	return nil
 }
