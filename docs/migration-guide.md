@@ -741,10 +741,11 @@ sudo docker --host unix:///var/run/docker.sock inspect --format '{{.HostConfig.R
 sudo docker --host unix:///var/run/docker.sock update --restart=no coolify && sudo docker --host unix:///var/run/docker.sock stop coolify
 ```
 
-Live apply refuses to start unless the `coolify` container is stopped with
-restart policy `no` (or is absent) and no `coolify-helper` container is still
-running deployment commands. An application deployment that began before you
-stopped Coolify keeps running in its helper container; wait until it finishes,
+A stateful live apply refuses to start unless the `coolify` container is
+stopped with restart policy `no` (or is absent) and no `coolify-helper`
+container is still running deployment commands. An application deployment
+that began before you stopped Coolify keeps running in its helper container;
+wait until it finishes,
 then retry. An idle helper left behind by a stopped deployment does not block
 the run. Bort checks the fence again before pausing each source app, deploying
 each target, and moving routes. Stopping the control plane does not stop
@@ -820,6 +821,14 @@ never copies data into a deployed target. Instead it:
 Routed apps stay stopped from step 2 until the proxy handoff moves traffic;
 plan for that downtime. Unrouted apps also keep the source stopped while target
 activation establishes target writer authority.
+
+A routed stateless app has no state steps, so its source pauses at the
+traffic switch itself. Routed sources of both kinds then stay stopped until
+retirement. Do not restart a stopped source app before retirement: a
+restarted source can take routing for its domains back from the target and
+break their traffic. Bort never stops a logical-dump database's source
+service: it must stay running for `pg_dump`, it holds no route, and it keeps
+running after handoff until the retirement guidance names it for removal.
 
 A stateful app whose plan needs a bind-mount copy is refused. Same-host bind
 mounts that keep their existing paths need no transfer. Do not remove real

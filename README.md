@@ -212,7 +212,12 @@ Bort's safety model defaults to “look first.”
   needed, and may disable Docker live-restore and reload Docker before asking
   for confirmation. Application migration begins only after confirmation.
 - **Explicit live apply:** creating target apps and moving traffic only happen
-  through `bort migrate --live` for an existing planned run.
+  through `bort migrate --live` for an existing planned run. Each routed
+  source app stops before its domains switch and stays stopped until
+  retirement, so only the target can answer a migrated domain (stateful apps
+  stop when state staging begins; stateless apps stop at the switch itself).
+  `bort rollback --live` restarts the paused sources first when it returns
+  traffic.
 - **State moves before the target exists:** for apps with named volumes or a
   Postgres database, Bort stops the source app, copies each volume and restores
   each dump into volumes it owns and labels with the run name, verifies the
@@ -236,10 +241,11 @@ Bort's safety model defaults to “look first.”
   `sudo docker --host unix:///var/run/docker.sock inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify`,
   then run
   `sudo docker --host unix:///var/run/docker.sock update --restart=no coolify && sudo docker --host unix:///var/run/docker.sock stop coolify` so
-  Coolify cannot redeploy a paused source app. Bort refuses to start, pause a
-  source, deploy a target, or move routes while the `coolify` container is
-  running or would restart, or while a Coolify deployment helper is still
-  running deployment commands. Stopping it pauses Coolify for every app on the
+  Coolify cannot redeploy a paused source app. A stateful live apply refuses
+  to start while the `coolify` container is running or would restart, or
+  while a Coolify deployment helper is still running deployment commands, and
+  Bort checks the fence again before pausing each source app, deploying each
+  target, and moving routes. Stopping it pauses Coolify for every app on the
   host. Restart Coolify only after source authority is finalized; after target
   acceptance, follow the restart guidance in the
   [migration guide](docs/migration-guide.md#apply-the-selected-run).
