@@ -22,8 +22,11 @@ type Options struct {
 }
 
 const (
-	privateDirMode  os.FileMode = 0o700
-	privateFileMode os.FileMode = 0o600
+	privateDirMode          os.FileMode = 0o700
+	privateFileMode         os.FileMode = 0o600
+	ComposeSourceRaw                    = "raw"
+	ComposeSourceGenerated              = "generated"
+	generatedComposeWarning             = "generated compose from discovered container metadata"
 )
 
 type Summary struct {
@@ -42,8 +45,25 @@ type AppSummary struct {
 	Role             string        `json:"role,omitempty"`
 	ProjectGroup     *ProjectGroup `json:"projectGroup,omitempty"`
 	PrivateEnvValues bool          `json:"privateEnvValues,omitempty"`
+	ComposeSource    string        `json:"composeSource,omitempty"`
 	Routes           []string      `json:"routes,omitempty"`
 	Warnings         []string      `json:"warnings,omitempty"`
+}
+
+func (a AppSummary) EffectiveComposeSource() (string, error) {
+	switch a.ComposeSource {
+	case ComposeSourceRaw, ComposeSourceGenerated:
+		return a.ComposeSource, nil
+	case "":
+		for _, warning := range a.Warnings {
+			if warning == generatedComposeWarning {
+				return ComposeSourceGenerated, nil
+			}
+		}
+		return ComposeSourceRaw, nil
+	default:
+		return "", fmt.Errorf("unsupported compose source %q", a.ComposeSource)
+	}
 }
 
 type ProjectGroup struct {
@@ -87,7 +107,7 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 		}
 
 		topology := analyzer.TopologyForAppInManifest(m, app)
-		warnings, err := exportApp(appDir, app, topology, opts)
+		composeSource, warnings, err := exportApp(appDir, app, topology, opts)
 		if err != nil {
 			return Summary{}, err
 		}
@@ -99,6 +119,7 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 			Role:             migrationRole(app),
 			ProjectGroup:     projectGroups[appKey(app)],
 			PrivateEnvValues: opts.IncludeEnvValues,
+			ComposeSource:    composeSource,
 			Routes:           routeHosts(app.Routes),
 			Warnings:         warnings,
 		})
@@ -111,9 +132,10 @@ func Export(m manifest.Manifest, opts Options) (Summary, error) {
 	return summary, nil
 }
 
-func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts Options) ([]string, error) {
+func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts Options) (string, []string, error) {
 	warnings := []string{}
-	compose, composeWarnings, serviceEnvFiles := composeForApp(app, opts.IncludeEnvValues)
+	compose, composeSource, composeWarnings, serviceEnvFiles := composeForApp(app, opts.IncludeEnvValues)
+	topology.Routes = routesForCompose(topology.Routes, topology.SourceServices, composeSource, compose)
 	warnings = append(warnings, composeWarnings...)
 	if names := analyzer.CoolifyServiceMagicEnvNames(app); len(names) > 0 {
 		warnings = append(warnings, "preserved Coolify service magic env vars for review: "+strings.Join(names, ", "))
@@ -123,7 +145,7 @@ func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts
 	files := map[string][]byte{
 		"compose.yaml":         []byte(compose),
 		".env.example":         []byte(envExample(appEnvironment, false)),
-		"migration-report.md":  []byte(report(app, warnings)),
+		"migration-report.md":  []byte(report(app, topology.Routes, warnings)),
 		"migration-runbook.md": []byte(runbook(app, topology, warnings)),
 	}
 	for _, envFile := range serviceEnvFilesForMode(app.Services, false) {
@@ -140,21 +162,84 @@ func exportApp(appDir string, app manifest.App, topology analyzer.Topology, opts
 
 	for name, contents := range files {
 		if err := writePrivateFile(filepath.Join(appDir, name), contents); err != nil {
-			return nil, err
+			return "", nil, err
 		}
 	}
 
-	if err := writeJSON(filepath.Join(appDir, "routes.json"), app.Routes); err != nil {
-		return nil, err
+	if err := writeJSON(filepath.Join(appDir, "routes.json"), topology.Routes); err != nil {
+		return "", nil, err
 	}
 	if err := writeJSON(filepath.Join(appDir, "storages.json"), app.Storages); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	if err := writeJSON(filepath.Join(appDir, "topology.json"), topology); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
-	return warnings, nil
+	return composeSource, warnings, nil
+}
+
+func routesForCompose(routes []manifest.Route, sourceServices []analyzer.SourceService, composeSource, compose string) []manifest.Route {
+	composeServices := composeServiceNameSet(compose)
+	rawServiceNamesByContainer := make(map[string]string, len(sourceServices))
+	for _, sourceService := range sourceServices {
+		containerName := strings.TrimSpace(sourceService.ContainerName)
+		serviceName := strings.TrimSpace(sourceService.ServiceName)
+		if containerName == "" {
+			continue
+		}
+		if _, exists := rawServiceNamesByContainer[containerName]; exists {
+			continue
+		}
+		if _, exists := composeServices[serviceName]; exists {
+			rawServiceNamesByContainer[containerName] = serviceName
+		}
+	}
+
+	result := append([]manifest.Route(nil), routes...)
+	for index := range result {
+		serviceName := strings.TrimSpace(result[index].ServiceName)
+		if len(composeServices) == 1 && (serviceName == "" || composeSource == ComposeSourceRaw && result[index].Source == "fqdn") {
+			for name := range composeServices {
+				result[index].ServiceName = name
+			}
+			continue
+		}
+		if composeSource == ComposeSourceGenerated {
+			if _, exists := composeServices[serviceName]; exists {
+				result[index].ServiceName = serviceName
+				continue
+			}
+			generatedName := planutil.Slug(serviceName)
+			if generatedName == "" && serviceName != "" {
+				generatedName = "app"
+			}
+			if _, exists := composeServices[generatedName]; exists {
+				result[index].ServiceName = generatedName
+			}
+			continue
+		}
+		if mappedService, exists := rawServiceNamesByContainer[serviceName]; exists {
+			result[index].ServiceName = mappedService
+		} else {
+			result[index].ServiceName = serviceName
+		}
+	}
+	return result
+}
+
+func composeServiceNameSet(compose string) map[string]struct{} {
+	var document struct {
+		Services map[string]any `yaml:"services"`
+	}
+	if err := yaml.Unmarshal([]byte(compose), &document); err != nil || document.Services == nil {
+		return nil
+	}
+	names := make(map[string]struct{}, len(document.Services))
+	for name := range document.Services {
+		names[strings.TrimSpace(name)] = struct{}{}
+	}
+	return names
 }
 
 func exportEnvMode(opts Options) string {
@@ -169,7 +254,7 @@ type envFile struct {
 	Vars []manifest.EnvVar
 }
 
-func composeForApp(app manifest.App, includePrivateValues bool) (string, []string, []envFile) {
+func composeForApp(app manifest.App, includePrivateValues bool) (string, string, []string, []envFile) {
 	warnings := []string{}
 	if app.Compose != nil {
 		if strings.TrimSpace(app.Compose.Raw) != "" {
@@ -180,7 +265,7 @@ func composeForApp(app manifest.App, includePrivateValues bool) (string, []strin
 			if names := composeCoolifyServiceMagicEnvNames(compose); len(names) > 0 {
 				warnings = append(warnings, "preserved Coolify service magic env vars in raw compose for review: "+strings.Join(names, ", "))
 			}
-			return ensureTrailingNewline(compose), warnings, serviceEnvFilesForMode(app.Services, includePrivateValues)
+			return ensureTrailingNewline(compose), ComposeSourceRaw, warnings, serviceEnvFilesForMode(app.Services, includePrivateValues)
 		}
 		if strings.TrimSpace(app.Compose.Resolved) != "" {
 			warnings = append(warnings, "skipped resolved compose because it may contain interpolated secret values")
@@ -189,7 +274,7 @@ func composeForApp(app manifest.App, includePrivateValues bool) (string, []strin
 
 	if len(app.Services) == 0 {
 		warnings = append(warnings, "no services were present in the manifest")
-		return "services: {}\n", warnings, nil
+		return "services: {}\n", ComposeSourceGenerated, warnings, nil
 	}
 
 	var builder strings.Builder
@@ -254,8 +339,8 @@ func composeForApp(app manifest.App, includePrivateValues bool) (string, []strin
 		}
 	}
 
-	warnings = append(warnings, "generated compose from discovered container metadata")
-	return builder.String(), warnings, sortedEnvFiles(serviceEnvFileMap)
+	warnings = append(warnings, generatedComposeWarning)
+	return builder.String(), ComposeSourceGenerated, warnings, sortedEnvFiles(serviceEnvFileMap)
 }
 
 func serviceEnvFilesForMode(services []manifest.Service, includePrivateValues bool) []envFile {
@@ -567,7 +652,7 @@ func envExample(envs []manifest.EnvVar, includePrivateValues bool) string {
 	return builder.String()
 }
 
-func report(app manifest.App, warnings []string) string {
+func report(app manifest.App, routes []manifest.Route, warnings []string) string {
 	var builder strings.Builder
 	builder.WriteString("# migration report\n\n")
 	builder.WriteString(fmt.Sprintf("app: `%s`\n\n", app.Name))
@@ -587,10 +672,10 @@ func report(app manifest.App, warnings []string) string {
 	}
 
 	builder.WriteString("## routes\n\n")
-	if len(app.Routes) == 0 {
+	if len(routes) == 0 {
 		builder.WriteString("no routes detected.\n\n")
 	} else {
-		for _, route := range app.Routes {
+		for _, route := range routes {
 			builder.WriteString(fmt.Sprintf("- `%s` -> `%s`", route.Host, planutil.Fallback(route.ServiceName, app.Name)))
 			if route.Port != "" {
 				builder.WriteString(fmt.Sprintf(" port `%s`", route.Port))

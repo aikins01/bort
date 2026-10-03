@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +27,7 @@ const (
 	stagingVolumeAppLabel     = "bort.app"
 	stagingVolumeServiceLabel = "bort.service"
 	stagingVolumeTargetLabel  = "bort.target"
+	stagingVolumePinLabel     = "bort.staging-pin"
 )
 
 // stagingOwner identifies the run that owns staging volumes. run names
@@ -186,22 +190,76 @@ func stagingVolumeLabels(plan Plan, appName string, volume stagedVolume) []strin
 	}
 }
 
-func stagingVolumeExists(ctx context.Context, runner dockerRunner, plan Plan, volume stagedVolume) (bool, error) {
-	out, err := runner.Output(ctx, "volume", "inspect", "--format", "{{index .Labels \""+stagingVolumeRunIDLabel+"\"}}", volume.VolumeName)
+func stagingVolumeExists(ctx context.Context, runner dockerRunner, plan Plan, appName string, volume stagedVolume) (bool, error) {
+	out, err := runner.Output(ctx, "volume", "inspect", volume.VolumeName)
 	if err != nil {
-		if isDockerVolumeOrNetworkMissingErr(err) {
+		if isDockerResourceMissingErr(err, "volume", volume.VolumeName) {
 			return false, nil
 		}
 		return false, fmt.Errorf("inspect staging volume %s: %w", volume.VolumeName, err)
 	}
-	if owner := strings.TrimSpace(string(out)); owner != stagingOwner(plan) {
-		return true, fmt.Errorf("docker volume %s already exists but is not owned by run %q (label %s=%q)", volume.VolumeName, plan.RunName, stagingVolumeRunIDLabel, owner)
+	return true, validateStagingVolumeOwnership(plan, appName, []stagedVolume{volume}, out)
+}
+
+type stagingVolumeState struct {
+	Name   string            `json:"Name"`
+	Labels map[string]string `json:"Labels"`
+}
+
+func requireStagingVolumeOwned(ctx context.Context, runner dockerRunner, plan Plan, appName string, volume stagedVolume) error {
+	return requireStagingVolumesOwned(ctx, runner, plan, appName, []stagedVolume{volume})
+}
+
+func requireStagingVolumesOwned(ctx context.Context, runner dockerRunner, plan Plan, appName string, volumes []stagedVolume) error {
+	if len(volumes) == 0 {
+		return nil
 	}
-	return true, nil
+	args := []string{"volume", "inspect"}
+	for _, volume := range volumes {
+		args = append(args, volume.VolumeName)
+	}
+	out, err := runner.Output(ctx, args...)
+	if err != nil {
+		return fmt.Errorf("inspect staging volume ownership: %w", err)
+	}
+	return validateStagingVolumeOwnership(plan, appName, volumes, out)
+}
+
+func validateStagingVolumeOwnership(plan Plan, appName string, volumes []stagedVolume, out []byte) error {
+	expected := make(map[string]stagedVolume, len(volumes))
+	for _, volume := range volumes {
+		expected[volume.VolumeName] = volume
+	}
+	var states []stagingVolumeState
+	if err := json.Unmarshal(out, &states); err != nil {
+		return fmt.Errorf("decode staging volume ownership: %w", err)
+	}
+	if len(states) != len(expected) {
+		return fmt.Errorf("docker volume inspect returned %d resources, want %d", len(states), len(expected))
+	}
+	seen := make(map[string]struct{}, len(states))
+	for _, state := range states {
+		name := strings.TrimSpace(state.Name)
+		volume, ok := expected[name]
+		if !ok {
+			return fmt.Errorf("docker volume inspect returned unexpected resource %q", name)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return fmt.Errorf("docker volume inspect returned duplicate resource %q", name)
+		}
+		seen[name] = struct{}{}
+		for _, expectedLabel := range stagingVolumeLabels(plan, appName, volume) {
+			key, value, _ := strings.Cut(expectedLabel, "=")
+			if state.Labels[key] != value {
+				return fmt.Errorf("docker volume %s is not the staged %s:%s volume for app %s in run %q (label %s=%q, want %q)", name, volume.Service, volume.Target, appName, plan.RunName, key, state.Labels[key], value)
+			}
+		}
+	}
+	return nil
 }
 
 func ensureStagingVolume(ctx context.Context, runner dockerRunner, plan Plan, appName string, volume stagedVolume) error {
-	exists, err := stagingVolumeExists(ctx, runner, plan, volume)
+	exists, err := stagingVolumeExists(ctx, runner, plan, appName, volume)
 	if err != nil || exists {
 		return err
 	}
@@ -213,31 +271,604 @@ func ensureStagingVolume(ctx context.Context, runner dockerRunner, plan Plan, ap
 	if _, err := runner.Output(ctx, args...); err != nil {
 		return fmt.Errorf("create staging volume %s: %w", volume.VolumeName, err)
 	}
+	return requireStagingVolumeOwned(ctx, runner, plan, appName, volume)
+}
+
+type stagingVolumePin struct {
+	name        string
+	containerID string
+}
+
+func ensureAppStagingVolumePin(ctx context.Context, runner dockerRunner, actx *applyContext, appName string, allowCreate bool) ([]stagedVolume, stagingVolumePin, error) {
+	volumes := stagedVolumesForApp(actx.plan, appName)
+	if len(volumes) == 0 {
+		return nil, stagingVolumePin{}, fmt.Errorf("pin staging volumes for app %s: no volumes supplied", appName)
+	}
+	if pin, ok := actx.stagingVolumePins[appName]; ok {
+		if err := requireStagingVolumesOwned(ctx, runner, actx.plan, appName, volumes); err != nil {
+			return nil, stagingVolumePin{}, err
+		}
+		if err := requireStagingVolumePin(ctx, runner, actx.plan, volumes, pin); err != nil {
+			return nil, stagingVolumePin{}, err
+		}
+		return volumes, pin, nil
+	}
+	if allowCreate {
+		for _, volume := range volumes {
+			if err := ensureStagingVolume(ctx, runner, actx.plan, appName, volume); err != nil {
+				return nil, stagingVolumePin{}, err
+			}
+		}
+	}
+	pin, err := acquireStagingVolumePin(ctx, runner, actx.plan, appName, volumes, allowCreate)
+	if pin.containerID != "" {
+		if actx.stagingVolumePins == nil {
+			actx.stagingVolumePins = map[string]stagingVolumePin{}
+		}
+		actx.stagingVolumePins[appName] = pin
+	}
+	if err != nil {
+		return nil, stagingVolumePin{}, err
+	}
+	return volumes, pin, nil
+}
+
+func acquireStagingVolumePin(ctx context.Context, runner dockerRunner, plan Plan, appName string, volumes []stagedVolume, allowCreate bool) (stagingVolumePin, error) {
+	if len(volumes) == 0 {
+		return stagingVolumePin{}, fmt.Errorf("pin staging volumes: no volumes supplied")
+	}
+	if err := requireStagingVolumesOwned(ctx, runner, plan, appName, volumes); err != nil {
+		return stagingVolumePin{}, err
+	}
+	name := stagingVolumePinName(plan, volumes)
+	finish := func(pin stagingVolumePin) (stagingVolumePin, error) {
+		if err := requireStagingVolumesOwned(ctx, runner, plan, appName, volumes); err != nil {
+			return pin, fmt.Errorf("verify staging volume ownership after pinning with %s: %w", pin.name, err)
+		}
+		if err := removeSupersededStagingVolumePins(ctx, runner, plan, appName, volumes, pin); err != nil {
+			return pin, err
+		}
+		return pin, nil
+	}
+	existing, err := reconcileStagingVolumePins(ctx, runner, plan, appName, volumes, name)
+	if err != nil {
+		return stagingVolumePin{}, err
+	}
+	if existing.containerID != "" {
+		return finish(existing)
+	}
+	if !allowCreate {
+		return stagingVolumePin{}, unsafeSourceResumeError{err: authorityRecoveryRequiredError{err: fmt.Errorf("required staging volume pin %s is missing after state transfer; refusing to recreate it because the volume identity was unprotected; paused source applications remain stopped; follow `%s` to recover source or target authority", name, recoveryStatusCommand(plan))}}
+	}
+	args := []string{
+		"run", "-d", "--name", name, "--network", "none", "--read-only", "--restart", "unless-stopped",
+		"--label", stagingVolumePinLabel + "=true",
+		"--label", stagingVolumeRunIDLabel + "=" + stagingOwner(plan),
+		"--label", stagingVolumeAppLabel + "=" + appName,
+	}
+	for index, volume := range volumes {
+		args = append(args, "-v", volume.VolumeName+":/bort-volume/"+strconv.Itoa(index)+":ro")
+	}
+	args = append(args, volumeCopyImage, "sh", "-c", "while :; do sleep 2147483647; done")
+	out, err := runner.Output(ctx, args...)
+	if err != nil {
+		recovered, reconcileErr := reconcileStagingVolumePinsWithTimeout(runner, plan, appName, volumes, name)
+		if reconcileErr == nil && recovered.containerID != "" {
+			return finish(recovered)
+		}
+		return stagingVolumePin{}, errors.Join(fmt.Errorf("pin staging volumes: %w", err), reconcileErr)
+	}
+	pin := stagingVolumePin{name: name, containerID: strings.TrimSpace(string(out))}
+	if pin.containerID == "" {
+		recovered, reconcileErr := reconcileStagingVolumePinsWithTimeout(runner, plan, appName, volumes, name)
+		if reconcileErr == nil && recovered.containerID != "" {
+			return finish(recovered)
+		}
+		return stagingVolumePin{}, errors.Join(fmt.Errorf("pin staging volumes: docker returned an empty container ID"), reconcileErr)
+	}
+	if err := requireStagingVolumePin(ctx, runner, plan, volumes, pin); err != nil {
+		return stagingVolumePin{}, err
+	}
+	return finish(pin)
+}
+
+func stagingVolumePinName(plan Plan, volumes []stagedVolume) string {
+	names := make([]string, 0, len(volumes))
+	for _, volume := range volumes {
+		names = append(names, volume.VolumeName)
+	}
+	slices.Sort(names)
+	return "bort-pin-" + dockerNameSegment(plan.RunName, 24) + "-" + stagingHash(stagingOwner(plan), strings.Join(names, "\x00"))
+}
+
+func releaseStagingVolumePin(ctx context.Context, runner dockerRunner, plan Plan, volumes []stagedVolume, pin stagingVolumePin) error {
+	ctx, cancel := context.WithTimeout(ctx, dockerStopTimeout)
+	defer cancel()
+	if _, err := runner.Output(ctx, "rm", "-f", pin.containerID); err != nil {
+		remaining, inspectErr := findStagingVolumePin(ctx, runner, plan, volumes, pin.name)
+		if inspectErr == nil && remaining.containerID == "" {
+			return nil
+		}
+		return errors.Join(fmt.Errorf("release staging volume pin %s: %w", pin.name, err), inspectErr)
+	}
 	return nil
 }
 
-func recreateStagingVolume(ctx context.Context, runner dockerRunner, plan Plan, appName string, volume stagedVolume) error {
-	exists, err := stagingVolumeExists(ctx, runner, plan, volume)
+func validateCachedStagingVolumePin(ctx context.Context, runner dockerRunner, actx *applyContext, appName string) error {
+	pin, ok := actx.stagingVolumePins[appName]
+	if !ok {
+		if !stagingTransferStarted(actx.entry(appName)) {
+			return nil
+		}
+		_, reconciled, err := ensureAppStagingVolumePin(ctx, runner, actx, appName, false)
+		if err != nil {
+			return err
+		}
+		pin = reconciled
+	}
+	volumes := stagedVolumesForApp(actx.plan, appName)
+	if err := requireStagingVolumesOwned(ctx, runner, actx.plan, appName, volumes); err != nil {
+		return err
+	}
+	if err := requireStagingVolumePin(ctx, runner, actx.plan, volumes, pin); err != nil {
+		return err
+	}
+	return requireStagingVolumeAttachments(ctx, runner, volumes, []string{pin.containerID})
+}
+
+type releasableStagingPin struct {
+	pin     stagingVolumePin
+	volumes []stagedVolume
+}
+
+func (c *Client) ValidateStagingVolumePins(ctx context.Context, plan Plan, targetAuthority bool) error {
+	ctx, cancel := context.WithTimeout(ctx, targetDiscoveryTimeout)
+	defer cancel()
+	_, err := c.validatedStagingVolumePins(ctx, plan, targetAuthority, true)
+	return err
+}
+
+func (c *Client) ReleaseStagingVolumePins(ctx context.Context, plan Plan, targetAuthority bool) error {
+	ctx, cancel := context.WithTimeout(ctx, targetDiscoveryTimeout)
+	defer cancel()
+	pins, err := c.validatedStagingVolumePins(ctx, plan, targetAuthority, false)
 	if err != nil {
 		return err
 	}
-	if exists {
-		if _, err := runner.Output(ctx, "volume", "rm", "-f", volume.VolumeName); err != nil {
-			return fmt.Errorf("remove staging volume %s: %w", volume.VolumeName, err)
+	for _, item := range pins {
+		if err := releaseStagingVolumePin(ctx, c.dockerRunner(), plan, item.volumes, item.pin); err != nil {
+			return err
 		}
 	}
-	return ensureStagingVolume(ctx, runner, plan, appName, volume)
+	return nil
 }
 
-func requireStagingVolumeUnattached(ctx context.Context, runner dockerRunner, volume stagedVolume) error {
-	out, err := runner.Output(ctx, "ps", "-a", "--filter", "volume="+volume.VolumeName, "-q")
+func (c *Client) validatedStagingVolumePins(ctx context.Context, plan Plan, targetAuthority, requireHandoff bool) ([]releasableStagingPin, error) {
+	runner := c.dockerRunner()
+	containers, err := listContainersByLabels(ctx, runner, stagingVolumePinLabel+"=true", stagingVolumeRunIDLabel+"="+stagingOwner(plan))
 	if err != nil {
-		return fmt.Errorf("list containers using staging volume %s: %w", volume.VolumeName, err)
+		return nil, fmt.Errorf("find staging volume pins for recovery: %w", err)
 	}
-	if ids := strings.Fields(string(out)); len(ids) > 0 {
-		return fmt.Errorf("staging volume %s is attached to container(s) %s before Bort handed it to Dokploy; refusing to treat the transferred state as authoritative", volume.VolumeName, strings.Join(ids, ", "))
+
+	type expectedPin struct {
+		app     string
+		volumes []stagedVolume
+	}
+	expected := map[string]expectedPin{}
+	for _, app := range plan.Prepare.Apps {
+		volumes := stagedVolumesForApp(plan, app.Name)
+		if len(volumes) == 0 {
+			continue
+		}
+		expected[stagingVolumePinName(plan, volumes)] = expectedPin{app: app.Name, volumes: volumes}
+	}
+
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	if err := actx.loadMigratedVolumeMounts(); err != nil {
+		return nil, err
+	}
+	for _, app := range plan.StagingTransferApps {
+		actx.entry(app).StagingTransferStarted = true
+	}
+	targetIdentitiesVerified := false
+
+	discovered := map[string]stagingVolumePin{}
+	for _, container := range containers {
+		want, ok := expected[container.Name]
+		if !ok {
+			return nil, fmt.Errorf("run %q owns unexpected staging volume pin %s; refusing to remove an unverified container", plan.RunName, container.Name)
+		}
+		if _, duplicate := discovered[container.Name]; duplicate {
+			return nil, fmt.Errorf("run %q has more than one staging volume pin named %s", plan.RunName, container.Name)
+		}
+		pin := stagingVolumePin{name: container.Name, containerID: container.ID}
+		if err := validateStagingVolumePinIdentity(plan, want.volumes, pin, container); err != nil {
+			return nil, err
+		}
+		discovered[container.Name] = pin
+	}
+
+	pins := make([]releasableStagingPin, 0, len(discovered))
+	for name, want := range expected {
+		entry := actx.entry(want.app)
+		pin, hasPin := discovered[name]
+		if !hasPin && !stagingTransferStarted(entry) {
+			continue
+		}
+		if targetAuthority && !stagedVolumesRecorded(entry, want.volumes) {
+			return nil, fmt.Errorf("run %q has no complete durable migrated-volume record for app %s; refusing target-authority finalization", plan.RunName, want.app)
+		}
+		if targetAuthority && !hasPin && (!requireHandoff || slices.Contains(plan.HandedOffApps, want.app)) {
+			continue
+		}
+		if targetAuthority && !targetIdentitiesVerified {
+			if err := c.hydratePersistedTargetIdentities(ctx, actx); err != nil {
+				return nil, fmt.Errorf("verify persisted target identities before authority finalization: %w", err)
+			}
+			targetIdentitiesVerified = true
+		}
+		volumes := want.volumes
+		if !targetAuthority && !hasPin {
+			volumes = nil
+			for _, volume := range want.volumes {
+				exists, err := stagingVolumeExists(ctx, runner, plan, want.app, volume)
+				if err != nil {
+					return nil, fmt.Errorf("verify staging volume %s for app %s before source-authority finalization: %w", volume.VolumeName, want.app, err)
+				}
+				if exists {
+					volumes = append(volumes, volume)
+				}
+			}
+			if len(volumes) == 0 {
+				continue
+			}
+		}
+		if err := requireStagingVolumesOwned(ctx, runner, plan, want.app, volumes); err != nil {
+			return nil, fmt.Errorf("verify staging volumes for app %s before authority finalization: %w", want.app, err)
+		}
+		allowedIDsByVolume := make(map[string][]string, len(volumes))
+		for _, volume := range volumes {
+			if hasPin {
+				allowedIDsByVolume[volume.VolumeName] = []string{pin.containerID}
+			} else {
+				allowedIDsByVolume[volume.VolumeName] = []string{}
+			}
+		}
+		if targetAuthority {
+			targetIDsByVolume, err := c.migratedVolumeAttachmentIDs(ctx, actx, want.app)
+			if err != nil {
+				return nil, fmt.Errorf("verify target attachments for app %s before authority finalization: %w", want.app, err)
+			}
+			for _, volume := range want.volumes {
+				targetIDs := targetIDsByVolume[volume.VolumeName]
+				if len(targetIDs) == 0 {
+					return nil, fmt.Errorf("verify target attachments for app %s before authority finalization: migrated volume %s has no target container", want.app, volume.VolumeName)
+				}
+				allowedIDsByVolume[volume.VolumeName] = append(allowedIDsByVolume[volume.VolumeName], targetIDs...)
+			}
+		}
+		if err := requireStagingVolumeAttachmentSets(ctx, runner, volumes, allowedIDsByVolume); err != nil {
+			if !targetAuthority {
+				return nil, fmt.Errorf("verify attachments for app %s before source-authority finalization: %w; remove every container attached to these staging volumes other than a bort-pin-* container (stopping is not enough because a stopped container keeps its mounts), then rerun this command", want.app, err)
+			}
+			return nil, fmt.Errorf("verify attachments for app %s before authority finalization: %w", want.app, err)
+		}
+		if hasPin {
+			pins = append(pins, releasableStagingPin{pin: pin, volumes: want.volumes})
+		}
+	}
+
+	return pins, nil
+}
+
+func PlanStagesVolumes(plan Plan) bool {
+	for _, app := range plan.Prepare.Apps {
+		if len(stagedVolumesForApp(plan, app.Name)) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func IncompleteStagingTransfers(plan Plan) ([]string, error) {
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	if err := actx.loadMigratedVolumeMounts(); err != nil {
+		return nil, err
+	}
+	for _, app := range plan.StagingTransferApps {
+		actx.entry(app).StagingTransferStarted = true
+	}
+	incomplete := []string{}
+	for _, app := range plan.Prepare.Apps {
+		volumes := stagedVolumesForApp(plan, app.Name)
+		entry := actx.entry(app.Name)
+		if len(volumes) > 0 && stagingTransferStarted(entry) && !stagedVolumesRecorded(entry, volumes) {
+			incomplete = append(incomplete, app.Name)
+		}
+	}
+	return incomplete, nil
+}
+
+func reconcileStagingVolumePinsWithTimeout(runner dockerRunner, plan Plan, appName string, volumes []stagedVolume, expectedName string) (stagingVolumePin, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerStopTimeout)
+	defer cancel()
+	return reconcileStagingVolumePins(ctx, runner, plan, appName, volumes, expectedName)
+}
+
+func reconcileStagingVolumePins(ctx context.Context, runner dockerRunner, plan Plan, appName string, volumes []stagedVolume, expectedName string) (stagingVolumePin, error) {
+	containers, err := listContainersByLabels(ctx, runner, stagingVolumePinLabel+"=true", stagingVolumeRunIDLabel+"="+stagingOwner(plan), stagingVolumeAppLabel+"="+appName)
+	if err != nil {
+		return stagingVolumePin{}, fmt.Errorf("find staging volume pins: %w", err)
+	}
+	for _, container := range containers {
+		if container.Name != expectedName {
+			continue
+		}
+		pin := stagingVolumePin{name: container.Name, containerID: container.ID}
+		if err := validateStagingVolumePinIdentity(plan, volumes, pin, container); err != nil {
+			return stagingVolumePin{}, err
+		}
+		if container.State.Running {
+			return pin, nil
+		}
+		_, startErr := runner.Output(ctx, "start", container.ID)
+		started, inspectErr := inspectContainer(ctx, runner, container.ID)
+		if inspectErr == nil {
+			if validateErr := validateStagingVolumePin(plan, volumes, pin, started); validateErr == nil {
+				return pin, nil
+			} else {
+				inspectErr = validateErr
+			}
+		}
+		if startErr != nil {
+			startErr = fmt.Errorf("restart stopped staging volume pin %s: %w", container.Name, startErr)
+		}
+		return stagingVolumePin{}, errors.Join(startErr, inspectErr)
+	}
+	return stagingVolumePin{}, nil
+}
+
+func removeSupersededStagingVolumePins(ctx context.Context, runner dockerRunner, plan Plan, appName string, volumes []stagedVolume, current stagingVolumePin) error {
+	containers, err := listContainersByLabels(ctx, runner, stagingVolumePinLabel+"=true", stagingVolumeRunIDLabel+"="+stagingOwner(plan), stagingVolumeAppLabel+"="+appName)
+	if err != nil {
+		return fmt.Errorf("find superseded staging volume pins: %w", err)
+	}
+	wanted := make(map[string]struct{}, len(volumes))
+	for _, volume := range volumes {
+		wanted[volume.VolumeName] = struct{}{}
+	}
+	for _, container := range containers {
+		if stagingContainerIDsMatch(container.ID, current.containerID) || !containerMountsAnyVolume(container, wanted) {
+			continue
+		}
+		if _, err := runner.Output(ctx, "rm", "-f", container.ID); err != nil {
+			return fmt.Errorf("remove superseded staging volume pin %s: %w", container.Name, err)
+		}
 	}
 	return nil
+}
+
+func findStagingVolumePin(ctx context.Context, runner dockerRunner, plan Plan, volumes []stagedVolume, expectedName string) (stagingVolumePin, error) {
+	containers, err := listContainersByLabels(ctx, runner, stagingVolumePinLabel+"=true", stagingVolumeRunIDLabel+"="+stagingOwner(plan))
+	if err != nil {
+		return stagingVolumePin{}, err
+	}
+	for _, container := range containers {
+		if container.Name != expectedName || strings.TrimSpace(container.Config.Labels[stagingVolumeRunIDLabel]) != stagingOwner(plan) {
+			continue
+		}
+		pin := stagingVolumePin{name: container.Name, containerID: container.ID}
+		if err := validateStagingVolumePin(plan, volumes, pin, container); err != nil {
+			return stagingVolumePin{}, err
+		}
+		return pin, nil
+	}
+	return stagingVolumePin{}, nil
+}
+
+func requireStagingVolumePin(ctx context.Context, runner dockerRunner, plan Plan, volumes []stagedVolume, pin stagingVolumePin) error {
+	container, err := inspectContainer(ctx, runner, pin.containerID)
+	if err != nil {
+		return err
+	}
+	return validateStagingVolumePin(plan, volumes, pin, container)
+}
+
+func validateStagingVolumePin(plan Plan, volumes []stagedVolume, pin stagingVolumePin, container dockerContainer) error {
+	if err := validateStagingVolumePinIdentity(plan, volumes, pin, container); err != nil {
+		return err
+	}
+	if !container.State.Running {
+		return fmt.Errorf("staging volume pin %s is not running", pin.name)
+	}
+	return nil
+}
+
+func validateStagingVolumePinIdentity(plan Plan, volumes []stagedVolume, pin stagingVolumePin, container dockerContainer) error {
+	if container.ID == "" || !stagingContainerIDsMatch(pin.containerID, container.ID) || container.Name != pin.name || container.Name != stagingVolumePinName(plan, volumes) {
+		return fmt.Errorf("staging volume pin %s resolved to an unexpected container", pin.name)
+	}
+	if container.Config.Labels[stagingVolumePinLabel] != "true" || strings.TrimSpace(container.Config.Labels[stagingVolumeRunIDLabel]) != stagingOwner(plan) {
+		return fmt.Errorf("staging volume pin %s is not owned by run %q", pin.name, plan.RunName)
+	}
+	if normalizedRestartPolicyName(container.HostConfig.RestartPolicy.Name) != "unless-stopped" {
+		return fmt.Errorf("staging volume pin %s does not have restart policy unless-stopped", pin.name)
+	}
+	wanted := make(map[string]struct{}, len(volumes))
+	for _, volume := range volumes {
+		wanted[volume.VolumeName] = struct{}{}
+	}
+	seen := map[string]struct{}{}
+	for _, mount := range container.Mounts {
+		if mount.Type != "volume" {
+			continue
+		}
+		if _, ok := wanted[mount.Name]; !ok || mount.RW {
+			return fmt.Errorf("staging volume pin %s has unexpected or writable volume mount %s", pin.name, mount.Name)
+		}
+		seen[mount.Name] = struct{}{}
+	}
+	if len(seen) != len(wanted) {
+		return fmt.Errorf("staging volume pin %s mounts %d owned volumes, want %d", pin.name, len(seen), len(wanted))
+	}
+	return nil
+}
+
+func containerMountsAnyVolume(container dockerContainer, names map[string]struct{}) bool {
+	for _, mount := range container.Mounts {
+		if mount.Type == "volume" {
+			if _, ok := names[mount.Name]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func clearStagingVolume(ctx context.Context, runner dockerRunner, plan Plan, appName string, volume stagedVolume) error {
+	if err := requireStagingVolumeOwned(ctx, runner, plan, appName, volume); err != nil {
+		return err
+	}
+	if err := runner.Run(ctx, nil, nil,
+		"run", "--rm", "--network", "none",
+		"-v", volume.VolumeName+":/volume",
+		volumeCopyImage,
+		"sh", "-c", "find /volume -mindepth 1 -delete && sync",
+	); err != nil {
+		return fmt.Errorf("clear staging volume %s: %w", volume.VolumeName, err)
+	}
+	return nil
+}
+
+func stagingVolumeAttachments(ctx context.Context, runner dockerRunner, volume stagedVolume) ([]string, error) {
+	args := []string{"ps", "-a", "--filter", "volume=" + volume.VolumeName, "--format", "{{.ID}}"}
+	out, err := runner.Output(ctx, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list containers using staging volume %s: %w", volume.VolumeName, err)
+	}
+	return strings.Fields(string(out)), nil
+}
+
+func requireStagingVolumeAttachments(ctx context.Context, runner dockerRunner, volumes []stagedVolume, allowedIDs []string) error {
+	allowedByVolume := make(map[string][]string, len(volumes))
+	for _, volume := range volumes {
+		allowedByVolume[volume.VolumeName] = allowedIDs
+	}
+	return requireStagingVolumeAttachmentSets(ctx, runner, volumes, allowedByVolume)
+}
+
+func requireStagingVolumeAttachmentSets(ctx context.Context, runner dockerRunner, volumes []stagedVolume, allowedByVolume map[string][]string) error {
+	attachedByVolume, err := stagingVolumeAttachmentSets(ctx, runner, volumes)
+	if err != nil {
+		return err
+	}
+	for _, volume := range volumes {
+		allowedIDs, ok := allowedByVolume[volume.VolumeName]
+		if !ok {
+			return fmt.Errorf("staging volume %s has no expected attachment set; refusing an incomplete handoff", volume.VolumeName)
+		}
+		if err := requireExactStagingVolumeAttachments(volume.VolumeName, attachedByVolume[volume.VolumeName], allowedIDs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func stagingVolumeAttachmentSets(ctx context.Context, runner dockerRunner, volumes []stagedVolume) (map[string][]string, error) {
+	attachedByVolume := make(map[string][]string, len(volumes))
+	if len(volumes) == 0 {
+		return attachedByVolume, nil
+	}
+	if len(volumes) == 1 {
+		ids, err := stagingVolumeAttachments(ctx, runner, volumes[0])
+		if err != nil {
+			return nil, err
+		}
+		attachedByVolume[volumes[0].VolumeName] = ids
+		return attachedByVolume, nil
+	}
+	wanted := make(map[string]struct{}, len(volumes))
+	args := []string{"ps", "-a"}
+	for _, volume := range volumes {
+		wanted[volume.VolumeName] = struct{}{}
+		attachedByVolume[volume.VolumeName] = nil
+		args = append(args, "--filter", "volume="+volume.VolumeName)
+	}
+	args = append(args, "--format", "{{.ID}}")
+	out, err := runner.Output(ctx, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list containers using staging volumes: %w", err)
+	}
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
+		return attachedByVolume, nil
+	}
+	containers, err := inspectContainers(ctx, runner, ids)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]map[string]struct{}, len(volumes))
+	for _, container := range containers {
+		for _, mount := range container.Mounts {
+			if mount.Type != "volume" {
+				continue
+			}
+			if _, ok := wanted[mount.Name]; !ok {
+				continue
+			}
+			if seen[mount.Name] == nil {
+				seen[mount.Name] = map[string]struct{}{}
+			}
+			if _, duplicate := seen[mount.Name][container.ID]; duplicate {
+				continue
+			}
+			seen[mount.Name][container.ID] = struct{}{}
+			attachedByVolume[mount.Name] = append(attachedByVolume[mount.Name], container.ID)
+		}
+	}
+	for volumeName := range attachedByVolume {
+		slices.Sort(attachedByVolume[volumeName])
+	}
+	return attachedByVolume, nil
+}
+
+func requireExactStagingVolumeAttachments(volumeName string, ids, allowedIDs []string) error {
+	for _, attachedID := range ids {
+		allowed := false
+		for _, id := range allowedIDs {
+			if stagingContainerIDsMatch(id, attachedID) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("staging volume %s is attached to unexpected container %s; refusing a handoff with an unverified writer", volumeName, attachedID)
+		}
+	}
+	for _, allowedID := range allowedIDs {
+		attached := false
+		for _, id := range ids {
+			if stagingContainerIDsMatch(allowedID, id) {
+				attached = true
+				break
+			}
+		}
+		if !attached {
+			return fmt.Errorf("expected staging volume %s attachment to container %s is missing; refusing an incomplete handoff", volumeName, allowedID)
+		}
+	}
+	return nil
+}
+
+func stagingContainerIDsMatch(first, second string) bool {
+	return sourceContainerIDMatches(first, second) || sourceContainerIDMatches(second, first)
+}
+
+func recoveryStatusCommand(plan Plan) string {
+	if command := strings.TrimSpace(plan.RecoveryCommand); command != "" {
+		return command
+	}
+	return "bort status"
 }
 
 const defaultPostgresDataDir = "/var/lib/postgresql/data"
@@ -281,7 +912,7 @@ func requirePlannedPostgresDataDirStaged(composeFile, stagingCompose string, app
 	if len(staged) == 0 {
 		return fmt.Errorf("%w: data store service %s for app %s mounts no named volume, so its restore would be lost when the staging container stops; choose a recreate or managed data store strategy or change the source compose before live apply", ErrNotImplemented, service, app.Name)
 	}
-	if err := requireLiteralMountTargets(composeFile, app.Name, service); err != nil {
+	if err := requireStagedComposeInputs(composeFile, app.Name, service); err != nil {
 		return fmt.Errorf("%w; choose a recreate or managed data store strategy or change the source compose before live apply", err)
 	}
 	var doc yaml.Node
@@ -293,7 +924,7 @@ func requirePlannedPostgresDataDirStaged(composeFile, stagingCompose string, app
 		return err
 	}
 	raw := strings.TrimSpace(composeServiceEnvValue(mappingValue(mappingValue(root, "services"), service), "PGDATA"))
-	if raw == "" || strings.Contains(raw, "$") {
+	if raw == "" || hasUnescapedComposeDollar(raw) {
 		return nil
 	}
 	if err := requireSourceMountsStageDataDir(app, service, path.Clean(raw), staged); err != nil {
@@ -302,29 +933,56 @@ func requirePlannedPostgresDataDirStaged(composeFile, stagingCompose string, app
 	return nil
 }
 
-func requireLiteralMountTargets(composeFile, appName, service string) error {
-	if target, ok := composeServiceInterpolatedMountTarget(composeFile, service); ok {
+func requireStagedComposeInputs(composeFile, appName, service string) error {
+	entry := resolvedComposeServiceNode(composeFile, service)
+	if target, ok := composeServiceInterpolatedMountTarget(entry); ok {
 		return fmt.Errorf("%w: data store service %s for app %s mounts %q at an interpolated path, so the postgres data directory cannot be checked", ErrNotImplemented, service, appName, target)
+	}
+	if input, ok := composeServiceExternalInput(entry); ok {
+		return fmt.Errorf("%w: data store service %s for app %s uses Compose %s, which Bort cannot preserve in its isolated staging service", ErrNotImplemented, service, appName, input)
 	}
 	return nil
 }
 
-func composeServiceInterpolatedMountTarget(composeFile, service string) (string, bool) {
+func resolvedComposeServiceNode(composeFile, service string) *yaml.Node {
 	var doc yaml.Node
 	if err := yaml.Unmarshal([]byte(composeFile), &doc); err != nil {
-		return "", false
+		return nil
 	}
 	root, err := composeRoot(&doc)
 	if err != nil {
-		return "", false
+		return nil
 	}
 	entry := mappingValue(mappingValue(root, "services"), service)
 	if entry == nil {
-		return "", false
+		return nil
 	}
-	if entry, err = selfContainedNode(entry, map[*yaml.Node]bool{}); err != nil {
-		return "", false
+	if entry, err = selfContainedNode(entry); err != nil {
+		return nil
 	}
+	return entry
+}
+
+func composeServiceExternalInput(entry *yaml.Node) (string, bool) {
+	for _, key := range []string{"secrets", "configs"} {
+		value := mappingValue(entry, key)
+		if value == nil {
+			continue
+		}
+		if value.Kind == yaml.SequenceNode || value.Kind == yaml.MappingNode {
+			if len(value.Content) > 0 {
+				return key, true
+			}
+			continue
+		}
+		if strings.TrimSpace(value.Value) != "" && value.Tag != "!!null" {
+			return key, true
+		}
+	}
+	return "", false
+}
+
+func composeServiceInterpolatedMountTarget(entry *yaml.Node) (string, bool) {
 	volumes := mappingValue(entry, "volumes")
 	if volumes == nil || volumes.Kind != yaml.SequenceNode {
 		return "", false
@@ -343,11 +1001,15 @@ func composeServiceInterpolatedMountTarget(composeFile, service string) (string,
 				target = dest.Value
 			}
 		}
-		if strings.Contains(target, "$") {
+		if hasUnescapedComposeDollar(target) {
 			return strings.TrimSpace(target), true
 		}
 	}
 	return "", false
+}
+
+func hasUnescapedComposeDollar(value string) bool {
+	return strings.Contains(strings.ReplaceAll(value, "$$", ""), "$")
 }
 
 // splitComposeVolumeShortSyntax splits SOURCE:TARGET[:MODE] on colons that
@@ -394,10 +1056,16 @@ func requireSourceMountsStageDataDir(app preparer.AppPlan, service, dataDir stri
 	if !found {
 		return fmt.Errorf("%w: postgres data directory %s for service %s in app %s is not mounted from a named volume, so the restore would be lost when the staging container stops", ErrNotImplemented, dataDir, service, app.Name)
 	}
-	if stagedVolumeMount(mount, staged) {
-		return nil
+	if !stagedVolumeMount(mount, staged) {
+		return fmt.Errorf("%w: postgres data directory %s for service %s in app %s is mounted from %s %q at %s, not a named volume, so the restore would be lost when the staging container stops", ErrNotImplemented, dataDir, service, app.Name, mount.Type, firstNonEmpty(mount.Name, mount.Source), mount.Target)
 	}
-	return fmt.Errorf("%w: postgres data directory %s for service %s in app %s is mounted from %s %q at %s, not a named volume, so the restore would be lost when the staging container stops", ErrNotImplemented, dataDir, service, app.Name, mount.Type, firstNonEmpty(mount.Name, mount.Source), mount.Target)
+	for _, candidate := range app.Resources.Volumes {
+		if candidate.Service != service || candidate.Type != "volume" || path.Clean(candidate.Target) == path.Clean(mount.Target) || mountCoversPath(dataDir, candidate.Target) {
+			continue
+		}
+		return fmt.Errorf("%w: named volume %q at %s for service %s in app %s is outside postgres data directory %s, so a logical restore cannot preserve its contents", ErrNotImplemented, firstNonEmpty(candidate.Name, candidate.Source), candidate.Target, service, app.Name, dataDir)
+	}
+	return nil
 }
 
 func stagedVolumeMount(mount preparer.VolumeResource, staged []stagedVolume) bool {
@@ -559,13 +1227,23 @@ func composeServiceInitBindMounts(entry *yaml.Node) ([]*yaml.Node, error) {
 			return nil, fmt.Errorf("init script mount %s -> %s must use an absolute host path so the staged restore runs the same scripts as the deploy", source, target)
 		}
 		if item.Kind == yaml.MappingNode {
-			ensureMappingBool(item, "read_only", true)
-			mounts = append(mounts, item)
+			mount := cloneNode(item)
+			ensureMappingBool(mount, "read_only", true)
+			mounts = append(mounts, mount)
 			continue
 		}
 		mounts = append(mounts, stringNode(source+":"+target+":"+strings.Join(append(withoutAccessMode(options), "ro"), ",")))
 	}
 	return mounts, nil
+}
+
+func cloneNode(node *yaml.Node) *yaml.Node {
+	copied := *node
+	copied.Content = make([]*yaml.Node, len(node.Content))
+	for i, child := range node.Content {
+		copied.Content[i] = cloneNode(child)
+	}
+	return &copied
 }
 
 func withoutAccessMode(options []string) []string {
@@ -647,7 +1325,7 @@ func stagingComposeFile(composeFile, service string, staged []stagedVolume) (str
 	services := mappingValue(root, "services")
 	entry := mappingValue(services, service)
 	if entry != nil {
-		if entry, err = selfContainedNode(entry, map[*yaml.Node]bool{}); err != nil {
+		if entry, err = selfContainedNode(entry); err != nil {
 			return "", fmt.Errorf("compose service %s: %w", service, err)
 		}
 	}
@@ -692,21 +1370,38 @@ func stagingComposeFile(composeFile, service string, staged []stagedVolume) (str
 
 // selfContainedNode copies a subtree with every alias expanded and every
 // merge key applied, so it stays valid after the anchors it referenced are
-// pruned from the document.
-func selfContainedNode(node *yaml.Node, expanding map[*yaml.Node]bool) (*yaml.Node, error) {
+// pruned from the document. Expansions of one anchor are shared between its
+// reference sites, so callers may edit the returned root but must treat
+// nodes nested inside it as read-only.
+func selfContainedNode(node *yaml.Node) (*yaml.Node, error) {
+	return expandSelfContained(node, map[*yaml.Node]bool{}, map[*yaml.Node]*yaml.Node{})
+}
+
+func expandSelfContained(node *yaml.Node, expanding map[*yaml.Node]bool, memo map[*yaml.Node]*yaml.Node) (*yaml.Node, error) {
 	if node.Kind == yaml.AliasNode {
-		if node.Alias == nil || expanding[node.Alias] {
+		if node.Alias == nil {
+			return nil, fmt.Errorf("alias *%s cannot be expanded", node.Value)
+		}
+		if expanded, ok := memo[node.Alias]; ok {
+			return expanded, nil
+		}
+		if expanding[node.Alias] {
 			return nil, fmt.Errorf("alias *%s cannot be expanded", node.Value)
 		}
 		expanding[node.Alias] = true
 		defer delete(expanding, node.Alias)
-		return selfContainedNode(node.Alias, expanding)
+		expanded, err := expandSelfContained(node.Alias, expanding, memo)
+		if err != nil {
+			return nil, err
+		}
+		memo[node.Alias] = expanded
+		return expanded, nil
 	}
 	copied := *node
 	copied.Anchor = ""
 	copied.Content = nil
 	for _, child := range node.Content {
-		resolved, err := selfContainedNode(child, expanding)
+		resolved, err := expandSelfContained(child, expanding, memo)
 		if err != nil {
 			return nil, err
 		}

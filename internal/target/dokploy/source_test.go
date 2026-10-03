@@ -8,10 +8,76 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aikins01/bort/internal/dockercli"
 	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/preparer"
 	syncplan "github.com/aikins01/bort/internal/sync"
 )
+
+func TestCoolifyDeploymentFenceRequiresStoppedNoRestartControlPlane(t *testing.T) {
+	const inspectRunning = "inspect --type container --format {{.Name}} {{.Config.Image}} {{len .ExecIDs}} "
+	for _, tc := range []struct {
+		name    string
+		missing bool
+		running bool
+		policy  string
+		env     string
+		listed  string
+		want    string
+	}{
+		{name: "fenced", policy: "no", listed: "/dokploy-traefik traefik:v3.6 0\n/cache coollabsio/coolify-helper-cache:1 3\n"},
+		{name: "control plane removed", missing: true},
+		{name: "running", running: true, policy: "no", want: "docker --host " + dockercli.LocalHost() + " update --restart=no coolify"},
+		{name: "restart enabled", policy: "always", want: "docker --host " + dockercli.LocalHost() + " update --restart=no coolify"},
+		{name: "idle helper left by a stopped deployment", policy: "no", listed: "/x8k2 docker.io/coollabsio/coolify-helper:1.0.17 0\n"},
+		{name: "helper still running deployment commands", policy: "no", listed: "/x8k2 docker.io/coollabsio/coolify-helper:1.0.17 1\n", want: "helper container(s) x8k2"},
+		{name: "registry helper pinned by digest", policy: "no", listed: "/x9 registry.local:5000/coollabsio/coolify-helper@sha256:abc 2\n", want: "helper container(s) x9"},
+		{name: "custom HELPER_IMAGE mirror", policy: "no", env: "HELPER_IMAGE=registry.internal/coolify-helper", listed: "/x7 registry.internal/coolify-helper:1.0.12 1\n", want: "helper container(s) x7"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeDockerRunner{outputs: map[string][]byte{}, outputErrs: map[string]error{}}
+			if tc.missing {
+				runner.outputErrs["inspect --type container coolify"] = errors.New("Error: No such object: coolify")
+			} else {
+				runner.outputs["inspect --type container coolify"] = []byte(fmt.Sprintf(`[{"Id":"coolify-id","Name":"/coolify","Config":{"Env":[%q]},"State":{"Running":%t,"Status":"exited"},"HostConfig":{"RestartPolicy":{"Name":"%s"}}}]`, tc.env, tc.running, tc.policy))
+			}
+			ids := []string{}
+			for _, line := range strings.Split(strings.TrimSpace(tc.listed), "\n") {
+				if fields := strings.Fields(line); len(fields) == 3 {
+					ids = append(ids, strings.TrimPrefix(fields[0], "/"))
+				}
+			}
+			runner.outputs["ps -q --no-trunc"] = []byte(strings.Join(ids, "\n"))
+			runner.outputs[inspectRunning+strings.Join(ids, " ")] = []byte(tc.listed)
+			err := requireCoolifyDeploymentFence(context.Background(), runner)
+			if tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Fatalf("expected actionable fence refusal, got %v", err)
+			}
+			if tc.want == "" && err != nil {
+				t.Fatalf("valid Coolify fence was refused: %v", err)
+			}
+		})
+	}
+}
+
+func TestStatefulCoolifyPlanRequiresDeploymentFence(t *testing.T) {
+	plan := Plan{
+		Prepare: preparer.Result{Source: "coolify-local"},
+		Steps:   []Step{{Kind: StepPauseSource, App: "api"}, {Kind: StepSyncVolume, App: "api"}, {Kind: StepPushImage, App: "api"}},
+	}
+	if !RequiresCoolifyDeploymentFence(plan) {
+		t.Fatal("stateful Coolify plan did not require a deployment fence")
+	}
+	plan.Prepare.Source = "docker"
+	plan.Prepare.Apps = []preparer.AppPlan{{Name: "api", Platform: "docker"}, {Name: "worker", Platform: "coolify"}}
+	if RequiresCoolifyDeploymentFence(plan) {
+		t.Fatal("plain Docker source unexpectedly required the Coolify control-plane fence")
+	}
+	plan.Steps = append(plan.Steps, Step{Kind: StepSyncVolume, App: "worker"})
+	if !RequiresCoolifyDeploymentFence(plan) {
+		t.Fatal("Docker-scanned Coolify app did not require the deployment fence")
+	}
+}
 
 func TestVerifySourceContainersBatchesReviewedIDs(t *testing.T) {
 	webID := strings.Repeat("a", 64)
@@ -233,7 +299,7 @@ func TestPlanFromArtifactsPausesBeforeDumpAndVolumeSync(t *testing.T) {
 		return kinds
 	}
 	staged := filter(PlanFromArtifacts(prepare, syncResult, gatewayResultEmpty()))
-	wantStaged := []StepKind{StepPauseSource, StepDumpDataStore, StepRestoreDataStore, StepSyncVolume, StepResumeSource, StepPushImage}
+	wantStaged := []StepKind{StepPauseSource, StepDumpDataStore, StepRestoreDataStore, StepSyncVolume, StepPushImage}
 	if !slices.Equal(staged, wantStaged) {
 		t.Fatalf("staged: expected %v, got %v", wantStaged, staged)
 	}
@@ -320,6 +386,81 @@ func TestPlanFromArtifactsDeploysRoutedStatefulTargetAfterStateTransfer(t *testi
 	}
 }
 
+func TestPlanFromArtifactsPausesRoutedStatelessSourceAtCutover(t *testing.T) {
+	routed := preparer.AppPlan{Name: "web"}
+	unrouted := preparer.AppPlan{Name: "worker"}
+	stateful := preparer.AppPlan{Name: "db"}
+	stateful.Resources.Volumes = []preparer.VolumeResource{{Service: "db", Type: "volume", Target: "/data"}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{routed, unrouted, stateful}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{
+		{Name: "web"},
+		{Name: "worker"},
+		{Name: "db", Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "volume:db -> /data", Strategy: syncplan.StrategyDockerVolumeArchive}}},
+	}}
+	cutover := gateway.Result{Apps: []gateway.AppPlan{
+		{Name: "web", Routes: []gateway.Route{{Host: "web.example.com"}}},
+		{Name: "db", Routes: []gateway.Route{{Host: "db.example.com"}}},
+	}}
+	plan := PlanFromArtifacts(prepare, sync, cutover)
+	pauseCount := map[string]int{}
+	webPause, stopProxy, webActivate, startProxy := -1, -1, -1, -1
+	for index, step := range plan.Steps {
+		if step.Kind == StepPauseSource {
+			pauseCount[step.App]++
+			if step.App == "web" {
+				webPause = index
+			}
+		}
+		if step.Kind == StepResumeSource && step.App == "web" {
+			t.Fatalf("routed stateless source must stay paused until retirement, got plan=%v", stepKinds(plan.Steps))
+		}
+		if step.Kind == StepStopCoolifyProxy {
+			stopProxy = index
+		}
+		if step.Kind == StepActivateRoutes && step.App == "web" {
+			webActivate = index
+		}
+		if step.Kind == StepStartDokployProxy {
+			startProxy = index
+		}
+	}
+	if pauseCount["web"] != 1 || pauseCount["db"] != 1 || pauseCount["worker"] != 0 {
+		t.Fatalf("expected one pause per routed app and none for the unrouted stateless app, got %v plan=%v", pauseCount, stepKinds(plan.Steps))
+	}
+	if webPause < 0 || stopProxy < 0 || webActivate < 0 || startProxy < 0 || !(webPause < stopProxy && stopProxy < webActivate && webActivate < startProxy) {
+		t.Fatalf("expected pause < stop proxy < activate < start proxy, got plan=%v", stepKinds(plan.Steps))
+	}
+}
+
+func TestPlanFromArtifactsPausesRoutedStatelessSourceInEveryPlanOrder(t *testing.T) {
+	prepare := preparer.Result{Apps: []preparer.AppPlan{{Name: "web"}}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{{Name: "web"}}}
+	cutover := gateway.Result{Apps: []gateway.AppPlan{{Name: "web", Routes: []gateway.Route{{Host: "web.example.com"}}}}}
+	builders := []struct {
+		name string
+		plan Plan
+	}{
+		{"v1alpha4", PlanFromArtifacts(prepare, sync, cutover)},
+		{"v1alpha3", LegacyPlanFromArtifactsV1Alpha3(prepare, sync, cutover)},
+		{"v1alpha2", PlanFromArtifactsV1Alpha2(prepare, sync, cutover)},
+		{"v1alpha1", LegacyPlanFromArtifactsV1Alpha1(prepare, sync, cutover)},
+	}
+	for _, builder := range builders {
+		pause, activate := -1, -1
+		for index, step := range builder.plan.Steps {
+			if step.Kind == StepPauseSource && step.App == "web" {
+				pause = index
+			}
+			if step.Kind == StepActivateRoutes && step.App == "web" {
+				activate = index
+			}
+		}
+		if pause < 0 || activate < 0 || pause > activate {
+			t.Fatalf("%s: expected routed stateless pause before route activation, got %v", builder.name, stepKinds(builder.plan.Steps))
+		}
+	}
+}
+
 func TestPlanFromArtifactsV1Alpha2StartsRoutedStatefulTargetDuringFinalProxyHandoff(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
 	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", Target: "/data"}}
@@ -392,7 +533,7 @@ func TestPlanFromArtifactsCopiesVolumeStrategyDataStoreVolumes(t *testing.T) {
 			kinds = append(kinds, step.Kind)
 		}
 	}
-	want := []StepKind{StepPauseSource, StepSyncVolume, StepResumeSource}
+	want := []StepKind{StepPauseSource, StepSyncVolume}
 	if len(kinds) != len(want) {
 		t.Fatalf("expected %v, got %v", want, kinds)
 	}
@@ -546,6 +687,47 @@ func TestApplyResumeSourceStartsOnlyOwnedStoppedContainers(t *testing.T) {
 	}
 	if !entry.SourcePauseRecorded || !slices.Equal(entry.SourcePausedContainers, []sourcePausedContainer{{ID: "web-id", Stopped: true}, {ID: "worker-id"}}) {
 		t.Fatalf("resume cleared source ownership before terminal progress was durable: %#v", entry)
+	}
+}
+
+func TestApplyResumeSourceWithoutRecordNoOpsWhenEverythingRuns(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "web", Type: "volume", SourceContainerID: "web-id"},
+	}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"inspect --type container web-id": []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	if err := client.applyResumeSource(context.Background(), actx, Step{Kind: StepResumeSource, App: "api"}); err != nil {
+		t.Fatalf("applyResumeSource: %v", err)
+	}
+	if fakeOutputCalled(runner, "start", "web-id") {
+		t.Fatalf("resume without recorded ownership must not start a running container, calls=%v", runner.outputArgs)
+	}
+}
+
+func TestApplyResumeSourceWithoutRecordRefusesStoppedContainer(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "web", Type: "volume", SourceContainerID: "web-id"},
+	}
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"inspect --type container web-id": []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":false,"Status":"exited"}}]`),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}}}
+	err := client.applyResumeSource(context.Background(), actx, Step{Kind: StepResumeSource, App: "api"})
+	if !isUnsafeSourceResumeError(err) || !strings.Contains(err.Error(), "was not durably recorded") {
+		t.Fatalf("expected ownership refusal for a stopped source without recorded ownership, got %v", err)
+	}
+	if fakeOutputCalled(runner, "start", "web-id") {
+		t.Fatalf("resume without recorded ownership started a stopped container, calls=%v", runner.outputArgs)
 	}
 }
 
@@ -1000,7 +1182,7 @@ func TestApplyRecordsCleanupResumeBeforeRestartingTransferredSource(t *testing.T
 		BeforeStep: &beforeStep,
 	}
 	err := client.Apply(context.Background(), plan)
-	if err == nil || !strings.Contains(err.Error(), "stays stopped") || !strings.Contains(err.Error(), "ledger unavailable") {
+	if err == nil || !strings.Contains(err.Error(), "remains stopped") || !strings.Contains(err.Error(), "bort status") || !strings.Contains(err.Error(), "ledger unavailable") {
 		t.Fatalf("expected refused restart when the cleanup cannot be recorded, got %v", err)
 	}
 	if runner.running["web-id"] {
@@ -1165,5 +1347,63 @@ func TestRouteActivationGateRechecksEveryHandedOffAppPerStep(t *testing.T) {
 	err := client.requireTransferredSourceStillPaused(context.Background(), actx, second, pausedSources{}, handedOff)
 	if err == nil || !strings.Contains(err.Error(), "source app worker ran after its state was handed") || !isUnsafeSourceResumeError(err) {
 		t.Fatalf("a handed-off source that ran must block every later activation, not only its own, got %v", err)
+	}
+}
+
+func TestRouteActivationRefusesPausedStatelessSourceThatRan(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "web", Type: "volume", SourceContainerID: "web-id"},
+	}
+	runner := &sourceOwnershipRunner{
+		running:    map[string]bool{"web-id": true},
+		startedAt:  map[string]string{"web-id": "started-9"},
+		finishedAt: map[string]string{"web-id": "stopped-10"},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{
+		plan:  Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}},
+		cache: map[string]*appCache{},
+	}
+	actx.entry("api").SourcePauseRecorded = true
+	actx.entry("api").SourcePausedContainers = []sourcePausedContainer{{ID: "web-id", Stopped: true, StartedAt: "started-0", FinishedAt: "stopped-1"}}
+	step := Step{Kind: StepActivateRoutes, App: "api", Ref: "routes"}
+	err := client.requireTransferredSourceStillPaused(context.Background(), actx, step, pausedSources{"api": false}, map[string]struct{}{})
+	if !isUnsafeSourceResumeError(err) || !strings.Contains(err.Error(), "compete with the activated target routes") {
+		t.Fatalf("expected route-shadowing refusal for a restarted paused source, got %v", err)
+	}
+	if fakeOutputCalled(&runner.fakeDockerRunner, "start", "web-id") {
+		t.Fatalf("refusal restarted the source, calls=%v", runner.outputArgs)
+	}
+}
+
+type vanishingContainerRunner struct {
+	*fakeDockerRunner
+	listed int
+}
+
+func (r *vanishingContainerRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	key := strings.Join(args, " ")
+	if key == "ps -q --no-trunc" {
+		r.listed++
+		if r.listed == 1 {
+			return []byte("short-lived\nx8k2\n"), nil
+		}
+		return []byte("x8k2\n"), nil
+	}
+	if strings.HasSuffix(key, "short-lived x8k2") {
+		return nil, errors.New("Error: No such container: short-lived")
+	}
+	return r.fakeDockerRunner.Output(ctx, args...)
+}
+
+func TestCoolifyDeploymentFenceRelistsWhenAnUnrelatedContainerExits(t *testing.T) {
+	runner := &vanishingContainerRunner{fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+		"inspect --type container coolify": []byte(`[{"Id":"coolify-id","Name":"/coolify","State":{"Running":false,"Status":"exited"},"HostConfig":{"RestartPolicy":{"Name":"no"}}}]`),
+		"inspect --type container --format {{.Name}} {{.Config.Image}} {{len .ExecIDs}} x8k2": []byte("/x8k2 coollabsio/coolify-helper:1.0.17 1\n"),
+	}}}
+	err := requireCoolifyDeploymentFence(context.Background(), runner)
+	if err == nil || !strings.Contains(err.Error(), "helper container(s) x8k2") || runner.listed != 2 {
+		t.Fatalf("fence did not re-list after a container exited mid-check: listed=%d err=%v", runner.listed, err)
 	}
 }

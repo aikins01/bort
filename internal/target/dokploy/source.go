@@ -9,9 +9,112 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aikins01/bort/internal/dockercli"
 	"github.com/aikins01/bort/internal/preparer"
 	"github.com/aikins01/bort/internal/safepath"
 )
+
+const coolifyControlPlaneContainer = "coolify"
+
+// RequiresCoolifyDeploymentFence reports whether applying plan needs the
+// Coolify control plane durably stopped first.
+func RequiresCoolifyDeploymentFence(plan Plan) bool {
+	source := strings.ToLower(strings.TrimSpace(plan.Prepare.Source))
+	coolifySource := source == "coolify-local" || source == "coolify-local-traefik" || source == "coolify-local-caddy"
+	for _, step := range plan.Steps {
+		if (step.Kind != StepRestoreDataStore && step.Kind != StepSyncVolume) || shouldSkipApplyStep(plan, step) {
+			continue
+		}
+		if coolifySource {
+			return true
+		}
+		if app, ok := findPrepareApp(plan.Prepare, step.App); ok && strings.EqualFold(strings.TrimSpace(app.Platform), "coolify") {
+			return true
+		}
+	}
+	return false
+}
+
+func requireCoolifyDeploymentFence(ctx context.Context, runner dockerRunner) error {
+	container, err := inspectContainer(ctx, runner, coolifyControlPlaneContainer)
+	if err != nil && !isContainerMissingErr(err) {
+		return fmt.Errorf("stateful live apply requires a durable Coolify deployment fence, but Bort could not inspect the %s control-plane container: %w; record its current restart policy, run `%s`, then retry", coolifyControlPlaneContainer, err, coolifyFenceCommand())
+	}
+	if err == nil {
+		policy := normalizedRestartPolicyName(container.HostConfig.RestartPolicy.Name)
+		if container.State.Running || policy != "no" {
+			return fmt.Errorf("stateful live apply requires the Coolify control-plane container %s to be stopped with restart policy no (running=%t, restart=%s); wait until no Coolify deployment is queued or running (a cancelled deployment can keep running, so confirm it has ended), record its current restart policy, run `%s`, then retry; restart Coolify only after source authority is finalized; after target acceptance, restart it only if other apps need it and immediately delete the migrated apps in Coolify", coolifyControlPlaneContainer, container.State.Running, policy, coolifyFenceCommand())
+		}
+	}
+	helperRepositories := []string{coolifyHelperImageRepository}
+	if err == nil {
+		if custom := imageRepository(envMap(container.Config.Env)["HELPER_IMAGE"]); custom != "" {
+			helperRepositories = append(helperRepositories, custom)
+		}
+	}
+	helpers, err := activeCoolifyDeploymentHelpers(ctx, runner, helperRepositories)
+	if err != nil {
+		return fmt.Errorf("stateful live apply requires a durable Coolify deployment fence, but Bort could not inspect Coolify deployment helpers: %w", err)
+	}
+	if len(helpers) > 0 {
+		return fmt.Errorf("stateful live apply requires in-flight Coolify deployments to finish, but helper container(s) %s are still running deployment commands that started before the control plane stopped; wait until they finish, then retry", strings.Join(helpers, ", "))
+	}
+	return nil
+}
+
+func coolifyFenceCommand() string {
+	docker := "docker --host " + dockercli.LocalHost()
+	if strings.TrimSpace(os.Getenv("SUDO_UID")) != "" {
+		docker = "sudo " + docker
+	}
+	return docker + " update --restart=no " + coolifyControlPlaneContainer + " && " + docker + " stop " + coolifyControlPlaneContainer
+}
+
+const coolifyHelperImageRepository = "coollabsio/coolify-helper"
+
+func activeCoolifyDeploymentHelpers(ctx context.Context, runner dockerRunner, helperRepositories []string) ([]string, error) {
+	var out []byte
+	for attempt := 0; ; attempt++ {
+		listed, err := runner.Output(ctx, "ps", "-q", "--no-trunc")
+		if err != nil {
+			return nil, err
+		}
+		ids := strings.Fields(string(listed))
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		out, err = runner.Output(ctx, append([]string{"inspect", "--type", "container", "--format", "{{.Name}} {{.Config.Image}} {{len .ExecIDs}}"}, ids...)...)
+		if err == nil {
+			break
+		}
+		if attempt == 2 || !isContainerMissingErr(err) {
+			return nil, err
+		}
+	}
+	active := []string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 3 || fields[2] == "0" {
+			continue
+		}
+		repository := imageRepository(fields[1])
+		for _, helper := range helperRepositories {
+			if repository == helper || strings.HasSuffix(repository, "/"+helper) || strings.HasSuffix(helper, "/"+repository) {
+				active = append(active, strings.TrimPrefix(fields[0], "/"))
+				break
+			}
+		}
+	}
+	return active, nil
+}
+
+func imageRepository(image string) string {
+	repository, _, _ := strings.Cut(strings.TrimSpace(image), "@")
+	if colon := strings.LastIndex(repository, ":"); colon > strings.LastIndex(repository, "/") {
+		repository = repository[:colon]
+	}
+	return repository
+}
 
 func (c *Client) applyPauseSource(ctx context.Context, actx *applyContext, step Step) error {
 	app, ok := findPrepareApp(actx.plan.Prepare, step.App)
@@ -173,14 +276,26 @@ func (c *Client) applyResumeSource(ctx context.Context, actx *applyContext, step
 	if !ok {
 		return fmt.Errorf("app %s not found in prepare result", step.App)
 	}
-	entry := actx.entry(step.App)
-	if !entry.SourcePauseRecorded {
-		return unsafeSourceResumeError{err: fmt.Errorf("source pause ownership for app %s was not durably recorded; refusing to start stopped containers", step.App)}
-	}
 	runner := c.dockerRunner()
 	containers, err := inspectSourceQuiesceTargets(ctx, runner, app)
 	if err != nil {
 		return err
+	}
+	entry := actx.entry(step.App)
+	if !entry.SourcePauseRecorded {
+		// a rollback of a run applied before cutover pauses existed, or an
+		// apply that failed before its pause step, has no recorded ownership;
+		// resuming is only a no-op when nothing needs starting.
+		stopped := []string{}
+		for _, container := range containers {
+			if !container.State.Running {
+				stopped = append(stopped, container.ID)
+			}
+		}
+		if len(stopped) > 0 {
+			return unsafeSourceResumeError{err: fmt.Errorf("source pause ownership for app %s was not durably recorded and source container(s) %s are stopped; verify they should run, start them with `docker start %s`, then retry", step.App, strings.Join(stopped, ", "), strings.Join(stopped, " "))}
+		}
+		return nil
 	}
 	byID := make(map[string]dockerContainer, len(containers))
 	for _, container := range containers {
@@ -513,6 +628,33 @@ func sourceCommitTargets(app preparer.AppPlan) []commitTargetRef {
 			seenName[name] = struct{}{}
 		}
 		refs = append(refs, ref)
+	}
+	return refs
+}
+
+func SourceRetirementContainers(plan Plan) []string {
+	refs := []string{}
+	seen := map[string]struct{}{}
+	add := func(ref string) {
+		if _, dup := seen[ref]; ref != "" && !dup {
+			seen[ref] = struct{}{}
+			refs = append(refs, ref)
+		}
+	}
+	for _, step := range plan.Steps {
+		if shouldSkipApplyStep(plan, step) {
+			continue
+		}
+		switch step.Kind {
+		case StepStopSourceApp:
+			if app, ok := findPrepareApp(plan.Prepare, step.App); ok {
+				for _, ref := range sourceCommitTargets(app) {
+					add(ref.label())
+				}
+			}
+		case StepStopCoolifyProxy:
+			add(coolifyProxyContainer)
+		}
 	}
 	return refs
 }

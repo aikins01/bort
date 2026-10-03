@@ -73,15 +73,16 @@ const (
 )
 
 type StepProgress struct {
-	Index             int
-	Total             int
-	Step              Step
-	Status            StepStatus
-	Message           string
-	Err               error
-	MutationAmbiguous bool
-	RequiresNewRun    bool
-	Target            *TargetIdentity
+	Index                     int
+	Total                     int
+	Step                      Step
+	Status                    StepStatus
+	Message                   string
+	Err                       error
+	MutationAmbiguous         bool
+	AuthorityRecoveryRequired bool
+	RequiresNewRun            bool
+	Target                    *TargetIdentity
 }
 
 type TargetIdentity struct {
@@ -113,8 +114,11 @@ type Plan struct {
 	RunName                  string
 	RunID                    string
 	RunDir                   string
+	RecoveryCommand          string
 	ResumeFrom               int
 	TargetIdentities         map[string]TargetIdentity
+	StagingTransferApps      []string
+	HandedOffApps            []string
 	BeforeStep               *func(StepProgress) error
 	OnProgress               *func(StepProgress)
 	stepTimeout              time.Duration
@@ -123,11 +127,14 @@ type Plan struct {
 type planStateOrder int
 
 const (
-	// planStateStaged transfers state into Bort-owned staging volumes
+	// planStateStagedV1Alpha4 transfers state into Bort-owned staging volumes
 	// before the Dokploy deployment exists, then deploys a compose file
 	// that mounts those volumes. no target writer ever runs during a
 	// copy, so Dokploy needs no fence it cannot provide.
-	planStateStaged planStateOrder = iota
+	planStateStagedV1Alpha4 planStateOrder = iota
+	// planStateStagedV1Alpha3 reproduces the first staged-transfer order,
+	// which resumed unrouted source writers before deploying the target.
+	planStateStagedV1Alpha3
 	// planStateInPlaceV1Alpha2 and planStateInPlaceV1Alpha1 reproduce the
 	// historical orders (deploy first, pause target writers, copy into the
 	// deployed volumes) so recorded ledgers keep matching by index.
@@ -136,7 +143,11 @@ const (
 )
 
 func PlanFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result) Plan {
-	return planFromArtifacts(prepare, sync, cutover, planStateStaged)
+	return planFromArtifacts(prepare, sync, cutover, planStateStagedV1Alpha4)
+}
+
+func LegacyPlanFromArtifactsV1Alpha3(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result) Plan {
+	return planFromArtifacts(prepare, sync, cutover, planStateStagedV1Alpha3)
 }
 
 func PlanFromArtifactsV1Alpha2(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result) Plan {
@@ -182,7 +193,8 @@ func appStateSteps(prepare preparer.Result, app syncplan.AppPlan) (dataStoreStep
 
 func planFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result, order planStateOrder) Plan {
 	plan := Plan{Prepare: prepare, Sync: sync, Cutover: cutover}
-	staged := order == planStateStaged
+	staged := order == planStateStagedV1Alpha4 || order == planStateStagedV1Alpha3
+	legacyStaged := order == planStateStagedV1Alpha3
 	legacyOrder := order == planStateInPlaceV1Alpha1
 	statefulApps := map[string]struct{}{}
 	for _, app := range sync.Apps {
@@ -238,7 +250,7 @@ func planFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 		plan.Steps = append(plan.Steps, volumeSteps...)
 		_, routed := routedAppNames[app.Name]
 		if staged {
-			if !routed {
+			if legacyStaged && !routed {
 				plan.Steps = append(plan.Steps, Step{Kind: StepResumeSource, App: app.Name, Ref: app.Name})
 			}
 			if pushStep, ok := deferredPushSteps[app.Name]; ok {
@@ -271,6 +283,20 @@ func planFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 	// only swap proxies when something actually depends on :80/:443 —
 	// keeps no-route migrations from disturbing a healthy coolify host.
 	if hasRoutes {
+		// a routed source container keeps its Coolify Traefik labels, which
+		// collide with the activated target router on the same host; a stopped
+		// container's labels drop out of Traefik's docker provider, so routed
+		// stateless sources pause at the cutover boundary and stay stopped
+		// until retirement, like routed stateful ones.
+		for _, appName := range routedApps {
+			if _, routed := routedAppNames[appName]; !routed {
+				continue
+			}
+			if _, stateful := statefulApps[appName]; stateful {
+				continue
+			}
+			plan.Steps = append(plan.Steps, Step{Kind: StepPauseSource, App: appName, Ref: appName})
+		}
 		if legacyOrder {
 			for _, appName := range routedApps {
 				plan.Steps = append(plan.Steps, Step{Kind: StepActivateRoutes, App: appName, Ref: "routes"})
@@ -339,13 +365,15 @@ type appCache struct {
 	TargetWritersStopped       []dockerContainer
 	SourcePausedContainers     []sourcePausedContainer
 	SourcePauseRecorded        bool
+	StagingTransferStarted     bool
 	MigratedVolumeMounts       map[string]migratedVolumeMount
 }
 
 type applyContext struct {
-	plan             Plan
-	cache            map[string]*appCache
-	stagingEnvFormat stagingEnvFormat
+	plan              Plan
+	cache             map[string]*appCache
+	stagingVolumePins map[string]stagingVolumePin
+	stagingEnvFormat  stagingEnvFormat
 }
 
 func (a *applyContext) entry(app string) *appCache {
@@ -455,7 +483,7 @@ func ValidateStagedTransfer(plan Plan) error {
 		if err != nil {
 			return err
 		}
-		if stagingComposeProjectNamePattern.MatchString(restore.stagingCompose) || stagingComposeProjectNamePattern.MatchString(envContent) {
+		if hasUnescapedComposeProjectName(restore.stagingCompose) || hasUnescapedComposeProjectName(envContent) {
 			return fmt.Errorf("%w: data store service %s for app %s interpolates COMPOSE_PROJECT_NAME, which resolves to the Bort staging project instead of the Dokploy app; choose a recreate or managed data store strategy or change the source compose before live apply", ErrNotImplemented, restore.store.Service, restore.app.Name)
 		}
 		return nil
@@ -539,6 +567,10 @@ func (c *Client) requireStagingCompatibleCompose(ctx context.Context, composeID,
 
 var stagingComposeProjectNamePattern = regexp.MustCompile(`\$\{?COMPOSE_PROJECT_NAME\b`)
 
+func hasUnescapedComposeProjectName(value string) bool {
+	return stagingComposeProjectNamePattern.MatchString(strings.ReplaceAll(value, "$$", "\x00"))
+}
+
 func appDecisionCodesApproved(plan Plan, app preparer.AppPlan) bool {
 	found := false
 	for _, gate := range app.Gates {
@@ -605,6 +637,18 @@ func (e deployedComposeMonitorError) Unwrap() error {
 	return e.err
 }
 
+type completedDeploymentHandoffError struct {
+	err error
+}
+
+func (e completedDeploymentHandoffError) Error() string {
+	return e.err.Error()
+}
+
+func (e completedDeploymentHandoffError) Unwrap() error {
+	return e.err
+}
+
 type ambiguousDeployResponseError struct {
 	err error
 }
@@ -628,6 +672,18 @@ func (e unsafeSourceResumeError) Error() string {
 }
 
 func (e unsafeSourceResumeError) Unwrap() error {
+	return e.err
+}
+
+type authorityRecoveryRequiredError struct {
+	err error
+}
+
+func (e authorityRecoveryRequiredError) Error() string {
+	return e.err.Error()
+}
+
+func (e authorityRecoveryRequiredError) Unwrap() error {
 	return e.err
 }
 
@@ -751,6 +807,11 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 	if err := validatePlanReadyForLiveApply(plan); err != nil {
 		return err
 	}
+	if RequiresCoolifyDeploymentFence(plan) {
+		if err := requireCoolifyDeploymentFence(ctx, c.dockerRunner()); err != nil {
+			return err
+		}
+	}
 	for app, identity := range plan.TargetIdentities {
 		identity.ProjectID = strings.TrimSpace(identity.ProjectID)
 		identity.EnvironmentID = strings.TrimSpace(identity.EnvironmentID)
@@ -784,6 +845,10 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 	}
 	if resumeFrom > 0 {
 		if err := c.primeResumeState(ctx, actx, plan.Steps[:resumeFrom], pausedApps, handedOff, &coolifyProxyStopped); err != nil {
+			if requiresAuthorityRecovery(err) && len(plan.Steps) > 0 {
+				index := min(resumeFrom, len(plan.Steps)-1)
+				emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: plan.Steps[index], Status: StepStatusError, Err: err, AuthorityRecoveryRequired: true})
+			}
 			resumePausedApps := pausedApps
 			if isUnsafeSourceResumeError(err) {
 				resumePausedApps = nil
@@ -797,7 +862,7 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 		started := StepProgress{Index: index, Total: total, Step: step, Status: StepStatusStarted}
 		if plan.BeforeStep != nil {
 			if err := (*plan.BeforeStep)(started); err != nil {
-				stepErr := fmt.Errorf("before dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
+				stepErr := fmt.Errorf("before Dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
 				return errors.Join(stepErr, c.bestEffortResume(ctx, actx, plan, total, pausedApps, coolifyProxyStopped, false))
 			}
 		}
@@ -847,14 +912,19 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 			// containers Bort owns for this app are running again, and the
 			// cleanup resume reports at this same index, so the claim is
 			// recorded after a successful resume.
-			refused := StepProgress{Index: index, Total: total, Step: step, Status: StepStatusError, Err: err, MutationAmbiguous: mutationResponseMayHaveSucceeded(err), RequiresNewRun: requiresNewRun && !sourceOwned}
+			refused := StepProgress{Index: index, Total: total, Step: step, Status: StepStatusError, Err: err, MutationAmbiguous: mutationResponseMayHaveSucceeded(err), AuthorityRecoveryRequired: requiresAuthorityRecovery(err), RequiresNewRun: requiresNewRun && !sourceOwned}
 			emitProgress(plan.OnProgress, refused)
 			resumePausedApps := pausedApps
 			if isUnsafeSourceResumeError(err) {
 				resumePausedApps = nil
 			}
-			stepErr := fmt.Errorf("dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
+			stepErr := fmt.Errorf("Dokploy step %s for %s (%s): %w", step.Kind, step.App, step.Ref, err)
 			cleanupErr := c.bestEffortResume(ctx, actx, plan, total, resumePausedApps, coolifyProxyStopped, isUnsafeTargetResumeError(err))
+			if requiresAuthorityRecovery(cleanupErr) {
+				refused.Err = errors.Join(err, cleanupErr)
+				refused.AuthorityRecoveryRequired = true
+				emitProgress(plan.OnProgress, refused)
+			}
 			if requiresNewRun && sourceOwned && cleanupErr == nil {
 				refused.RequiresNewRun = true
 				emitProgress(plan.OnProgress, refused)
@@ -920,6 +990,12 @@ func (p pausedSources) observeCompleted(step Step, handedOff map[string]struct{}
 }
 
 func (c *Client) requireTransferredSourceStillPaused(ctx context.Context, actx *applyContext, step Step, pausedApps pausedSources, handedOff map[string]struct{}) error {
+	if RequiresCoolifyDeploymentFence(actx.plan) &&
+		(step.Kind == StepPauseSource || step.Kind == StepPushImage || step.Kind == StepActivateRoutes) {
+		if err := requireCoolifyDeploymentFence(ctx, c.dockerRunner()); err != nil {
+			return err
+		}
+	}
 	switch step.Kind {
 	case StepPushImage:
 		if !pausedApps[step.App] {
@@ -933,8 +1009,11 @@ func (c *Client) requireTransferredSourceStillPaused(ctx context.Context, actx *
 			return fmt.Errorf("source app %s ran after its state was transferred, which invalidated the transfer; retry the live apply to pause and transfer it again", step.App)
 		}
 	case StepActivateRoutes:
-		apps := make([]string, 0, len(handedOff))
+		apps := make([]string, 0, len(handedOff)+len(pausedApps))
 		for app := range handedOff {
+			apps = append(apps, app)
+		}
+		for app := range pausedApps {
 			apps = append(apps, app)
 		}
 		sort.Strings(apps)
@@ -942,9 +1021,13 @@ func (c *Client) requireTransferredSourceStillPaused(ctx context.Context, actx *
 		if err != nil {
 			return fmt.Errorf("verify handed-off source apps stayed paused before activating target routes: %w", err)
 		}
-		if ran != "" {
+		if ran == "" {
+			return nil
+		}
+		if _, off := handedOff[ran]; off || pausedApps[ran] {
 			return unsafeSourceResumeError{err: staleStagedHandoffError(ran)}
 		}
+		return unsafeSourceResumeError{err: fmt.Errorf("source app %s ran after its cutover pause, so its source routes would compete with the activated target routes; retry the live apply to pause it again before activating routes", ran)}
 	}
 	return nil
 }
@@ -1079,9 +1162,17 @@ func (c *Client) bestEffortResume(_ context.Context, actx *applyContext, plan Pl
 		if transferred && plan.BeforeStep != nil {
 			if err := (*plan.BeforeStep)(started); err != nil {
 				sourcesRestored = false
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("source app %s stays stopped: its transferred state must be recorded as invalidated before its containers restart: %w", app, err))
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("source app %s remains stopped because its transferred state must be recorded as invalidated before its containers restart; follow `%s` for the required recovery: %w", app, recoveryStatusCommand(plan), err))
 				continue
 			}
+		}
+		pinCtx, cancelPin := context.WithTimeout(context.Background(), dockerStopTimeout)
+		pinErr := validateCachedStagingVolumePin(pinCtx, c.dockerRunner(), actx, app)
+		cancelPin()
+		if pinErr != nil {
+			sourcesRestored = false
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("source app %s remains stopped because its staging-volume pin could not be verified before restart; follow `%s` for the required recovery: %w", app, recoveryStatusCommand(plan), pinErr))
+			continue
 		}
 		emitProgress(plan.OnProgress, started)
 		resumeCtx, cancel := context.WithTimeout(context.Background(), dockerStartTimeout)
@@ -1090,7 +1181,7 @@ func (c *Client) bestEffortResume(_ context.Context, actx *applyContext, plan Pl
 		if err != nil {
 			sourcesRestored = false
 			emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: resumeStep, Status: StepStatusError, Err: err})
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("resume source app %s after failed apply: %w", app, err))
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("source app %s remains stopped after failed apply; follow `%s` for the required recovery: %w", app, recoveryStatusCommand(plan), err))
 			continue
 		}
 		emitProgress(plan.OnProgress, StepProgress{Index: index, Total: total, Step: resumeStep, Status: StepStatusOK})
@@ -1111,7 +1202,7 @@ func (c *Client) bestEffortResume(_ context.Context, actx *applyContext, plan Pl
 		}
 		emitProgress(plan.OnProgress, StepProgress{Index: total, Total: total, Step: resumeProxyStep, Status: StepStatusOK})
 	} else if coolifyProxyStopped {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("coolify proxy remains stopped because at least one source app could not be resumed"))
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("coolify proxy and at least one paused source application remain stopped; follow `%s` for the required recovery", recoveryStatusCommand(plan)))
 	}
 	return cleanupErr
 }
@@ -1184,6 +1275,11 @@ func isUnsafeTargetResumeError(err error) bool {
 func isUnsafeSourceResumeError(err error) bool {
 	var unsafe unsafeSourceResumeError
 	return errors.As(err, &unsafe)
+}
+
+func requiresAuthorityRecovery(err error) bool {
+	var required authorityRecoveryRequiredError
+	return errors.As(err, &required)
 }
 
 func (c *Client) applyStep(ctx context.Context, actx *applyContext, step Step) error {
@@ -1359,10 +1455,78 @@ func (c *Client) applyPushImage(ctx context.Context, actx *applyContext, step St
 	if err != nil {
 		return err
 	}
-	if err := c.deployComposeForApply(ctx, actx, step.App, composeFile, envContent); err != nil {
+	staged := stagedVolumesForApp(actx.plan, step.App)
+	if len(staged) == 0 {
+		if err := c.deployComposeForApply(ctx, actx, step.App, composeFile, envContent); err != nil {
+			return err
+		}
+		return c.pauseTargetWritersForState(ctx, c.dockerRunner(), actx, step.App)
+	}
+	runner := c.dockerRunner()
+	staged, pin, err := ensureAppStagingVolumePin(ctx, runner, actx, step.App, false)
+	if err != nil {
 		return err
 	}
-	return c.pauseTargetWritersForState(ctx, c.dockerRunner(), actx, step.App)
+	if err := requireStagingVolumeAttachments(ctx, runner, staged, []string{pin.containerID}); err != nil {
+		return failedStagingVolumeHandoff(runner, actx.plan, step.App, staged, pin, "a previous target attachment may have survived an interrupted deployment", err)
+	}
+	deployErr := c.deployComposeForApply(ctx, actx, step.App, composeFile, envContent)
+	if deployErr != nil {
+		var completed completedDeploymentHandoffError
+		if errors.As(deployErr, &completed) || isUnsafeSourceResumeError(deployErr) {
+			return failedStagingVolumeHandoff(runner, actx.plan, step.App, staged, pin, "target deployment completed or may still be active", deployErr)
+		}
+		if isUnsafeTargetResumeError(deployErr) {
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), targetDiscoveryTimeout)
+			detachErr := c.removeStoppedTargetAttachments(cleanupCtx, actx, step.App, staged, pin.containerID)
+			cancelCleanup()
+			if detachErr != nil {
+				return failedStagingVolumeHandoff(runner, actx.plan, step.App, staged, pin, "failed to release stopped target containers before source recovery", errors.Join(deployErr, detachErr))
+			}
+		} else if err := requireStagingVolumeAttachments(ctx, runner, staged, []string{pin.containerID}); err != nil {
+			return failedStagingVolumeHandoff(runner, actx.plan, step.App, staged, pin, "the failed deployment left an unverified target attachment", errors.Join(deployErr, err))
+		}
+		return deployErr
+	}
+	if err := requireStagingVolumesOwned(ctx, runner, actx.plan, step.App, staged); err != nil {
+		return failedStagingVolumeHandoff(runner, actx.plan, step.App, staged, pin, "target deployment completed, but staging-volume ownership changed", err)
+	}
+	if err := requireStagingVolumePin(ctx, runner, actx.plan, staged, pin); err != nil {
+		return failedStagingVolumeHandoff(runner, actx.plan, step.App, staged, pin, "target deployment completed, but its volume pin changed", err)
+	}
+	targetIDsByVolume, err := c.migratedVolumeAttachmentIDs(ctx, actx, step.App)
+	if err != nil {
+		return failedStagingVolumeHandoff(runner, actx.plan, step.App, staged, pin, "target deployment completed, but target attachment validation failed", err)
+	}
+	allowedIDsByVolume := make(map[string][]string, len(staged))
+	for _, volume := range staged {
+		targetIDs := targetIDsByVolume[volume.VolumeName]
+		if len(targetIDs) == 0 {
+			return failedStagingVolumeHandoff(runner, actx.plan, step.App, staged, pin, "target deployment completed, but the final attachment set was incomplete", fmt.Errorf("migrated volume %s has no target container", volume.VolumeName))
+		}
+		allowedIDsByVolume[volume.VolumeName] = append([]string{pin.containerID}, targetIDs...)
+	}
+	if err := requireStagingVolumeAttachmentSets(ctx, runner, staged, allowedIDsByVolume); err != nil {
+		return failedStagingVolumeHandoff(runner, actx.plan, step.App, staged, pin, "target deployment completed, but the final attachment set was not exact", err)
+	}
+	if err := releaseStagingVolumePin(ctx, runner, actx.plan, staged, pin); err != nil {
+		return failedStagingVolumeHandoff(runner, actx.plan, step.App, staged, pin, "target deployment completed, but Bort could not release its staging-volume pin", err)
+	}
+	delete(actx.stagingVolumePins, step.App)
+	return c.pauseTargetWritersForState(ctx, runner, actx, step.App)
+}
+
+func failedStagingVolumeHandoff(runner dockerRunner, plan Plan, appName string, volumes []stagedVolume, pin stagingVolumePin, reason string, err error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerStopTimeout)
+	defer cancel()
+	guardErr := requireStagingVolumesOwned(ctx, runner, plan, appName, volumes)
+	if guardErr == nil {
+		guardErr = requireStagingVolumePin(ctx, runner, plan, volumes, pin)
+	}
+	if guardErr == nil {
+		return ambiguousMutationResponseError{err: unsafeSourceResumeError{err: fmt.Errorf("%s; paused source applications remain stopped and Bort verified and preserved read-only staging-volume pin %s; follow `%s` for the required recovery: %w", reason, pin.name, recoveryStatusCommand(plan), err)}}
+	}
+	return ambiguousMutationResponseError{err: unsafeSourceResumeError{err: fmt.Errorf("%s; paused source applications remain stopped, but Bort could not verify the read-only staging-volume guard for pin %s; follow `%s` for the required recovery: %w", reason, pin.name, recoveryStatusCommand(plan), errors.Join(err, guardErr))}}
 }
 
 func (c *Client) updateComposeWithPatchGuard(ctx context.Context, composeID, composeFile, envContent string) error {
@@ -1417,7 +1581,10 @@ func (c *Client) deployComposeForApply(ctx context.Context, actx *applyContext, 
 				err = deployedComposeGuardError{err: errors.Join(responseErr, guardErr)}
 			}
 		} else {
-			return c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, appName)
+			if err := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, appName); err != nil {
+				return completedDeploymentHandoffError{err: err}
+			}
+			return nil
 		}
 	}
 	var deployedGuardErr deployedComposeGuardError
@@ -1441,7 +1608,7 @@ func (c *Client) deployComposeForApply(ctx context.Context, actx *applyContext, 
 		defer cancelStop()
 		stopErr := c.quiesceGuardedDeployment(stopCtx, actx, appName, title)
 		if stopErr != nil {
-			unsafeErr := unsafeSourceResumeError{err: unsafeTargetResumeError{err: fmt.Errorf("%s: %w; quiescence could not be proved, so Bort will leave any paused source applications stopped and skip target recovery: %v", failure, err, stopErr)}}
+			unsafeErr := unsafeSourceResumeError{err: unsafeTargetResumeError{err: fmt.Errorf("%s: %w; quiescence could not be proved, so paused source applications remain stopped and Bort skipped target recovery; follow `%s` for the required recovery: %v", failure, err, recoveryStatusCommand(actx.plan), stopErr)}}
 			return ambiguousMutationResponseError{err: unsafeErr}
 		}
 		safetyErr := c.validateMigratedVolumeMountsAfterDeploy(ctx, actx, appName)
@@ -1715,9 +1882,10 @@ func (c *Client) applyInstallGateway(ctx context.Context, actx *applyContext, st
 	if err != nil {
 		return err
 	}
-	route, err = resolveRouteForCompose(route, composeFile)
+	sourceServices, composeSource := routeServiceContextForApp(actx.plan, step.App)
+	route, err = resolveRouteForCompose(route, composeFile, sourceServices, composeSource)
 	if err != nil {
-		return err
+		return withRecoveryStatusCommand(err, actx.plan)
 	}
 	return c.ensureRouteDomain(ctx, entry.ComposeID, route)
 }
@@ -1741,10 +1909,11 @@ func (c *Client) applyActivateRoutes(ctx context.Context, actx *applyContext, st
 	if err := c.validateNoActiveBortOverrides(ctx, entry.ComposeID); err != nil {
 		return err
 	}
+	sourceServices, composeSource := routeServiceContextForApp(actx.plan, step.App)
 	for _, route := range cutoverRoutesForApp(actx.plan.Cutover, step.App) {
-		resolved, err := resolveRouteForCompose(route, composeFile)
+		resolved, err := resolveRouteForCompose(route, composeFile, sourceServices, composeSource)
 		if err != nil {
-			return err
+			return withRecoveryStatusCommand(err, actx.plan)
 		}
 		if err := c.ensureRouteDomain(ctx, entry.ComposeID, resolved); err != nil {
 			return err
@@ -1809,32 +1978,64 @@ type composeServiceSummary struct {
 	Ports map[string]struct{}
 }
 
-func resolveRouteForCompose(route gateway.Route, composeFile string) (gateway.Route, error) {
+func routeServiceContextForApp(plan Plan, appName string) ([]preparer.SourceServiceRef, string) {
+	app, ok := findPrepareApp(plan.Prepare, appName)
+	if !ok {
+		return nil, ""
+	}
+	if app.Resources.App.ComposeSource != "" {
+		return nil, app.Resources.App.ComposeSource
+	}
+	return app.Resources.SourceServices, app.Resources.App.ComposeSource
+}
+
+func withRecoveryStatusCommand(err error, plan Plan) error {
+	if !requiresAuthorityRecovery(err) {
+		return err
+	}
+	return authorityRecoveryRequiredError{err: fmt.Errorf("%w; run `%s` for the exact recovery commands", err, recoveryStatusCommand(plan))}
+}
+
+func resolveRouteForCompose(route gateway.Route, composeFile string, sourceServices []preparer.SourceServiceRef, composeSource string) (gateway.Route, error) {
 	services, err := composeServiceSummaries(composeFile)
 	if err != nil {
 		return gateway.Route{}, err
 	}
-	if len(services) == 0 {
+	switch composeSource {
+	case preparer.ComposeSourceRaw, preparer.ComposeSourceGenerated:
+		serviceName := strings.TrimSpace(route.ServiceName)
+		if _, ok := services[serviceName]; ok {
+			route.ServiceName = serviceName
+			return route, nil
+		}
+	case "":
+	default:
+		return gateway.Route{}, fmt.Errorf("route %s has unsupported compose source %q", planutilFallback(route.Host, "unknown"), composeSource)
+	}
+	if len(services) == 0 && composeSource == "" {
 		return route, nil
 	}
-	if _, ok := services[route.ServiceName]; ok {
-		return route, nil
-	}
-	if serviceName, ok := inferComposeServiceForRoute(route, services); ok {
-		route.ServiceName = serviceName
-		return route, nil
+	if composeSource == "" {
+		if serviceName, ok := inferComposeServiceForRoute(route, services, sourceServices); ok {
+			route.ServiceName = serviceName
+			return route, nil
+		}
 	}
 	available := make([]string, 0, len(services))
 	for name := range services {
 		available = append(available, name)
 	}
 	sort.Strings(available)
-	return gateway.Route{}, fmt.Errorf("route %s points at service %q, but the dokploy compose has %s; rescan before retrying so bort can refresh the route mapping",
-		planutilFallback(route.Host, "unknown"), route.ServiceName, strings.Join(available, ", "))
+	availableServices := strings.Join(available, ", ")
+	if availableServices == "" {
+		availableServices = "no services"
+	}
+	return gateway.Route{}, authorityRecoveryRequiredError{err: fmt.Errorf("route %s points at service %q, but the Dokploy Compose file has %s; no retry of this immutable run can pass this step, so follow the run status guidance (`bort status`) to record source or target authority with recover-authority, then correct the source configuration or the bundle used to create the next run and create a new run",
+		planutilFallback(route.Host, "unknown"), route.ServiceName, availableServices)}
 }
 
-func inferComposeServiceForRoute(route gateway.Route, services map[string]composeServiceSummary) (string, bool) {
-	for _, candidate := range routeServiceNameCandidates(route) {
+func inferComposeServiceForRoute(route gateway.Route, services map[string]composeServiceSummary, sourceServices []preparer.SourceServiceRef) (string, bool) {
+	for _, candidate := range routeServiceNameCandidates(route, sourceServices) {
 		if _, ok := services[candidate]; ok {
 			return candidate, true
 		}
@@ -1859,7 +2060,7 @@ func inferComposeServiceForRoute(route gateway.Route, services map[string]compos
 	return "", false
 }
 
-func routeServiceNameCandidates(route gateway.Route) []string {
+func routeServiceNameCandidates(route gateway.Route, sourceServices []preparer.SourceServiceRef) []string {
 	candidates := []string{}
 	add := func(value string) {
 		value = strings.TrimSpace(value)
@@ -1874,6 +2075,11 @@ func routeServiceNameCandidates(route gateway.Route) []string {
 		candidates = append(candidates, value)
 	}
 	add(route.ServiceName)
+	for _, sourceService := range sourceServices {
+		if sourceService.ContainerName == route.ServiceName {
+			add(sourceService.ServiceName)
+		}
+	}
 	add(stripCoolifyGeneratedServiceSuffix(route.ServiceName))
 	if fromSource := serviceNameFromTraefikRouterSource(route.Source); fromSource != "" {
 		add(fromSource)
@@ -1955,6 +2161,10 @@ func composeServiceSummaries(contents string) (map[string]composeServiceSummary,
 	root := &doc
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
 		root = doc.Content[0]
+	}
+	root, err := selfContainedNode(root)
+	if err != nil {
+		return nil, err
 	}
 	services := mappingValue(root, "services")
 	if services == nil || services.Kind != yaml.MappingNode {

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aikins01/bort/internal/manifest"
+	"github.com/aikins01/bort/internal/preparer"
 	"github.com/aikins01/bort/internal/target/dokploy"
 )
 
@@ -123,6 +125,87 @@ func TestRecoverAuthorityFinalizesSourceAndReleasesHost(t *testing.T) {
 	}
 }
 
+func TestRecoverAuthorityKeepsHostOwnershipWhenPinCleanupFails(t *testing.T) {
+	for _, authority := range []string{dokployTrafficSource, dokployTrafficTarget} {
+		t.Run(authority, func(t *testing.T) {
+			run := writeAmbiguousAuthorityRun(t, "pin-cleanup-"+authority)
+			previous := releaseAuthorityStagingVolumePins
+			calls := 0
+			releaseAuthorityStagingVolumePins = func(_ context.Context, _ loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
+				calls++
+				if plan.RunName != run.Run.Name || plan.RunDir != run.Run.RunDir || plan.RunID == "" || targetAuthority != (authority == dokployTrafficTarget) {
+					t.Fatalf("pin cleanup received incomplete recovery identity: plan=%#v target=%t", plan, targetAuthority)
+				}
+				if calls == 1 {
+					return errors.New("pin cleanup failed")
+				}
+				return nil
+			}
+			t.Cleanup(func() { releaseAuthorityStagingVolumePins = previous })
+
+			args := []string{"--run", run.Run.Name, "--authority", authority, "--confirm", authorityRecoveryConfirmation(run.Run, authority)}
+			if authority == dokployTrafficTarget {
+				args = []string{"--run", run.Run.Name, "--authority", authority, "--source-retired", "--confirm", authorityRecoverySourceRetiredConfirmation(run.Run)}
+			}
+			err := runRecoverAuthority(context.Background(), args, io.Discard, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), "host ownership remains held") || !strings.Contains(err.Error(), "pin cleanup failed") {
+				t.Fatalf("expected pin cleanup failure to retain host ownership, got %v", err)
+			}
+			owner, found, err := readDokployTrafficOwner()
+			if err != nil || !found || owner.Authority != authority {
+				t.Fatalf("pin cleanup failure released or changed owner: owner=%#v found=%t err=%v", owner, found, err)
+			}
+			interrupted, err := loadMigrationRun(run.Run.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if authority == dokployTrafficSource && (interrupted.Run.RolledBackAt == nil || interrupted.Run.AuthorityFinalizedAt != nil) {
+				t.Fatalf("source recovery did not stop at pin cleanup boundary: %#v", interrupted.Run)
+			}
+			if authority == dokployTrafficTarget && interrupted.Run.CommittedAt == nil {
+				t.Fatalf("target recovery did not record retirement before pin cleanup: %#v", interrupted.Run)
+			}
+
+			if err := runRecoverAuthority(context.Background(), args, io.Discard, io.Discard); err != nil {
+				t.Fatalf("pin cleanup retry did not finish recovery: %v", err)
+			}
+			owner, found, err = readDokployTrafficOwner()
+			if err != nil || !found || owner.Authority != dokployTrafficReleased || calls != 2 {
+				t.Fatalf("recovery retry did not release owner: owner=%#v found=%t calls=%d err=%v", owner, found, calls, err)
+			}
+		})
+	}
+}
+
+func TestAuthorityRecoveryCarriesAppliedTransferEvidenceIntoPinCleanup(t *testing.T) {
+	run := writeAmbiguousAuthorityRun(t, "transfer-evidence")
+	run.Applied.PlanVersion = appliedPlanV1Alpha3
+	run.Applied.Steps = []appliedStep{{
+		Index:  1,
+		Kind:   string(dokploy.StepRestoreDataStore),
+		App:    "api",
+		Ref:    "postgres:db",
+		Status: string(dokploy.StepStatusError),
+	}}
+	previous := releaseAuthorityStagingVolumePins
+	called := false
+	releaseAuthorityStagingVolumePins = func(_ context.Context, _ loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
+		called = true
+		if !targetAuthority || len(plan.StagingTransferApps) != 1 || plan.StagingTransferApps[0] != "api" {
+			t.Fatalf("pin cleanup did not receive transfer evidence: plan=%#v target=%t", plan, targetAuthority)
+		}
+		return nil
+	}
+	t.Cleanup(func() { releaseAuthorityStagingVolumePins = previous })
+
+	if err := releaseRecoveredAuthorityStagingVolumePins(context.Background(), run, true); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("pin cleanup was not invoked")
+	}
+}
+
 func TestRecoverAuthorityFinalizesTargetForCommitAndRefusesAutomaticRollback(t *testing.T) {
 	writeAmbiguousAuthorityRun(t, "target-run")
 	args := []string{"--run", "target-run", "--authority", "target", "--confirm", "recover target-run as target"}
@@ -153,7 +236,7 @@ func TestRecoverAuthorityFinalizesTargetForCommitAndRefusesAutomaticRollback(t *
 	if phase := migrationRunPhase(completed); phase != "applied" {
 		t.Fatalf("target recovery phase=%q, want applied", phase)
 	}
-	if next := nextSafeStep(completed, nil); !strings.Contains(next.Action, "--source-retired") || !strings.Contains(next.Action, "disable future Coolify deployments") || strings.Contains(next.Action, "commit --apply") || strings.Contains(next.Action, "rollback --live") {
+	if next := nextSafeStep(completed, nil); !strings.Contains(next.Action, "--source-retired") || !strings.Contains(next.Action, "even if it is already stopped") || strings.Contains(next.Action, "commit --apply") || strings.Contains(next.Action, "rollback --live") {
 		t.Fatalf("target recovery next step is unsafe: %#v", next)
 	}
 	if err := runRecoverAuthority(context.Background(), args, io.Discard, io.Discard); err != nil {
@@ -499,5 +582,156 @@ func TestRecoverAuthorityAcceptsDefiniteFailureWhileHostOwnerIsPending(t *testin
 	run.Run.AuthorityFinalizedAt = nil
 	if err := validateAuthorityRecovery(run, dokployTrafficSource, false); err == nil || !strings.Contains(err.Error(), "authority recovery refused") {
 		t.Fatalf("definite failure without host ownership must still be refused, got %v", err)
+	}
+}
+
+func TestAuthorityRecoveryClientBindsTargetCredentialsToRunOrigin(t *testing.T) {
+	origin, err := dokploy.NormalizeTokenBaseURL("http://127.0.0.1:3030")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(dokploy.EnvBaseURL, "http://127.0.0.1:3030")
+	t.Setenv(dokploy.EnvToken, "token-1")
+
+	source, err := authorityRecoveryDokployClient(loadedMigrationRun{}, dokploy.Plan{}, false)
+	if err != nil || source.BaseURL != "" {
+		t.Fatalf("source recovery should not need Dokploy credentials: client=%#v err=%v", source, err)
+	}
+	stateless, err := authorityRecoveryDokployClient(loadedMigrationRun{}, dokploy.Plan{}, true)
+	if err != nil || stateless.BaseURL != "" {
+		t.Fatalf("target recovery without staged volumes should not need Dokploy credentials: client=%#v err=%v", stateless, err)
+	}
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", Name: "api-data", Target: "/data"}}
+	staged := dokploy.Plan{
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{app}},
+		Steps:   []dokploy.Step{{Kind: dokploy.StepSyncVolume, App: "api", Ref: "volume:web -> /data"}, {Kind: dokploy.StepPushImage, App: "api"}},
+	}
+	target, err := authorityRecoveryDokployClient(loadedMigrationRun{Applied: runApplied{TargetOrigin: origin}}, staged, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.BaseURL != origin || target.Token != "token-1" {
+		t.Fatalf("target recovery client is not configured for the run origin: %#v", target)
+	}
+	if _, err := authorityRecoveryDokployClient(loadedMigrationRun{Applied: runApplied{TargetOrigin: "http://127.0.0.1:4040"}}, staged, true); err == nil || !strings.Contains(err.Error(), "bound to Dokploy origin") {
+		t.Fatalf("target recovery accepted credentials for another Dokploy origin: %v", err)
+	}
+}
+
+func TestRecoverAuthorityRefusesTargetForUnfinishedStagedTransfer(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	t.Chdir(t.TempDir())
+	writeTestBundle(t, "bundle", manifest.Manifest{
+		Source: manifest.Source{Platform: "coolify-local", DockerEngineID: "engine-reviewed"},
+		Apps: []manifest.App{{
+			Name: "api",
+			Services: []manifest.Service{{
+				ID: "source-id", Name: "web", Image: "example/api:latest",
+				Mounts: []manifest.Mount{{Type: "volume", Name: "api-data", Target: "/data"}},
+			}},
+		}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", "bundle", "--run", "unfinished", "--observation-window", "0", "--rollback-window", "0"})
+	markRunLocallyScanned(t, "unfinished", "coolify-local")
+	run, err := loadMigrationRun("unfinished")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := newRunApplied(run.Run)
+	applied.Steps = []appliedStep{{Index: 1, Kind: string(dokploy.StepSyncVolume), App: "api", Ref: "volume:web -> /data", Status: string(dokploy.StepStatusError), UpdatedAt: time.Now().UTC(), Error: "copy interrupted"}}
+	if err := writeRunApplied(runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied), applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimDokployHostOwnership(run.Run, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+		t.Fatal(err)
+	}
+	if run, err = loadMigrationRun("unfinished"); err != nil {
+		t.Fatal(err)
+	}
+	if incomplete, err := incompleteStagingTransferApps(run); err != nil || len(incomplete) != 1 || incomplete[0] != "api" {
+		t.Fatalf("unfinished staged transfer was not detected: %v %v", incomplete, err)
+	}
+
+	err = runRecoverAuthority(context.Background(), []string{"--run", "unfinished", "--authority", "target", "--confirm", authorityRecoveryConfirmation(run.Run, dokployTrafficTarget)}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "did not finish") || !strings.Contains(err.Error(), "--authority source") {
+		t.Fatalf("target recovery accepted an unfinished staged transfer: %v", err)
+	}
+	after, err := loadMigrationRun("unfinished")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Run.ResolvedAuthority != "" || after.Run.CommittedAt != nil {
+		t.Fatalf("refused target recovery recorded authority: %#v", after.Run)
+	}
+	if guidance := authorityRecoveryInstruction(after) + authorityRecoveryNextStep(after, "").Action; strings.Contains(guidance, "--authority target") || !strings.Contains(guidance, "--authority source") {
+		t.Fatalf("recovery guidance offered target recovery for an unfinished transfer: %q", guidance)
+	}
+	var status bytes.Buffer
+	writeAuthorityRecoveryGuidance(&status, newStyler(&status), after, "")
+	if strings.Contains(status.String(), "--authority target") || !strings.Contains(status.String(), "--authority source") {
+		t.Fatalf("status offered target recovery for an unfinished transfer:\n%s", status.String())
+	}
+
+	retried := newRunApplied(after.Run)
+	if err := writeRunApplied(runArtifactPath(after.Run.RunDir, after.Run.Artifacts.Applied), retried); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(after.Run.RunDir, "migrated-volumes.json"), []byte(`{"apiVersion":"bort.migrated-volumes/v1alpha2","startedApps":["api"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if after, err = loadMigrationRun("unfinished"); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"--run", "unfinished", "--authority", "target", "--confirm", authorityRecoveryConfirmation(after.Run, dokployTrafficTarget)},
+		{"--run", "unfinished", "--authority", "target", "--source-retired", "--confirm", authorityRecoverySourceRetiredConfirmation(after.Run)},
+	} {
+		err := runRecoverAuthority(context.Background(), args, io.Discard, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "did not finish") {
+			t.Fatalf("target recovery ignored durable transfer evidence after the ledger was trimmed (%v): %v", args, err)
+		}
+	}
+	final, err := loadMigrationRun("unfinished")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, found, err := readDokployTrafficOwner()
+	if final.Run.ResolvedAuthority != "" || final.Run.CommittedAt != nil || err != nil || !found || owner.Authority != dokployTrafficPending {
+		t.Fatalf("refused target recovery changed run or owner state: run=%#v owner=%#v err=%v", final.Run, owner, err)
+	}
+}
+
+func TestTargetRecoveryValidatesStagingVolumesBeforeRecordingAuthority(t *testing.T) {
+	for _, sourceRetired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("source-retired=%t", sourceRetired), func(t *testing.T) {
+			run := writeAmbiguousAuthorityRun(t, fmt.Sprintf("target-validate-%t", sourceRetired))
+			previous := validateAuthorityStagingVolumePins
+			validateAuthorityStagingVolumePins = func(_ context.Context, _ loadedMigrationRun, _ dokploy.Plan, targetAuthority bool) error {
+				if !targetAuthority {
+					t.Fatal("target recovery validated source authority")
+				}
+				return errors.New("migrated volume bort-v has no target container")
+			}
+			t.Cleanup(func() { validateAuthorityStagingVolumePins = previous })
+			args := []string{"--run", run.Run.Name, "--authority", "target", "--confirm", authorityRecoveryConfirmation(run.Run, dokployTrafficTarget)}
+			if sourceRetired {
+				args = []string{"--run", run.Run.Name, "--authority", "target", "--source-retired", "--confirm", authorityRecoverySourceRetiredConfirmation(run.Run)}
+			}
+			err := runRecoverAuthority(context.Background(), args, io.Discard, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), "has no target container") {
+				t.Fatalf("target recovery did not refuse on staging validation: %v", err)
+			}
+			after, err := loadMigrationRun(run.Run.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Run.ResolvedAuthority != "" || after.Run.CommittedAt != nil || after.Run.LiveAppliedAt != nil {
+				t.Fatalf("refused target recovery recorded state: %#v", after.Run)
+			}
+			if _, err := os.Stat(filepath.Join(after.Run.RunDir, "run.json")); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

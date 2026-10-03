@@ -10,6 +10,44 @@ import (
 	"github.com/aikins01/bort/internal/target/dokploy"
 )
 
+var releaseAuthorityStagingVolumePins = func(ctx context.Context, run loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
+	client, err := authorityRecoveryDokployClient(run, plan, targetAuthority)
+	if err != nil {
+		return err
+	}
+	return client.ReleaseStagingVolumePins(ctx, plan, targetAuthority)
+}
+
+var validateAuthorityStagingVolumePins = func(ctx context.Context, run loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
+	client, err := authorityRecoveryDokployClient(run, plan, targetAuthority)
+	if err != nil {
+		return err
+	}
+	return client.ValidateStagingVolumePins(ctx, plan, targetAuthority)
+}
+
+func validateRecoveredTargetAuthority(ctx context.Context, run loadedMigrationRun) error {
+	plan, err := authorityRecoveryPlan(run)
+	if err != nil {
+		return err
+	}
+	return validateAuthorityStagingVolumePins(ctx, run, plan, true)
+}
+
+func authorityRecoveryDokployClient(run loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) (*dokploy.Client, error) {
+	if !targetAuthority || !dokploy.PlanStagesVolumes(plan) {
+		return &dokploy.Client{}, nil
+	}
+	client, err := lookupDokployClient(run.Run.Target)
+	if err != nil {
+		return nil, fmt.Errorf("load Dokploy credentials to verify target attachments: %w", err)
+	}
+	if err := validateAppliedTargetOrigin(run.Applied, client.BaseURL); err != nil {
+		return nil, fmt.Errorf("verify target attachments: %w", err)
+	}
+	return client, nil
+}
+
 func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("recover-authority", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -84,12 +122,32 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 	}
 	if !found {
 		if authority == dokployTrafficSource && run.Run.AuthorityFinalizedAt == nil {
+			if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, false); err != nil {
+				return fmt.Errorf("remove source-authority staging-volume pins before finalization: %w", err)
+			}
 			if err := markRunAuthorityFinalizedLocked(run.Run); err != nil {
 				return fmt.Errorf("record source-authority finalization: %w", err)
 			}
 		}
+		if authority == dokployTrafficTarget && run.Run.CommittedAt != nil {
+			if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, true); err != nil {
+				return fmt.Errorf("remove target-authority staging-volume pins after source retirement: %w", err)
+			}
+		}
 		fmt.Fprintf(stdout, "Authority recovery already complete for run %s: %s authority.\n", run.Run.Name, authority)
 		return nil
+	}
+	if authority == dokployTrafficTarget {
+		incomplete, err := incompleteStagingTransferApps(run)
+		if err != nil {
+			return fmt.Errorf("check staged transfers before recording target authority: %w", err)
+		}
+		if len(incomplete) > 0 {
+			return fmt.Errorf("target authority was not recorded: the staged state transfer for app(s) %s did not finish, so the target cannot hold the complete source state; restore the source and run `%s`", strings.Join(incomplete, ", "), authorityRecoveryCommand(run, dokployTrafficSource))
+		}
+		if err := validateRecoveredTargetAuthority(ctx, run); err != nil {
+			return fmt.Errorf("target authority was not recorded because the transferred staging volumes do not match the target: %w", err)
+		}
 	}
 	if authority == dokployTrafficTarget && !sourceRetired {
 		var sourceAttestationErr error
@@ -123,6 +181,9 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 		if err := markRunRolledBackLocked(run.Run); err != nil {
 			return fmt.Errorf("record manual source recovery completion: %w", err)
 		}
+		if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, false); err != nil {
+			return fmt.Errorf("source authority was recorded, but staging-volume validation or pin removal failed; host ownership remains held so this recovery can be retried: %w", err)
+		}
 		if err := releaseDokployTrafficOwner(run.Run); err != nil {
 			return fmt.Errorf("release source-authority host ownership: %w", err)
 		}
@@ -148,6 +209,9 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 		if err := markRunCommittedLocked(run.Run); err != nil {
 			return fmt.Errorf("record manual source retirement completion: %w", err)
 		}
+		if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, true); err != nil {
+			return fmt.Errorf("target authority and source retirement were recorded, but staging-volume validation or pin removal failed; host ownership remains held so this recovery can be retried: %w", err)
+		}
 		if err := releaseDokployTargetOwner(run.Run); err != nil {
 			return fmt.Errorf("release target-authority host ownership: %w", err)
 		}
@@ -160,6 +224,37 @@ func runRecoverAuthority(ctx context.Context, args []string, stdout, stderr io.W
 	}
 	fmt.Fprintf(stdout, "Authority recovery complete for run %s: target authority recorded. Run `%s` when ready to retire the source.\n", run.Run.Name, runScopedCommand(run, "commit --apply"))
 	return nil
+}
+
+func releaseRecoveredAuthorityStagingVolumePins(ctx context.Context, run loadedMigrationRun, targetAuthority bool) error {
+	plan, err := authorityRecoveryPlan(run)
+	if err != nil {
+		return err
+	}
+	return releaseAuthorityStagingVolumePins(ctx, run, plan, targetAuthority)
+}
+
+func authorityRecoveryPlan(run loadedMigrationRun) (dokploy.Plan, error) {
+	plan := livePlanForApplied(run, run.Applied)
+	plan.RunName = run.Run.Name
+	plan.RunDir = run.Run.RunDir
+	runID, err := dokployTrafficRunID(run.Run)
+	if err != nil {
+		return dokploy.Plan{}, err
+	}
+	plan.RunID = runID
+	plan.TargetIdentities = appliedTargetIdentities(run.Applied)
+	plan.StagingTransferApps = appliedStagingTransferApps(run.Applied)
+	plan.HandedOffApps = appliedHandedOffApps(run.Applied)
+	return plan, nil
+}
+
+func incompleteStagingTransferApps(run loadedMigrationRun) ([]string, error) {
+	plan, err := authorityRecoveryPlan(run)
+	if err != nil {
+		return nil, err
+	}
+	return dokploy.IncompleteStagingTransfers(plan)
 }
 
 func recordOwnerlessSourceRetirement(run loadedMigrationRun, stdout io.Writer) error {
@@ -296,7 +391,14 @@ func pendingAuthorityRecoveryCommand(run loadedMigrationRun) string {
 
 func authorityRecoveryInstruction(run loadedMigrationRun) string {
 	if authorityRecoveryAvailable(run) {
-		return fmt.Sprintf("inspect and preserve both sides, manually fence the other side and verify authority, then run `%s` for source or `%s` for target", authorityRecoveryCommand(run, dokployTrafficSource), authorityRecoveryCommand(run, dokployTrafficTarget))
+		return "inspect and preserve both sides, " + authorityRecoveryChoice(run)
 	}
 	return "inspect and preserve both sides, establish writer and traffic authority manually, then start a fresh migration run"
+}
+
+func authorityRecoveryChoice(run loadedMigrationRun) string {
+	if incomplete, err := incompleteStagingTransferApps(run); err == nil && len(incomplete) > 0 {
+		return fmt.Sprintf("restore and verify the source (the staged state transfer for %s did not finish, so target recovery is unavailable; remove, not just stop, any target container attached to the bort staging volumes), then run `%s`", strings.Join(incomplete, ", "), authorityRecoveryCommand(run, dokployTrafficSource))
+	}
+	return fmt.Sprintf("manually fence the other side and verify authority, then run `%s` for source or `%s` for target", authorityRecoveryCommand(run, dokployTrafficSource), authorityRecoveryCommand(run, dokployTrafficTarget))
 }

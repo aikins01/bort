@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -87,6 +88,45 @@ func TestFixCommandOnlyReturnsCommandsThatPersistState(t *testing.T) {
 	}
 }
 
+func TestRouteIssueNextStepDistinguishesBlockedMappings(t *testing.T) {
+	wantBlocked := "if live execution has started, run `" + bortCommand("status") + "`, complete the required recovery, then correct the source or input bundle and create a new run; otherwise correct the route-to-Compose-service mapping in the app's topology.json in the run's bundle, keep its routes.json consistent, and re-plan with `" + bortCommand("migrate --run <run>") + "`"
+	for _, blocked := range []appIssue{
+		{Kind: issueKindRoute, Items: []runDecisionItem{{Code: preparer.GateRoutesNone}, {Code: preparer.GateDomainServiceMissing}}},
+		{Kind: issueKindRoute, Items: []runDecisionItem{{Code: preparer.GateDomainServiceNotInCompose}}},
+	} {
+		if got := blocked.NextStep(); got != wantBlocked {
+			t.Fatalf("unexpected blocked route guidance: %q", got)
+		}
+	}
+	review := appIssue{Kind: issueKindRoute, Items: []runDecisionItem{{Code: preparer.GateRoutesNone}}}
+	if got := review.NextStep(); got != "confirm the route host and service in Dokploy before live apply" {
+		t.Fatalf("unexpected review route guidance: %q", got)
+	}
+	run := loadedMigrationRun{Run: migrationRun{Name: "demo", RunDir: filepath.Join(t.TempDir(), "demo")}}
+	blocked := appIssue{Kind: issueKindRoute, Items: []runDecisionItem{{Code: preparer.GateDomainServiceMissing}}}
+	got := blocked.NextStepForRun(run)
+	if !strings.Contains(got, "`"+runScopedCommand(run, "status")+"`") || !strings.Contains(got, "`"+runScopedCommand(run, "migrate")+"`") {
+		t.Fatalf("run-specific route guidance lost its run context: %q", got)
+	}
+
+	for _, tc := range []struct {
+		name string
+		run  migrationRun
+		want string
+	}{
+		{name: "source-created run edits its snapshot", run: migrationRun{Source: "coolify-local", BundleDir: "/runs/demo/bundle-2", SourceBundleDir: "/stale/input"}, want: "/runs/demo/bundle-2"},
+		{name: "input-bundle run edits the original bundle", run: migrationRun{BundleDir: "/runs/demo/bundle-2", SourceBundleDir: "/work/bort-bundle"}, want: "/work/bort-bundle"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.run.Name, tc.run.RunDir = run.Run.Name, run.Run.RunDir
+			got := blocked.NextStepForRun(loadedMigrationRun{Run: tc.run})
+			if !strings.Contains(got, "topology.json in `"+tc.want+"`") {
+				t.Fatalf("route guidance should name re-plan bundle %s: %q", tc.want, got)
+			}
+		})
+	}
+}
+
 func TestFixCommandShellQuotesUntrustedNames(t *testing.T) {
 	envIssue := appIssue{Kind: issueKindEnv}
 	if got := envIssue.FixCommand("My App"); got != "bort env 'My App' KEY=value" {
@@ -110,5 +150,9 @@ func TestFixAndLiveCommandsPreserveSudoLifecycle(t *testing.T) {
 	}
 	if got := liveApplyCommand(loadedMigrationRun{Run: migrationRun{Name: "demo"}}); got != "sudo bort migrate --live --run demo" {
 		t.Fatalf("expected sudo live command, got %q", got)
+	}
+	route := appIssue{Kind: issueKindRoute, Items: []runDecisionItem{{Code: preparer.GateDomainServiceMissing}}}
+	if got := route.NextStep(); !strings.Contains(got, "`sudo bort status`") || !strings.Contains(got, "`sudo bort migrate --run <run>`") {
+		t.Fatalf("expected sudo route recovery commands, got %q", got)
 	}
 }

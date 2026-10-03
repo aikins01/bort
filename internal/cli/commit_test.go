@@ -17,6 +17,7 @@ import (
 	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/manifest"
 	"github.com/aikins01/bort/internal/preparer"
+	syncplan "github.com/aikins01/bort/internal/sync"
 	"github.com/aikins01/bort/internal/target/dokploy"
 )
 
@@ -474,6 +475,16 @@ func TestCommitRetryRepublishesCompletedMetadataBeforeOwnerRelease(t *testing.T)
 	if err := markRunHostOwnerReleaseStartedLocked(run.Run); err != nil {
 		t.Fatal(err)
 	}
+	previous := releaseAuthorityStagingVolumePins
+	cleanupCalls := 0
+	releaseAuthorityStagingVolumePins = func(_ context.Context, _ loadedMigrationRun, plan dokploy.Plan, targetAuthority bool) error {
+		cleanupCalls++
+		if plan.RunName != run.Run.Name || plan.RunDir != run.Run.RunDir || plan.RunID == "" || !targetAuthority {
+			t.Fatalf("commit pin cleanup received incomplete target identity: plan=%#v target=%t", plan, targetAuthority)
+		}
+		return nil
+	}
+	t.Cleanup(func() { releaseAuthorityStagingVolumePins = previous })
 	path := filepath.Join(run.Run.RunDir, "run.json")
 	before, err := os.Stat(path)
 	if err != nil {
@@ -492,6 +503,42 @@ func TestCommitRetryRepublishesCompletedMetadataBeforeOwnerRelease(t *testing.T)
 	owner, found, err := readDokployTrafficOwner()
 	if err != nil || !found || owner.Authority != dokployTrafficReleased {
 		t.Fatalf("completed commit owner = %#v, found=%t err=%v", owner, found, err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("completed commit pin cleanup calls = %d, want 1", cleanupCalls)
+	}
+}
+
+func TestCommitRetryKeepsOwnerWhenPinCleanupFails(t *testing.T) {
+	run := writeAmbiguousAuthorityRun(t, "durable-commit-pin-cleanup")
+	if err := markRunAuthorityResolvedLocked(run.Run, dokployTrafficTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(run.Run, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunLiveAppliedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunCommitStartedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunCommittedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	previous := releaseAuthorityStagingVolumePins
+	releaseAuthorityStagingVolumePins = func(context.Context, loadedMigrationRun, dokploy.Plan, bool) error {
+		return errors.New("pin cleanup failed")
+	}
+	t.Cleanup(func() { releaseAuthorityStagingVolumePins = previous })
+
+	err := applyCommitFromArgs(context.Background(), run.Run.Name, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "host ownership remains held") || !strings.Contains(err.Error(), "pin cleanup failed") {
+		t.Fatalf("expected pin cleanup failure, got %v", err)
+	}
+	owner, found, err := readDokployTrafficOwner()
+	if err != nil || !found || owner.Authority != dokployTrafficTarget {
+		t.Fatalf("pin cleanup failure released owner: owner=%#v found=%t err=%v", owner, found, err)
 	}
 }
 
@@ -748,15 +795,97 @@ func forbidLocalSourceVerification(t *testing.T) {
 }
 
 func TestManualCoolifySourceRetirementActionScopesProxyToRoutedCutovers(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.SourceServices = []preparer.SourceServiceRef{
+		{ServiceName: "web", ContainerID: "web-id", ContainerName: "web-x1y2"},
+		{ServiceName: "db", ContainerID: "db-id"},
+	}
 	run := loadedMigrationRun{
 		Run:     migrationRun{Name: "coolify-run"},
-		Prepare: preparer.Result{Source: "coolify-local", Apps: []preparer.AppPlan{{Name: "api"}}},
+		Prepare: preparer.Result{Source: "coolify-local", Apps: []preparer.AppPlan{app}},
 	}
-	if action := manualCoolifySourceRetirementAction(run); strings.Contains(action, "source proxy") || !strings.Contains(action, "--source-retired") {
-		t.Fatalf("route-free retirement hint touched the shared proxy: %q", action)
+	if action := manualCoolifySourceRetirementAction(run); !strings.Contains(action, "`"+dockerCommand("rm -f web-id db-id")+"`") || !strings.Contains(action, "--source-retired") {
+		t.Fatalf("route-free retirement hint did not name exactly the reviewed containers: %q", action)
 	}
 	run.Cutover = gateway.Result{Apps: []gateway.AppPlan{{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}}}}
-	if action := manualCoolifySourceRetirementAction(run); !strings.Contains(action, "and the source proxy") {
+	if action := manualCoolifySourceRetirementAction(run); !strings.Contains(action, "`"+dockerCommand("rm -f web-id db-id coolify-proxy")+"`") {
 		t.Fatalf("routed retirement hint omitted the proxy handoff: %q", action)
+	}
+	applied := time.Now().UTC()
+	run.Run.ResolvedAuthority = dokployTrafficTarget
+	run.Run.AuthorityResolvedAt = &applied
+	run.Run.LiveAppliedAt = &applied
+	run.Sync = syncplan.Result{Apps: []syncplan.AppPlan{{
+		Name:  "api",
+		Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "data", Strategy: syncplan.StrategyVolumeSync}},
+	}}}
+	run.Applied.Steps = []appliedStep{{Index: 0, Kind: string(dokploy.StepSyncVolume), App: "api", Ref: "data", Status: string(dokploy.StepStatusOK), UpdatedAt: applied}}
+	action := manualCoolifySourceRetirementAction(run)
+	if !strings.Contains(action, "do not record it again") ||
+		!strings.Contains(action, "restore the restart policy you recorded before fencing") ||
+		strings.Contains(action, "record the Coolify control plane's restart policy with") {
+		t.Fatalf("retirement hint after a live-apply fence did not keep the pre-fence policy record: %q", action)
+	}
+	run.Run.ResolvedAuthority = ""
+	run.Run.AuthorityResolvedAt = nil
+	run.Run.LiveAppliedAt = nil
+	run.Applied.Steps[0].Status = string(dokploy.StepStatusError)
+	action = manualCoolifySourceRetirementAction(run)
+	if !strings.Contains(action, "do not record it again") ||
+		strings.Contains(action, "record the Coolify control plane's restart policy with") {
+		t.Fatalf("retirement hint after an interrupted fenced live apply re-recorded the fence policy: %q", action)
+	}
+}
+
+func TestCommitValidatesStagingVolumesBeforeRetiringSource(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	t.Chdir(t.TempDir())
+	writeTestBundle(t, "bundle", manifest.Manifest{
+		Source: manifest.Source{Platform: "docker", DockerEngineID: "engine-reviewed"},
+		Apps: []manifest.App{{
+			Name:     "api",
+			Services: []manifest.Service{{ID: "source-id", Name: "web", Image: "example/api:latest"}},
+			Routes:   []manifest.Route{{Host: "api.example.com", ServiceName: "web", Port: "3000"}},
+		}},
+	})
+	runCommand(t, runMigrate, []string{"--bundle", "bundle", "--run", "docker-commit", "--observation-window", "0", "--rollback-window", "0"})
+	markRunLocallyScanned(t, "docker-commit", "docker")
+	run, err := loadMigrationRun("docker-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := newRunApplied(run.Run)
+	applied.Steps = []appliedStep{{Index: 0, Kind: string(dokploy.StepPushImage), App: "api", Ref: "example/api:latest", Status: string(dokploy.StepStatusError), UpdatedAt: time.Now().UTC(), Error: "outcome unknown"}}
+	if err := writeRunApplied(runArtifactPath(run.Run.RunDir, run.Run.Artifacts.Applied), applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimDokployHostOwnership(run.Run, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunAuthorityResolvedLocked(run.Run, dokployTrafficTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDokployTrafficTarget(run.Run, "http://127.0.0.1:3030"); err != nil {
+		t.Fatal(err)
+	}
+	if err := markRunLiveAppliedLocked(run.Run); err != nil {
+		t.Fatal(err)
+	}
+	previous := validateAuthorityStagingVolumePins
+	validateAuthorityStagingVolumePins = func(context.Context, loadedMigrationRun, dokploy.Plan, bool) error {
+		return errors.New("migrated volume bort-v has no target container")
+	}
+	t.Cleanup(func() { validateAuthorityStagingVolumePins = previous })
+
+	err = applyCommitFromArgs(context.Background(), "docker-commit", io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "before retiring the source") {
+		t.Fatalf("commit did not validate staging volumes before retiring the source: %v", err)
+	}
+	after, err := loadMigrationRun("docker-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Run.CommitStartedAt != nil || after.Run.CommittedAt != nil {
+		t.Fatalf("refused commit recorded source retirement: %#v", after.Run)
 	}
 }

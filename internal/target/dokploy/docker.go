@@ -325,9 +325,18 @@ func inspectContainers(ctx context.Context, runner dockerRunner, refs []string) 
 }
 
 func listContainersByLabel(ctx context.Context, runner dockerRunner, label string) ([]dockerContainer, error) {
-	out, err := runner.Output(ctx, "ps", "-a", "--filter", "label="+label, "--format", "{{.ID}}")
+	return listContainersByLabels(ctx, runner, label)
+}
+
+func listContainersByLabels(ctx context.Context, runner dockerRunner, labels ...string) ([]dockerContainer, error) {
+	args := []string{"ps", "-a"}
+	for _, label := range labels {
+		args = append(args, "--filter", "label="+label)
+	}
+	args = append(args, "--format", "{{.ID}}")
+	out, err := runner.Output(ctx, args...)
 	if err != nil {
-		return nil, fmt.Errorf("docker ps label=%s: %w", label, err)
+		return nil, fmt.Errorf("docker ps labels=%s: %w", strings.Join(labels, ","), err)
 	}
 	ids := []string{}
 	for _, line := range strings.Split(string(out), "\n") {

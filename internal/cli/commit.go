@@ -212,6 +212,9 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 			return fmt.Errorf("reconfirm completed commit metadata durability: %w", err)
 		}
 		if requiresHostOwner {
+			if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, true); err != nil {
+				return fmt.Errorf("remove target-authority staging-volume pins after completed source retirement; host ownership remains held so this commit can be retried: %w", err)
+			}
 			if err := releaseDokployTargetOwner(run.Run); err != nil {
 				return fmt.Errorf("release completed commit host ownership: %w", err)
 			}
@@ -222,6 +225,11 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 		return fmt.Errorf("commit refused on an unverified Docker source: %w", err)
 	}
 	if requiresHostOwner {
+		if err := validateRecoveredTargetAuthority(ctx, run); err != nil {
+			return fmt.Errorf("commit refused before retiring the source because the transferred staging volumes do not match the target: %w", err)
+		}
+	}
+	if requiresHostOwner {
 		if err := ensureDokployTrafficTargetOwner(ctx, run, nil, false); err != nil {
 			return fmt.Errorf("commit refused: %w", err)
 		}
@@ -229,11 +237,12 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 	client := &dokploy.Client{}
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
+	plan.RecoveryCommand = runScopedCommand(run, "status")
 	plan.ApprovedPrepareDecisions = approvedPrepareDecisions(run)
 	if err := markRunCommitStartedLocked(run.Run); err != nil {
 		return fmt.Errorf("record source retirement start: %w", err)
 	}
-	fmt.Fprintf(stderr, "commit apply: run %s; planned %d step(s) to retire source\n", run.Run.Name, len(plan.Steps))
+	fmt.Fprintf(stderr, "commit apply: run %s; planned %s to retire source\n", run.Run.Name, pluralize(len(plan.Steps), "step", "steps"))
 	if err := client.Apply(ctx, plan); err != nil {
 		return err
 	}
@@ -241,6 +250,9 @@ func applyCommitFromArgs(ctx context.Context, runRef string, stderr io.Writer) e
 		return fmt.Errorf("source retirement completed, but migration commit metadata could not be recorded: %w", err)
 	}
 	if requiresHostOwner {
+		if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, true); err != nil {
+			return fmt.Errorf("commit was recorded, but target-authority staging-volume validation or pin removal failed; host ownership remains held so this commit can be retried: %w", err)
+		}
 		if err := releaseDokployTargetOwner(run.Run); err != nil {
 			return fmt.Errorf("commit was recorded, but its Dokploy host ownership could not be released: %w", err)
 		}
@@ -262,14 +274,21 @@ func coolifySourceRetirementRequired(run loadedMigrationRun) bool {
 }
 
 func manualCoolifySourceRetirementAction(run loadedMigrationRun) string {
-	targets := "every reviewed source app"
-	for _, step := range dokploy.PlanForCommit(run.Prepare, run.Cutover).Steps {
-		if step.Kind == dokploy.StepStopCoolifyProxy {
-			targets += " and the source proxy"
-			break
+	refs := dokploy.SourceRetirementContainers(dokploy.PlanForCommit(run.Prepare, run.Cutover))
+	removal := "remove every reviewed source app container (and the source proxy container when routes moved) with Docker"
+	if len(refs) > 0 {
+		quoted := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			quoted = append(quoted, shellQuote(ref))
 		}
+		removal = fmt.Sprintf("remove the reviewed source containers with `%s`", dockerCommand("rm -f "+strings.Join(quoted, " ")))
 	}
-	return fmt.Sprintf("manually disable future Coolify deployments for the reviewed apps, retire %s, verify they remain retired, then run `%s`", targets, authorityRecoverySourceRetiredCommand(run))
+	fence := fmt.Sprintf("run `%s && %s` even if it is already stopped (this pauses Coolify for every app on the host)", dockerCommand("update --restart=no coolify"), dockerCommand("stop coolify"))
+	keepStopped := "leave Coolify stopped afterwards if you can, because starting it again can recreate its proxy and redeploy the removed apps"
+	if appliedHasHistory(run.Applied) && dokploy.RequiresCoolifyDeploymentFence(livePlanForApplied(run, run.Applied)) {
+		return fmt.Sprintf("retain the restart policy you recorded before fencing Coolify for live apply (its policy now reads `no`; do not record it again), %s, %s, verify they stay removed, then run `%s`; %s; if other apps need it, restore the restart policy you recorded before fencing, start it, and immediately delete the migrated apps in Coolify", fence, removal, authorityRecoverySourceRetiredCommand(run), keepStopped)
+	}
+	return fmt.Sprintf("record the Coolify control plane's restart policy with `%s`, then %s, %s, verify they stay removed, then run `%s`; %s; if other apps need it, restore the recorded restart policy, start it, and immediately delete the migrated apps in Coolify", dockerCommand("inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify"), fence, removal, authorityRecoverySourceRetiredCommand(run), keepStopped)
 }
 
 func finishStartedAcceptanceAction(run loadedMigrationRun) string {

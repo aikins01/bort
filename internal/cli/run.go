@@ -615,7 +615,7 @@ func recoverInterruptedStatefulSources(ctx context.Context, run loadedMigrationR
 			onProgress(item)
 		}
 	}
-	plan := dokploy.Plan{Steps: steps, Prepare: prepare, RunDir: run.Run.RunDir, BeforeStep: &beforeStep, OnProgress: &progress}
+	plan := dokploy.Plan{Steps: steps, Prepare: prepare, RunDir: run.Run.RunDir, RecoveryCommand: runScopedCommand(run, "status"), BeforeStep: &beforeStep, OnProgress: &progress}
 	client := &dokploy.Client{}
 	if err := client.AdoptHistoricalSourcePause(ctx, plan, appNames); err != nil {
 		return errors.Join(refusal, fmt.Errorf("record historical source pause ownership: %w", err))
@@ -845,6 +845,7 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 	}
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
+	plan.RecoveryCommand = runScopedCommand(run, "status")
 	if plan.RunID, err = dokployTrafficRunID(run.Run); err != nil {
 		return err
 	}
@@ -904,12 +905,12 @@ func applyLiveMigrationLocked(ctx context.Context, run loadedMigrationRun, stder
 		}
 	}
 	plan.OnProgress = &fn
-	fmt.Fprintf(stderr, "live mode: %s reachable; planned %d dokploy step(s)\n", client.BaseURL, len(plan.Steps))
+	fmt.Fprintf(stderr, "live mode: %s reachable; planned %s\n", client.BaseURL, pluralize(len(plan.Steps), "Dokploy step", "Dokploy steps"))
 	if resumeFrom > 0 && resumeFrom < len(plan.Steps) {
-		fmt.Fprintf(stderr, "live mode: resuming after %d completed step(s)\n", resumeFrom)
+		fmt.Fprintf(stderr, "live mode: resuming after %s completed\n", pluralize(resumeFrom, "step", "steps"))
 	}
 	if resumeFrom == len(plan.Steps) && len(plan.Steps) > 0 {
-		fmt.Fprintln(stderr, "live mode: all planned dokploy steps are already recorded as complete")
+		fmt.Fprintln(stderr, "live mode: all planned Dokploy steps are already recorded as complete")
 	}
 	if err := client.Apply(ctx, plan); err != nil {
 		return err
@@ -1337,7 +1338,7 @@ func attachLiveMigration(ctx context.Context, run loadedMigrationRun, appliedPat
 		entries := attachProgressEntries(plan.Steps, initialApplied, time.Time{})
 		emitAttachProgress(onProgress, entries)
 		if onProgress == nil {
-			fmt.Fprintf(stderr, "live mode: apply already complete (%d/%d step(s) recorded)\n", len(plan.Steps), len(plan.Steps))
+			fmt.Fprintf(stderr, "live mode: apply already complete (%s recorded)\n", pluralize(len(plan.Steps), "step", "steps"))
 		}
 		return nil
 	}
@@ -1355,7 +1356,7 @@ func attachLiveMigration(ctx context.Context, run loadedMigrationRun, appliedPat
 				writeAttachTextProgress(stderr, latest.progress, latest.progress.Total, "already recorded")
 			}
 		} else if onProgress == nil {
-			fmt.Fprintf(stderr, "live mode: 0/%d step(s) already recorded\n", len(plan.Steps))
+			fmt.Fprintf(stderr, "live mode: 0 of %s already recorded\n", pluralize(len(plan.Steps), "step", "steps"))
 		}
 	}
 
@@ -1480,7 +1481,7 @@ func latestAttachProgressEntry(entries []attachProgressEntry) (attachProgressEnt
 }
 
 func writeAttachTextProgress(stderr io.Writer, progress dokploy.StepProgress, total int, label string) {
-	fmt.Fprintf(stderr, "live mode: %d/%d step(s) %s; latest %s %s/%s %s\n", progress.Index+1, total, label, progress.Status, progress.Step.App, progress.Step.Ref, progress.Step.Kind)
+	fmt.Fprintf(stderr, "live mode: %d of %s %s; latest %s %s/%s %s\n", progress.Index+1, pluralize(total, "step", "steps"), label, progress.Status, progress.Step.App, progress.Step.Ref, progress.Step.Kind)
 }
 
 func attachExitResult(run loadedMigrationRun, steps []dokploy.Step, applied runApplied, attachedAt time.Time) error {
@@ -1489,12 +1490,12 @@ func attachExitResult(run loadedMigrationRun, steps []dokploy.Step, applied runA
 		if applied.SucceededAt != nil {
 			return nil
 		}
-		return fmt.Errorf("live migration recorded all %d step(s) but no successful live-apply outcome; rerun `%s` to continue", len(steps), liveApplyCommand(run))
+		return fmt.Errorf("live migration recorded %s but no successful live-apply outcome; rerun `%s` to continue", pluralize(len(steps), "step", "steps"), liveApplyCommand(run))
 	}
 	if failed, ok := latestAttachFailure(steps, applied, attachedAt); ok {
-		return fmt.Errorf("live migration exited after %d/%d recorded step(s); latest failure: %s %s/%s: %s", completed, len(steps), failed.Kind, failed.App, failed.Ref, failed.Error)
+		return fmt.Errorf("live migration exited after recording %d of %s; latest failure: %s %s/%s: %s", completed, pluralize(len(steps), "step", "steps"), failed.Kind, failed.App, failed.Ref, failed.Error)
 	}
-	return fmt.Errorf("live migration exited after %d/%d recorded step(s); rerun `%s` to continue", completed, len(steps), liveApplyCommand(run))
+	return fmt.Errorf("live migration exited after recording %d of %s; rerun `%s` to continue", completed, pluralize(len(steps), "step", "steps"), liveApplyCommand(run))
 }
 
 func latestAttachFailure(steps []dokploy.Step, applied runApplied, attachedAt time.Time) (appliedStep, bool) {
@@ -2687,7 +2688,7 @@ func appliedRequiresNewRun(applied runApplied) bool {
 
 func authorityRecoveryNextStep(run loadedMigrationRun, reason string) runNextStep {
 	return runNextStep{
-		Action: fmt.Sprintf("manually fence the other side and verify authority, then run `%s` for source or `%s` for target", authorityRecoveryCommand(run, dokployTrafficSource), authorityRecoveryCommand(run, dokployTrafficTarget)),
+		Action: authorityRecoveryChoice(run),
 		Reason: reason,
 	}
 }
@@ -3177,7 +3178,7 @@ func writeMigrationRunTextWithFooter(w io.Writer, heading string, summary migrat
 		fmt.Fprintf(w, "Platform/internal apps excluded: %d\n", summary.PlatformApps)
 	}
 	fmt.Fprintf(w, "Routes: %d cutover, %d rollback, %d commit\n", summary.CutoverRoutes, summary.RollbackRoutes, summary.CommitRoutes)
-	fmt.Fprintf(w, "State sync: %d resource step(s), %d pause/decision step(s)\n", summary.StateSteps, summary.PauseSteps)
+	fmt.Fprintf(w, "State sync: %s, %s\n", pluralize(summary.StateSteps, "resource step", "resource steps"), pluralize(summary.PauseSteps, "pause/decision step", "pause/decision steps"))
 	fmt.Fprintf(w, "Gates: %d blocked, %d need input, %d need decision\n", summary.GateCounts.Blocked, summary.GateCounts.NeedsInput, summary.GateCounts.NeedsDecision)
 	fmt.Fprintf(w, "Decisions: %d open\n", len(summary.Decisions))
 	if summary.Progress != "" {

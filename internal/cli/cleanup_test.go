@@ -1198,6 +1198,7 @@ func TestCleanupStaleProjectNameCollisions(t *testing.T) {
 	run := loadedMigrationRun{Prepare: preparer.Result{Apps: []preparer.AppPlan{
 		{Name: "api", TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{Project: preparer.DokployProject{Name: "proxy"}}}},
 		{Name: "worker", TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{Project: preparer.DokployProject{Name: "app"}}}},
+		{Name: "internal-router", Role: "platform", TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{Project: preparer.DokployProject{Name: "coolify-proxy"}}}},
 	}}}
 	collisions := cleanupStaleProjectNameCollisions(run, []string{"coolify-proxy", "proxy", "source"})
 	if len(collisions) != 1 || collisions[0] != "proxy" {

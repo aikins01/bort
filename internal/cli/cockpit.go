@@ -92,7 +92,7 @@ func writeAppFirstCockpitSummary(w io.Writer, run loadedMigrationRun, summary mi
 				}
 				if fix := issue.FixCommand(app.Name); fix != "" {
 					fmt.Fprintf(w, "          %s\n", st.fix(fix))
-				} else if next := issue.NextStep(); next != "" {
+				} else if next := issue.NextStepForRun(run); next != "" {
 					fmt.Fprintf(w, "          %s\n", st.muted("next: "+next))
 				}
 			}
@@ -472,14 +472,27 @@ func writeAuthorityRecoveryGuidance(w io.Writer, st *styler, run loadedMigration
 		fmt.Fprintln(w, st.muted(prefix+" Inspect and preserve both sides, establish authority manually, and start a fresh migration run."))
 		return
 	}
-	fmt.Fprintln(w, st.muted(prefix+" After manually fencing the other side and verifying the chosen writer and traffic authority, finish this owner-bound run with one of:"))
+	incomplete, incompleteErr := incompleteStagingTransferApps(run)
+	if incompleteErr == nil && len(incomplete) > 0 {
+		fmt.Fprintln(w, st.muted(prefix+" The staged state transfer for "+strings.Join(incomplete, ", ")+" did not finish, so only source recovery is available. After restoring the source writers and traffic, finish this owner-bound run with:"))
+	} else {
+		fmt.Fprintln(w, st.muted(prefix+" After manually fencing the other side and verifying the chosen writer and traffic authority, finish this owner-bound run with one of:"))
+	}
+	if len(appliedStagingTransferApps(run.Applied)) > 0 || len(incomplete) > 0 {
+		fmt.Fprintln(w, st.muted("  Before source recovery, remove (not just stop) every target container attached to the transferred bort staging volumes. Do not remove the bort-pin-* containers."))
+	}
 	fmt.Fprintf(w, "%s\n", st.muted("  source: `"+authorityRecoveryCommand(run, dokployTrafficSource)+"`"))
-	fmt.Fprintf(w, "%s\n", st.muted("  target: `"+authorityRecoveryCommand(run, dokployTrafficTarget)+"`"))
+	if incompleteErr != nil || len(incomplete) == 0 {
+		fmt.Fprintf(w, "%s\n", st.muted("  target: `"+authorityRecoveryCommand(run, dokployTrafficTarget)+"`"))
+	}
 }
 
 func writeManualRollbackRecoveryCommands(w io.Writer, st *styler, run loadedMigrationRun) {
 	if run.Run.ResolvedAuthority != "" || !authorityRecoveryAvailable(run) {
 		return
+	}
+	if len(appliedStagingTransferApps(run.Applied)) > 0 {
+		fmt.Fprintln(w, st.muted("  Before source recovery, remove (not just stop) every target container attached to the transferred bort staging volumes; the volumes and their data remain."))
 	}
 	fmt.Fprintln(w, st.muted("  After manually restoring and verifying source authority, record it with:"))
 	fmt.Fprintf(w, "%s\n", st.muted("  source: `"+authorityRecoveryCommand(run, dokployTrafficSource)+"`"))
@@ -521,7 +534,7 @@ func appliedFooter(applied runApplied) string {
 			errs++
 		}
 	}
-	parts := []string{fmt.Sprintf("Applied: %d step(s) recorded", len(applied.Steps))}
+	parts := []string{fmt.Sprintf("Applied: %s recorded", pluralize(len(applied.Steps), "step", "steps"))}
 	if ok > 0 {
 		parts = append(parts, fmt.Sprintf("%d ok", ok))
 	}

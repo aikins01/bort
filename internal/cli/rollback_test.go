@@ -868,10 +868,11 @@ fi
 		t.Fatalf("expected rollback progress header, got:\n%s", stderr.String())
 	}
 	for _, want := range []string{
-		"rollback [1/4] verify_source_health api: ok",
-		"rollback [2/4] stop_dokploy_proxy dokploy-traefik: ok",
-		"rollback [3/4] start_coolify_proxy coolify-proxy: ok",
-		"rollback [4/4] observe_rollback api: ok",
+		"rollback [1/5] resume_source api: ok",
+		"rollback [2/5] verify_source_health api: ok",
+		"rollback [3/5] stop_dokploy_proxy dokploy-traefik: ok",
+		"rollback [4/5] start_coolify_proxy coolify-proxy: ok",
+		"rollback [5/5] observe_rollback api: ok",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("expected rollback progress %q, got:\n%s", want, stderr.String())

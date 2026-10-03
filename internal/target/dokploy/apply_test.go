@@ -217,6 +217,35 @@ func TestLegacyPlanPreservesV1Alpha1RoutedStateOrder(t *testing.T) {
 	}
 }
 
+func TestLegacyPlanPreservesV1Alpha3UnroutedStateOrder(t *testing.T) {
+	app := preparer.AppPlan{
+		Name: "api",
+		TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{
+			ComposeApp: preparer.DokployComposeApp{Name: "api"},
+		}},
+	}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "volume", Name: "data", Target: "/data"}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{app}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{{Name: "api", Steps: []syncplan.Step{{
+		ResourceType: "volume",
+		ResourceRef:  "volume:web -> /data",
+		Strategy:     syncplan.StrategyDockerVolumeArchive,
+	}}}}}
+	legacy := LegacyPlanFromArtifactsV1Alpha3(prepare, sync, gateway.Result{})
+	current := PlanFromArtifacts(prepare, sync, gateway.Result{})
+
+	legacyKinds := stepKinds(legacy.Steps)
+	syncIndex := slices.Index(legacyKinds, StepSyncVolume)
+	pushIndex := slices.Index(legacyKinds, StepPushImage)
+	resumeIndex := slices.Index(legacyKinds, StepResumeSource)
+	if syncIndex < 0 || resumeIndex != syncIndex+1 || pushIndex != resumeIndex+1 {
+		t.Fatalf("legacy v1alpha3 order changed: %v", legacyKinds)
+	}
+	if slices.Contains(stepKinds(current.Steps), StepResumeSource) {
+		t.Fatalf("current staged plan resumed an unrouted source writer: %v", stepKinds(current.Steps))
+	}
+}
+
 func TestNewClientFromEnvRejectsRemoteHTTP(t *testing.T) {
 	t.Setenv(EnvBaseURL, "http://dokploy.example")
 	t.Setenv(EnvToken, "secret")
@@ -1391,7 +1420,7 @@ func TestApplyLeavesPausedSourceStoppedWhenGuardedDeploymentCannotBeQuiesced(t *
 		},
 		Prepare: preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}},
 	})
-	if err == nil || !strings.Contains(err.Error(), "leave any paused source applications stopped") {
+	if err == nil || !strings.Contains(err.Error(), "paused source applications remain stopped") || !strings.Contains(err.Error(), "bort status") {
 		t.Fatalf("expected fail-closed guarded deployment error, got %v", err)
 	}
 	if !mutationResponseMayHaveSucceeded(err) {
@@ -2406,5 +2435,39 @@ func TestApplyActivateRoutesDetectsMigratedVolumeDriftAfterDeploy(t *testing.T) 
 	}
 	if !fakeOutputCalled(&fakeDockerRunner{outputArgs: runner.outputArgs}, "stop", "web-id") {
 		t.Fatalf("expected drifted target container to stop, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestResolveRouteForComposeExpandsServiceAliases(t *testing.T) {
+	for name, compose := range map[string]string{
+		"direct alias": "x-services: &app-services\n  web:\n    image: example/api\n    expose:\n      - \"8080\"\nservices: *app-services\n",
+		"merge key":    "x-services: &app-services\n  web:\n    image: example/api\n    expose:\n      - \"8080\"\nservices:\n  <<: *app-services\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			route, err := resolveRouteForCompose(gateway.Route{Host: "api.example.com", ServiceName: "web", Port: "8080"}, compose, nil, preparer.ComposeSourceRaw)
+			if err != nil || route.ServiceName != "web" {
+				t.Fatalf("aliased Compose service was not resolved at apply time: route=%#v err=%v", route, err)
+			}
+		})
+	}
+}
+
+func TestComposeServiceSummariesExpandsSharedAliasChainsWithoutExponentialCost(t *testing.T) {
+	var compose strings.Builder
+	compose.WriteString("x-base: &level0\n  image: example/api\n  expose:\n    - \"8080\"\n")
+	for i := 1; i < 30; i++ {
+		fmt.Fprintf(&compose, "x-level%d: &level%d\n  <<: *level%d\n  back: *level%d\n", i, i, i-1, i-1)
+	}
+	compose.WriteString("services:\n  api:\n    <<: *level29\n")
+	summaries, err := composeServiceSummaries(compose.String())
+	if err != nil {
+		t.Fatalf("composeServiceSummaries: %v", err)
+	}
+	summary, ok := summaries["api"]
+	if !ok {
+		t.Fatalf("expected an api service summary, got %#v", summaries)
+	}
+	if _, ok := summary.Ports["8080"]; !ok {
+		t.Fatalf("port exposed through 30 levels of shared anchors was lost: %#v", summary.Ports)
 	}
 }

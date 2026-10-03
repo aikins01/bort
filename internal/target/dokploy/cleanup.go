@@ -773,7 +773,7 @@ func purgeSourceNetwork(ctx context.Context, runner dockerRunner, item SourcePur
 	}
 	result.Identity = identity
 	if _, err := runner.Output(ctx, "network", "rm", identity); err != nil {
-		if isDockerVolumeOrNetworkMissingErr(err) {
+		if isDockerResourceMissingErr(err, "network", identity) {
 			_, absent, inspectErr := inspectSourcePurgeNetworkIdentity(ctx, runner, name)
 			if inspectErr != nil {
 				result.Status = "error"
@@ -856,7 +856,7 @@ type sourcePurgeNetworkIdentity struct {
 func inspectSourcePurgeVolumeAbsent(ctx context.Context, runner dockerRunner, name string) (bool, error) {
 	out, err := runner.Output(ctx, "volume", "inspect", name)
 	if err != nil {
-		if isDockerVolumeOrNetworkMissingErr(err) {
+		if isDockerResourceMissingErr(err, "volume", name) {
 			return true, nil
 		}
 		return false, err
@@ -874,7 +874,7 @@ func inspectSourcePurgeVolumeAbsent(ctx context.Context, runner dockerRunner, na
 func inspectSourcePurgeNetworkIdentity(ctx context.Context, runner dockerRunner, name string) (string, bool, error) {
 	out, err := runner.Output(ctx, "network", "inspect", name)
 	if err != nil {
-		if isDockerVolumeOrNetworkMissingErr(err) {
+		if isDockerResourceMissingErr(err, "network", name) {
 			return "", true, nil
 		}
 		return "", false, err
@@ -1031,14 +1031,54 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func isDockerVolumeOrNetworkMissingErr(err error) bool {
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+func isDockerResourceMissingErr(err error, resource, name string) bool {
 	if err == nil {
 		return false
 	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "no such volume") ||
-		strings.Contains(message, "no such network") ||
-		(strings.Contains(message, "error response from daemon: network ") && strings.Contains(message, " not found"))
+	message := err.Error()
+	lower := asciiLower(message)
+	name = strings.TrimSpace(name)
+	legacyPrefix := "error: no such " + resource + ": "
+	if index := strings.LastIndex(lower, legacyPrefix); index >= 0 && dockerMessageNamesResource(strings.TrimSpace(message[index:]), legacyPrefix, name, "") {
+		return resource == "volume" || resource == "network"
+	}
+	marker := "error response from daemon: "
+	index := strings.LastIndex(lower, marker)
+	if index < 0 {
+		return false
+	}
+	detail := strings.TrimSpace(message[index+len(marker):])
+	switch resource {
+	case "volume":
+		return dockerMessageNamesResource(detail, "get ", name, ": no such volume") ||
+			dockerMessageNamesResource(detail, "remove ", name, ": no such volume") ||
+			dockerMessageNamesResource(detail, "volume ", name, " not found")
+	case "network":
+		return strings.EqualFold(detail, "network not found") ||
+			dockerMessageNamesResource(detail, "network ", name, " not found") ||
+			dockerMessageNamesResource(detail, "no such network: ", name, "")
+	default:
+		return false
+	}
+}
+
+func dockerMessageNamesResource(message, prefix, name, suffix string) bool {
+	if len(message) < len(prefix)+len(name)+len(suffix) ||
+		!strings.EqualFold(message[:len(prefix)], prefix) ||
+		!strings.EqualFold(message[len(message)-len(suffix):], suffix) {
+		return false
+	}
+	return message[len(prefix):len(message)-len(suffix)] == name
 }
 
 func cleanupProjectNames(names []string) []string {
