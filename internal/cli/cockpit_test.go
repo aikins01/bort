@@ -239,7 +239,14 @@ func TestAppliedFooterCountsOkAndError(t *testing.T) {
 		{Index: 2, Status: "skipped"},
 	}}
 	got := appliedFooter(applied)
-	if got != "Applied: 3 step(s) recorded · 2 ok · 1 failed" {
+	if got != "Applied: 3 steps recorded · 2 ok · 1 failed" {
+		t.Fatalf("unexpected footer: %q", got)
+	}
+}
+
+func TestAppliedFooterUsesSingularStep(t *testing.T) {
+	applied := runApplied{Steps: []appliedStep{{Index: 0, Status: "ok"}}}
+	if got := appliedFooter(applied); got != "Applied: 1 step recorded · 1 ok" {
 		t.Fatalf("unexpected footer: %q", got)
 	}
 }
@@ -1126,6 +1133,42 @@ func TestCockpitBlocksPlanLiveApplyWouldRefuse(t *testing.T) {
 		if strings.Contains(next.Action, "no state was transferred") || !strings.Contains(next.Action, "restore the earlier apps' source writers and traffic manually") || !strings.Contains(next.Action, "--authority source") || !strings.Contains(next.Reason, "earlier app's source may already be paused or handed off") {
 			t.Fatalf("refusal after another app's %s and resumed source released the run: %#v", name, next)
 		}
+	}
+}
+
+func TestMissingStagingPinStatusRequiresAuthorityRecovery(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	now := time.Now().UTC()
+	meta := persistRunFixture(t, migrationRun{
+		Name:         "missing-pin",
+		RunDir:       filepath.Join(t.TempDir(), "missing-pin"),
+		Target:       "dokploy",
+		CreatedAt:    now,
+		BundleDigest: "missing-pin-digest",
+	})
+	run := loadedMigrationRun{Run: meta, Applied: runApplied{
+		APIVersion:       appliedAPIVersion,
+		RecoveryProtocol: appliedRecoveryProtocol,
+		PlanVersion:      appliedPlanCurrent,
+		Steps: []appliedStep{{
+			Index:                     2,
+			Kind:                      string(dokploy.StepRestoreDataStore),
+			App:                       "api",
+			Ref:                       "postgres",
+			Status:                    string(dokploy.StepStatusError),
+			Error:                     "required staging volume pin is missing after state transfer",
+			AuthorityRecoveryRequired: true,
+		}},
+	}}
+	if err := claimDokployHostOwnership(run.Run, "http://127.0.0.1:3030", "cred-1"); err != nil {
+		t.Fatal(err)
+	}
+	if phase := migrationRunPhase(run); phase != "authority-ambiguous" {
+		t.Fatalf("missing-pin phase = %q, want authority-ambiguous", phase)
+	}
+	next := nextSafeStep(run, nil)
+	if !strings.Contains(next.Action, "recover-authority --authority source") || !strings.Contains(next.Action, "recover-authority --authority target") || strings.Contains(next.Action, "migrate --live") || strings.Contains(next.Action, "resume") {
+		t.Fatalf("missing-pin status offered an impossible retry: %#v", next)
 	}
 }
 

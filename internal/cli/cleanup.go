@@ -1323,6 +1323,9 @@ func cleanupStaleProjectNameCollisions(run loadedMigrationRun, names []string) [
 	collisions := []string{}
 	seen := map[string]struct{}{}
 	for _, app := range run.Prepare.Apps {
+		if isPlatformRunApp(app.Role) {
+			continue
+		}
 		if app.TargetResources == nil || app.TargetResources.Dokploy == nil {
 			continue
 		}

@@ -20,7 +20,8 @@ const (
 	appliedPlanV1Alpha1     = "v1alpha1"
 	appliedPlanV1Alpha2     = "v1alpha2"
 	appliedPlanV1Alpha3     = "v1alpha3"
-	appliedPlanCurrent      = appliedPlanV1Alpha3
+	appliedPlanV1Alpha4     = "v1alpha4"
+	appliedPlanCurrent      = appliedPlanV1Alpha4
 )
 
 // runApplied is the per-run audit ledger. it captures the outcome of every
@@ -41,15 +42,16 @@ type runApplied struct {
 }
 
 type appliedStep struct {
-	Index             int       `json:"index"`
-	Kind              string    `json:"kind"`
-	App               string    `json:"app"`
-	Ref               string    `json:"ref"`
-	Status            string    `json:"status"`
-	UpdatedAt         time.Time `json:"updatedAt"`
-	Error             string    `json:"error,omitempty"`
-	MutationAmbiguous *bool     `json:"mutationAmbiguous,omitempty"`
-	RequiresNewRun    bool      `json:"requiresNewRun,omitempty"`
+	Index                     int       `json:"index"`
+	Kind                      string    `json:"kind"`
+	App                       string    `json:"app"`
+	Ref                       string    `json:"ref"`
+	Status                    string    `json:"status"`
+	UpdatedAt                 time.Time `json:"updatedAt"`
+	Error                     string    `json:"error,omitempty"`
+	MutationAmbiguous         *bool     `json:"mutationAmbiguous,omitempty"`
+	AuthorityRecoveryRequired bool      `json:"authorityRecoveryRequired,omitempty"`
+	RequiresNewRun            bool      `json:"requiresNewRun,omitempty"`
 }
 
 type appliedApp struct {
@@ -78,7 +80,7 @@ func readRunApplied(path string, run migrationRun) (runApplied, error) {
 		return runApplied{}, fmt.Errorf("%s has unsupported apiVersion %q (want %q or %q)", path, applied.APIVersion, appliedAPIVersion, appliedLegacyAPIVersion)
 	}
 	switch applied.PlanVersion {
-	case "", appliedPlanV1Alpha1, appliedPlanV1Alpha2, appliedPlanV1Alpha3:
+	case "", appliedPlanV1Alpha1, appliedPlanV1Alpha2, appliedPlanV1Alpha3, appliedPlanV1Alpha4:
 	default:
 		return runApplied{}, fmt.Errorf("%s has unsupported planVersion %q", path, applied.PlanVersion)
 	}
@@ -149,6 +151,7 @@ func recordAppliedStep(applied runApplied, progress dokploy.StepProgress) runApp
 		step.Error = progress.Err.Error()
 		ambiguous := progress.MutationAmbiguous
 		step.MutationAmbiguous = &ambiguous
+		step.AuthorityRecoveryRequired = progress.AuthorityRecoveryRequired
 		step.RequiresNewRun = progress.RequiresNewRun
 	}
 	if progress.Step.App != "" && progress.Target != nil {
@@ -218,7 +221,7 @@ func (l *appliedLedger) PrepareRetry(index int) error {
 			next.Steps = append(next.Steps, step)
 		}
 	}
-	if index == 0 && !appliedHasHistory(next) {
+	if (index == 0 && !appliedHasHistory(next)) || appliedV1Alpha3UsesCurrentPlan(l.state) {
 		next.PlanVersion = appliedPlanCurrent
 	}
 	if len(next.Steps) == len(l.state.Steps) && next.RecoveryProtocol == appliedRecoveryProtocol && next.APIVersion == appliedAPIVersion && next.PlanVersion == l.state.PlanVersion {
@@ -369,9 +372,20 @@ func livePlanForApplied(run loadedMigrationRun, applied runApplied) dokploy.Plan
 		return dokploy.LegacyPlanFromArtifactsV1Alpha1(run.Prepare, run.Sync, run.Cutover)
 	case appliedPlanV1Alpha2:
 		return dokploy.PlanFromArtifactsV1Alpha2(run.Prepare, run.Sync, run.Cutover)
+	case appliedPlanV1Alpha3:
+		if appliedV1Alpha3UsesCurrentPlan(applied) {
+			return dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
+		}
+		return dokploy.LegacyPlanFromArtifactsV1Alpha3(run.Prepare, run.Sync, run.Cutover)
 	default:
 		return dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
 	}
+}
+
+func appliedV1Alpha3UsesCurrentPlan(applied runApplied) bool {
+	return appliedPlanVersion(applied) == appliedPlanV1Alpha3 &&
+		applied.SucceededAt == nil &&
+		!appliedV1Alpha3StateTransferMayHaveRun(applied)
 }
 
 // appliedPlanTransfersStateInPlace reports whether the ledger is pinned to
@@ -397,6 +411,14 @@ const (
 func appliedAuthorityAmbiguity(applied runApplied) applyAuthorityAmbiguity {
 	if applied.SucceededAt != nil {
 		return applyAuthorityUnambiguous
+	}
+	for _, recorded := range applied.Steps {
+		if recorded.AuthorityRecoveryRequired {
+			return applyWriterAuthorityAmbiguous
+		}
+	}
+	if appliedPlanVersion(applied) == appliedPlanV1Alpha3 && appliedV1Alpha3StateTransferMayHaveRun(applied) {
+		return applyWriterAuthorityAmbiguous
 	}
 	if applied.APIVersion == appliedAPIVersion && applied.RecoveryProtocol == appliedRecoveryProtocol {
 		for _, recorded := range applied.Steps {
@@ -426,6 +448,47 @@ func appliedAuthorityAmbiguity(applied runApplied) applyAuthorityAmbiguity {
 		}
 	}
 	return ambiguity
+}
+
+func appliedV1Alpha3StateTransferMayHaveRun(applied runApplied) bool {
+	for _, recorded := range applied.Steps {
+		kind := dokploy.StepKind(recorded.Kind)
+		if (kind == dokploy.StepRestoreDataStore || kind == dokploy.StepSyncVolume) && appliedStepMayHaveRun(recorded) {
+			return true
+		}
+	}
+	return false
+}
+
+func appliedStagingTransferApps(applied runApplied) []string {
+	apps := map[string]struct{}{}
+	for _, recorded := range applied.Steps {
+		kind := dokploy.StepKind(recorded.Kind)
+		if recorded.App != "" && (kind == dokploy.StepRestoreDataStore || kind == dokploy.StepSyncVolume) && appliedStepMayHaveRun(recorded) {
+			apps[recorded.App] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(apps))
+	for app := range apps {
+		result = append(result, app)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func appliedHandedOffApps(applied runApplied) []string {
+	apps := map[string]struct{}{}
+	for _, recorded := range applied.Steps {
+		if recorded.App != "" && dokploy.StepKind(recorded.Kind) == dokploy.StepPushImage && appliedStepCompleted(recorded) {
+			apps[recorded.App] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(apps))
+	for app := range apps {
+		result = append(result, app)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func appliedStepMutatesDokploy(kind string) bool {

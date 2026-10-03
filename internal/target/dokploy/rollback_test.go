@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -60,7 +61,7 @@ func TestPlanForRollbackReturnsTrafficOnlyForStatelessApps(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := stepKinds(plan.Steps)
-	want := []StepKind{StepVerifySourceHealth, StepStopDokployProxy, StepStartCoolifyProxy, StepObserveRollback}
+	want := []StepKind{StepResumeSource, StepVerifySourceHealth, StepStopDokployProxy, StepStartCoolifyProxy, StepObserveRollback}
 	if len(got) != len(want) {
 		t.Fatalf("expected stateless traffic rollback %v, got %v", want, got)
 	}
@@ -87,7 +88,7 @@ func TestPlanForRollbackIgnoresSkippedPlatformState(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := stepKinds(plan.Steps)
-	want := []StepKind{StepVerifySourceHealth, StepStopDokployProxy, StepStartCoolifyProxy, StepObserveRollback}
+	want := []StepKind{StepResumeSource, StepVerifySourceHealth, StepStopDokployProxy, StepStartCoolifyProxy, StepObserveRollback}
 	if len(got) != len(want) {
 		t.Fatalf("expected skipped platform state to retain stateless rollback %v, got %v", want, got)
 	}
@@ -105,6 +106,55 @@ func TestPlanForRollbackSkipsProxySwapWithoutRoutes(t *testing.T) {
 	}
 	if len(plan.Steps) != 0 {
 		t.Fatalf("expected no rollback steps without state transfer or routes, got %v", plan.Steps)
+	}
+}
+
+func TestPlanForRollbackResumesPausedRoutedStatelessSourcesBeforeVerifying(t *testing.T) {
+	web := preparer.AppPlan{Name: "web"}
+	web.Resources.SourceServices = []preparer.SourceServiceRef{{ServiceName: "web", ContainerID: "web-id"}}
+	api := preparer.AppPlan{Name: "api"}
+	api.Resources.SourceServices = []preparer.SourceServiceRef{{ServiceName: "api", ContainerID: "api-id"}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{web, api}}
+	cutover := gateway.Result{Apps: []gateway.AppPlan{
+		{Name: "web", Routes: []gateway.Route{{Host: "web.example.com"}}},
+		{Name: "api", Routes: []gateway.Route{{Host: "api.example.com"}}},
+	}}
+	plan, err := PlanForRollback(prepare, syncplan.Result{}, cutover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := stepKinds(plan.Steps)
+	want := []StepKind{StepResumeSource, StepResumeSource, StepVerifySourceHealth, StepVerifySourceHealth, StepStopDokployProxy, StepStartCoolifyProxy, StepObserveRollback, StepObserveRollback}
+	if !slices.Equal(got, want) {
+		t.Fatalf("expected rollback to resume both paused routed sources before verification, want %v got %v", want, got)
+	}
+	resumed := []string{plan.Steps[0].App, plan.Steps[1].App}
+	if !slices.Equal(resumed, []string{"web", "api"}) {
+		t.Fatalf("expected resumes in cutover order, got %v", resumed)
+	}
+}
+
+func TestPlanForRollbackRefusesWhenAnyPausedSourceIsStateful(t *testing.T) {
+	prepare := rollbackPrepareFixture()
+	web := preparer.AppPlan{Name: "web"}
+	web.Resources.SourceServices = []preparer.SourceServiceRef{{ServiceName: "web", ContainerID: "web-id"}}
+	prepare.Apps = append(prepare.Apps, web)
+	cutover := rollbackCutoverFixture()
+	cutover.Apps = append(cutover.Apps, gateway.AppPlan{Name: "web", Routes: []gateway.Route{{Host: "web.example.com"}}})
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{{
+		Name: "api",
+		Steps: []syncplan.Step{{
+			ResourceType: "volume",
+			ResourceRef:  "volume:web -> /data",
+			Strategy:     syncplan.StrategyDockerVolumeArchive,
+		}},
+	}}}
+	plan, err := PlanForRollback(prepare, sync, cutover)
+	if err == nil || !strings.Contains(err.Error(), "no durable application fence") || !strings.Contains(err.Error(), "api") {
+		t.Fatalf("expected stateful refusal with a routed stateless app present, got plan=%#v err=%v", plan, err)
+	}
+	if strings.Contains(err.Error(), "web") {
+		t.Fatalf("routed stateless pause must not block rollback, got %v", err)
 	}
 }
 

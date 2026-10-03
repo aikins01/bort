@@ -194,6 +194,19 @@ func applyRollbackFromArgs(ctx context.Context, runRef, confirm string, stderr i
 		return err
 	}
 	if run.Run.RolledBackAt != nil {
+		if run.Run.ResolvedAuthority == dokployTrafficSource && run.Run.AuthorityFinalizedAt == nil {
+			if err := releaseRecoveredAuthorityStagingVolumePins(ctx, run, false); err != nil {
+				return fmt.Errorf("complete rolled-back source-authority staging-volume validation: %w", err)
+			}
+			if err := releaseDokployTrafficOwner(run.Run); err != nil {
+				return fmt.Errorf("release rolled-back source-authority host ownership: %w", err)
+			}
+			if err := markRunAuthorityFinalizedLocked(run.Run); err != nil {
+				return fmt.Errorf("record rolled-back source-authority finalization: %w", err)
+			}
+			fmt.Fprintf(stderr, "rollback recovery complete for run %s: staging-volume attachments validated and host ownership released\n", run.Run.Name)
+			return nil
+		}
 		plan, planErr := dokploy.PlanForRollback(run.Prepare, run.Sync, run.Cutover)
 		if planErr != nil || planRequiresDokployHostOwner(run, plan) {
 			if err := releaseDokployTrafficOwner(run.Run); err != nil {
@@ -255,6 +268,7 @@ func applyRollbackFromArgs(ctx context.Context, runRef, confirm string, stderr i
 	client := &dokploy.Client{}
 	plan.RunName = run.Run.Name
 	plan.RunDir = run.Run.RunDir
+	plan.RecoveryCommand = runScopedCommand(run, "status")
 	plan.ApprovedPrepareDecisions = approvedPrepareDecisions(run)
 	onProgress := func(p dokploy.StepProgress) {
 		target := p.Step.App
@@ -271,9 +285,12 @@ func applyRollbackFromArgs(ctx context.Context, runRef, confirm string, stderr i
 	if err := markRunRollbackStartedLocked(run.Run); err != nil {
 		return fmt.Errorf("record rollback start: %w", err)
 	}
-	fmt.Fprintf(stderr, "rollback live: run %s; planned %d step(s) to return traffic to the source\n", run.Run.Name, len(plan.Steps))
+	fmt.Fprintf(stderr, "rollback live: run %s; planned %s to return traffic to the source\n", run.Run.Name, pluralize(len(plan.Steps), "step", "steps"))
 	if err := client.Apply(ctx, plan); err != nil {
 		return err
+	}
+	if err := client.FinalizeSourceResumes(plan); err != nil {
+		return fmt.Errorf("rollback completed, but its source resume state could not be finalized: %w", err)
 	}
 	if planChangesDokployTraffic(plan) {
 		if err := client.ReconcileSourceTrafficAuthority(ctx); err != nil {

@@ -28,12 +28,23 @@ source retirement starts, even if commit is interrupted. Rerun `commit --apply`
 to finish an interrupted acceptance.
 
 For a Coolify source, `commit --apply` refuses because Bort cannot disable
-queued or future Coolify deployments. Disable future deployments in Coolify for
-the reviewed apps, manually retire every reviewed source app (and the source
-proxy when the cutover moved routes), and verify they remain retired. Then run
-the exact
+queued or future Coolify deployments. If live apply already fenced Coolify for
+a stateful move, keep the restart policy you recorded before that fence: the
+container's policy now reads `no`, so do not record it again. Otherwise, record
+the Coolify control plane's restart policy with
+`sudo docker --host unix:///var/run/docker.sock inspect --format '{{.HostConfig.RestartPolicy.Name}}' coolify`,
+then run
+`sudo docker --host unix:///var/run/docker.sock update --restart=no coolify && sudo docker --host unix:///var/run/docker.sock stop coolify`
+even if it is already stopped. Remove the reviewed source app containers (and the source proxy
+container when the cutover moved routes) with the exact `sudo docker rm -f ...`
+command Bort prints, and verify they stay removed.
+Then run the exact
 `recover-authority --authority target --source-retired --confirm ...` command
-Bort prints. This records acceptance without mutating source resources.
+Bort prints. This records acceptance without mutating source resources. Leave
+Coolify stopped afterwards when nothing else on the host needs it: starting it
+again can recreate its proxy and redeploy the removed apps. If other apps still
+need Coolify, restore the restart policy you recorded before fencing, start
+it, and immediately delete the migrated apps in Coolify.
 
 Do not accept the target until you have independently checked it. Bort does not
 measure the rollback window or block acceptance when the window has not passed.

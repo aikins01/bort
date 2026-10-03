@@ -12,12 +12,15 @@ import (
 	"github.com/aikins01/bort/internal/analyzer"
 	"github.com/aikins01/bort/internal/exporter"
 	"github.com/aikins01/bort/internal/planutil"
+	"gopkg.in/yaml.v3"
 )
 
 type Status string
 
 const (
-	APIVersion = "bort.prepare/v1alpha1"
+	APIVersion             = "bort.prepare/v1alpha1"
+	ComposeSourceRaw       = exporter.ComposeSourceRaw
+	ComposeSourceGenerated = exporter.ComposeSourceGenerated
 
 	StatusGreen  Status = "green"
 	StatusYellow Status = "yellow"
@@ -52,6 +55,7 @@ const (
 	GateEnvValuesRedacted              = "env.values_redacted"
 	GateDomainHostMissing              = "domain.host_missing"
 	GateDomainServiceMissing           = "domain.service_missing"
+	GateDomainServiceNotInCompose      = "domain.service_not_in_compose"
 	GateRoutesNone                     = "routes.none"
 	GateDataStoreManualReview          = "data_store.manual_review"
 	GateDataStorePrepareRequired       = "data_store.prepare_required"
@@ -146,6 +150,7 @@ type AppResource struct {
 	Type           string    `json:"type"`
 	Name           string    `json:"name"`
 	ComposePath    string    `json:"composePath"`
+	ComposeSource  string    `json:"composeSource,omitempty"`
 	ComposeMissing bool      `json:"composeMissing,omitempty"`
 	MissingInputs  []string  `json:"missingInputs,omitempty"`
 	Readiness      Readiness `json:"readiness"`
@@ -276,9 +281,16 @@ func planApp(bundleDir, target string, app exporter.AppSummary) (AppPlan, error)
 	if err != nil {
 		return AppPlan{}, fmt.Errorf("read topology for %s: %w", app.Name, err)
 	}
+	composeSource, err := app.EffectiveComposeSource()
+	if err != nil {
+		return AppPlan{}, fmt.Errorf("read compose source for %s: %w", app.Name, err)
+	}
 
 	plan := AppPlan{Name: app.Name, Directory: app.Directory, Platform: app.Platform, Role: app.Role, ProjectGroup: projectGroup(app.ProjectGroup), Status: StatusGreen, Readiness: ReadinessReadyToCreate}
-	plan.Resources = resourceSpecs(app, appDir, topology)
+	plan.Resources, err = resourceSpecs(app, appDir, topology, composeSource)
+	if err != nil {
+		return AppPlan{}, fmt.Errorf("read compose services for %s: %w", app.Name, err)
+	}
 	addReadinessGates(&plan, topology)
 	plan.add(SeverityInfo, "compose", fmt.Sprintf("would create %s compose app from compose.yaml", target))
 	addSourceControlActions(&plan)
@@ -309,23 +321,65 @@ func projectGroup(group *exporter.ProjectGroup) *ProjectGroup {
 	return &ProjectGroup{Name: group.Name, Environment: group.Environment, Source: group.Source}
 }
 
-func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Topology) ResourceSpecs {
+func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Topology, composeSource string) (ResourceSpecs, error) {
+	composePath := filepath.Join(appDir, "compose.yaml")
+	composeContents, composeErr := os.ReadFile(composePath)
 	resources := ResourceSpecs{
-		App:      appResource(app.Name, appDir),
+		App:      appResource(app.Name, composeSource, composeContents, composeErr),
 		EnvFiles: envFileResources(appDir, app.PrivateEnvValues),
 	}
 	resources.SourceControl = sourceControlResource(topology.SourceControl)
+	for _, service := range topology.SourceServices {
+		if service.ContainerID == "" && service.ContainerName == "" {
+			continue
+		}
+		resources.SourceServices = append(resources.SourceServices, SourceServiceRef{
+			ServiceName:   service.ServiceName,
+			ContainerID:   service.ContainerID,
+			ContainerName: service.ContainerName,
+		})
+	}
+	composeServices := map[string]struct{}{}
+	if !resources.App.ComposeMissing {
+		var err error
+		composeServices, err = composeServiceNames(composeContents)
+		if err != nil {
+			return ResourceSpecs{}, err
+		}
+	}
+	rawServiceNamesByContainer := make(map[string]string, len(resources.SourceServices))
+	routesNameContainers := strings.TrimSpace(app.ComposeSource) == ""
+	for _, sourceService := range resources.SourceServices {
+		containerName := strings.TrimSpace(sourceService.ContainerName)
+		serviceName := strings.TrimSpace(sourceService.ServiceName)
+		if !routesNameContainers || containerName == "" {
+			continue
+		}
+		if _, exists := rawServiceNamesByContainer[containerName]; exists {
+			continue
+		}
+		if _, exists := composeServices[serviceName]; exists {
+			rawServiceNamesByContainer[containerName] = serviceName
+		}
+	}
 
 	for _, route := range topology.Routes {
+		serviceName := strings.TrimSpace(route.ServiceName)
+		serviceExists := true
+		if !resources.App.ComposeMissing {
+			serviceName, serviceExists = preparedServiceName(serviceName, route.Source, rawServiceNamesByContainer, composeSource, composeServices)
+		}
 		readiness := ReadinessReadyToCreate
 		if strings.TrimSpace(route.Host) == "" {
 			readiness = ReadinessNeedsInput
-		} else if strings.TrimSpace(route.ServiceName) == "" {
-			readiness = ReadinessNeedsDecision
+		} else if strings.TrimSpace(serviceName) == "" {
+			readiness = ReadinessBlocked
+		} else if !serviceExists {
+			readiness = ReadinessBlocked
 		}
 		resources.Domains = append(resources.Domains, DomainResource{
 			Host:        route.Host,
-			ServiceName: route.ServiceName,
+			ServiceName: serviceName,
 			Port:        route.Port,
 			Source:      route.Source,
 			Readiness:   readiness,
@@ -350,30 +404,64 @@ func resourceSpecs(app exporter.AppSummary, appDir string, topology analyzer.Top
 	for _, link := range topology.LinkedResources {
 		resources.LinkedResources = append(resources.LinkedResources, linkedResourceCandidate(link))
 	}
-	for _, service := range topology.SourceServices {
-		if service.ContainerID == "" && service.ContainerName == "" {
-			continue
-		}
-		resources.SourceServices = append(resources.SourceServices, SourceServiceRef{
-			ServiceName:   service.ServiceName,
-			ContainerID:   service.ContainerID,
-			ContainerName: service.ContainerName,
-		})
-	}
 
-	return resources
+	return resources, nil
 }
 
-func appResource(name, appDir string) AppResource {
+func composeServiceNames(contents []byte) (map[string]struct{}, error) {
+	var document struct {
+		Services map[string]yaml.Node `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(contents, &document); err != nil {
+		return nil, err
+	}
+	names := make(map[string]struct{}, len(document.Services))
+	for name := range document.Services {
+		names[name] = struct{}{}
+	}
+	return names, nil
+}
+
+func preparedServiceName(serviceName, routeSource string, rawServiceNamesByContainer map[string]string, composeSource string, composeServices map[string]struct{}) (string, bool) {
+	if len(composeServices) == 1 && (serviceName == "" || (composeSource == ComposeSourceRaw && routeSource == "fqdn")) {
+		for name := range composeServices {
+			return name, true
+		}
+	}
+	switch composeSource {
+	case ComposeSourceGenerated:
+		if _, ok := composeServices[serviceName]; ok {
+			return serviceName, true
+		}
+		generatedName := planutil.Slug(serviceName)
+		if generatedName == "" && serviceName != "" {
+			generatedName = "app"
+		}
+		if _, ok := composeServices[generatedName]; ok {
+			return generatedName, true
+		}
+		return serviceName, false
+	case ComposeSourceRaw:
+		if mappedService, ok := rawServiceNamesByContainer[serviceName]; ok {
+			return mappedService, true
+		}
+		_, ok := composeServices[serviceName]
+		return serviceName, ok
+	default:
+		return serviceName, false
+	}
+}
+
+func appResource(name, composeSource string, contents []byte, composeErr error) AppResource {
 	resource := AppResource{
-		Type:        "compose",
-		Name:        name,
-		ComposePath: "compose.yaml",
-		Readiness:   ReadinessReadyToCreate,
+		Type:          "compose",
+		Name:          name,
+		ComposePath:   "compose.yaml",
+		ComposeSource: composeSource,
+		Readiness:     ReadinessReadyToCreate,
 	}
 
-	contents, err := os.ReadFile(filepath.Join(appDir, resource.ComposePath))
-	if err != nil {
+	if composeErr != nil {
 		resource.Readiness = ReadinessBlocked
 		resource.ComposeMissing = true
 		return resource
@@ -551,7 +639,9 @@ func addReadinessGates(plan *AppPlan, topology analyzer.Topology) {
 		if strings.TrimSpace(domain.Host) == "" {
 			plan.addGate(ReadinessNeedsInput, SeverityWarn, GateDomainHostMissing, "domain route has no host and must be filled before deploy", resourceRef, nil)
 		} else if strings.TrimSpace(domain.ServiceName) == "" {
-			plan.addGate(ReadinessNeedsDecision, SeverityWarn, GateDomainServiceMissing, fmt.Sprintf("domain %s has no service mapping; confirm target service manually", domain.Host), resourceRef, nil)
+			plan.addGate(ReadinessBlocked, SeverityError, GateDomainServiceMissing, fmt.Sprintf("domain %s has no service mapping and compose.yaml does not identify a unique service; rescan or correct the route before deploy", domain.Host), resourceRef, nil)
+		} else if domain.Readiness == ReadinessBlocked {
+			plan.addGate(ReadinessBlocked, SeverityError, GateDomainServiceNotInCompose, fmt.Sprintf("domain %s points at service %q, which is not present in compose.yaml; rescan or correct the route before deploy", domain.Host, domain.ServiceName), resourceRef, []string{domain.ServiceName})
 		}
 	}
 	if len(plan.Resources.Domains) == 0 {

@@ -18,7 +18,14 @@ var sourceHealthPollInterval = 2 * time.Second
 // PlanForRollback builds the steps that return traffic to the source.
 func PlanForRollback(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result) (Plan, error) {
 	plan := Plan{Prepare: prepare, Cutover: cutover, stepTimeout: dockerStartTimeout}
-	statefulApps := []string{}
+	statefulApps := map[string]struct{}{}
+	for _, app := range sync.Apps {
+		if dataStoreSteps, volumeSteps := appStateSteps(prepare, app); len(dataStoreSteps) > 0 || len(volumeSteps) > 0 {
+			statefulApps[app.Name] = struct{}{}
+		}
+	}
+	statefulPauses := []string{}
+	pausedStateless := []string{}
 	seen := map[string]struct{}{}
 	livePlan := PlanFromArtifacts(prepare, sync, cutover)
 	for _, step := range livePlan.Steps {
@@ -29,12 +36,19 @@ func PlanForRollback(prepare preparer.Result, sync syncplan.Result, cutover gate
 			continue
 		}
 		seen[step.App] = struct{}{}
-		statefulApps = append(statefulApps, step.App)
+		if _, stateful := statefulApps[step.App]; stateful {
+			statefulPauses = append(statefulPauses, step.App)
+			continue
+		}
+		pausedStateless = append(pausedStateless, step.App)
 	}
-	if len(statefulApps) > 0 {
-		return Plan{}, fmt.Errorf("automatic rollback is unsafe for stateful app(s) %s: Dokploy has no durable application fence that prevents a queued or future deployment from restarting target writers after source writers resume; preserve both sides and establish writer and traffic authority manually", strings.Join(statefulApps, ", "))
+	if len(statefulPauses) > 0 {
+		return Plan{}, fmt.Errorf("automatic rollback is unsafe for stateful app(s) %s: Dokploy has no durable application fence that prevents a queued or future deployment from restarting target writers after source writers resume; preserve both sides and establish writer and traffic authority manually", strings.Join(statefulPauses, ", "))
 	}
 	if cutoverPlanHasRoutes(cutover) {
+		for _, app := range pausedStateless {
+			plan.Steps = append(plan.Steps, Step{Kind: StepResumeSource, App: app, Ref: app})
+		}
 		statelessApps := []preparer.AppPlan{}
 		for _, app := range prepare.Apps {
 			if len(sourceQuiesceTargetRefs(app)) > 0 {

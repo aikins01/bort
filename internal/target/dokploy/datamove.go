@@ -77,17 +77,23 @@ func (c *Client) applySyncVolume(ctx context.Context, actx *applyContext, step S
 // source container set is inspected before and after the copy and any
 // restart in between invalidates the transfer.
 func (c *Client) syncVolumeToStaging(ctx context.Context, runner dockerRunner, actx *applyContext, appName string, app preparer.AppPlan, staged stagedVolume) error {
+	entry := actx.entry(appName)
+	allowPinCreate := !stagingTransferStarted(entry)
 	if err := actx.forgetMigratedVolumeMount(appName, staged.Service, staged.Target); err != nil {
-		return err
-	}
-	if err := ensureStagingVolume(ctx, runner, actx.plan, appName, staged); err != nil {
 		return err
 	}
 	srcVolName, err := resolveSourceVolume(ctx, runner, staged.Source)
 	if err != nil {
 		return err
 	}
-	if err := requireStagingVolumeUnattached(ctx, runner, staged); err != nil {
+	allStaged, pin, err := ensureAppStagingVolumePin(ctx, runner, actx, appName, allowPinCreate)
+	if err != nil {
+		return err
+	}
+	if err := requireStagingVolumeAttachments(ctx, runner, allStaged, []string{pin.containerID}); err != nil {
+		return err
+	}
+	if err := actx.markStagingTransferStarted(appName); err != nil {
 		return err
 	}
 	before, err := inspectSourceQuiesceTargets(ctx, runner, app)
@@ -107,7 +113,13 @@ func (c *Client) syncVolumeToStaging(ctx context.Context, runner dockerRunner, a
 	if err := requireSourceQuiesceUnchanged(before, after); err != nil {
 		return err
 	}
-	if err := requireStagingVolumeUnattached(ctx, runner, staged); err != nil {
+	if err := requireStagingVolumesOwned(ctx, runner, actx.plan, appName, allStaged); err != nil {
+		return err
+	}
+	if err := requireStagingVolumePin(ctx, runner, actx.plan, allStaged, pin); err != nil {
+		return err
+	}
+	if err := requireStagingVolumeAttachments(ctx, runner, allStaged, []string{pin.containerID}); err != nil {
 		return err
 	}
 	return actx.recordMigratedVolumeMount(appName, migratedVolumeMount{
@@ -207,11 +219,15 @@ func migratedMountKey(service, target string) string {
 const migratedVolumeMountsArtifact = "migrated-volumes.json"
 
 type migratedVolumeMountsState struct {
-	APIVersion string                           `json:"apiVersion"`
-	Apps       map[string][]migratedVolumeMount `json:"apps,omitempty"`
+	APIVersion  string                           `json:"apiVersion"`
+	Apps        map[string][]migratedVolumeMount `json:"apps,omitempty"`
+	StartedApps []string                         `json:"startedApps,omitempty"`
 }
 
-const migratedVolumeMountsAPIVersion = "bort.migrated-volumes/v1alpha1"
+const (
+	migratedVolumeMountsLegacyAPIVersion = "bort.migrated-volumes/v1alpha1"
+	migratedVolumeMountsAPIVersion       = "bort.migrated-volumes/v1alpha2"
+)
 
 func (a *applyContext) persistMigratedVolumeMounts() error {
 	if a == nil || strings.TrimSpace(a.plan.RunDir) == "" {
@@ -226,6 +242,9 @@ func (a *applyContext) persistMigratedVolumeMounts() error {
 		Apps:       map[string][]migratedVolumeMount{},
 	}
 	for app, entry := range a.cache {
+		if stagingTransferStarted(entry) {
+			state.StartedApps = append(state.StartedApps, app)
+		}
 		if len(entry.MigratedVolumeMounts) == 0 {
 			continue
 		}
@@ -238,6 +257,7 @@ func (a *applyContext) persistMigratedVolumeMounts() error {
 		})
 		state.Apps[app] = mounts
 	}
+	sort.Strings(state.StartedApps)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("prepare migrated volume state dir: %w", err)
 	}
@@ -271,11 +291,19 @@ func (a *applyContext) loadMigratedVolumeMounts() error {
 	if err := json.Unmarshal(contents, &state); err != nil {
 		return fmt.Errorf("decode migrated volume state: %w", err)
 	}
-	if state.APIVersion != "" && state.APIVersion != migratedVolumeMountsAPIVersion {
+	if state.APIVersion != "" && state.APIVersion != migratedVolumeMountsLegacyAPIVersion && state.APIVersion != migratedVolumeMountsAPIVersion {
 		return fmt.Errorf("%s has unsupported apiVersion %q (want %q)", path, state.APIVersion, migratedVolumeMountsAPIVersion)
+	}
+	for _, app := range state.StartedApps {
+		if strings.TrimSpace(app) != "" {
+			a.entry(app).StagingTransferStarted = true
+		}
 	}
 	for app, mounts := range state.Apps {
 		entry := a.entry(app)
+		if len(mounts) > 0 {
+			entry.StagingTransferStarted = true
+		}
 		if entry.MigratedVolumeMounts == nil {
 			entry.MigratedVolumeMounts = map[string]migratedVolumeMount{}
 		}
@@ -285,6 +313,23 @@ func (a *applyContext) loadMigratedVolumeMounts() error {
 			}
 			entry.MigratedVolumeMounts[migratedMountKey(mount.Service, mount.Target)] = mount
 		}
+	}
+	return nil
+}
+
+func stagingTransferStarted(entry *appCache) bool {
+	return entry != nil && (entry.StagingTransferStarted || len(entry.MigratedVolumeMounts) > 0)
+}
+
+func (a *applyContext) markStagingTransferStarted(appName string) error {
+	entry := a.entry(appName)
+	if entry.StagingTransferStarted {
+		return nil
+	}
+	entry.StagingTransferStarted = true
+	if err := a.persistMigratedVolumeMounts(); err != nil {
+		entry.StagingTransferStarted = false
+		return fmt.Errorf("record staging transfer start for app %s: %w", appName, err)
 	}
 	return nil
 }
@@ -342,7 +387,11 @@ func appHasStateWork(plan Plan, appName string) bool {
 		return false
 	}
 	for _, step := range plan.Steps {
-		if step.App == appName && step.Kind == StepPauseSource {
+		if step.App != appName || shouldSkipApplyStep(plan, step) {
+			continue
+		}
+		switch step.Kind {
+		case StepDumpDataStore, StepRestoreDataStore, StepSyncVolume:
 			return true
 		}
 	}
@@ -544,7 +593,7 @@ func (c *Client) applyResumeTarget(ctx context.Context, actx *applyContext, step
 			stopCtx, cancelStop := context.WithTimeout(context.Background(), targetDiscoveryTimeout)
 			defer cancelStop()
 			if stopErr := c.stopTargetComposeContainers(stopCtx, actx, step.App); stopErr != nil {
-				return ambiguousMutationResponseError{err: unsafeSourceResumeError{err: fmt.Errorf("%w (also failed to stop unsafe target containers, so Bort will leave any paused source applications stopped: %v)", err, stopErr)}}
+				return ambiguousMutationResponseError{err: unsafeSourceResumeError{err: fmt.Errorf("%w (also failed to stop unsafe target containers, so paused source applications remain stopped; follow `%s` for the required recovery: %v)", err, recoveryStatusCommand(actx.plan), stopErr)}}
 			}
 		}
 		return err
@@ -574,7 +623,7 @@ func (c *Client) validateMigratedVolumeMountsAfterDeploy(ctx context.Context, ac
 			stopCtx, cancelStop := context.WithDeadline(context.Background(), operationDeadline)
 			defer cancelStop()
 			if stopErr := c.stopTargetComposeContainers(stopCtx, actx, appName); stopErr != nil {
-				return ambiguousMutationResponseError{err: unsafeSourceResumeError{err: fmt.Errorf("%w (also failed to stop unsafe target containers, so Bort will leave any paused source applications stopped: %v)", err, stopErr)}}
+				return ambiguousMutationResponseError{err: unsafeSourceResumeError{err: fmt.Errorf("%w (also failed to stop unsafe target containers, so paused source applications remain stopped; follow `%s` for the required recovery: %v)", err, recoveryStatusCommand(actx.plan), stopErr)}}
 			}
 		}
 		return err
@@ -615,28 +664,116 @@ func (c *Client) validateMigratedVolumeMountsStable(ctx context.Context, actx *a
 }
 
 func (c *Client) validateMigratedVolumeMountsSnapshot(ctx context.Context, actx *applyContext, appName string) (string, error) {
+	signature, _, err := c.validatedMigratedVolumeMountsSnapshot(ctx, actx, appName)
+	return signature, err
+}
+
+func (c *Client) migratedVolumeAttachmentIDs(ctx context.Context, actx *applyContext, appName string) (map[string][]string, error) {
+	_, idsByVolume, err := c.validatedMigratedVolumeMountsSnapshot(ctx, actx, appName)
+	return idsByVolume, err
+}
+
+func (c *Client) validatedMigratedVolumeMountsSnapshot(ctx context.Context, actx *applyContext, appName string) (string, map[string][]string, error) {
 	entry := actx.entry(appName)
 	if len(entry.MigratedVolumeMounts) == 0 {
-		return "", nil
+		return "", map[string][]string{}, nil
 	}
-	runner := c.dockerRunner()
-	parts := make([]string, 0, len(entry.MigratedVolumeMounts))
+	services := map[string]struct{}{}
 	for _, expected := range entry.MigratedVolumeMounts {
-		container, err := c.targetContainerForServiceNoRedeploy(ctx, runner, actx, appName, expected.Service)
-		if err != nil {
-			return "", unsafeTargetResumeError{err: err}
-		}
+		services[expected.Service] = struct{}{}
+	}
+	containers, err := c.migratedServiceContainers(ctx, actx, appName, services)
+	if err != nil {
+		return "", nil, unsafeTargetResumeError{err: err}
+	}
+	parts := make([]string, 0, len(entry.MigratedVolumeMounts))
+	containerIDsByVolume := map[string]map[string]struct{}{}
+	for _, expected := range entry.MigratedVolumeMounts {
+		container := containers[expected.Service]
 		mount, ok := findMountByTarget(container, expected.Target)
 		if !ok || mount.Type != "volume" || mount.Name == "" {
-			return "", unsafeTargetResumeError{err: fmt.Errorf("target service %s no longer has migrated volume mounted at %s", expected.Service, expected.Target)}
+			return "", nil, unsafeTargetResumeError{err: fmt.Errorf("target service %s no longer has migrated volume mounted at %s", expected.Service, expected.Target)}
 		}
 		if mount.Name != expected.VolumeName {
-			return "", unsafeTargetResumeError{err: fmt.Errorf("target service %s volume mount %s changed from migrated volume %s to %s; refusing to accept a deploy that may be using fresh state", expected.Service, expected.Target, expected.VolumeName, mount.Name)}
+			return "", nil, unsafeTargetResumeError{err: fmt.Errorf("target service %s volume mount %s changed from migrated volume %s to %s; refusing to accept a deploy that may be using fresh state", expected.Service, expected.Target, expected.VolumeName, mount.Name)}
 		}
 		parts = append(parts, migratedMountKey(expected.Service, expected.Target)+"\x00"+container.ID+"\x00"+mount.Name)
+		if containerIDsByVolume[mount.Name] == nil {
+			containerIDsByVolume[mount.Name] = map[string]struct{}{}
+		}
+		containerIDsByVolume[mount.Name][container.ID] = struct{}{}
 	}
 	sort.Strings(parts)
-	return strings.Join(parts, "\x1e"), nil
+	idsByVolume := make(map[string][]string, len(containerIDsByVolume))
+	for volumeName, containerIDs := range containerIDsByVolume {
+		ids := make([]string, 0, len(containerIDs))
+		for id := range containerIDs {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		idsByVolume[volumeName] = ids
+	}
+	return strings.Join(parts, "\x1e"), idsByVolume, nil
+}
+
+func (c *Client) migratedServiceContainers(ctx context.Context, actx *applyContext, appName string, services map[string]struct{}) (map[string]dockerContainer, error) {
+	entry := actx.entry(appName)
+	if entry.ComposeAppName == "" {
+		if err := c.refreshComposeAppName(ctx, entry); err != nil {
+			return nil, err
+		}
+	}
+	deadline := time.Now().Add(targetDiscoveryTimeout)
+	for {
+		containers, err := listContainersByLabel(ctx, c.dockerRunner(), "com.docker.compose.project="+entry.ComposeAppName)
+		if err != nil {
+			return nil, err
+		}
+		matchesByService := make(map[string][]dockerContainer, len(services))
+		for _, container := range containers {
+			service := container.Config.Labels[composeServiceLabel]
+			if _, wanted := services[service]; wanted {
+				matchesByService[service] = append(matchesByService[service], container)
+			}
+		}
+		selected := make(map[string]dockerContainer, len(services))
+		missing := false
+		for service := range services {
+			matches := matchesByService[service]
+			var running []dockerContainer
+			for _, container := range matches {
+				if container.State.Running {
+					running = append(running, container)
+				}
+			}
+			switch {
+			case len(running) > 1:
+				return nil, fmt.Errorf("target compose project %s has %d running containers for migrated service %s; refusing to validate only one writer", entry.ComposeAppName, len(running), service)
+			case len(running) == 1:
+				selected[service] = running[0]
+			case len(matches) == 1:
+				selected[service] = matches[0]
+			case len(matches) > 1:
+				return nil, fmt.Errorf("target compose project %s has %d stopped containers for migrated service %s; refusing ambiguous target identity", entry.ComposeAppName, len(matches), service)
+			default:
+				missing = true
+			}
+		}
+		if !missing {
+			return selected, nil
+		}
+		if err := c.composeDeploymentError(ctx, entry); err != nil {
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("migrated target services not found in dokploy compose project %q after %s", entry.ComposeAppName, targetDiscoveryTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(targetDiscoveryDelay):
+		}
+	}
 }
 
 type unsafeTargetResumeError struct {
@@ -709,6 +846,68 @@ func (c *Client) stopTargetComposeContainers(ctx context.Context, actx *applyCon
 		case <-time.After(targetWriterDiscoveryDelay):
 		}
 	}
+}
+
+func (c *Client) removeStoppedTargetAttachments(ctx context.Context, actx *applyContext, appName string, volumes []stagedVolume, pinID string) error {
+	attached := map[string]struct{}{}
+	if err := requireStagingVolumesOwned(ctx, c.dockerRunner(), actx.plan, appName, volumes); err != nil {
+		return err
+	}
+	attachedByVolume, err := stagingVolumeAttachmentSets(ctx, c.dockerRunner(), volumes)
+	if err != nil {
+		return err
+	}
+	for _, ids := range attachedByVolume {
+		for _, id := range ids {
+			if stagingContainerIDsMatch(id, pinID) {
+				continue
+			}
+			attached[id] = struct{}{}
+		}
+	}
+	if len(attached) == 0 {
+		return nil
+	}
+	entry := actx.entry(appName)
+	if entry.ComposeAppName == "" {
+		if err := c.refreshComposeAppName(ctx, entry); err != nil {
+			return err
+		}
+	}
+	containers, err := listContainersByLabel(ctx, c.dockerRunner(), "com.docker.compose.project="+entry.ComposeAppName)
+	if err != nil {
+		return err
+	}
+	remove := map[string]dockerContainer{}
+	for attachedID := range attached {
+		matched := false
+		for _, container := range containers {
+			if !sourceContainerIDMatches(attachedID, container.ID) {
+				continue
+			}
+			if container.State.Running {
+				return fmt.Errorf("target container %s for app %s restarted while Bort was releasing a failed deployment; refusing to resume the source", container.Name, appName)
+			}
+			remove[container.ID] = container
+			matched = true
+			break
+		}
+		if !matched {
+			return fmt.Errorf("staging volume for app %s is attached to container %s outside Dokploy Compose project %s", appName, attachedID, entry.ComposeAppName)
+		}
+	}
+	for _, container := range remove {
+		if _, err := c.dockerRunner().Output(ctx, "rm", container.ID); err != nil {
+			return fmt.Errorf("remove stopped target container %s after failed deployment: %w", container.Name, err)
+		}
+	}
+	if err := requireStagingVolumesOwned(ctx, c.dockerRunner(), actx.plan, appName, volumes); err != nil {
+		return err
+	}
+	if err := requireStagingVolumeAttachments(ctx, c.dockerRunner(), volumes, []string{pinID}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func startStoppedTargetWriters(runner dockerRunner, containers []dockerContainer) error {
@@ -831,7 +1030,7 @@ func requireStagedRestoreLayout(plan Plan, step Step, store preparer.DataStoreRe
 	if err != nil {
 		return nil, err
 	}
-	return staged, requireLiteralMountTargets(composeFile, step.App, store.Service)
+	return staged, requireStagedComposeInputs(composeFile, step.App, store.Service)
 }
 
 func (c *Client) stagingRestoreProject(ctx context.Context, actx *applyContext, step Step, store preparer.DataStoreResource, staged []stagedVolume) (stagingProject, error) {
@@ -899,12 +1098,12 @@ func (e stagedRestorePreflightError) Error() string { return e.err.Error() }
 
 func (e stagedRestorePreflightError) Unwrap() error { return e.err }
 
-func stagedRestoreLayoutRefusal(err error, app string) error {
+func stagedRestoreLayoutRefusal(err error, plan Plan, app string) error {
 	if !errors.Is(err, ErrNotImplemented) {
 		return err
 	}
 	return stagedRestorePreflightError{
-		err:            fmt.Errorf("%w; no retry of this run can pass pause_source for app %s because its reviewed plan is immutable: follow the recovery `bort status` shows to release this run, then choose a recreate or managed data store strategy or change the source compose and create a new run", err, app),
+		err:            fmt.Errorf("%w; no retry of this run can pass pause_source for app %s because its reviewed plan is immutable: follow the recovery `%s` shows to release this run, then choose a recreate or managed data store strategy or change the source compose and create a new run", err, app, recoveryStatusCommand(plan)),
 		requiresNewRun: true,
 	}
 }
@@ -912,7 +1111,7 @@ func stagedRestoreLayoutRefusal(err error, app string) error {
 func (c *Client) preflightStagedRestore(ctx context.Context, runner dockerRunner, actx *applyContext, app preparer.AppPlan, step Step, store preparer.DataStoreResource) error {
 	staged, err := requireStagedRestoreLayout(actx.plan, step, store)
 	if err != nil {
-		return stagedRestoreLayoutRefusal(err, step.App)
+		return stagedRestoreLayoutRefusal(err, actx.plan, step.App)
 	}
 	project, err := c.stagingRestoreProject(ctx, actx, step, store, staged)
 	if err != nil {
@@ -930,6 +1129,9 @@ func (c *Client) preflightStagedRestore(ctx context.Context, runner dockerRunner
 		if err := runner.Run(ctx, nil, nil, project.args("create", "--no-build", store.Service)...); err != nil {
 			return fmt.Errorf("create staging data store %s: %w", store.Service, err)
 		}
+		if err := requireStagingVolumesOwned(ctx, runner, actx.plan, step.App, staged); err != nil {
+			return err
+		}
 		dst, err := project.serviceContainer(ctx, runner, store.Service)
 		if err != nil {
 			return err
@@ -939,7 +1141,7 @@ func (c *Client) preflightStagedRestore(ctx context.Context, runner dockerRunner
 		}
 		return requireSourceMountsStageDataDir(app, store.Service, postgresDataDir(dst), staged)
 	}()
-	checkErr = stagedRestoreLayoutRefusal(checkErr, step.App)
+	checkErr = stagedRestoreLayoutRefusal(checkErr, actx.plan, step.App)
 	if downErr := project.down(runner); downErr != nil {
 		if checkErr != nil {
 			return fmt.Errorf("%w (also failed to stop staging project: %v)", checkErr, downErr)
@@ -951,9 +1153,9 @@ func (c *Client) preflightStagedRestore(ctx context.Context, runner dockerRunner
 
 // restoreDataStoreToStaging runs the data store service alone under a
 // Bort-owned compose project with only its staging volumes and read-only
-// init-script mounts, restores the dump into it, and stops it again. the
-// volumes are recreated first so a retry never restores on top of a
-// partial earlier attempt.
+// init-script mounts, restores the dump into it, and stops it again. each
+// volume is pinned and cleared in place first so a retry cannot replace
+// its identity or restore on top of a partial earlier attempt.
 func (c *Client) restoreDataStoreToStaging(ctx context.Context, runner dockerRunner, actx *applyContext, app preparer.AppPlan, step Step, store preparer.DataStoreResource) error {
 	staged, err := requireStagedRestoreLayout(actx.plan, step, store)
 	if err != nil {
@@ -963,28 +1165,63 @@ func (c *Client) restoreDataStoreToStaging(ctx context.Context, runner dockerRun
 	if err != nil {
 		return err
 	}
+	entry := actx.entry(step.App)
+	allowPinCreate := !stagingTransferStarted(entry)
+	if entry.MigratedVolumeMounts == nil {
+		entry.MigratedVolumeMounts = map[string]migratedVolumeMount{}
+	}
 	for _, volume := range staged {
-		if err := actx.forgetMigratedVolumeMount(step.App, volume.Service, volume.Target); err != nil {
-			return err
-		}
+		delete(entry.MigratedVolumeMounts, migratedMountKey(volume.Service, volume.Target))
+	}
+	if err := actx.persistMigratedVolumeMounts(); err != nil {
+		return err
 	}
 	if err := project.down(runner); err != nil {
 		return err
 	}
+	allStaged, pin, err := ensureAppStagingVolumePin(ctx, runner, actx, step.App, allowPinCreate)
+	if err != nil {
+		return err
+	}
+	if err := requireStagingVolumeAttachments(ctx, runner, allStaged, []string{pin.containerID}); err != nil {
+		return err
+	}
+	if err := actx.markStagingTransferStarted(step.App); err != nil {
+		return err
+	}
 	for _, volume := range staged {
-		if err := requireStagingVolumeUnattached(ctx, runner, volume); err != nil {
-			return err
-		}
-		if err := recreateStagingVolume(ctx, runner, actx.plan, step.App, volume); err != nil {
+		if err := clearStagingVolume(ctx, runner, actx.plan, step.App, volume); err != nil {
 			return err
 		}
 	}
-	if err := runner.Run(ctx, nil, nil, project.args("up", "-d", "--no-build", "--no-deps", store.Service)...); err != nil {
-		return fmt.Errorf("start staging data store %s: %w", store.Service, err)
+	if err := requireStagingVolumePin(ctx, runner, actx.plan, allStaged, pin); err != nil {
+		return err
+	}
+	if err := requireStagingVolumeAttachments(ctx, runner, allStaged, []string{pin.containerID}); err != nil {
+		return err
+	}
+	if startErr := runner.Run(ctx, nil, nil, project.args("up", "-d", "--no-build", "--no-deps", store.Service)...); startErr != nil {
+		if downErr := project.down(runner); downErr != nil {
+			return fmt.Errorf("start staging data store %s: %w (also failed to stop staging project: %v)", store.Service, startErr, downErr)
+		}
+		return fmt.Errorf("start staging data store %s: %w", store.Service, startErr)
 	}
 	restoreErr := func() error {
+		if err := requireStagingVolumesOwned(ctx, runner, actx.plan, step.App, staged); err != nil {
+			return err
+		}
 		dst, err := project.serviceContainer(ctx, runner, store.Service)
 		if err != nil {
+			return err
+		}
+		allowedIDsByVolume := make(map[string][]string, len(allStaged))
+		for _, volume := range allStaged {
+			allowedIDsByVolume[volume.VolumeName] = []string{pin.containerID}
+		}
+		for _, volume := range staged {
+			allowedIDsByVolume[volume.VolumeName] = append(allowedIDsByVolume[volume.VolumeName], dst.ID)
+		}
+		if err := requireStagingVolumeAttachmentSets(ctx, runner, allStaged, allowedIDsByVolume); err != nil {
 			return err
 		}
 		if err := requireStagedPostgresDataDir(dst, staged); err != nil {
@@ -1004,19 +1241,20 @@ func (c *Client) restoreDataStoreToStaging(ctx context.Context, runner dockerRun
 	if restoreErr != nil {
 		return restoreErr
 	}
+	if err := requireStagingVolumePin(ctx, runner, actx.plan, allStaged, pin); err != nil {
+		return err
+	}
+	if err := requireStagingVolumeAttachments(ctx, runner, allStaged, []string{pin.containerID}); err != nil {
+		return err
+	}
 	for _, volume := range staged {
-		if err := requireStagingVolumeUnattached(ctx, runner, volume); err != nil {
-			return err
-		}
-		if err := actx.recordMigratedVolumeMount(step.App, migratedVolumeMount{
+		entry.MigratedVolumeMounts[migratedMountKey(volume.Service, volume.Target)] = migratedVolumeMount{
 			Service:    volume.Service,
 			Target:     volume.Target,
 			VolumeName: volume.VolumeName,
-		}); err != nil {
-			return err
 		}
 	}
-	return nil
+	return actx.persistMigratedVolumeMounts()
 }
 
 func pgRestoreIntoContainer(ctx context.Context, runner dockerRunner, plan Plan, step Step, dst dockerContainer) error {

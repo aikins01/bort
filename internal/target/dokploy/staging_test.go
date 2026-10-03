@@ -10,10 +10,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aikins01/bort/internal/preparer"
 	"gopkg.in/yaml.v3"
@@ -22,6 +24,51 @@ import (
 type sequencedOutputRunner struct {
 	fakeDockerRunner
 	sequences map[string][][]byte
+}
+
+type deadlineRecordingRunner struct {
+	fakeDockerRunner
+	deadlines []time.Time
+}
+
+type foreignVolumeAfterCreateRunner struct {
+	fakeDockerRunner
+	volumeName string
+	created    bool
+}
+
+func (r *deadlineRecordingRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil, errors.New("docker call has no deadline")
+	}
+	r.deadlines = append(r.deadlines, deadline)
+	return r.fakeDockerRunner.Output(ctx, args...)
+}
+
+func (r *deadlineRecordingRunner) Run(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return errors.New("docker call has no deadline")
+	}
+	r.deadlines = append(r.deadlines, deadline)
+	return r.fakeDockerRunner.Run(ctx, stdin, stdout, args...)
+}
+
+func (r *foreignVolumeAfterCreateRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	key := strings.Join(args, " ")
+	if key == "volume inspect "+r.volumeName {
+		r.outputArgs = append(r.outputArgs, append([]string{}, args...))
+		if !r.created {
+			return nil, errors.New("Error response from daemon: volume " + r.volumeName + " not found")
+		}
+		return []byte(`[{"Name":"` + r.volumeName + `","Labels":{"bort.run-id":"other-run"}}]`), nil
+	}
+	out, err := r.fakeDockerRunner.Output(ctx, args...)
+	if err == nil && len(args) > 2 && args[0] == "volume" && args[1] == "create" && args[len(args)-1] == r.volumeName {
+		r.created = true
+	}
+	return out, err
 }
 
 func (r *sequencedOutputRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
@@ -85,8 +132,17 @@ func TestRewriteComposeStagedVolumesHandlesShortAndLongSyntax(t *testing.T) {
 	}
 	services := doc["services"].(map[string]any)
 	dbVolumes := services["db"].(map[string]any)["volumes"].([]any)
-	if len(dbVolumes) != 2 || dbVolumes[0] != "pgdata:/var/lib/postgresql/data" {
+	wantDBVolumes := []any{"pgdata:/var/lib/postgresql/data", "./local:/host"}
+	if !reflect.DeepEqual(dbVolumes, wantDBVolumes) {
 		t.Fatalf("service mounts must be left untouched, got %#v", dbVolumes)
+	}
+	webVolumes := services["web"].(map[string]any)["volumes"].([]any)
+	wantWebVolumes := []any{
+		map[string]any{"type": "volume", "source": "uploads", "target": "/uploads"},
+		map[string]any{"type": "bind", "source": "./cfg", "target": "/cfg"},
+	}
+	if !reflect.DeepEqual(webVolumes, wantWebVolumes) {
+		t.Fatalf("long-form service mounts must be left untouched, got %#v", webVolumes)
 	}
 
 	_, err = rewriteComposeStagedVolumes(compose, []stagedVolume{{Service: "web", Target: "/cfg", VolumeName: "bort-x"}})
@@ -275,6 +331,19 @@ func TestLocalDockerRunnerIsolatesComposeEnvironment(t *testing.T) {
 	}
 	t.Setenv("BORT_SHELL_LEAK", "1")
 	runner := localDockerRunner{Path: shim}
+	command, err := runner.command(context.Background(), []string{"compose", "-p", "stage", "config"})
+	if err != nil {
+		t.Fatalf("build compose command: %v", err)
+	}
+	keys := make([]string, 0, len(command.Env))
+	for _, entry := range command.Env {
+		key, _, _ := strings.Cut(entry, "=")
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	if !slices.Equal(keys, []string{"HOME", "PATH"}) {
+		t.Fatalf("compose command environment keys must be exactly HOME and PATH, got %v", keys)
+	}
 	compose, err := runner.Output(context.Background(), "compose", "-p", "stage", "config")
 	if err != nil {
 		t.Fatalf("compose shim: %v", err)
@@ -302,10 +371,12 @@ func TestValidatePlanReadyForLiveApplyRefusesComposeProjectNameInStagedDataStore
 		compose string
 		refuse  bool
 	}{
-		"braced reference in db":     {compose: strings.Replace(original, "${DB_PASSWORD}", "${COMPOSE_PROJECT_NAME}_db", 1), refuse: true},
-		"bare reference in db":       {compose: strings.Replace(original, "${DB_PASSWORD}", "$COMPOSE_PROJECT_NAME", 1), refuse: true},
-		"longer variable name in db": {compose: strings.Replace(original, "${DB_PASSWORD}", "${COMPOSE_PROJECT_NAME_SUFFIX}", 1), refuse: false},
-		"reference in other service": {compose: strings.Replace(original, "image: example/web\n", "image: example/web\n    environment:\n      APP: ${COMPOSE_PROJECT_NAME}\n", 1), refuse: false},
+		"braced reference in db":                {compose: strings.Replace(original, "${DB_PASSWORD}", "${COMPOSE_PROJECT_NAME}_db", 1), refuse: true},
+		"bare reference in db":                  {compose: strings.Replace(original, "${DB_PASSWORD}", "$COMPOSE_PROJECT_NAME", 1), refuse: true},
+		"escaped reference in db":               {compose: strings.Replace(original, "${DB_PASSWORD}", "$${COMPOSE_PROJECT_NAME}_db", 1), refuse: false},
+		"reference before escaped dollar in db": {compose: strings.Replace(original, "${DB_PASSWORD}", "$COMPOSE_PROJECT_NAME$$archive", 1), refuse: true},
+		"longer variable name in db":            {compose: strings.Replace(original, "${DB_PASSWORD}", "${COMPOSE_PROJECT_NAME_SUFFIX}", 1), refuse: false},
+		"reference in other service":            {compose: strings.Replace(original, "image: example/web\n", "image: example/web\n    environment:\n      APP: ${COMPOSE_PROJECT_NAME}\n", 1), refuse: false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if tc.compose == original {
@@ -344,6 +415,23 @@ func TestValidatePlanReadyForLiveApplyRefusesRelativeInitScriptMountBeforePause(
 	plan.BundleFiles[filepath.Clean(composePath)] = []byte(strings.Replace(withInit, "./init:", "/srv/db/init:", 1))
 	if err := validatePlanReadyForLiveApply(plan); err != nil {
 		t.Fatalf("absolute init script mount must stage: %v", err)
+	}
+}
+
+func TestValidatePlanReadyForLiveApplyRefusesStagedComposeSecretsAndConfigsBeforePause(t *testing.T) {
+	for _, input := range []string{"secrets", "configs"} {
+		t.Run(input, func(t *testing.T) {
+			plan, _, _ := stagedRestoreFixture(t)
+			composePath := filepath.Join(plan.Prepare.BundleDir, "api", "compose.yaml")
+			original := string(plan.BundleFiles[filepath.Clean(composePath)])
+			compose := strings.Replace(original, "    volumes:\n", "    "+input+":\n      - db_input\n    volumes:\n", 1) + "\n" + input + ":\n  db_input:\n    file: /run/bort-db-input\n"
+			plan.BundleFiles[filepath.Clean(composePath)] = []byte(compose)
+
+			err := ValidatePlannedPostgresDataDirs(plan)
+			if !errors.Is(err, ErrNotImplemented) || !strings.Contains(err.Error(), "uses Compose "+input) || !strings.Contains(err.Error(), "cannot preserve") {
+				t.Fatalf("expected staged %s refusal before live apply, got %v", input, err)
+			}
+		})
 	}
 }
 
@@ -461,6 +549,77 @@ func stoppedSourceInspect(startedAt, finishedAt string) []byte {
 	return []byte(`[{"Id":"src-id","Name":"/coolify-web","State":{"Running":false,"StartedAt":"` + startedAt + `","FinishedAt":"` + finishedAt + `"}}]`)
 }
 
+func ownedStagingVolumeInspect(plan Plan, volume stagedVolume) []byte {
+	owner := plan.RunID
+	if owner == "" {
+		owner = plan.RunName
+	}
+	return stagingVolumeInspect(plan, volume, owner)
+}
+
+func stagingVolumeInspect(plan Plan, volume stagedVolume, owner string) []byte {
+	labels := map[string]string{
+		"bort.run":     plan.RunName,
+		"bort.run-id":  owner,
+		"bort.app":     "api",
+		"bort.service": volume.Service,
+		"bort.target":  volume.Target,
+	}
+	state, _ := json.Marshal([]stagingVolumeState{{Name: volume.VolumeName, Labels: labels}})
+	return state
+}
+
+func targetAuthorityTestClient(t *testing.T, runner dockerRunner, plan *Plan) *Client {
+	t.Helper()
+	const projectID, environmentID, composeID, composeAppName = "project-1", "environment-1", "compose-1", "stack-1"
+	plan.TargetIdentities = map[string]TargetIdentity{"api": {
+		ProjectID: projectID, EnvironmentID: environmentID, ComposeID: composeID, ComposeAppName: composeAppName,
+	}}
+	plan.Prepare.Apps[0].TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/project.one":
+			_ = json.NewEncoder(w).Encode(Project{ProjectID: projectID, Environments: []ProjectEnvironment{{EnvironmentID: environmentID}}})
+		case "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: composeID, EnvironmentID: environmentID, AppName: composeAppName})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+}
+
+func TestRequireStagingVolumeOwnedRejectsMismatchedIdentityLabel(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	for label, value := range map[string]string{
+		"bort.run":     "other-run",
+		"bort.app":     "other-app",
+		"bort.service": "worker",
+		"bort.target":  "/other",
+	} {
+		t.Run(label, func(t *testing.T) {
+			labels := map[string]string{
+				"bort.run":     plan.RunName,
+				"bort.run-id":  plan.RunName,
+				"bort.app":     "api",
+				"bort.service": staged.Service,
+				"bort.target":  staged.Target,
+			}
+			labels[label] = value
+			state, err := json.Marshal([]stagingVolumeState{{Name: staged.VolumeName, Labels: labels}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner := &fakeDockerRunner{outputs: map[string][]byte{"volume inspect " + staged.VolumeName: state}}
+			err = requireStagingVolumeOwned(context.Background(), runner, plan, "api", staged)
+			if err == nil || !strings.Contains(err.Error(), "label "+label) {
+				t.Fatalf("expected %s mismatch refusal, got %v", label, err)
+			}
+		})
+	}
+}
+
 func TestApplyCreateVolumeCreatesOnlyItsOwnStagedVolume(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
 	app.Resources.Volumes = []preparer.VolumeResource{
@@ -480,7 +639,8 @@ func TestApplyCreateVolumeCreatesOnlyItsOwnStagedVolume(t *testing.T) {
 	}
 	runner := &fakeDockerRunner{outputs: map[string][]byte{"volume create": []byte("created\n")}, outputErrs: map[string]error{}}
 	for _, volume := range staged {
-		runner.outputErrs["volume inspect --format {{index .Labels \"bort.run-id\"}} "+volume.VolumeName] = errors.New("Error response from daemon: get " + volume.VolumeName + ": no such volume")
+		runner.outputErrs["volume inspect --format {{index .Labels \"bort.run-id\"}} "+volume.VolumeName] = errors.New("Error response from daemon: volume " + volume.VolumeName + " not found")
+		runner.outputs["volume inspect "+volume.VolumeName] = ownedStagingVolumeInspect(plan, volume)
 	}
 	client := &Client{Docker: runner}
 	actx := &applyContext{cache: map[string]*appCache{}, plan: plan}
@@ -498,6 +658,1156 @@ func TestApplyCreateVolumeCreatesOnlyItsOwnStagedVolume(t *testing.T) {
 	}
 }
 
+func TestEnsureStagingVolumeRejectsConcurrentForeignCreate(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	runner := &foreignVolumeAfterCreateRunner{
+		fakeDockerRunner: fakeDockerRunner{outputs: map[string][]byte{"volume create": []byte(staged.VolumeName + "\n")}},
+		volumeName:       staged.VolumeName,
+	}
+	if err := ensureStagingVolume(context.Background(), runner, plan, "api", staged); err == nil || !strings.Contains(err.Error(), "not the staged") {
+		t.Fatalf("expected concurrent foreign volume to be rejected, got %v", err)
+	}
+	if !runner.created {
+		t.Fatalf("foreign replacement was exposed before volume creation: calls=%v", runner.outputArgs)
+	}
+}
+
+func TestAcquireStagingVolumePinVerifiesOwnershipAndKeepsRunning(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil || pin.containerID != "pin-id" {
+		t.Fatalf("expected an owned staging volume pin, pin=%#v err=%v", pin, err)
+	}
+	if !runner.activePins[pin.containerID].State.Running || fakeOutputCalled(runner, "rm", "-f", pin.containerID) {
+		t.Fatalf("staging volume pin was not left running: active=%#v calls=%v", runner.activePins, runner.outputArgs)
+	}
+	pinRuns := 0
+	for _, args := range runner.outputArgs {
+		if len(args) > 1 && args[0] == "run" && args[1] == "-d" {
+			pinRuns++
+			if got := strings.Join(args, " "); !strings.HasSuffix(got, volumeCopyImage+" sh -c while :; do sleep 2147483647; done") {
+				t.Fatalf("pin does not use the long-running keepalive command: %s", got)
+			}
+		}
+	}
+	if pinRuns != 1 {
+		t.Fatalf("pin creation calls = %d, want 1: %v", pinRuns, runner.outputArgs)
+	}
+}
+
+func TestAcquireStagingVolumePinRejectsReplacementBeforeOperation(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: []byte(`[{"Name":"` + staged.VolumeName + `","Labels":{"bort.run-id":"other-run"}}]`),
+	}}
+	_, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err == nil || !strings.Contains(err.Error(), "not the staged") {
+		t.Fatalf("expected replacement volume rejection, got %v", err)
+	}
+}
+
+type replaceStagingVolumeAfterPinRunner struct {
+	*fakeDockerRunner
+	volumeName string
+}
+
+func (r *replaceStagingVolumeAfterPinRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	out, err := r.fakeDockerRunner.Output(ctx, args...)
+	if err == nil && len(args) > 1 && args[0] == "run" && args[1] == "-d" && slices.Contains(args, stagingVolumePinLabel+"=true") {
+		r.outputs["volume inspect "+r.volumeName] = []byte(`[{"Name":"` + r.volumeName + `","Labels":{"bort.run":"run1","bort.run-id":"other-run","bort.app":"api","bort.service":"web","bort.target":"/data"}}]`)
+	}
+	return out, err
+}
+
+func TestSyncVolumeToStagingRechecksOwnershipAfterPinCreation(t *testing.T) {
+	_, plan, step, staged := stagedSyncFixture(t)
+	runner := &replaceStagingVolumeAfterPinRunner{
+		fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+			"volume inspect src-vol":              []byte(`[{"Name":"src-vol"}]`),
+			"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
+		}},
+		volumeName: staged.VolumeName,
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+
+	err := client.applySyncVolume(context.Background(), actx, step)
+	if err == nil || !strings.Contains(err.Error(), "verify staging volume ownership after pinning") || !strings.Contains(err.Error(), "bort.run-id") {
+		t.Fatalf("expected post-pin ownership refusal, got %v", err)
+	}
+	if len(runner.runs) != 0 {
+		t.Fatalf("ownership drift after pin creation must abort before copy or clear, runs=%#v", runner.runs)
+	}
+	if pin := actx.stagingVolumePins["api"]; pin.containerID != "pin-id" {
+		t.Fatalf("known pin was not cached for cleanup after post-pin refusal: %#v", actx.stagingVolumePins)
+	}
+}
+
+func TestApplyPushImageRefusesMissingPinAfterDurableTransfer(t *testing.T) {
+	app, plan, _, staged := stagedSyncFixture(t)
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	compose := "services:\n  web:\n    image: example/web\n    volumes:\n      - data:/data\nvolumes:\n  data:\n"
+	composePath := filepath.Join(appDir, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte(compose), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app.Directory = "api"
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
+	plan.Prepare = preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}
+	plan.BundleFiles = map[string][]byte{filepath.Clean(composePath): []byte(compose)}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"image inspect example/web":           []byte(`[{}]`),
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}
+	client := &Client{Docker: runner}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	entry := actx.entry("api")
+	entry.ComposeID = "compose-1"
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: staged.VolumeName},
+	}
+
+	err := client.applyPushImage(context.Background(), actx, Step{Kind: StepPushImage, App: "api", Ref: "api"})
+	if err == nil || !strings.Contains(err.Error(), "missing after state transfer") || !strings.Contains(err.Error(), "identity was unprotected") {
+		t.Fatalf("expected missing transferred-state pin refusal, got %v", err)
+	}
+	for _, args := range runner.outputArgs {
+		if len(args) > 1 && args[0] == "run" && args[1] == "-d" {
+			t.Fatalf("push_image recreated a missing transferred-state pin: calls=%v", runner.outputArgs)
+		}
+	}
+}
+
+func TestApplyKeepsSourceStoppedWhenTransferredPinIsMissing(t *testing.T) {
+	for _, failBeforePin := range []bool{false, true} {
+		name := "missing pin at acquisition"
+		if failBeforePin {
+			name = "failure before pin acquisition"
+		}
+		t.Run(name, func(t *testing.T) {
+			testApplyKeepsSourceStoppedWhenTransferredPinIsMissing(t, failBeforePin)
+		})
+	}
+}
+
+func testApplyKeepsSourceStoppedWhenTransferredPinIsMissing(t *testing.T, failBeforePin bool) {
+	t.Helper()
+	app, plan, step, staged := stagedSyncFixture(t)
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	compose := "services:\n  web:\n    image: example/web\n    volumes:\n      - data:/data\nvolumes:\n  data:\n"
+	composePath := filepath.Join(appDir, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte(compose), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app.Directory = "api"
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
+	plan.Prepare = preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}
+	plan.BundleFiles = map[string][]byte{filepath.Clean(composePath): []byte(compose)}
+	plan.Steps = []Step{{Kind: StepPauseSource, App: "api", Ref: "api"}, step, {Kind: StepPushImage, App: "api", Ref: "api"}}
+	plan.RecoveryCommand = "sudo bort status --run missing-pin"
+	plan.ResumeFrom = 2
+	plan.TargetIdentities = map[string]TargetIdentity{"api": {
+		ProjectID:      "project-1",
+		EnvironmentID:  "environment-1",
+		ComposeID:      "compose-1",
+		ComposeAppName: "stack-1",
+	}}
+	var failure StepProgress
+	onProgress := func(progress StepProgress) {
+		if progress.Status == StepStatusError {
+			failure = progress
+		}
+	}
+	plan.OnProgress = &onProgress
+
+	seed := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	seed.entry("api").SourcePauseRecorded = true
+	seed.entry("api").SourcePausedContainers = []sourcePausedContainer{{
+		ID:         "src-id",
+		Stopped:    true,
+		StartedAt:  "2026-01-01T00:00:00Z",
+		FinishedAt: "2026-01-02T00:00:00Z",
+	}}
+	if err := seed.persistSourcePauseState(); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.recordMigratedVolumeMount("api", migratedVolumeMount{Service: "web", Target: "/data", VolumeName: staged.VolumeName}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"image inspect example/web":                  []byte(`[{}]`),
+		"volume inspect " + staged.VolumeName:        ownedStagingVolumeInspect(plan, staged),
+		"inspect --type container src-id":            stoppedSourceInspect("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+		"ps -a --filter volume=" + staged.VolumeName: []byte(""),
+	}}
+	if failBeforePin {
+		runner.outputErrs = map[string]error{"image inspect example/web": errors.New("image unavailable")}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/project.one":
+			_ = json.NewEncoder(w).Encode(Project{ProjectID: "project-1", Environments: []ProjectEnvironment{{EnvironmentID: "environment-1"}}})
+		case "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "compose-1", EnvironmentID: "environment-1", AppName: "stack-1"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := (&Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}).Apply(context.Background(), plan)
+	if err == nil || !isUnsafeSourceResumeError(err) || !strings.Contains(err.Error(), "missing after state transfer") || !strings.Contains(err.Error(), "`sudo bort status --run missing-pin`") {
+		t.Fatalf("expected a missing transferred-state pin to block source recovery, got %v", err)
+	}
+	if fakeOutputCalled(runner, "start", "src-id") {
+		t.Fatalf("source restarted after its transferred-state pin disappeared: calls=%v", runner.outputArgs)
+	}
+	if !failure.AuthorityRecoveryRequired {
+		t.Fatalf("missing-pin failure was not marked for authority recovery: %#v", failure)
+	}
+}
+
+func TestSyncVolumeReplayRefusesMissingPinAfterDurableTransfer(t *testing.T) {
+	_, plan, step, staged := stagedSyncFixture(t)
+	seed := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	if err := seed.recordMigratedVolumeMount("api", migratedVolumeMount{Service: staged.Service, Target: staged.Target, VolumeName: staged.VolumeName}); err != nil {
+		t.Fatal(err)
+	}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	if err := actx.loadMigratedVolumeMounts(); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect src-vol":              []byte(`[{"Name":"src-vol"}]`),
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}
+
+	err := (&Client{Docker: runner}).applySyncVolume(context.Background(), actx, step)
+	if err == nil || !isUnsafeSourceResumeError(err) || !strings.Contains(err.Error(), "missing after state transfer") {
+		t.Fatalf("expected same-transfer replay to refuse pin recreation, got %v", err)
+	}
+	for _, args := range runner.outputArgs {
+		if len(args) > 1 && args[0] == "run" && args[1] == "-d" {
+			t.Fatalf("same-transfer replay recreated the missing pin: calls=%v", runner.outputArgs)
+		}
+	}
+}
+
+func TestLaterStagedTransferRefusesMissingAppPin(t *testing.T) {
+	app, plan, firstStep, first := stagedSyncFixture(t)
+	secondSource := preparer.VolumeResource{
+		Service:             "worker",
+		Type:                "volume",
+		Name:                "src-cache",
+		Target:              "/cache",
+		SourceContainerID:   "src-id",
+		SourceContainerName: "coolify-web",
+	}
+	app.Resources.Volumes = append(app.Resources.Volumes, secondSource)
+	secondStep := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:worker -> /cache"}
+	plan = stagedPlan(t, app, plan.RunDir, Step{Kind: StepPauseSource, App: "api"}, firstStep, secondStep)
+	second, ok := stagedVolumeFor(plan, "api", secondSource)
+	if !ok {
+		t.Fatal("second volume is not staged")
+	}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect src-cache":            []byte(`[{"Name":"src-cache"}]`),
+		"volume inspect " + first.VolumeName:  ownedStagingVolumeInspect(plan, first),
+		"volume inspect " + second.VolumeName: ownedStagingVolumeInspect(plan, second),
+	}}
+	client := &Client{Docker: runner}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	actx.entry("api").MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey(first.Service, first.Target): {Service: first.Service, Target: first.Target, VolumeName: first.VolumeName},
+	}
+
+	err := client.applySyncVolume(context.Background(), actx, secondStep)
+	if err == nil || !strings.Contains(err.Error(), "missing after state transfer") {
+		t.Fatalf("expected later transfer to refuse a missing app pin, got %v", err)
+	}
+	if len(runner.runs) != 0 {
+		t.Fatalf("later transfer copied or cleared data without the original pin: runs=%#v", runner.runs)
+	}
+	for _, args := range runner.outputArgs {
+		if len(args) > 1 && args[0] == "run" && args[1] == "-d" {
+			t.Fatalf("later transfer recreated the missing app pin: calls=%v", runner.outputArgs)
+		}
+	}
+}
+
+func TestAcquireStagingVolumePinHoldsEveryVolumeUntilExplicitRelease(t *testing.T) {
+	_, plan, _, first := stagedSyncFixture(t)
+	second := first
+	second.Service = "worker"
+	second.Target = "/work"
+	second.VolumeName += "-worker"
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + first.VolumeName:  ownedStagingVolumeInspect(plan, first),
+		"volume inspect " + second.VolumeName: ownedStagingVolumeInspect(plan, second),
+	}}
+	volumes := []stagedVolume{first, second}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", volumes, true)
+	if err != nil {
+		t.Fatalf("acquireStagingVolumePin: %v", err)
+	}
+	var runCalls []string
+	for _, args := range runner.outputArgs {
+		if len(args) > 1 && args[0] == "run" && args[1] == "-d" {
+			runCalls = append(runCalls, strings.Join(args, " "))
+		}
+	}
+	if len(runCalls) != 1 || !strings.Contains(runCalls[0], "--restart unless-stopped") || !strings.Contains(runCalls[0], "-v "+first.VolumeName+":/bort-volume/0:ro") || !strings.Contains(runCalls[0], "-v "+second.VolumeName+":/bort-volume/1:ro") {
+		t.Fatalf("expected one persistent read-only helper mounting every staging volume, got %v", runCalls)
+	}
+	if err := releaseStagingVolumePin(context.Background(), runner, plan, volumes, pin); err != nil {
+		t.Fatalf("releaseStagingVolumePin: %v", err)
+	}
+	if !fakeOutputCalled(runner, "rm", "-f", pin.containerID) {
+		t.Fatalf("expected explicit staging volume pin release, calls=%v", runner.outputArgs)
+	}
+}
+
+func TestRequireStagingVolumeAttachmentSetsBatchesMultipleVolumes(t *testing.T) {
+	volumes := []stagedVolume{{VolumeName: "stage-web"}, {VolumeName: "stage-worker"}}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter volume=stage-web --filter volume=stage-worker --format {{.ID}}": []byte("pin-id\ntarget-id\n"),
+		"inspect --type container pin-id target-id": []byte(`[
+			{"Id":"pin-id","Mounts":[{"Type":"volume","Name":"stage-web"},{"Type":"volume","Name":"stage-worker"}]},
+			{"Id":"target-id","Mounts":[{"Type":"volume","Name":"stage-web"}]}
+		]`),
+	}}
+	allowed := map[string][]string{
+		"stage-web":    {"pin-id", "target-id"},
+		"stage-worker": {"pin-id"},
+	}
+	if err := requireStagingVolumeAttachmentSets(context.Background(), runner, volumes, allowed); err != nil {
+		t.Fatal(err)
+	}
+	if !fakeOutputCalled(runner, "ps", "-a", "--filter", "volume=stage-web", "--filter", "volume=stage-worker", "--format", "{{.ID}}") {
+		t.Fatalf("multiple volume attachments were not discovered in one Docker query: %v", runner.outputArgs)
+	}
+	for _, volume := range volumes {
+		if fakeOutputCalled(runner, "ps", "-a", "--filter", "volume="+volume.VolumeName, "--format", "{{.ID}}") {
+			t.Fatalf("volume %s was queried separately: %v", volume.VolumeName, runner.outputArgs)
+		}
+	}
+}
+
+func TestReleaseStagingVolumePinsRequiresAuthorityAttachmentSet(t *testing.T) {
+	for _, targetAuthority := range []bool{false, true} {
+		name := "source"
+		if targetAuthority {
+			name = "target"
+		}
+		t.Run(name, func(t *testing.T) {
+			_, plan, _, staged := stagedSyncFixture(t)
+			plan.RunID = "run-digest"
+			staged, _ = stagedVolumeFor(plan, "api", plan.Prepare.Apps[0].Resources.Volumes[0])
+			runner := &fakeDockerRunner{outputs: map[string][]byte{
+				"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+			}}
+			pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &Client{Docker: runner}
+			if targetAuthority {
+				const targetID = "target-id"
+				client = targetAuthorityTestClient(t, runner, &plan)
+				runner.outputs["ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}"] = []byte(targetID + "\n")
+				runner.outputs["inspect --type container "+targetID] = []byte(`[{"Id":"` + targetID + `","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/data","RW":true}]}]`)
+				runner.activeComposeProjects = map[string][]string{"stack-1": {targetID}}
+				state := &applyContext{plan: plan, cache: map[string]*appCache{}}
+				if err := state.recordMigratedVolumeMount("api", migratedVolumeMount{Service: "web", Target: "/data", VolumeName: staged.VolumeName}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := client.ReleaseStagingVolumePins(context.Background(), plan, targetAuthority); err != nil {
+				t.Fatalf("release pins under %s authority: %v", name, err)
+			}
+			if _, ok := runner.activePins[pin.containerID]; ok {
+				t.Fatalf("verified pin remained after %s-authority cleanup: %#v", name, runner.activePins)
+			}
+			if err := client.ReleaseStagingVolumePins(context.Background(), plan, targetAuthority); err != nil {
+				t.Fatalf("repeated %s-authority cleanup was not idempotent: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestReleaseStagingVolumePinsBoundsDockerCallsByCallerDeadline(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	base := fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}
+	if _, err := acquireStagingVolumePin(context.Background(), &base, plan, "api", []stagedVolume{staged}, true); err != nil {
+		t.Fatal(err)
+	}
+	base.outputArgs = nil
+	runner := &deadlineRecordingRunner{fakeDockerRunner: base}
+	deadline := time.Now().Add(5 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	if err := (&Client{Docker: runner}).ReleaseStagingVolumePins(ctx, plan, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.deadlines) == 0 {
+		t.Fatal("pin release made no Docker validation call")
+	}
+	for _, got := range runner.deadlines {
+		if !got.Equal(deadline) {
+			t.Fatalf("Docker deadline = %s, want caller deadline %s", got, deadline)
+		}
+	}
+	for _, want := range [][]string{
+		{"ps", "-a", "--filter", "label=bort.staging-pin=true", "--filter", "label=bort.run-id=run1", "--format", "{{.ID}}"},
+		{"inspect", "--type", "container", "pin-id"},
+		{"volume", "inspect", staged.VolumeName},
+		{"ps", "-a", "--filter", "volume=" + staged.VolumeName, "--format", "{{.ID}}"},
+	} {
+		if !fakeOutputCalled(&runner.fakeDockerRunner, want...) {
+			t.Fatalf("deadline test did not reach Docker call %v: %v", want, runner.outputArgs)
+		}
+	}
+}
+
+func TestReleaseTargetAuthorityPinRequiresDurableRecordAndTargetAttachment(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		recordMount  bool
+		targetMounts string
+		want         string
+	}{
+		{name: "missing durable record", targetMounts: `[{"Type":"volume","Name":"%s","Destination":"/data","RW":true}]`, want: "no complete durable migrated-volume record"},
+		{name: "missing target attachment", recordMount: true, targetMounts: `[]`, want: "no longer has migrated volume mounted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, plan, _, staged := stagedSyncFixture(t)
+			plan.RunID = "run-digest"
+			staged, _ = stagedVolumeFor(plan, "api", plan.Prepare.Apps[0].Resources.Volumes[0])
+			const targetID = "target-id"
+			targetMounts := tc.targetMounts
+			if strings.Contains(targetMounts, "%s") {
+				targetMounts = fmt.Sprintf(targetMounts, staged.VolumeName)
+			}
+			runner := &fakeDockerRunner{outputs: map[string][]byte{
+				"volume inspect " + staged.VolumeName:                                      ownedStagingVolumeInspect(plan, staged),
+				"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte(targetID + "\n"),
+				"inspect --type container " + targetID:                                     []byte(fmt.Sprintf(`[{"Id":"%s","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":%s}]`, targetID, targetMounts)),
+			}, activeComposeProjects: map[string][]string{"stack-1": {targetID}}}
+			client := targetAuthorityTestClient(t, runner, &plan)
+			pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.recordMount {
+				state := &applyContext{plan: plan, cache: map[string]*appCache{}}
+				if err := state.recordMigratedVolumeMount("api", migratedVolumeMount{Service: "web", Target: "/data", VolumeName: staged.VolumeName}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			err = client.ReleaseStagingVolumePins(context.Background(), plan, true)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q rejection, got %v", tc.want, err)
+			}
+			if _, ok := runner.activePins[pin.containerID]; !ok {
+				t.Fatalf("target-authority validation removed the pin after %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestReleaseTargetAuthorityPinRejectsCrossMountedStagingVolume(t *testing.T) {
+	app, plan, firstStep, first := stagedSyncFixture(t)
+	app.Resources.Volumes = append(app.Resources.Volumes, preparer.VolumeResource{Service: "worker", Type: "volume", Name: "worker-data", Target: "/work"})
+	secondStep := Step{Kind: StepSyncVolume, App: "api", Ref: "volume:worker -> /work"}
+	plan = stagedPlan(t, app, plan.RunDir, Step{Kind: StepPauseSource, App: "api"}, firstStep, secondStep)
+	plan.RunID = "run-digest"
+	volumes := stagedVolumesForApp(plan, "api")
+	if len(volumes) != 2 {
+		t.Fatalf("staged volumes = %#v, want two", volumes)
+	}
+	first, _ = stagedVolumeFor(plan, "api", app.Resources.Volumes[0])
+	second, _ := stagedVolumeFor(plan, "api", app.Resources.Volumes[1])
+	const webID, workerID = "web-id", "worker-id"
+	webInspect := fmt.Sprintf(`{"Id":"%s","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"%s","Destination":"/data","RW":true},{"Type":"volume","Name":"%s","Destination":"/stolen","RW":true}]}`, webID, first.VolumeName, second.VolumeName)
+	workerInspect := fmt.Sprintf(`{"Id":"%s","Name":"/worker","Config":{"Labels":{"com.docker.compose.service":"worker","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"%s","Destination":"/work","RW":true}]}`, workerID, second.VolumeName)
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + first.VolumeName:                                       ownedStagingVolumeInspect(plan, first),
+		"volume inspect " + second.VolumeName:                                      ownedStagingVolumeInspect(plan, second),
+		"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte(webID + "\n" + workerID + "\n"),
+		"inspect --type container " + webID:                                        []byte("[" + webInspect + "]"),
+		"inspect --type container " + workerID:                                     []byte("[" + workerInspect + "]"),
+		"inspect --type container " + webID + " " + workerID:                       []byte("[" + webInspect + "," + workerInspect + "]"),
+	}, activeComposeProjects: map[string][]string{"stack-1": {webID, workerID}}}
+	client := targetAuthorityTestClient(t, runner, &plan)
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", volumes, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	for _, mount := range []migratedVolumeMount{
+		{Service: "web", Target: "/data", VolumeName: first.VolumeName},
+		{Service: "worker", Target: "/work", VolumeName: second.VolumeName},
+	} {
+		if err := state.recordMigratedVolumeMount("api", mount); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err = client.ReleaseStagingVolumePins(context.Background(), plan, true)
+	if err == nil || !strings.Contains(err.Error(), "unexpected container "+webID) || !strings.Contains(err.Error(), second.VolumeName) {
+		t.Fatalf("cross-mounted writer was not rejected per volume: %v", err)
+	}
+	if _, ok := runner.activePins[pin.containerID]; !ok {
+		t.Fatal("cross-volume validation released the pin")
+	}
+}
+
+func TestReleaseSourceAuthorityPinRefusesTargetAttachment(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const targetID = "target-id"
+	runner.outputs["inspect --type container "+targetID] = []byte(`[{"Id":"` + targetID + `","Name":"/web","Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/data","RW":true}]}]`)
+	runner.activeComposeProjects = map[string][]string{"stack-1": {targetID}}
+
+	err = (&Client{Docker: runner}).ReleaseStagingVolumePins(context.Background(), plan, false)
+	if err == nil || !strings.Contains(err.Error(), "unexpected container "+targetID) {
+		t.Fatalf("source authority removed a pin while the target remained attached: %v", err)
+	}
+	if _, ok := runner.activePins[pin.containerID]; !ok {
+		t.Fatal("source-authority cleanup removed the pin despite a target attachment")
+	}
+}
+
+func TestReleaseSourceAuthorityRefusesPinMountDrift(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	container := runner.activePins[pin.containerID]
+	container.Mounts[0].RW = true
+	runner.activePins[pin.containerID] = container
+
+	err = (&Client{Docker: runner}).ReleaseStagingVolumePins(context.Background(), plan, false)
+	if err == nil || !strings.Contains(err.Error(), "unexpected or writable volume mount") {
+		t.Fatalf("pin mount drift was not rejected: %v", err)
+	}
+	if _, ok := runner.activePins[pin.containerID]; !ok {
+		t.Fatal("drifted pin was removed")
+	}
+}
+
+func TestReleaseSourceAuthorityWithoutPinStillRefusesTargetAttachment(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	plan.StagingTransferApps = []string{"api"}
+	const targetID = "target-id"
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"volume inspect " + staged.VolumeName:  ownedStagingVolumeInspect(plan, staged),
+			"inspect --type container " + targetID: []byte(`[{"Id":"` + targetID + `","Name":"/web","Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/data","RW":true}]}]`),
+		},
+		activeComposeProjects: map[string][]string{"stack-1": {targetID}},
+	}
+
+	err := (&Client{Docker: runner}).ReleaseStagingVolumePins(context.Background(), plan, false)
+	if err == nil || !strings.Contains(err.Error(), "unexpected container "+targetID) {
+		t.Fatalf("source authority bypassed attachment validation because the pin was absent: %v", err)
+	}
+}
+
+func TestReleaseTargetAuthorityWithoutPinRequiresDurableTransferRecord(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	plan.StagingTransferApps = []string{"api"}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}
+
+	err := (&Client{Docker: runner}).ReleaseStagingVolumePins(context.Background(), plan, true)
+	if err == nil || !strings.Contains(err.Error(), "no complete durable migrated-volume record") {
+		t.Fatalf("target authority bypassed durable transfer validation because the pin was absent: %v", err)
+	}
+}
+
+func TestReleaseSourceAuthoritySkipsUncreatedVolumesAfterPartialTransfer(t *testing.T) {
+	app, plan, firstStep, first := stagedSyncFixture(t)
+	app.Resources.Volumes = append(app.Resources.Volumes, preparer.VolumeResource{Service: "worker", Type: "volume", Name: "worker-data", Target: "/work"})
+	plan = stagedPlan(t, app, plan.RunDir, Step{Kind: StepPauseSource, App: "api"}, firstStep, Step{Kind: StepSyncVolume, App: "api", Ref: "volume:worker -> /work"})
+	plan.StagingTransferApps = []string{"api"}
+	volumes := stagedVolumesForApp(plan, "api")
+	first, _ = stagedVolumeFor(plan, "api", app.Resources.Volumes[0])
+	second, _ := stagedVolumeFor(plan, "api", app.Resources.Volumes[1])
+	runner := &fakeDockerRunner{
+		outputs:    map[string][]byte{"volume inspect " + first.VolumeName: ownedStagingVolumeInspect(plan, first)},
+		outputErrs: map[string]error{"volume inspect " + second.VolumeName: errors.New("Error response from daemon: volume " + second.VolumeName + " not found")},
+	}
+
+	if err := (&Client{Docker: runner}).ReleaseStagingVolumePins(context.Background(), plan, false); err != nil {
+		t.Fatalf("source recovery dead-ended on an uncreated later volume: %v (planned=%#v)", err, volumes)
+	}
+	if !fakeOutputCalled(runner, "ps", "-a", "--filter", "volume="+first.VolumeName, "--format", "{{.ID}}") {
+		t.Fatalf("source recovery skipped attachment validation for the created volume: %v", runner.outputArgs)
+	}
+	for _, args := range runner.outputArgs {
+		if strings.Contains(strings.Join(args, " "), "volume="+second.VolumeName) {
+			t.Fatalf("source recovery queried attachments for the uncreated volume: %v", args)
+		}
+	}
+}
+
+func TestReleaseSourceAuthorityHonorsLegacyTransferStartEvidence(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	path, err := migratedVolumeMountsPath(plan.RunDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := json.Marshal(migratedVolumeMountsState{APIVersion: migratedVolumeMountsLegacyAPIVersion, StartedApps: []string{"api"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const targetID = "target-id"
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"volume inspect " + staged.VolumeName:  ownedStagingVolumeInspect(plan, staged),
+			"inspect --type container " + targetID: []byte(`[{"Id":"` + targetID + `","Name":"/web","Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/data","RW":true}]}]`),
+		},
+		activeComposeProjects: map[string][]string{"stack-1": {targetID}},
+	}
+
+	err = (&Client{Docker: runner}).ReleaseStagingVolumePins(context.Background(), plan, false)
+	if err == nil || !strings.Contains(err.Error(), "unexpected container "+targetID) {
+		t.Fatalf("legacy transfer-start evidence did not trigger attachment validation: %v", err)
+	}
+}
+
+func TestExactStagingVolumeAttachmentsAcceptsShortAndFullContainerIDs(t *testing.T) {
+	shortID := "123456789abc"
+	fullID := shortID + strings.Repeat("d", 52)
+	for _, ids := range [][2]string{{shortID, fullID}, {fullID, shortID}} {
+		if err := requireExactStagingVolumeAttachments("data", []string{ids[0]}, []string{ids[1]}); err != nil {
+			t.Fatalf("equivalent Docker IDs %q and %q did not match: %v", ids[0], ids[1], err)
+		}
+	}
+}
+
+func TestStagingVolumePinRejectsUnexpectedAttachment(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	attachmentCommand := "ps -a --filter volume=" + staged.VolumeName + " --format {{.ID}}"
+	runner := &sequencedOutputRunner{
+		fakeDockerRunner: fakeDockerRunner{outputs: map[string][]byte{
+			"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+		}},
+		sequences: map[string][][]byte{
+			attachmentCommand: {[]byte("pin-id\nforeign-writer\n")},
+		},
+	}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil {
+		t.Fatalf("acquireStagingVolumePin: %v", err)
+	}
+	err = requireStagingVolumeAttachments(context.Background(), runner, []stagedVolume{staged}, []string{pin.containerID})
+	if err == nil || !strings.Contains(err.Error(), "unexpected container foreign-writer") {
+		t.Fatalf("expected a foreign attachment to block handoff, got %v", err)
+	}
+}
+
+type ambiguousPinCreateRunner struct {
+	*fakeDockerRunner
+	failCreate bool
+}
+
+func (r *ambiguousPinCreateRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	if len(args) > 1 && args[0] == "run" && args[1] == "-d" && slices.Contains(args, stagingVolumePinLabel+"=true") && r.failCreate {
+		r.failCreate = false
+		_, _ = r.fakeDockerRunner.Output(ctx, args...)
+		return nil, errors.New("docker response lost after creating pin")
+	}
+	return r.fakeDockerRunner.Output(ctx, args...)
+}
+
+func TestAcquireStagingVolumePinAdoptsAmbiguousCreateAndRetry(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	runner := &ambiguousPinCreateRunner{
+		fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+			"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+		}},
+		failCreate: true,
+	}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil || pin.containerID != "pin-id" {
+		t.Fatalf("expected ambiguous create to adopt the running pin, pin=%#v err=%v", pin, err)
+	}
+	if len(runner.activePins) != 1 || fakeOutputCalled(runner.fakeDockerRunner, "rm", "-f", "pin-id") {
+		t.Fatalf("adopted pin was not preserved: active=%v calls=%v", runner.activePins, runner.outputArgs)
+	}
+	second, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil || second.containerID != pin.containerID {
+		t.Fatalf("adopted pin blocked ordinary retry: first=%#v second=%#v err=%v", pin, second, err)
+	}
+	runCalls := 0
+	for _, args := range runner.outputArgs {
+		if len(args) > 1 && args[0] == "run" && args[1] == "-d" {
+			runCalls++
+		}
+	}
+	if runCalls != 1 {
+		t.Fatalf("ambiguous create and retry ran %d pin containers, want 1; calls=%v", runCalls, runner.outputArgs)
+	}
+}
+
+func TestAcquireStagingVolumePinRestartsStoppedExactPinInPlace(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil {
+		t.Fatalf("create staging volume pin: %v", err)
+	}
+	stopped := runner.activePins[pin.containerID]
+	stopped.State.Running = false
+	stopped.State.Status = "exited"
+	runner.activePins[pin.containerID] = stopped
+	runner.outputArgs = nil
+
+	restarted, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil || restarted != pin {
+		t.Fatalf("expected stopped exact pin to restart in place, pin=%#v restarted=%#v err=%v", pin, restarted, err)
+	}
+	if !runner.activePins[pin.containerID].State.Running || !fakeOutputCalled(runner, "start", pin.containerID) {
+		t.Fatalf("stopped pin was not restarted: active=%#v calls=%v", runner.activePins, runner.outputArgs)
+	}
+	for _, args := range runner.outputArgs {
+		if len(args) > 1 && args[0] == "run" && args[1] == "-d" || len(args) > 1 && args[0] == "rm" {
+			t.Fatalf("stopped exact pin was replaced instead of restarted: calls=%v", runner.outputArgs)
+		}
+	}
+}
+
+func TestAcquireStagingVolumePinFailedRestartPreservesStoppedPin(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil {
+		t.Fatalf("create staging volume pin: %v", err)
+	}
+	stopped := runner.activePins[pin.containerID]
+	stopped.State.Running = false
+	stopped.State.Status = "exited"
+	runner.activePins[pin.containerID] = stopped
+	runner.outputArgs = nil
+	runner.outputErrs = map[string]error{"start " + pin.containerID: errors.New("restart failed")}
+
+	_, err = acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err == nil || !strings.Contains(err.Error(), "restart stopped staging volume pin") {
+		t.Fatalf("expected stopped pin restart failure, got %v", err)
+	}
+	if active, ok := runner.activePins[pin.containerID]; !ok || active.State.Running {
+		t.Fatalf("failed restart did not preserve the stopped pin: active=%#v", runner.activePins)
+	}
+	for _, args := range runner.outputArgs {
+		if len(args) > 1 && args[0] == "run" && args[1] == "-d" || len(args) > 1 && args[0] == "rm" {
+			t.Fatalf("failed restart replaced or removed the stopped pin: calls=%v", runner.outputArgs)
+		}
+	}
+}
+
+type sourceRecoveryPinRunner struct {
+	*fakeDockerRunner
+	sourceRunning bool
+}
+
+func (r *sourceRecoveryPinRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	if len(args) == 4 && args[0] == "inspect" && args[1] == "--type" && args[2] == "container" && args[3] == "src-id" {
+		r.outputArgs = append(r.outputArgs, append([]string{}, args...))
+		return []byte(fmt.Sprintf(`[{"Id":"src-id","Name":"/coolify-web","State":{"Running":%t,"Status":"exited"}}]`, r.sourceRunning)), nil
+	}
+	if len(args) == 2 && args[0] == "start" && args[1] == "src-id" {
+		r.outputArgs = append(r.outputArgs, append([]string{}, args...))
+		r.sourceRunning = true
+		return []byte("src-id\n"), nil
+	}
+	return r.fakeDockerRunner.Output(ctx, args...)
+}
+
+func TestBestEffortResumePreservesVerifiedPreHandoffPin(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	runner := &sourceRecoveryPinRunner{fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}, stagingVolumePins: map[string]stagingVolumePin{"api": pin}}
+	entry := actx.entry("api")
+	entry.SourcePauseRecorded = true
+	entry.SourcePausedContainers = []sourcePausedContainer{{ID: "src-id", Stopped: true}}
+	client := &Client{Docker: runner}
+
+	if err := client.bestEffortResume(context.Background(), actx, plan, len(plan.Steps), pausedSources{"api": true}, false, true); err != nil {
+		t.Fatalf("resume source with pre-handoff pin: %v", err)
+	}
+	if !runner.sourceRunning {
+		t.Fatal("source was not resumed")
+	}
+	if _, ok := runner.activePins[pin.containerID]; !ok {
+		t.Fatalf("verified pre-handoff pin was removed before a retry could reuse it: %#v", runner.activePins)
+	}
+	if cached, ok := actx.stagingVolumePins["api"]; !ok || cached != pin {
+		t.Fatalf("preserved pin was not cached for retry: %#v", actx.stagingVolumePins)
+	}
+	pinRuns := 0
+	for _, args := range runner.outputArgs {
+		if len(args) > 1 && args[0] == "run" && args[1] == "-d" {
+			pinRuns++
+		}
+		if len(args) > 1 && args[0] == "rm" && args[1] == "-f" {
+			t.Fatalf("source recovery removed the preserved pin: %v", runner.outputArgs)
+		}
+	}
+	if pinRuns != 1 {
+		t.Fatalf("source recovery recreated the preserved pin: run calls=%d all calls=%v", pinRuns, runner.outputArgs)
+	}
+}
+
+func TestBestEffortResumeKeepsSourceStoppedWhenPinGuardIsUnverified(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	runner := &sourceRecoveryPinRunner{fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const targetID = "unexpected-target"
+	runner.outputs["inspect --type container "+targetID] = []byte(`[{"Id":"` + targetID + `","Name":"/web","Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/data","RW":true}]}]`)
+	runner.activeComposeProjects = map[string][]string{"stack-1": {targetID}}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}, stagingVolumePins: map[string]stagingVolumePin{"api": pin}}
+	entry := actx.entry("api")
+	entry.SourcePauseRecorded = true
+	entry.SourcePausedContainers = []sourcePausedContainer{{ID: "src-id", Stopped: true}}
+	client := &Client{Docker: runner}
+
+	err = client.bestEffortResume(context.Background(), actx, plan, len(plan.Steps), pausedSources{"api": true}, false, true)
+	if err == nil || !strings.Contains(err.Error(), "pin could not be verified before restart") {
+		t.Fatalf("expected unverified pin guard to block source restart, got %v", err)
+	}
+	if runner.sourceRunning || fakeOutputCalled(runner.fakeDockerRunner, "start", "src-id") {
+		t.Fatalf("source restarted with an unverified pin guard: running=%t calls=%v", runner.sourceRunning, runner.outputArgs)
+	}
+	if _, ok := runner.activePins[pin.containerID]; !ok {
+		t.Fatal("unverified pin guard was removed")
+	}
+}
+
+func TestFailedStagingVolumeHandoffReportsGuardVerification(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified := failedStagingVolumeHandoff(runner, plan, "api", []stagedVolume{staged}, pin, "handoff failed", errors.New("deploy error"))
+	if !strings.Contains(verified.Error(), "verified and preserved") {
+		t.Fatalf("verified guard was not reported accurately: %v", verified)
+	}
+	runner.outputs["volume inspect "+staged.VolumeName] = []byte(`[{"Name":"` + staged.VolumeName + `","Labels":{"bort.run-id":"other-run"}}]`)
+	unverified := failedStagingVolumeHandoff(runner, plan, "api", []stagedVolume{staged}, pin, "handoff failed", errors.New("deploy error"))
+	if !strings.Contains(unverified.Error(), "could not verify the read-only staging-volume guard") || strings.Contains(unverified.Error(), "verified and preserved") {
+		t.Fatalf("unverified guard was reported inaccurately: %v", unverified)
+	}
+}
+
+type handoffPinRunner struct {
+	*fakeDockerRunner
+	pinCommand    string
+	pinID         string
+	targetID      string
+	targetInspect string
+	pinned        bool
+	sawTarget     bool
+}
+
+func (r *handoffPinRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	key := strings.Join(args, " ")
+	if key == r.targetInspect {
+		if !r.pinned {
+			return nil, errors.New("target attached after staging volume pin was released")
+		}
+		r.sawTarget = true
+	}
+	if strings.HasPrefix(key, "ps -a --filter volume=") && r.sawTarget {
+		return []byte(r.pinID + "\n" + r.targetID + "\n"), nil
+	}
+	out, err := r.fakeDockerRunner.Output(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	if key == r.pinCommand {
+		r.pinned = true
+	}
+	if key == "rm -f "+r.pinID {
+		if !r.sawTarget {
+			return nil, errors.New("staging volume pin released before target attachment was verified")
+		}
+		r.pinned = false
+	}
+	return out, nil
+}
+
+type completedDriftHandoffRunner struct {
+	*fakeDockerRunner
+	targetID      string
+	targetVisible bool
+	targetStopped bool
+}
+
+func (r *completedDriftHandoffRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
+	key := strings.Join(args, " ")
+	if strings.HasPrefix(key, "ps -a --filter volume=") {
+		out, err := r.fakeDockerRunner.Output(ctx, args...)
+		if err != nil || !r.targetVisible {
+			return out, err
+		}
+		return append(out, []byte("\n"+r.targetID+"\n")...), nil
+	}
+	out, err := r.fakeDockerRunner.Output(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	if key == "stop "+r.targetID {
+		r.targetStopped = true
+	}
+	if key == "inspect --type container "+r.targetID && r.targetStopped {
+		out = []byte(strings.ReplaceAll(strings.ReplaceAll(string(out), `"Running":true`, `"Running":false`), `"Status":"running"`, `"Status":"exited"`))
+	}
+	return out, nil
+}
+
+func TestApplyPushImagePinsStagingVolumeThroughTargetValidation(t *testing.T) {
+	app, plan, _, staged := stagedSyncFixture(t)
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	compose := "services:\n  web:\n    image: example/web\n    volumes:\n      - data:/data\nvolumes:\n  data:\n"
+	composePath := filepath.Join(appDir, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte(compose), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app.Directory = "api"
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
+	plan.Prepare = preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}
+	plan.BundleFiles = map[string][]byte{filepath.Clean(composePath): []byte(compose)}
+
+	var deploymentTitle string
+	deploys := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			deploys++
+			var request deployComposeRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			deploymentTitle = request.Title
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "c1", AppName: "stack-1", Deployments: []Deployment{{Title: deploymentTitle, Status: "done"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	const targetID = "abcdef123456"
+	pinCommand := "run -d --name " + stagingVolumePinName(plan, []stagedVolume{staged}) + " --network none --read-only --restart unless-stopped --label " + stagingVolumePinLabel + "=true --label " + stagingVolumeRunIDLabel + "=" + stagingOwner(plan) + " --label " + stagingVolumeAppLabel + "=api -v " + staged.VolumeName + ":/bort-volume/0:ro " + volumeCopyImage + " sh -c while :; do sleep 2147483647; done"
+	targetInspect := "inspect --type container " + targetID
+	runner := &handoffPinRunner{
+		fakeDockerRunner: &fakeDockerRunner{
+			outputs: map[string][]byte{
+				"image inspect example/web": []byte(`[{}]`),
+				"ps --format {{.Names}}":    []byte("dokploy-postgres\n"),
+				pinCommand:                  []byte("handoff-pin\n"),
+				"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
+				"volume inspect " + staged.VolumeName:                                            ownedStagingVolumeInspect(plan, staged),
+				"rm -f handoff-pin":                                                              []byte("handoff-pin\n"),
+				"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}":       []byte(targetID + "\n"),
+				targetInspect: []byte(`[{"Id":"` + targetID + `","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/data","RW":true}]}]`),
+			},
+			runOutputs: map[string][]byte{
+				"exec -i dokploy-postgres psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": {},
+			},
+		},
+		pinCommand:    pinCommand,
+		pinID:         "handoff-pin",
+		targetID:      targetID,
+		targetInspect: targetInspect,
+	}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	entry := actx.entry("api")
+	entry.ComposeID = "c1"
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: staged.VolumeName},
+	}
+	if _, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true); err != nil {
+		t.Fatalf("seed transferred-state pin: %v", err)
+	}
+
+	if err := client.applyPushImage(context.Background(), actx, Step{Kind: StepPushImage, App: "api", Ref: "api"}); err != nil {
+		t.Fatalf("applyPushImage: %v", err)
+	}
+	if !runner.sawTarget || runner.pinned {
+		t.Fatalf("expected target validation while pinned followed by release, sawTarget=%t pinned=%t", runner.sawTarget, runner.pinned)
+	}
+	if _, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true); err != nil {
+		t.Fatalf("seed interrupted-handoff pin: %v", err)
+	}
+	runner.sawTarget = true
+	err := client.applyPushImage(context.Background(), actx, Step{Kind: StepPushImage, App: "api", Ref: "api"})
+	if err == nil || !isUnsafeSourceResumeError(err) || !mutationResponseMayHaveSucceeded(err) || !strings.Contains(err.Error(), "previous target attachment may have survived") || !runner.pinned {
+		t.Fatalf("a resumed push with a surviving target attachment must preserve the pin and keep the source stopped, pinned=%t err=%v", runner.pinned, err)
+	}
+	if deploys != 1 {
+		t.Fatalf("a surviving target attachment must block another deployment, deploys=%d", deploys)
+	}
+	if err := releaseStagingVolumePin(context.Background(), runner, plan, []stagedVolume{staged}, stagingVolumePin{name: stagingVolumePinName(plan, []stagedVolume{staged}), containerID: runner.pinID}); err != nil {
+		t.Fatalf("release preserved test pin: %v", err)
+	}
+	delete(actx.stagingVolumePins, "api")
+	runner.sawTarget = false
+	if _, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true); err != nil {
+		t.Fatalf("seed transferred-state pin for release failure: %v", err)
+	}
+	runner.outputErrs = map[string]error{"rm -f handoff-pin": errors.New("docker response lost while releasing pin")}
+	err = client.applyPushImage(context.Background(), actx, Step{Kind: StepPushImage, App: "api", Ref: "api"})
+	if err == nil || !isUnsafeSourceResumeError(err) || !mutationResponseMayHaveSucceeded(err) || !strings.Contains(err.Error(), "paused source applications remain stopped") || !strings.Contains(err.Error(), "bort status") {
+		t.Fatalf("a pin-release failure after target validation must keep the source stopped, got %v", err)
+	}
+}
+
+func TestApplyPushImageKeepsSourceStoppedAfterCompletedDeploymentMountDrift(t *testing.T) {
+	app, plan, _, staged := stagedSyncFixture(t)
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	compose := "services:\n  web:\n    image: example/web\n    volumes:\n      - data:/data\nvolumes:\n  data:\n"
+	composePath := filepath.Join(appDir, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte(compose), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app.Directory = "api"
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
+	plan.Prepare = preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}
+	plan.BundleFiles = map[string][]byte{filepath.Clean(composePath): []byte(compose)}
+
+	const targetID = "drifted-web"
+	runner := &completedDriftHandoffRunner{
+		fakeDockerRunner: &fakeDockerRunner{
+			outputs: map[string][]byte{
+				"image inspect example/web": []byte(`[{}]`),
+				"ps --format {{.Names}}":    []byte("dokploy-postgres\n"),
+				"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
+				"volume inspect " + staged.VolumeName:                                            ownedStagingVolumeInspect(plan, staged),
+				"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}":       []byte(targetID + "\n"),
+				"inspect --type container " + targetID:                                           []byte(`[{"Id":"` + targetID + `","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-vol","Destination":"/data","RW":true}]}]`),
+				"stop " + targetID:                                                               []byte(targetID + "\n"),
+			},
+			runOutputs: map[string][]byte{
+				"exec -i dokploy-postgres psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": {},
+			},
+		},
+		targetID: targetID,
+	}
+	var deploymentTitle string
+	deploys := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			deploys++
+			var request deployComposeRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			deploymentTitle = request.Title
+			runner.targetVisible = true
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "c1", AppName: "stack-1", Deployments: []Deployment{{Title: deploymentTitle, Status: "done"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	entry := actx.entry("api")
+	entry.ComposeID = "c1"
+	entry.ComposeAppName = "stack-1"
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: staged.VolumeName},
+	}
+	if _, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true); err != nil {
+		t.Fatalf("seed transferred-state pin: %v", err)
+	}
+
+	err := client.applyPushImage(context.Background(), actx, Step{Kind: StepPushImage, App: "api", Ref: "api"})
+	if err == nil || !isUnsafeSourceResumeError(err) || !mutationResponseMayHaveSucceeded(err) || !strings.Contains(err.Error(), "changed from migrated volume") {
+		t.Fatalf("a completed deployment with mount drift must keep the source stopped, got %v", err)
+	}
+	if !runner.targetStopped {
+		t.Fatalf("the drifted target was not stopped, calls=%#v", runner.outputArgs)
+	}
+	if len(runner.activePins) != 1 {
+		t.Fatalf("the staging-volume pin must remain active after an unsafe completed deployment, active=%#v", runner.activePins)
+	}
+	if deploys != 1 {
+		t.Fatalf("mount drift test observed %d deploy requests, want 1", deploys)
+	}
+}
+
 func TestSyncVolumeToStagingCreatesOwnedVolumeAndRecordsMount(t *testing.T) {
 	app, plan, step, _ := stagedSyncFixture(t)
 	plan.RunID = "run-digest"
@@ -507,9 +1817,11 @@ func TestSyncVolumeToStagingCreatesOwnedVolumeAndRecordsMount(t *testing.T) {
 	}
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
-			"volume inspect src-vol":                     []byte(`[{"Name":"src-vol"}]`),
-			"volume inspect " + staged.VolumeName:        []byte(`[{"Name":"` + staged.VolumeName + `"}]`),
-			"volume create":                              []byte(staged.VolumeName + "\n"),
+			"volume inspect src-vol":              []byte(`[{"Name":"src-vol"}]`),
+			"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+			"volume create":                       []byte(staged.VolumeName + "\n"),
+			"create --network none -v " + staged.VolumeName + ":/volume " + volumeCopyImage + " true": []byte("pin-id\n"),
+			"rm -f pin-id":                               []byte("pin-id\n"),
 			"inspect --type container src-id":            stoppedSourceInspect("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
 			"ps -a --filter volume=" + staged.VolumeName: []byte(""),
 		},
@@ -540,6 +1852,9 @@ func TestSyncVolumeToStagingCreatesOwnedVolumeAndRecordsMount(t *testing.T) {
 	if !ok || mount.VolumeName != staged.VolumeName {
 		t.Fatalf("expected staging mount recorded, got %#v", actx.entry("api").MigratedVolumeMounts)
 	}
+	if len(runner.activePins) != 1 {
+		t.Fatalf("sync must leave the app-wide staging-volume pin active for deployment handoff, active=%#v", runner.activePins)
+	}
 }
 
 func TestSyncVolumeToStagingRefusesCopyWhoseFlushFails(t *testing.T) {
@@ -551,9 +1866,11 @@ func TestSyncVolumeToStagingRefusesCopyWhoseFlushFails(t *testing.T) {
 	}
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
-			"volume inspect src-vol":                     []byte(`[{"Name":"src-vol"}]`),
-			"volume inspect " + staged.VolumeName:        []byte(`[{"Name":"` + staged.VolumeName + `"}]`),
-			"volume create":                              []byte(staged.VolumeName + "\n"),
+			"volume inspect src-vol":              []byte(`[{"Name":"src-vol"}]`),
+			"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+			"volume create":                       []byte(staged.VolumeName + "\n"),
+			"create --network none -v " + staged.VolumeName + ":/volume " + volumeCopyImage + " true": []byte("pin-id\n"),
+			"rm -f pin-id":                               []byte("pin-id\n"),
 			"inspect --type container src-id":            stoppedSourceInspect("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
 			"ps -a --filter volume=" + staged.VolumeName: []byte(""),
 		},
@@ -585,13 +1902,13 @@ func TestSyncVolumeToStagingRefusesForeignOwnedVolume(t *testing.T) {
 	_, plan, step, staged := stagedSyncFixture(t)
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
-			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("other-run\n"),
+			"volume inspect " + staged.VolumeName: stagingVolumeInspect(plan, staged, "other-run"),
 		},
 	}
 	client := &Client{Docker: runner}
 	actx := &applyContext{cache: map[string]*appCache{}, plan: plan}
 	err := client.applySyncVolume(context.Background(), actx, step)
-	if err == nil || !strings.Contains(err.Error(), "not owned by run \"run1\"") {
+	if err == nil || !strings.Contains(err.Error(), "label bort.run-id=\"other-run\", want \"run1\"") {
 		t.Fatalf("expected ownership error, got %v", err)
 	}
 	if len(runner.runs) != 0 {
@@ -605,7 +1922,7 @@ func TestSyncVolumeToStagingRejectsSourceRestartDuringCopy(t *testing.T) {
 		fakeDockerRunner: fakeDockerRunner{
 			outputs: map[string][]byte{
 				"volume inspect src-vol":              []byte(`[{"Name":"src-vol"}]`),
-				"volume inspect " + staged.VolumeName: []byte(`[{"Name":"` + staged.VolumeName + `"}]`),
+				"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
 				"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
 				"ps -a --filter volume=" + staged.VolumeName:                                     []byte(""),
 			},
@@ -621,6 +1938,9 @@ func TestSyncVolumeToStagingRejectsSourceRestartDuringCopy(t *testing.T) {
 	actx := &applyContext{cache: map[string]*appCache{}, plan: plan}
 	actx.entry("api").MigratedVolumeMounts = map[string]migratedVolumeMount{
 		migratedMountKey("web", "/data"): {Service: "web", Target: "/data", VolumeName: staged.VolumeName},
+	}
+	if _, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{staged}, true); err != nil {
+		t.Fatalf("seed transferred-state pin: %v", err)
 	}
 
 	err := client.applySyncVolume(context.Background(), actx, step)
@@ -640,7 +1960,7 @@ func TestSyncVolumeToStagingRefusesRunningSource(t *testing.T) {
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
 			"volume inspect src-vol":              []byte(`[{"Name":"src-vol"}]`),
-			"volume inspect " + staged.VolumeName: []byte(`[{"Name":"` + staged.VolumeName + `"}]`),
+			"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
 			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
 			"ps -a --filter volume=" + staged.VolumeName:                                     []byte(""),
 			"inspect --type container src-id":                                                []byte(`[{"Id":"src-id","Name":"/coolify-web","State":{"Running":true}}]`),
@@ -746,34 +2066,13 @@ func stagedRestoreFixture(t *testing.T) (Plan, Step, stagedVolume) {
 	return plan, step, staged[0]
 }
 
-type stagingVolumeStateRunner struct {
-	*fakeDockerRunner
-	volumeName string
-	present    bool
-}
-
-func (r *stagingVolumeStateRunner) Output(ctx context.Context, args ...string) ([]byte, error) {
-	out, err := r.fakeDockerRunner.Output(ctx, args...)
-	key := strings.Join(args, " ")
-	switch {
-	case key == "volume rm -f "+r.volumeName:
-		r.present = false
-	case args[0] == "volume" && args[1] == "create" && args[len(args)-1] == r.volumeName:
-		r.present = true
-	case strings.HasPrefix(key, "volume inspect --format") && strings.HasSuffix(key, " "+r.volumeName) && !r.present:
-		return nil, errors.New("Error response from daemon: get " + r.volumeName + ": no such volume")
-	}
-	return out, err
-}
-
 func TestRestoreDataStoreToStagingRunsIsolatedComposeProject(t *testing.T) {
 	plan, step, staged := stagedRestoreFixture(t)
 	project := stagingProjectName(plan, "api", "db")
-	fake := &fakeDockerRunner{
+	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
 			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
-			"volume rm -f " + staged.VolumeName:                                              []byte(staged.VolumeName + "\n"),
-			"volume create":                                                                  []byte(staged.VolumeName + "\n"),
+			"volume inspect " + staged.VolumeName:                                            ownedStagingVolumeInspect(plan, staged),
 			"compose -p " + project:                                                          []byte("stg-id\n"),
 			"inspect --type container stg-id":                                                []byte(`[{"Id":"stg-id","Name":"/` + project + `-db-1","Config":{"Env":["POSTGRES_USER=bob","POSTGRES_PASSWORD=s3cret","POSTGRES_DB=app"]},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/var/lib/postgresql/data","RW":true}]}]`),
 			"ps -a --filter volume=" + staged.VolumeName:                                     []byte(""),
@@ -783,7 +2082,6 @@ func TestRestoreDataStoreToStagingRunsIsolatedComposeProject(t *testing.T) {
 			"exec -i stg-id pg_restore -l": []byte("271; 1259 100 TABLE public widgets bob\n"),
 		},
 	}
-	runner := &stagingVolumeStateRunner{fakeDockerRunner: fake, volumeName: staged.VolumeName, present: true}
 	client := stagingCompatibleClient(t, runner, true, "")
 	actx := &applyContext{cache: map[string]*appCache{}, plan: plan, stagingEnvFormat: stagingEnvFormatKeepInterpolation}
 	actx.entry("api").ComposeAppName = "stack-1"
@@ -845,43 +2143,128 @@ func TestRestoreDataStoreToStagingRunsIsolatedComposeProject(t *testing.T) {
 		t.Fatalf("pg_restore must run between compose up and the final down, runs=%#v", runner.runs)
 	}
 
-	removed, recreated := false, false
-	recreateIndex, lookupIndex := -1, -1
-	for index, args := range runner.outputArgs {
-		joined := strings.Join(args, " ")
-		if joined == "volume rm -f "+staged.VolumeName {
-			removed = true
-		}
-		if removed && !recreated && strings.HasPrefix(joined, "volume create ") && strings.HasSuffix(joined, " "+staged.VolumeName) {
-			if !strings.Contains(joined, " --label bort.run-id="+stagingOwner(plan)+" ") {
-				t.Fatalf("recreated staging volume must carry the run label, got %v", args)
-			}
-			recreated = true
-			recreateIndex = index
-		}
-		if lookupIndex < 0 && strings.HasPrefix(joined, "compose -p "+project+" ") {
-			lookupIndex = index
+	clearIndex := -1
+	for index, run := range runner.runs {
+		if strings.Contains(strings.Join(run.Args, " "), "find /volume -mindepth 1 -delete && sync") {
+			clearIndex = index
+			break
 		}
 	}
-	if !removed || !recreated {
-		t.Fatalf("staging volume must be recreated before restore, outputs=%v", runner.outputArgs)
+	if clearIndex < 0 || upIndex < 0 || clearIndex >= upIndex {
+		t.Fatalf("staging volume must be cleared under its pin before restore, clear=%d up=%d runs=%#v", clearIndex, upIndex, runner.runs)
 	}
-	if lookupIndex < 0 || lookupIndex < recreateIndex {
-		t.Fatalf("staging container lookup must follow the volume recreate (recreate=%d lookup=%d), outputs=%v", recreateIndex, lookupIndex, runner.outputArgs)
+	if fakeOutputCalled(runner, "volume", "rm", "-f", staged.VolumeName) {
+		t.Fatalf("restore must preserve the owned staging volume identity, outputs=%v", runner.outputArgs)
 	}
 	mount, ok := actx.entry("api").MigratedVolumeMounts[migratedMountKey("db", "/var/lib/postgresql/data")]
 	if !ok || mount.VolumeName != staged.VolumeName {
 		t.Fatalf("expected staging mount recorded after restore, got %#v", actx.entry("api").MigratedVolumeMounts)
 	}
+	if len(runner.activePins) != 1 {
+		t.Fatalf("restore must leave the app-wide staging-volume pin active for deployment handoff, active=%#v", runner.activePins)
+	}
 }
 
-func TestRestoreDataStoreToStagingRefusesToRemoveForeignVolume(t *testing.T) {
+func TestRestoreDataStoreToStagingLeavesUnrelatedAppVolumeAttachedOnlyToPin(t *testing.T) {
+	plan, step, databaseVolume := stagedRestoreFixture(t)
+	app := &plan.Prepare.Apps[0]
+	uploads := preparer.VolumeResource{Service: "web", Type: "volume", Name: "src-uploads", Target: "/uploads"}
+	app.Resources.Volumes = append(app.Resources.Volumes, uploads)
+	plan.Steps = slices.Insert(plan.Steps, len(plan.Steps)-1, Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /uploads"})
+	uploadsVolume, ok := stagedVolumeFor(plan, "api", uploads)
+	if !ok {
+		t.Fatal("uploads volume is not staged")
+	}
+	project := stagingProjectName(plan, "api", "db")
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"volume inspect " + databaseVolume.VolumeName: ownedStagingVolumeInspect(plan, databaseVolume),
+			"volume inspect " + uploadsVolume.VolumeName:  ownedStagingVolumeInspect(plan, uploadsVolume),
+			"compose -p " + project:                       []byte("stg-id\n"),
+			"inspect --type container stg-id":             []byte(`[{"Id":"stg-id","Name":"/` + project + `-db-1","Config":{"Env":["POSTGRES_USER=bob","POSTGRES_PASSWORD=[REDACTED:password]","POSTGRES_DB=app"]},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"` + databaseVolume.VolumeName + `","Destination":"/var/lib/postgresql/data","RW":true}]}]`),
+			"exec stg-id rm -f":                           []byte(""),
+		},
+		runOutputs: map[string][]byte{
+			"exec -i stg-id pg_restore -l": []byte("271; 1259 100 TABLE public widgets bob\n"),
+		},
+	}
+	client := stagingCompatibleClient(t, runner, true, "")
+	actx := &applyContext{cache: map[string]*appCache{}, plan: plan, stagingEnvFormat: stagingEnvFormatKeepInterpolation}
+	actx.entry("api").ComposeAppName = "stack-1"
+
+	if err := client.applyRestoreDataStore(context.Background(), actx, step); err != nil {
+		t.Fatalf("restore rejected the unrelated uploads volume: %v", err)
+	}
+	if len(runner.activePins) != 1 {
+		t.Fatalf("app-wide pin was not preserved across restore: %#v", runner.activePins)
+	}
+	var pin dockerContainer
+	for _, candidate := range runner.activePins {
+		pin = candidate
+	}
+	mounted := map[string]bool{}
+	for _, mount := range pin.Mounts {
+		if mount.Type == "volume" {
+			mounted[mount.Name] = !mount.RW
+		}
+	}
+	if !mounted[databaseVolume.VolumeName] || !mounted[uploadsVolume.VolumeName] || len(mounted) != 2 {
+		t.Fatalf("app-wide pin mounts = %#v, want both staging volumes read-only", pin.Mounts)
+	}
+	attachments, err := stagingVolumeAttachmentSets(context.Background(), runner, []stagedVolume{databaseVolume, uploadsVolume})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, volume := range []stagedVolume{databaseVolume, uploadsVolume} {
+		if got := attachments[volume.VolumeName]; len(got) != 1 || !stagingContainerIDsMatch(got[0], pin.ID) {
+			t.Fatalf("staging volume %s attachments = %v, want only pin %s", volume.VolumeName, got, pin.ID)
+		}
+	}
+}
+
+func TestRestoreDataStoreReplayRefusesMissingPinAfterDurableTransfer(t *testing.T) {
+	plan, step, staged := stagedRestoreFixture(t)
+	seed := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	if err := seed.recordMigratedVolumeMount("api", migratedVolumeMount{Service: staged.Service, Target: staged.Target, VolumeName: staged.VolumeName}); err != nil {
+		t.Fatal(err)
+	}
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}, stagingEnvFormat: stagingEnvFormatKeepInterpolation}
+	if err := actx.loadMigratedVolumeMounts(); err != nil {
+		t.Fatal(err)
+	}
+	actx.entry("api").ComposeID = "c1"
+	actx.entry("api").ComposeAppName = "stack-1"
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
+	}}
+	client := stagingCompatibleClient(t, runner, true, "")
+
+	err := client.applyRestoreDataStore(context.Background(), actx, step)
+	if err == nil || !isUnsafeSourceResumeError(err) || !strings.Contains(err.Error(), "missing after state transfer") {
+		t.Fatalf("expected same-restore replay to refuse pin recreation, got %v", err)
+	}
+	for _, run := range runner.runs {
+		joined := strings.Join(run.Args, " ")
+		if strings.Contains(joined, "find /volume -mindepth 1 -delete") {
+			t.Fatalf("same-restore replay cleared data: runs=%#v", runner.runs)
+		}
+	}
+	for _, args := range runner.outputArgs {
+		if len(args) > 1 && args[0] == "run" && args[1] == "-d" {
+			t.Fatalf("same-restore replay recreated the missing pin: outputs=%#v", runner.outputArgs)
+		}
+	}
+	if len(runner.activePins) != 0 {
+		t.Fatalf("same-restore replay left an unexpected pin active: %#v", runner.activePins)
+	}
+}
+
+func TestRestoreDataStoreToStagingRefusesToClearForeignVolume(t *testing.T) {
 	plan, step, staged := stagedRestoreFixture(t)
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
-			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("other-run\n"),
-			"volume rm -f " + staged.VolumeName:                                              []byte(staged.VolumeName + "\n"),
-			"ps -a --filter volume=" + staged.VolumeName:                                     []byte(""),
+			"volume inspect " + staged.VolumeName:        stagingVolumeInspect(plan, staged, "other-run"),
+			"ps -a --filter volume=" + staged.VolumeName: []byte(""),
 		},
 	}
 	client := stagingCompatibleClient(t, runner, true, "")
@@ -889,11 +2272,13 @@ func TestRestoreDataStoreToStagingRefusesToRemoveForeignVolume(t *testing.T) {
 	actx.entry("api").ComposeAppName = "stack-1"
 
 	err := client.applyRestoreDataStore(context.Background(), actx, step)
-	if err == nil || !strings.Contains(err.Error(), "not owned by run") {
+	if err == nil || !strings.Contains(err.Error(), "label bort.run-id=\"other-run\", want \"run1\"") {
 		t.Fatalf("expected foreign volume refusal, got %v", err)
 	}
-	if fakeOutputCalled(runner, "volume", "rm", "-f", staged.VolumeName) {
-		t.Fatalf("restore removed a volume it does not own: %#v", runner.outputArgs)
+	for _, run := range runner.runs {
+		if strings.Contains(strings.Join(run.Args, " "), "find /volume -mindepth 1 -delete") {
+			t.Fatalf("restore cleared a volume it does not own: %#v", runner.runs)
+		}
 	}
 }
 
@@ -903,7 +2288,7 @@ func TestRestoreDataStoreToStagingStopsProjectAndSkipsRecordOnFailure(t *testing
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
 			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
-			"volume rm -f " + staged.VolumeName:                                              []byte(staged.VolumeName + "\n"),
+			"volume inspect " + staged.VolumeName:                                            ownedStagingVolumeInspect(plan, staged),
 			"ps -a --filter volume=" + staged.VolumeName:                                     []byte(""),
 			"compose -p " + project:                                                          []byte("stg-a\nstg-b\n"),
 		},
@@ -922,6 +2307,51 @@ func TestRestoreDataStoreToStagingStopsProjectAndSkipsRecordOnFailure(t *testing
 	}
 	if len(actx.entry("api").MigratedVolumeMounts) != 0 {
 		t.Fatalf("failed restore must not record mounts, got %#v", actx.entry("api").MigratedVolumeMounts)
+	}
+}
+
+type failingStagingUpRunner struct {
+	*fakeDockerRunner
+}
+
+func (r *failingStagingUpRunner) Run(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {
+	if err := r.fakeDockerRunner.Run(ctx, stdin, stdout, args...); err != nil {
+		return err
+	}
+	if slices.Contains(args, "up") {
+		return errors.New("docker compose response lost after start")
+	}
+	return nil
+}
+
+func TestRestoreDataStoreToStagingStopsProjectAfterAmbiguousStartFailure(t *testing.T) {
+	plan, step, staged := stagedRestoreFixture(t)
+	project := stagingProjectName(plan, "api", "db")
+	runner := &failingStagingUpRunner{fakeDockerRunner: &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
+		"volume inspect " + staged.VolumeName:                                            ownedStagingVolumeInspect(plan, staged),
+		"ps -a --filter volume=" + staged.VolumeName:                                     []byte(""),
+	}}}
+	client := stagingCompatibleClient(t, runner, true, "")
+	actx := &applyContext{cache: map[string]*appCache{}, plan: plan, stagingEnvFormat: stagingEnvFormatKeepInterpolation}
+	actx.entry("api").ComposeAppName = "stack-1"
+
+	err := client.applyRestoreDataStore(context.Background(), actx, step)
+	if err == nil || !strings.Contains(err.Error(), "docker compose response lost after start") {
+		t.Fatalf("expected staging start failure, got %v", err)
+	}
+	var composeRuns []string
+	for _, run := range runner.runs {
+		joined := strings.Join(run.Args, " ")
+		if strings.HasPrefix(joined, "compose -p "+project+" ") {
+			composeRuns = append(composeRuns, joined)
+		}
+	}
+	if len(composeRuns) != 3 || !strings.Contains(composeRuns[1], " up -d ") || !strings.HasSuffix(composeRuns[2], " down --remove-orphans") {
+		t.Fatalf("failed staging start must be followed by teardown, runs=%v", composeRuns)
+	}
+	if len(actx.entry("api").MigratedVolumeMounts) != 0 {
+		t.Fatalf("failed staging start must not record mounts, got %#v", actx.entry("api").MigratedVolumeMounts)
 	}
 }
 
@@ -990,7 +2420,7 @@ func TestSyncVolumeToStagingRefusesAttachedVolumeBeforeCopy(t *testing.T) {
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
 			"volume inspect src-vol":              []byte(`[{"Name":"src-vol"}]`),
-			"volume inspect " + staged.VolumeName: []byte(`[{"Name":"` + staged.VolumeName + `"}]`),
+			"volume inspect " + staged.VolumeName: ownedStagingVolumeInspect(plan, staged),
 			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
 			"ps -a --filter volume=" + staged.VolumeName:                                     []byte("deployed-id\n"),
 			"inspect --type container src-id":                                                stoppedSourceInspect("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
@@ -999,7 +2429,7 @@ func TestSyncVolumeToStagingRefusesAttachedVolumeBeforeCopy(t *testing.T) {
 	client := &Client{Docker: runner}
 	actx := &applyContext{cache: map[string]*appCache{}, plan: plan}
 	err := client.applySyncVolume(context.Background(), actx, step)
-	if err == nil || !strings.Contains(err.Error(), "attached to container(s) deployed-id") {
+	if err == nil || !strings.Contains(err.Error(), "attached to unexpected container deployed-id") {
 		t.Fatalf("expected attached-volume refusal, got %v", err)
 	}
 	if len(runner.runs) != 0 {
@@ -1020,7 +2450,7 @@ func TestStagingOwnershipUsesRunIDOverRunName(t *testing.T) {
 	}
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
-			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
+			"volume inspect " + staged.VolumeName: stagingVolumeInspect(plan, staged, "run1"),
 		},
 	}
 	client := &Client{Docker: runner}
@@ -1061,7 +2491,7 @@ func TestRestoreDataStoreToStagingRefusesUnstagedDataDir(t *testing.T) {
 			runner := &fakeDockerRunner{
 				outputs: map[string][]byte{
 					"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
-					"volume rm -f " + staged.VolumeName:                                              []byte(staged.VolumeName + "\n"),
+					"volume inspect " + staged.VolumeName:                                            ownedStagingVolumeInspect(plan, staged),
 					"ps -a --filter volume=" + staged.VolumeName:                                     []byte(""),
 					"compose -p " + project:                                                          []byte("stg-id\n"),
 					"inspect --type container stg-id":                                                []byte(`[{"Id":"stg-id","Name":"/` + project + `-db-1",` + inspect + `,"State":{"Running":true,"Status":"running"}}]`),
@@ -1242,6 +2672,11 @@ func TestValidatePlannedPostgresDataDirsRefusesUnstagedLayoutsBeforeLiveApply(t 
 			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /var/lib/postgresql/data\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - wal:/var/lib/postgresql/data/pg_wal\nvolumes:\n  pgdata:\n  wal:\n",
 			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}, {Service: "db", Type: "volume", Name: "src-wal", Target: "/var/lib/postgresql/data/pg_wal"}},
 		},
+		"named volume outside PGDATA": {
+			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /var/lib/postgresql/data\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - backups:/backups\nvolumes:\n  pgdata:\n  backups:\n",
+			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}, {Service: "db", Type: "volume", Name: "src-backups", Target: "/backups"}},
+			want:    "named volume \"src-backups\" at /backups",
+		},
 		"named volume beside custom PGDATA": {
 			compose: "services:\n  db:\n    image: postgres:16\n    environment:\n      PGDATA: /pg/data\n    volumes:\n      - pgdata:/var/lib/postgresql/data\nvolumes:\n  pgdata:\n",
 			volumes: []preparer.VolumeResource{{Service: "db", Type: "volume", Name: "src-pgdata", Target: "/var/lib/postgresql/data"}},
@@ -1363,10 +2798,11 @@ func TestPauseSourcePreflightsStagedRestoreOnCreatedContainer(t *testing.T) {
 			runner := &fakeDockerRunner{
 				outputs: map[string][]byte{
 					"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
-					"compose -p " + project:           []byte("stg-id\n"),
-					"inspect --type container stg-id": []byte(`[{"Id":"stg-id","Name":"/` + project + `-db-1","Config":{"Env":[` + tc.env + `]},"State":{"Running":false,"Status":"created"},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/var/lib/postgresql/data","RW":true}]}]`),
-					"inspect --type container web-id": []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
-					"stop web-id":                     []byte("web-id\n"),
+					"volume inspect " + staged.VolumeName:                                            ownedStagingVolumeInspect(plan, staged),
+					"compose -p " + project:                                                          []byte("stg-id\n"),
+					"inspect --type container stg-id":                                                []byte(`[{"Id":"stg-id","Name":"/` + project + `-db-1","Config":{"Env":[` + tc.env + `]},"State":{"Running":false,"Status":"created"},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/var/lib/postgresql/data","RW":true}]}]`),
+					"inspect --type container web-id":                                                []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+					"stop web-id":                                                                    []byte("web-id\n"),
 				},
 			}
 			client := stagingCompatibleClient(t, runner, true, "")
@@ -1444,6 +2880,7 @@ func TestPauseSourcePreflightStopsStagingProjectAfterFailedCreate(t *testing.T) 
 	runner := &failingCreateRunner{fakeDockerRunner: &fakeDockerRunner{
 		outputs: map[string][]byte{
 			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
+			"volume inspect " + staged.VolumeName:                                            ownedStagingVolumeInspect(plan, staged),
 		},
 	}}
 	client := stagingCompatibleClient(t, runner, true, "")
@@ -1532,9 +2969,10 @@ func testApplyPreflightRefusal(t *testing.T, tc applyPreflightRefusalCase) {
 	runner := &fakeDockerRunner{
 		outputs: map[string][]byte{
 			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + staged.VolumeName: []byte("run1\n"),
-			"compose -p " + project:           []byte("stg-id\n"),
-			"inspect --type container stg-id": []byte(`[{"Id":"stg-id","Name":"/` + project + `-db-1","Config":{"Env":["PGDATA=/pg/data"]},"State":{"Running":false,"Status":"created"},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/var/lib/postgresql/data","RW":true}]}]`),
-			"inspect --type container web-id": []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
+			"volume inspect " + staged.VolumeName:                                            ownedStagingVolumeInspect(plan, staged),
+			"compose -p " + project:                                                          []byte("stg-id\n"),
+			"inspect --type container stg-id":                                                []byte(`[{"Id":"stg-id","Name":"/` + project + `-db-1","Config":{"Env":["PGDATA=/pg/data"]},"State":{"Running":false,"Status":"created"},"Mounts":[{"Type":"volume","Name":"` + staged.VolumeName + `","Destination":"/var/lib/postgresql/data","RW":true}]}]`),
+			"inspect --type container web-id":                                                []byte(`[{"Id":"web-id","Name":"/web","State":{"Running":true,"Status":"running"}}]`),
 		},
 	}
 	if tc.earlierPartialPause {
@@ -1584,8 +3022,8 @@ func testApplyPreflightRefusal(t *testing.T, tc applyPreflightRefusalCase) {
 	if errors.As(err, new(stagedRestorePreflightError)) != requiresNewRun {
 		t.Fatalf("preflight error classified as layout refusal = %v, want %v: %v", !requiresNewRun, requiresNewRun, err)
 	}
-	if strings.Contains(err.Error(), "resume source app") != tc.resumeFails || strings.Contains(err.Error(), "was not durably recorded") {
-		t.Fatalf("resume failure reported = %v, want %v: %v", strings.Contains(err.Error(), "resume source app"), tc.resumeFails, err)
+	if strings.Contains(err.Error(), "remains stopped after failed apply") != tc.resumeFails || strings.Contains(err.Error(), "was not durably recorded") {
+		t.Fatalf("resume failure reported = %v, want %v: %v", strings.Contains(err.Error(), "remains stopped after failed apply"), tc.resumeFails, err)
 	}
 	var first, last *StepProgress
 	resumed := false
@@ -1620,5 +3058,113 @@ func testApplyPreflightRefusal(t *testing.T, tc applyPreflightRefusalCase) {
 	wantResumed := tc.earlierPartialPause && !tc.resumeFails
 	if fakeOutputCalled(runner, "start", "web-id") != tc.earlierPartialPause || resumed != wantResumed {
 		t.Fatalf("source restart after refusal = %v (resume progress %v), want %v/%v: calls=%v", fakeOutputCalled(runner, "start", "web-id"), resumed, tc.earlierPartialPause, wantResumed, runner.outputArgs)
+	}
+}
+
+func TestReleaseTargetAuthorityPinsSkipsDokployAPIWithoutStagedState(t *testing.T) {
+	_, plan, _, _ := stagedSyncFixture(t)
+	plan.TargetIdentities = map[string]TargetIdentity{"api": {ProjectID: "project-1", EnvironmentID: "env-1", ComposeID: "compose-1", ComposeAppName: "stack-1"}}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter label=bort.staging-pin=true --filter label=bort.run-id=run1 --format {{.ID}}": nil,
+	}}
+	if err := (&Client{Docker: runner}).ReleaseStagingVolumePins(context.Background(), plan, true); err != nil {
+		t.Fatalf("target finalization without staged state needed the Dokploy API: %v", err)
+	}
+}
+
+func TestRequireSourceMountsStageDataDirRefusesAuxiliaryVolumeWithDefaultPGDATA(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "db", Type: "volume", Name: "pgdata", Target: "/var/lib/postgresql/data", ReadWrite: true},
+		{Service: "db", Type: "volume", Name: "backups", Target: "/backups", ReadWrite: true},
+	}
+	staged := []stagedVolume{
+		{Service: "db", Target: "/var/lib/postgresql/data", VolumeName: "bort-pgdata"},
+		{Service: "db", Target: "/backups", VolumeName: "bort-backups"},
+	}
+	err := requireSourceMountsStageDataDir(app, "db", postgresDataDir(dockerContainer{}), staged)
+	if !errors.Is(err, ErrNotImplemented) || !strings.Contains(err.Error(), `"backups" at /backups`) {
+		t.Fatalf("default-PGDATA layout must refuse the auxiliary volume before pause_source, got %v", err)
+	}
+}
+
+func TestReleaseTargetAuthorityWithoutPinSkipsLiveAttachmentChecks(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	plan.StagingTransferApps = []string{"api"}
+	plan.TargetIdentities = map[string]TargetIdentity{"api": {ProjectID: "project-1", EnvironmentID: "env-1", ComposeID: "compose-1", ComposeAppName: "stack-1"}}
+	state := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	if err := state.recordMigratedVolumeMount("api", migratedVolumeMount{Service: "web", Target: "/data", VolumeName: staged.VolumeName}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"ps -a --filter label=bort.staging-pin=true --filter label=bort.run-id=run1 --format {{.ID}}": nil,
+	}}
+
+	if err := (&Client{Docker: runner}).ReleaseStagingVolumePins(context.Background(), plan, true); err != nil {
+		t.Fatalf("target finalization with no pin left depended on live target state: %v", err)
+	}
+	for _, args := range runner.outputArgs {
+		if len(args) > 0 && args[0] != "ps" || strings.Contains(strings.Join(args, " "), "volume=") {
+			t.Fatalf("target finalization with no pin left inspected live attachments: %v", runner.outputArgs)
+		}
+	}
+}
+
+func TestIncompleteStagingTransfersRequiresEveryStagedVolumeRecord(t *testing.T) {
+	app, plan, firstStep, _ := stagedSyncFixture(t)
+	app.Resources.Volumes = append(app.Resources.Volumes, preparer.VolumeResource{Service: "worker", Type: "volume", Name: "worker-data", Target: "/work"})
+	plan = stagedPlan(t, app, plan.RunDir, Step{Kind: StepPauseSource, App: "api"}, firstStep, Step{Kind: StepSyncVolume, App: "api", Ref: "volume:worker -> /work"})
+	plan.StagingTransferApps = []string{"api"}
+	first, _ := stagedVolumeFor(plan, "api", app.Resources.Volumes[0])
+	second, _ := stagedVolumeFor(plan, "api", app.Resources.Volumes[1])
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	for i, volume := range []stagedVolume{first, second} {
+		if incomplete, err := IncompleteStagingTransfers(plan); err != nil || len(incomplete) != 1 || incomplete[0] != "api" {
+			t.Fatalf("after %d of 2 volume records: incomplete = %v, %v; want [api]", i, incomplete, err)
+		}
+		if err := actx.recordMigratedVolumeMount("api", migratedVolumeMount{Service: volume.Service, Target: volume.Target, VolumeName: volume.VolumeName}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if incomplete, err := IncompleteStagingTransfers(plan); err != nil || len(incomplete) != 0 {
+		t.Fatalf("fully recorded transfer reported incomplete: %v, %v", incomplete, err)
+	}
+}
+
+func TestValidateTargetAuthorityRequiresHandoffEvidenceWhenPinIsMissing(t *testing.T) {
+	_, plan, _, staged := stagedSyncFixture(t)
+	plan.StagingTransferApps = []string{"api"}
+	plan.RunID = "run-digest"
+	staged, _ = stagedVolumeFor(plan, "api", plan.Prepare.Apps[0].Resources.Volumes[0])
+	const targetID = "target-id"
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged.VolumeName:                                      ownedStagingVolumeInspect(plan, staged),
+		"ps -a --filter label=com.docker.compose.project=stack-1 --format {{.ID}}": []byte(targetID + "\n"),
+		"inspect --type container " + targetID:                                     []byte(`[{"Id":"` + targetID + `","Name":"/web","Config":{"Labels":{"com.docker.compose.service":"web","com.docker.compose.project":"stack-1"}},"State":{"Running":true,"Status":"running"},"Mounts":[{"Type":"volume","Name":"fresh-data","Destination":"/data","RW":true}]}]`),
+	}, activeComposeProjects: map[string][]string{"stack-1": {targetID}}}
+	client := targetAuthorityTestClient(t, runner, &plan)
+	actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	if err := actx.recordMigratedVolumeMount("api", migratedVolumeMount{Service: "web", Target: "/data", VolumeName: staged.VolumeName}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.ValidateStagingVolumePins(context.Background(), plan, true); err == nil || !strings.Contains(err.Error(), "fresh-data") {
+		t.Fatalf("target validation accepted a missing pin without handoff evidence while the target mounts fresh state: %v", err)
+	}
+	plan.HandedOffApps = []string{"api"}
+	if err := client.ValidateStagingVolumePins(context.Background(), plan, true); err != nil {
+		t.Fatalf("target validation refused a recorded handoff whose pin was released: %v", err)
+	}
+}
+
+func TestRequireSourceMountsStageDataDirRefusesUnmeasuredAnonymousVolume(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "db", Type: "volume", Name: "pgdata", Target: "/pgdata", ReadWrite: true},
+		{Service: "db", Type: "volume", Name: strings.Repeat("ab", 32), Target: "/var/lib/postgresql/data", ReadWrite: true},
+	}
+	staged := []stagedVolume{{Service: "db", Target: "/pgdata", VolumeName: "bort-pgdata"}, {Service: "db", Target: "/var/lib/postgresql/data", VolumeName: "bort-anon"}}
+	if err := requireSourceMountsStageDataDir(app, "db", "/pgdata", staged); err == nil || !errors.Is(err, ErrNotImplemented) {
+		t.Fatalf("anonymous volume outside PGDATA with unknown contents was accepted: %v", err)
 	}
 }
