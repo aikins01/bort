@@ -95,6 +95,20 @@ inputs is refused. The bound inputs include the admin display name and API-key
 name used by post-install bootstrap. Bort removes the marker only after the
 local Dokploy service answers and passes same-host verification.
 
+When a readable kernel configuration explicitly reports that IPVS is disabled,
+Bort refuses VIP mode before it records the marker, so no recovery state
+exists to clear. An unreadable kernel configuration does not establish IPVS
+support; if such an installation then fails, use the abandonment path below.
+If you determine that the recorded command cannot succeed on
+this host, inspect the host, then clear the marker with
+`sudo bort init-target --abandon-recovery --live` as the same OS user that
+started the installation. Without `--live`, the command only prints what it
+found and changes nothing. Bort clears the marker only when the recorded
+Dokploy URL accepts no connection and the host is not owned by a migration,
+and it never clears a completed installation. Abandoning does not undo
+partial host state such as a half-created Docker swarm; rerun
+`init-target --install` with corrected options to try the installation again.
+
 #### Recover an existing Dokploy service using the legacy secret
 
 Dokploy releases that have no explicit authentication secret use the legacy
@@ -542,9 +556,11 @@ from being combined with source-container or proxy changes on the local VPS.
 ### Kernels without IPVS
 
 Dokploy's control-plane services use Docker Swarm VIP networking by default.
-If the kernel explicitly reports that IPVS is disabled, Bort stops before
-installing anything. On these hosts, use Dokploy's documented DNS round-robin
-mode when starting Bort, for example:
+Before installing, Bort reads the kernel configuration and refuses VIP mode
+when the kernel explicitly reports that IPVS is disabled. The refusal happens
+before any recovery state is recorded, so you can retry immediately. On these
+hosts, use Dokploy's documented DNS round-robin mode when starting Bort, for
+example:
 
 ```sh
 sudo ENDPOINT_MODE=dnsrr bort migrate --live
@@ -1115,6 +1131,7 @@ Ordinary cleanup and destructive source purge are separate operations. See the
 | Situation | Safe next action |
 | --- | --- |
 | Bort cannot find the expected run | Return to the original working directory and original OS user. Do not create a replacement workspace accidentally. |
+| An interrupted `init-target --install` left a recovery marker, but the recorded command cannot succeed on this host | First rerun the recorded command `bort status` shows, which is the only path that reconciles a finished or half-finished installation. If you have confirmed it cannot succeed (for example VIP mode on a kernel without IPVS support), inspect the host, then run `sudo bort init-target --abandon-recovery` as the same OS user that started the installation to see what Bort found, and add `--live` to clear the marker. Bort refuses while the recorded Dokploy URL still answers, while another migration owns the host, or once the installation completed. Abandoning does not undo partial host state such as a half-created Docker swarm; rerun `init-target --install` with corrected options to try again. |
 | Stateless live apply was interrupted at a safe completed boundary | Run `sudo bort status`, then rerun `sudo bort migrate --live` to resume from the saved progress. |
 | Live apply reports `MANUAL STATE` for a stateful run | The run was applied with an older plan version that copied state into a deployed target. The blocked run cannot continue. Complete recovery with the guidance shown by `bort status`, then create a new run. |
 | Stateful live apply refuses because the Coolify control plane is running or would restart, or a Coolify deployment helper is still running deployment commands | Wait until no Coolify deployment is queued or running, record the `coolify` container's restart policy, run `sudo docker --host unix:///var/run/docker.sock update --restart=no coolify && sudo docker --host unix:///var/run/docker.sock stop coolify`, wait until no `coolify-helper` container is still deploying, then rerun `sudo bort migrate --live`. Restore the policy and start Coolify only after source-authority recovery succeeds; after target acceptance, restore the policy and start it only if other apps need it, then immediately delete the migrated apps in Coolify. |

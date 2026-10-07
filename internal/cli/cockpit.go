@@ -143,14 +143,14 @@ func writeCockpitPhaseGuidance(w io.Writer, st *styler, run loadedMigrationRun, 
 	case "host-lock-error":
 		fmt.Fprintln(w, st.muted("The host-wide Dokploy operation lock could not be verified. Inspect /var/lib/bort/dokploy-live.lock before retrying."))
 	case "install-recovery":
-		command, found, err := dokployInstallationRecoveryCommand()
+		recovery, found, err := readDokployInstallationRecovery()
 		switch {
 		case err != nil:
 			fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("A Dokploy installation was interrupted, but its recovery command could not be read: %v. Inspect /var/lib/bort/dokploy-live.lock.install-recovery-required before other host mutations.", err)))
 		case !found:
 			fmt.Fprintln(w, st.muted("A Dokploy installation was interrupted, but its recovery marker is no longer present. Re-check this run before other host mutations."))
 		default:
-			fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("A Dokploy installation was interrupted after host mutation may have started. Run `%s` to reconcile it before other host mutations.", command)))
+			fmt.Fprintf(w, "%s\n", st.muted(fmt.Sprintf("A Dokploy installation was interrupted after host mutation may have started. Run `%s` to reconcile it before other host mutations. If the recorded options cannot succeed, inspect the host and run `%s init-target --abandon-recovery --live` to clear this state.", recovery.Command, recovery.CommandPrefix)))
 		}
 	case "host-busy":
 		fmt.Fprintln(w, st.muted("Another process is changing this Dokploy host. Wait for that operation to finish, then check this run again."))

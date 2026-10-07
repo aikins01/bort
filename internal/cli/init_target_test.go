@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2353,4 +2355,350 @@ func requireNoDokployInstallationRecovery(t *testing.T) {
 	if blocked, err := dokployInstallationRecoveryRequired(); err != nil || blocked {
 		t.Fatalf("blocked init-target left installation recovery required: blocked=%t err=%v", blocked, err)
 	}
+}
+
+type abortingAdminLister struct{}
+
+func (*abortingAdminLister) listAdmins(context.Context) ([]coolifyAdmin, error) {
+	return nil, errors.New("admin listing must not run")
+}
+
+func strandedDokployInstallRecovery(t *testing.T, targetURL string) dokployInstallationRecovery {
+	t.Helper()
+	t.Cleanup(func() { _ = clearDokployInstallationRecoveryRequired() })
+	recovery := newDokployInstallationRecovery(targetURL, dokployInstallOptions{
+		HostPort:         "3030",
+		AddrPool:         "auto",
+		Version:          defaultDokployVersion + "@" + defaultDokployDigest,
+		EndpointMode:     "vip",
+		ACMEEmail:        "admin@example.com",
+		AuthSecretBackup: filepath.Join(t.TempDir(), "dokploy-auth-secret"),
+		AdminName:        "Recovery Admin",
+		APIKeyName:       "recovery key",
+	})
+	if err := markDokployInstallationRecoveryRequired(recovery); err != nil {
+		t.Fatal(err)
+	}
+	return recovery
+}
+
+func requireDokployInstallationRecovery(t *testing.T) {
+	t.Helper()
+	blocked, err := dokployInstallationRecoveryRequired()
+	if err != nil || !blocked {
+		t.Fatalf("expected installation recovery state to remain: blocked=%t err=%v", blocked, err)
+	}
+}
+
+func TestInitTargetInstallRefusesVIPModeWhenKernelConfigDisablesIPVS(t *testing.T) {
+	for _, line := range []string{"# CONFIG_IP_VS is not set", "CONFIG_IP_VS=n"} {
+		t.Run(line, func(t *testing.T) {
+			t.Setenv(envDokployAuthBackup, filepath.Join(t.TempDir(), "dokploy-auth-secret"))
+			installer := &fakeDokployInstaller{}
+			deps := initTargetDeps{
+				lister:    &abortingAdminLister{},
+				installer: installer,
+				newClient: func(string) *dokploy.Client {
+					t.Fatal("Dokploy client was created after a refused VIP preflight")
+					return nil
+				},
+				statePath:    filepath.Join(t.TempDir(), "state.json"),
+				kernelConfig: func() (string, bool) { return line + "\nCONFIG_NET_IP_TUNNEL=y\n", true },
+			}
+			err := runInitTargetWith(context.Background(), []string{
+				"--install",
+				"--dokploy-url", "http://127.0.0.1:3030",
+				"--endpoint-mode", "vip",
+			}, strings.NewReader(""), io.Discard, io.Discard, deps)
+			if err == nil || !strings.Contains(err.Error(), "Docker Swarm VIP mode requires kernel IPVS support; set ENDPOINT_MODE=dnsrr in the environment when rerunning the original command, or pass --endpoint-mode dnsrr to init-target") {
+				t.Fatalf("expected VIP refusal for %q, got %v", line, err)
+			}
+			if installer.calls != 0 {
+				t.Fatalf("refused VIP preflight reached the installer %d time(s)", installer.calls)
+			}
+			requireNoDokployInstallationRecovery(t)
+		})
+	}
+}
+
+func TestInitTargetInstallVIPPreflightPassesWithIPVSOrUnavailableConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		mode         string
+		kernelConfig func() (string, bool)
+	}{
+		{name: "ipvs enabled", mode: "vip", kernelConfig: func() (string, bool) {
+			return "CONFIG_IP_VS=m\nCONFIG_IP_VS_PROTO_TCP=y\n", true
+		}},
+		{name: "kernel config unavailable", mode: "vip", kernelConfig: func() (string, bool) {
+			return "", false
+		}},
+		{name: "dnsrr bypasses the kernel check", mode: "dnsrr", kernelConfig: func() (string, bool) {
+			return "# CONFIG_IP_VS is not set\n", true
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envDokployAuthBackup, filepath.Join(t.TempDir(), "dokploy-auth-secret"))
+			stub := &dokployStub{}
+			server := newDokployStub(t, stub)
+			defer server.Close()
+			installer := &fakeDokployInstaller{}
+			deps := initTargetDeps{
+				lister: &fakeAdminLister{admins: []coolifyAdmin{
+					{Email: "admin@example.com", Name: "Admin User", PasswordHash: bcryptCoolifyHash(t, "right-password")},
+				}},
+				installer:    installer,
+				newClient:    func(string) *dokploy.Client { return defaultDokployClient(server.URL) },
+				statePath:    filepath.Join(t.TempDir(), "state.json"),
+				kernelConfig: tc.kernelConfig,
+			}
+			t.Setenv(envCoolifyAdminPwd, "right-password")
+			err := runInitTargetWith(context.Background(), []string{
+				"--install",
+				"--dokploy-url", server.URL,
+				"--install-port", serverPort(t, server),
+				"--coolify-email", "admin@example.com",
+				"--endpoint-mode", tc.mode,
+			}, strings.NewReader(""), io.Discard, io.Discard, deps)
+			if err != nil {
+				t.Fatalf("init-target --install failed: %v", err)
+			}
+			if installer.calls != 1 || stub.createKeyCalls != 1 {
+				t.Fatalf("expected one installer call and one api key, got installer=%d api_keys=%d", installer.calls, stub.createKeyCalls)
+			}
+			requireNoDokployInstallationRecovery(t)
+		})
+	}
+}
+
+func TestInitTargetAbandonRecoveryDryRunKeepsState(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	recovery := strandedDokployInstallRecovery(t, "http://127.0.0.1:3030")
+	deps := initTargetDeps{
+		probeTargetLiveness: func(context.Context, string) (bool, error) { return false, nil },
+	}
+	stdout := &bytes.Buffer{}
+	if err := runInitTargetWith(context.Background(), []string{"--abandon-recovery"}, strings.NewReader(""), stdout, io.Discard, deps); err != nil {
+		t.Fatalf("abandon dry run failed: %v", err)
+	}
+	output := stdout.String()
+	if !strings.Contains(output, "Dry run: found interrupted Dokploy installation recovery state") || !strings.Contains(output, recovery.Command) {
+		t.Fatalf("abandon dry run omitted its findings: %q", output)
+	}
+	requireDokployInstallationRecovery(t)
+}
+
+func TestInitTargetAbandonRecoveryLiveClearsState(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	recovery := strandedDokployInstallRecovery(t, "http://127.0.0.1:3030")
+	deps := initTargetDeps{
+		probeTargetLiveness: func(context.Context, string) (bool, error) { return false, nil },
+	}
+	stdout := &bytes.Buffer{}
+	if err := runInitTargetWith(context.Background(), []string{"--abandon-recovery", "--live"}, strings.NewReader(""), stdout, io.Discard, deps); err != nil {
+		t.Fatalf("abandon --live failed: %v", err)
+	}
+	output := stdout.String()
+	if !strings.Contains(output, "Cleared the interrupted Dokploy installation recovery state") || !strings.Contains(output, recovery.Command) {
+		t.Fatalf("abandon --live omitted its findings: %q", output)
+	}
+	requireNoDokployInstallationRecovery(t)
+}
+
+func TestInitTargetAbandonRecoveryLiveClearsStateAgainstClosedListener(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovery := strandedDokployInstallRecovery(t, fmt.Sprintf("http://127.0.0.1:%d", port))
+	stdout := &bytes.Buffer{}
+	if err := runInitTargetWith(context.Background(), []string{"--abandon-recovery", "--live"}, strings.NewReader(""), stdout, io.Discard, initTargetDeps{}); err != nil {
+		t.Fatalf("abandon --live against a closed listener failed: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Cleared the interrupted Dokploy installation recovery state") || !strings.Contains(stdout.String(), recovery.Command) {
+		t.Fatalf("abandon --live omitted its findings: %q", stdout.String())
+	}
+	requireNoDokployInstallationRecovery(t)
+}
+
+func TestInitTargetAbandonRecoveryRefusesWhileDokployAnswers(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	strandedDokployInstallRecovery(t, "http://127.0.0.1:3030")
+	deps := initTargetDeps{
+		probeTargetLiveness: func(context.Context, string) (bool, error) { return true, nil },
+	}
+	err := runInitTargetWith(context.Background(), []string{"--abandon-recovery", "--live"}, strings.NewReader(""), io.Discard, io.Discard, deps)
+	if err == nil || !strings.Contains(err.Error(), "reconcile it by rerunning") {
+		t.Fatalf("expected refusal while Dokploy answers, got %v", err)
+	}
+	requireDokployInstallationRecovery(t)
+}
+
+func TestInitTargetAbandonRecoveryRefusesCompletedInstall(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	recovery := strandedDokployInstallRecovery(t, "http://127.0.0.1:3030")
+	recovery.Phase = dokployInstallAPIKey
+	recovery.APIKeyBaselineIDs = []string{"key-1"}
+	recovery = canonicalDokployInstallationRecovery(recovery)
+	if err := markDokployInstallationRecoveryRequired(recovery); err != nil {
+		t.Fatal(err)
+	}
+	deps := initTargetDeps{
+		probeTargetLiveness: func(context.Context, string) (bool, error) {
+			t.Fatal("Dokploy liveness probe ran for a completed install")
+			return false, nil
+		},
+	}
+	err := runInitTargetWith(context.Background(), []string{"--abandon-recovery", "--live"}, strings.NewReader(""), io.Discard, io.Discard, deps)
+	if err == nil || !strings.Contains(err.Error(), `reached phase "api-key-pending"`) || !strings.Contains(err.Error(), recovery.Command) {
+		t.Fatalf("expected completed-install refusal, got %v", err)
+	}
+	requireDokployInstallationRecovery(t)
+}
+
+func TestInitTargetAbandonRecoveryWithoutStateReportsNone(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	requireNoDokployInstallationRecovery(t)
+	stdout := &bytes.Buffer{}
+	if err := runInitTargetWith(context.Background(), []string{"--abandon-recovery"}, strings.NewReader(""), stdout, io.Discard, initTargetDeps{}); err != nil {
+		t.Fatalf("abandon without state failed: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "No interrupted Dokploy installation recovery state found.") {
+		t.Fatalf("abandon without state printed unexpected output: %q", stdout.String())
+	}
+}
+
+func TestInitTargetAbandonRecoveryRefusesUnreadableState(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	path, err := dokployInstallationRecoveryPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareDokployLiveOperationLockPath(path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	if err := os.WriteFile(path, []byte("not-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = runInitTargetWith(context.Background(), []string{"--abandon-recovery", "--live"}, strings.NewReader(""), io.Discard, io.Discard, initTargetDeps{})
+	if err == nil || !strings.Contains(err.Error(), "is malformed") {
+		t.Fatalf("expected unreadable recovery state refusal, got %v", err)
+	}
+}
+
+func TestInitTargetAbandonRecoveryRefusesWhileHostOwned(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	strandedDokployInstallRecovery(t, "http://127.0.0.1:3030")
+	ownerRun := migrationRun{Name: "owner-run", RunDir: filepath.Join(t.TempDir(), "owner-run"), CreatedAt: time.Now().UTC(), BundleDigest: "owner-digest"}
+	if err := claimDokployHostOwnership(ownerRun, "http://127.0.0.1:3030", dokployCredentialID("test-token")); err != nil {
+		t.Fatal(err)
+	}
+	deps := initTargetDeps{
+		probeTargetLiveness: func(context.Context, string) (bool, error) {
+			t.Fatal("Dokploy liveness probe ran while the host was owned")
+			return false, nil
+		},
+	}
+	err := runInitTargetWith(context.Background(), []string{"--abandon-recovery", "--live"}, strings.NewReader(""), io.Discard, io.Discard, deps)
+	if err == nil || !strings.Contains(err.Error(), "refusing standalone init-target") {
+		t.Fatalf("expected host-ownership refusal, got %v", err)
+	}
+	requireDokployInstallationRecovery(t)
+}
+
+func TestInitTargetAbandonRecoveryRefusesWhenProbeIsInconclusive(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	strandedDokployInstallRecovery(t, "http://127.0.0.1:3030")
+	deps := initTargetDeps{
+		probeTargetLiveness: func(context.Context, string) (bool, error) {
+			return false, errors.New("probe interrupted")
+		},
+	}
+	err := runInitTargetWith(context.Background(), []string{"--abandon-recovery", "--live"}, strings.NewReader(""), io.Discard, io.Discard, deps)
+	if err == nil || !strings.Contains(err.Error(), "cannot tell whether the recorded Dokploy installation is live") || !strings.Contains(err.Error(), "probe interrupted") {
+		t.Fatalf("expected inconclusive-probe refusal, got %v", err)
+	}
+	requireDokployInstallationRecovery(t)
+}
+
+func TestInitTargetAbandonRecoveryRefusesWhenCanceledContext(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	strandedDokployInstallRecovery(t, "http://127.0.0.1:3030")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := runInitTargetWith(ctx, []string{"--abandon-recovery", "--live"}, strings.NewReader(""), io.Discard, io.Discard, initTargetDeps{})
+	if err == nil || !strings.Contains(err.Error(), "cannot tell whether the recorded Dokploy installation is live") {
+		t.Fatalf("expected canceled-context refusal, got %v", err)
+	}
+	requireDokployInstallationRecovery(t)
+}
+
+func TestInitTargetAbandonRecoveryTreatsRedirectResponseAsLive(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://127.0.0.1:1/unreachable", http.StatusFound)
+	}))
+	defer server.Close()
+	strandedDokployInstallRecovery(t, server.URL)
+	err := runInitTargetWith(context.Background(), []string{"--abandon-recovery", "--live"}, strings.NewReader(""), io.Discard, io.Discard, initTargetDeps{})
+	if err == nil || !strings.Contains(err.Error(), "reconcile it by rerunning") {
+		t.Fatalf("expected live-endpoint refusal behind a redirect, got %v", err)
+	}
+	requireDokployInstallationRecovery(t)
+}
+
+func TestInitTargetAbandonRecoveryRefusesWhenConnectionDropsWithoutResponse(t *testing.T) {
+	resetDokployTrafficOwner(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	strandedDokployInstallRecovery(t, "http://"+listener.Addr().String())
+	err = runInitTargetWith(context.Background(), []string{"--abandon-recovery", "--live"}, strings.NewReader(""), io.Discard, io.Discard, initTargetDeps{})
+	if err == nil || !strings.Contains(err.Error(), "cannot tell whether the recorded Dokploy installation is live") {
+		t.Fatalf("expected dropped-connection refusal, got %v", err)
+	}
+	requireDokployInstallationRecovery(t)
+}
+
+func TestDokployTargetProbeUnreachableClassifiesOnlyConnectionRefusal(t *testing.T) {
+	refused := &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+	if !dokployTargetProbeUnreachable(refused) {
+		t.Fatal("expected a connection refusal to be classified as unreachable")
+	}
+	if dokployTargetProbeUnreachable(&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.EACCES)}) {
+		t.Fatal("expected a permission-denied dial failure to stay inconclusive")
+	}
+	if dokployTargetProbeUnreachable(&net.OpError{Op: "dial", Err: errors.New("i/o timeout")}) {
+		t.Fatal("expected a dial timeout to stay inconclusive")
+	}
+}
+
+func TestInitTargetAbandonRecoveryFlagConflicts(t *testing.T) {
+	deps := initTargetDeps{lister: &abortingAdminLister{}}
+	err := runInitTargetWith(context.Background(), []string{"--abandon-recovery", "--install"}, strings.NewReader(""), io.Discard, io.Discard, deps)
+	if err == nil || !strings.Contains(err.Error(), "cannot run together with --install") {
+		t.Fatalf("expected --abandon-recovery --install refusal, got %v", err)
+	}
+	err = runInitTargetWith(context.Background(), []string{"--live"}, strings.NewReader(""), io.Discard, io.Discard, deps)
+	if err == nil || !strings.Contains(err.Error(), "--live is only valid with --abandon-recovery") {
+		t.Fatalf("expected --live alone refusal, got %v", err)
+	}
+	requireNoDokployInstallationRecovery(t)
 }
