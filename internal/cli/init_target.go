@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -19,9 +20,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -68,6 +71,8 @@ type initTargetDeps struct {
 	retainLiveOperationLock   **applyLock
 	revalidateAfterTargetLock func() error
 	installTimeout            time.Duration
+	kernelConfig              func() (string, bool)
+	probeTargetLiveness       func(context.Context, string) (bool, error)
 }
 
 type dokployInstallOptions struct {
@@ -274,6 +279,8 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 		version      string
 		endpointMode string
 		authBackup   string
+		abandon      bool
+		live         bool
 	)
 	fs.StringVar(&target, "target", "dokploy", "target platform to bootstrap (only dokploy is supported)")
 	fs.StringVar(&email, "coolify-email", "", "coolify admin email to reuse (prompted if absent and multiple admins exist)")
@@ -290,6 +297,8 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 	}
 	fs.StringVar(&endpointMode, "endpoint-mode", endpointMode, "Docker Swarm endpoint mode for Dokploy control-plane services: vip or dnsrr")
 	fs.StringVar(&authBackup, "auth-secret-backup", strings.TrimSpace(os.Getenv(envDokployAuthBackup)), "absolute path on encrypted or off-host storage for the Dokploy authentication-secret escrow")
+	fs.BoolVar(&abandon, "abandon-recovery", false, "clear a stranded interrupted Dokploy install-recovery state after safety checks; without --live it only shows what would happen")
+	fs.BoolVar(&live, "live", false, "with --abandon-recovery, actually clear the recovery state (default is a dry run)")
 
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		target = args[0]
@@ -300,6 +309,15 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 	}
 	if target != "dokploy" {
 		return fmt.Errorf("init-target only supports --target=dokploy, got %q", target)
+	}
+	if abandon && install {
+		return errors.New("--abandon-recovery clears a stranded interrupted-install recovery state; it cannot run together with --install")
+	}
+	if abandon {
+		return runAbandonDokployInstallRecovery(ctx, stdout, live, deps)
+	}
+	if live {
+		return errors.New("--live is only valid with --abandon-recovery")
 	}
 	apiKeyName = strings.TrimSpace(apiKeyName)
 	if err := validateDokployAPIKeyName(apiKeyName); err != nil {
@@ -322,6 +340,11 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 		endpointMode = strings.ToLower(strings.TrimSpace(endpointMode))
 		if endpointMode != "vip" && endpointMode != "dnsrr" {
 			return fmt.Errorf("invalid --endpoint-mode %q: must be vip or dnsrr", endpointMode)
+		}
+		if endpointMode == "vip" {
+			if err := ensureKernelSupportsSwarmVIP(deps.kernelConfig); err != nil {
+				return err
+			}
 		}
 		if err := validateAuthSecretBackupPath(authBackup); err != nil {
 			return err
@@ -428,7 +451,7 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 		case stateErr != nil:
 			err = fmt.Errorf("%w; Dokploy installation recovery state is unreadable, so other host mutations may stay blocked: %v", err, stateErr)
 		case blocked:
-			err = fmt.Errorf("%w; the interrupted installation now blocks other host mutations: run `%s` to reconcile it", err, dokployInstallRecoveryCommand(installationRecovery))
+			err = fmt.Errorf("%w; the interrupted installation now blocks other host mutations: run `%s` to reconcile it, or inspect the host and run `%s init-target --abandon-recovery --live` if the recorded options cannot succeed", err, dokployInstallRecoveryCommand(installationRecovery), installationRecovery.CommandPrefix)
 		}
 	}()
 	if install {
@@ -566,6 +589,82 @@ func runInitTargetWith(ctx context.Context, args []string, stdin io.Reader, stdo
 	fmt.Fprintf(stdout, "Dokploy setup complete for %s at %s\n", admin.Email, client.BaseURL)
 	fmt.Fprintln(stdout, "Bort can now continue with this migration.")
 	return nil
+}
+
+func runAbandonDokployInstallRecovery(ctx context.Context, stdout io.Writer, live bool, deps initTargetDeps) error {
+	lock, err := acquireDokployInstallRecoveryLock()
+	if err != nil {
+		return fmt.Errorf("lock Dokploy live operations: %w", err)
+	}
+	defer lock.Release()
+	recovery, found, err := readDokployInstallationRecovery()
+	if err != nil {
+		return fmt.Errorf("read Dokploy installation recovery state: %w; inspect it before other host mutations", err)
+	}
+	if !found {
+		fmt.Fprintln(stdout, "No interrupted Dokploy installation recovery state found.")
+		return nil
+	}
+	if recovery.Phase != dokployInstallInstalling {
+		return fmt.Errorf("the interrupted Dokploy installation reached phase %q, so Dokploy is installed; reconcile it by rerunning `%s`", recovery.Phase, recovery.Command)
+	}
+	if err := ensureStandaloneDokployInitAvailable(); err != nil {
+		return fmt.Errorf("cannot abandon install recovery: %w", err)
+	}
+	probeTargetLiveness := deps.probeTargetLiveness
+	if probeTargetLiveness == nil {
+		probeTargetLiveness = probeDokployTargetLiveness
+	}
+	answered, err := probeTargetLiveness(ctx, recovery.TargetURL)
+	if err != nil {
+		return fmt.Errorf("cannot tell whether the recorded Dokploy installation is live at %s: %w; inspect the host before abandoning recovery state", recovery.TargetURL, err)
+	}
+	if answered {
+		return fmt.Errorf("Dokploy answered at %s, so the interrupted installation appears to be live; reconcile it by rerunning `%s`", recovery.TargetURL, recovery.Command)
+	}
+	if !live {
+		fmt.Fprintf(stdout, "Dry run: found interrupted Dokploy installation recovery state (phase %q).\n", recovery.Phase)
+		fmt.Fprintf(stdout, "Recorded command: %s\n", recovery.Command)
+		fmt.Fprintf(stdout, "Dokploy did not accept a connection at %s, so the recorded endpoint is not serving; that does not rule out partial host state such as a half-created Docker swarm.\n", recovery.TargetURL)
+		fmt.Fprintln(stdout, "Run the same command with --live to clear this recovery state, then rerun init-target --install with corrected options.")
+		return nil
+	}
+	if err := clearDokployInstallationRecoveryRequired(); err != nil {
+		return fmt.Errorf("clear Dokploy installation recovery state: %w", err)
+	}
+	fmt.Fprintf(stdout, "Cleared the interrupted Dokploy installation recovery state (recorded command: %s).\n", recovery.Command)
+	fmt.Fprintln(stdout, "This does not undo partial host state such as a half-created Docker swarm; inspect the host if the installation got that far.")
+	fmt.Fprintln(stdout, "Rerun init-target --install with corrected options to try the installation again.")
+	return nil
+}
+
+func probeDokployTargetLiveness(ctx context.Context, targetURL string) (bool, error) {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSpace(targetURL), nil)
+	if err != nil {
+		return false, fmt.Errorf("build probe request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if dokployTargetProbeUnreachable(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	resp.Body.Close()
+	return true, nil
+}
+
+func dokployTargetProbeUnreachable(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
 func prepareDokployAPIKeyRecovery(ctx context.Context, client *dokploy.Client, cookie string, recovery dokployInstallationRecovery, keys []dokploy.APIKey) (dokployInstallationRecovery, error) {
@@ -717,6 +816,40 @@ func validateAuthSecretBackupPath(path string) error {
 		return fmt.Errorf("invalid --auth-secret-backup %q: use an absolute path on encrypted or off-host storage", path)
 	}
 	return nil
+}
+
+func ensureKernelSupportsSwarmVIP(kernelConfig func() (string, bool)) error {
+	if kernelConfig == nil {
+		kernelConfig = readKernelConfig
+	}
+	contents, found := kernelConfig()
+	if !found {
+		return nil
+	}
+	for _, line := range strings.Split(contents, "\n") {
+		if line == "# CONFIG_IP_VS is not set" || line == "CONFIG_IP_VS=n" {
+			return errors.New("Docker Swarm VIP mode requires kernel IPVS support; set ENDPOINT_MODE=dnsrr in the environment when rerunning the original command, or pass --endpoint-mode dnsrr to init-target, or use a kernel with IPVS support")
+		}
+	}
+	return nil
+}
+
+func readKernelConfig() (string, bool) {
+	if compressed, err := os.ReadFile("/proc/config.gz"); err == nil {
+		if reader, err := gzip.NewReader(bytes.NewReader(compressed)); err == nil {
+			if contents, err := io.ReadAll(reader); err == nil {
+				return string(contents), true
+			}
+		}
+	}
+	if runtime.GOOS == "linux" {
+		if release, err := exec.Command("uname", "-r").Output(); err == nil {
+			if contents, err := os.ReadFile(filepath.Join("/boot", "config-"+strings.TrimSpace(string(release)))); err == nil {
+				return string(contents), true
+			}
+		}
+	}
+	return "", false
 }
 
 func validateDokployVersionTag(tag string) error {

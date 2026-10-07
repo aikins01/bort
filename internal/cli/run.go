@@ -2583,11 +2583,11 @@ func nextSafeStepContextWithSourceProbe(ctx context.Context, run loadedMigration
 func dokployHostOperationBlocker(active bool, err error) (runNextStep, bool) {
 	if err != nil {
 		if errors.Is(err, errDokployInstallRecoveryRequired) {
-			command, found, recoveryErr := dokployInstallationRecoveryCommand()
+			recovery, found, recoveryErr := readDokployInstallationRecovery()
 			if recoveryErr != nil || !found {
 				return runNextStep{Action: "inspect /var/lib/bort/dokploy-live.lock.install-recovery-required before further host mutation", Reason: errors.Join(err, recoveryErr).Error()}, true
 			}
-			return runNextStep{Action: fmt.Sprintf("run `%s` to reconcile the interrupted installation", command), Reason: errDokployInstallRecoveryRequired.Error()}, true
+			return runNextStep{Action: fmt.Sprintf("run `%s` to reconcile the interrupted installation, or inspect the host and run `%s init-target --abandon-recovery --live` if the recorded options cannot succeed", recovery.Command, recovery.CommandPrefix), Reason: errDokployInstallRecoveryRequired.Error()}, true
 		}
 		return runNextStep{Action: "inspect the host-wide Dokploy operation lock before changing this run", Reason: err.Error()}, true
 	}
