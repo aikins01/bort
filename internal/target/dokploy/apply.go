@@ -473,12 +473,15 @@ func ValidateStagedTransfer(plan Plan) error {
 				continue
 			}
 			if other, dup := bySourceName[name]; dup && other.volume.VolumeName != volume.VolumeName {
-				return fmt.Errorf("source volume %s is mounted by %s %s:%s and %s %s:%s, which would stage as separate volumes %s and %s; a shared named volume cannot be transferred before deploy, so choose a recreate or managed data store strategy or change the source compose before live apply", name, other.app, other.volume.Service, other.volume.Target, app.Name, volume.Service, volume.Target, other.volume.VolumeName, volume.VolumeName)
+				return fmt.Errorf("source volume %s is mounted by %s %s:%s and %s %s:%s, which would stage as separate volumes %s and %s; a named volume shared across apps cannot be staged per app, so choose a recreate or managed data store strategy or change the source compose before live apply", name, other.app, other.volume.Service, other.volume.Target, app.Name, volume.Service, volume.Target, other.volume.VolumeName, volume.VolumeName)
 			}
 			bySourceName[name] = stagedSourceVolume{app: app.Name, volume: volume}
 		}
 	}
 	return eachPlannedStagedRestore(plan, func(restore plannedStagedRestore) error {
+		if err := validatePlannedSharedRestoreVolumes(plan, restore); err != nil {
+			return err
+		}
 		envContent, err := readEnvContent(plan, restore.app.Name)
 		if err != nil {
 			return err
@@ -488,6 +491,32 @@ func ValidateStagedTransfer(plan Plan) error {
 		}
 		return nil
 	})
+}
+
+// validatePlannedSharedRestoreVolumes refuses a logical data store restore
+// into a staging volume shared with another service's mount. the restore
+// replaces the whole staged volume, so the sibling mount's recorded transfer
+// would be destroyed while its completion record survives.
+func validatePlannedSharedRestoreVolumes(plan Plan, restore plannedStagedRestore) error {
+	bySource := map[string][]stagedVolume{}
+	for _, volume := range stagedVolumesForApp(plan, restore.app.Name) {
+		if name := strings.TrimSpace(volume.Source.Name); name != "" {
+			bySource[name] = append(bySource[name], volume)
+		}
+	}
+	for _, volume := range restore.stagedVolumes {
+		name := strings.TrimSpace(volume.Source.Name)
+		if name == "" {
+			continue
+		}
+		for _, other := range bySource[name] {
+			if other.Service == volume.Service {
+				continue
+			}
+			return fmt.Errorf("source volume %s is mounted by %s %s and %s %s in app %s; a data store restore replaces the whole staged volume, so a restored store cannot share one with another mount; choose a recreate or managed data store strategy or change the source compose before live apply", name, volume.Service, volume.Target, other.Service, other.Target, restore.app.Name)
+		}
+	}
+	return nil
 }
 
 // ValidatePlannedPostgresDataDirs refuses, before a run starts live
@@ -1299,6 +1328,9 @@ func (c *Client) applyStep(ctx context.Context, actx *applyContext, step Step) e
 	case StepActivateRoutes:
 		return c.applyActivateRoutes(ctx, actx, step)
 	case StepPauseSource:
+		if err := actx.invalidateMigratedVolumeMounts(step.App); err != nil {
+			return fmt.Errorf("invalidate transferred state for %s: %w", step.App, err)
+		}
 		return c.applyPauseSource(ctx, actx, step)
 	case StepResumeSource:
 		return c.applyResumeSource(ctx, actx, step)

@@ -303,10 +303,14 @@ Bort's safety model defaults to “look first.”
 - Stateful live apply transfers named volumes and Postgres dumps only. A
   stateful app whose plan needs a bind-mount copy is refused; same-host bind
   mounts that stay at their existing paths do not require a transfer.
-- A named volume mounted by more than one compose service cannot be staged.
-  Live apply refuses it before changing Dokploy; choose `bort data <app>
-  <store> --recreate` or `--managed` for a data store volume and re-plan with
-  `bort migrate --run <run>`, or change the source compose and scan a new run.
+- A named volume shared by services within one app stages once and is handed
+  to Dokploy as one external volume. A named volume mounted by more than one
+  app cannot be staged per app, and a data store restore cannot write a volume
+  its app shares with another service, because the restore replaces the whole
+  staged volume. Live apply refuses both before changing Dokploy; choose
+  `bort data <app> <store> --recreate` or `--managed` for a data store volume
+  and re-plan with `bort migrate --run <run>`, or change the source compose
+  and scan a new run.
 - A migrated Postgres store must keep its data directory (`PGDATA`) on a named
   volume the service mounts, with no writable bind mount inside it and no named
   volume outside it. A logical dump cannot restore an auxiliary volume such as

@@ -569,6 +569,21 @@ func stagingVolumeInspect(plan Plan, volume stagedVolume, owner string) []byte {
 	return state
 }
 
+func sharedStagingVolumeInspect(plan Plan, volume stagedVolume) []byte {
+	owner := plan.RunID
+	if owner == "" {
+		owner = plan.RunName
+	}
+	labels := map[string]string{
+		"bort.run":    plan.RunName,
+		"bort.run-id": owner,
+		"bort.app":    "api",
+		"bort.source": volume.Source.Name,
+	}
+	state, _ := json.Marshal([]stagingVolumeState{{Name: volume.VolumeName, Labels: labels}})
+	return state
+}
+
 func targetAuthorityTestClient(t *testing.T, runner dockerRunner, plan *Plan) *Client {
 	t.Helper()
 	const projectID, environmentID, composeID, composeAppName = "project-1", "environment-1", "compose-1", "stack-1"
@@ -1955,6 +1970,181 @@ func TestSyncVolumeToStagingRejectsSourceRestartDuringCopy(t *testing.T) {
 	}
 }
 
+func stagedSharedSyncFixture(t *testing.T) (Plan, []Step, []stagedVolume) {
+	t.Helper()
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.SourceServices = []preparer.SourceServiceRef{
+		{ServiceName: "web", ContainerID: "src-web-id", ContainerName: "coolify-web"},
+		{ServiceName: "worker", ContainerID: "src-worker-id", ContainerName: "coolify-worker"},
+	}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "web", Type: "volume", Name: "src-shared", Target: "/data", SourceContainerID: "src-web-id", SourceContainerName: "coolify-web"},
+		{Service: "worker", Type: "volume", Name: "src-shared", Target: "/work", SourceContainerID: "src-worker-id", SourceContainerName: "coolify-worker"},
+		{Service: "web", Type: "volume", Name: "src-uploads", Target: "/uploads", SourceContainerID: "src-web-id", SourceContainerName: "coolify-web"},
+	}
+	steps := []Step{
+		{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"},
+		{Kind: StepSyncVolume, App: "api", Ref: "volume:worker -> /work"},
+		{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /uploads"},
+	}
+	plan := stagedPlan(t, app, t.TempDir(), append([]Step{{Kind: StepPauseSource, App: "api"}}, steps...)...)
+	staged := stagedVolumesForApp(plan, "api")
+	if len(staged) != 3 {
+		t.Fatalf("expected all mounts to stage, got %#v", staged)
+	}
+	return plan, steps, staged
+}
+
+func sourceContainerInspects(args [][]string) int {
+	count := 0
+	for _, inspect := range args {
+		if len(inspect) > 3 && inspect[0] == "inspect" && inspect[1] == "--type" && inspect[2] == "container" &&
+			(slices.Contains(inspect, "src-web-id") || slices.Contains(inspect, "src-worker-id")) {
+			count++
+		}
+	}
+	return count
+}
+
+func TestSyncVolumeToStagingCopiesSharedSourceOnce(t *testing.T) {
+	plan, steps, staged := stagedSharedSyncFixture(t)
+	if staged[0].VolumeName != staged[1].VolumeName || !staged[0].Shared || !staged[1].Shared {
+		t.Fatalf("expected one shared staging volume, got %#v", staged)
+	}
+	if staged[2].Shared || staged[2].VolumeName == staged[0].VolumeName {
+		t.Fatalf("expected the unrelated upload mount to keep its own staging volume, got %#v", staged)
+	}
+	shared := staged[0].VolumeName
+	uploads := staged[2].VolumeName
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"volume inspect " + shared:               sharedStagingVolumeInspect(plan, staged[0]),
+			"volume inspect " + uploads:              stagingVolumeInspect(plan, staged[2], "run1"),
+			"volume create":                          []byte(shared + "\n"),
+			"volume inspect src-shared":              []byte(`[{"Name":"src-shared"}]`),
+			"volume inspect src-uploads":             []byte(`[{"Name":"src-uploads"}]`),
+			"inspect --type container src-web-id":    []byte(`[{"Id":"src-web-id","Name":"/coolify-web","State":{"Running":false,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"2026-01-02T00:00:00Z"}}]`),
+			"inspect --type container src-worker-id": []byte(`[{"Id":"src-worker-id","Name":"/coolify-worker","State":{"Running":false,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"2026-01-02T00:00:00Z"}}]`),
+		},
+		outputErrs: map[string]error{
+			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + shared:  errors.New("Error response from daemon: get " + shared + ": no such volume"),
+			"volume inspect --format {{index .Labels \"bort.run-id\"}} " + uploads: errors.New("Error response from daemon: get " + uploads + ": no such volume"),
+		},
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: plan}
+
+	if err := client.applySyncVolume(context.Background(), actx, steps[2]); err != nil {
+		t.Fatalf("applySyncVolume(uploads): %v", err)
+	}
+	if len(runner.runs) != 1 || !strings.Contains(strings.Join(runner.runs[0].Args, " "), "src-uploads:/from:ro -v "+uploads+":/to") {
+		t.Fatalf("expected one copy into the private staging volume, got %#v", runner.runs)
+	}
+	if err := client.applySyncVolume(context.Background(), actx, steps[0]); err != nil {
+		t.Fatalf("applySyncVolume(web): %v", err)
+	}
+	if len(runner.runs) != 2 || !strings.Contains(strings.Join(runner.runs[1].Args, " "), "src-shared:/from:ro -v "+shared+":/to") {
+		t.Fatalf("the shared mount must copy despite a recorded transfer into another staging volume, got %#v", runner.runs)
+	}
+	var sharedCreate []string
+	for _, args := range runner.outputArgs {
+		if len(args) > 2 && args[0] == "volume" && args[1] == "create" && strings.HasSuffix(strings.Join(args, " "), shared) {
+			sharedCreate = args
+		}
+	}
+	joined := strings.Join(sharedCreate, " ")
+	if !strings.Contains(joined, "--label bort.source=src-shared") || !strings.HasSuffix(joined, shared) {
+		t.Fatalf("expected the shared staging volume to be created with its source label, got %v", sharedCreate)
+	}
+
+	inspectsBeforeWorker := sourceContainerInspects(runner.outputArgs)
+	if err := client.applySyncVolume(context.Background(), actx, steps[1]); err != nil {
+		t.Fatalf("applySyncVolume(worker): %v", err)
+	}
+	if len(runner.runs) != 2 {
+		t.Fatalf("the second mount of a shared source must not copy again, got %#v", runner.runs)
+	}
+	if got := sourceContainerInspects(runner.outputArgs); got != inspectsBeforeWorker {
+		t.Fatalf("the skipped mount must not re-inspect quiesce targets, got %d source inspects, want %d", got, inspectsBeforeWorker)
+	}
+	for _, mount := range []struct{ service, target string }{{"web", "/data"}, {"worker", "/work"}} {
+		record, ok := actx.entry("api").MigratedVolumeMounts[migratedMountKey(mount.service, mount.target)]
+		if !ok || record.VolumeName != shared {
+			t.Fatalf("expected %s:%s to be recorded on the shared staging volume, got %#v", mount.service, mount.target, actx.entry("api").MigratedVolumeMounts)
+		}
+	}
+
+	if err := client.applySyncVolume(context.Background(), actx, steps[0]); err != nil {
+		t.Fatalf("applySyncVolume(web) retry: %v", err)
+	}
+	if len(runner.runs) != 2 {
+		t.Fatalf("a retried mount of a shared source must not copy again, got %#v", runner.runs)
+	}
+	if len(runner.activePins) != 1 {
+		t.Fatalf("the shared staging volume pin must stay active for deployment handoff, active=%#v", runner.activePins)
+	}
+}
+
+func TestPauseStepRerunInvalidatesSharedVolumeRecords(t *testing.T) {
+	plan, steps, staged := stagedSharedSyncFixture(t)
+	shared := staged[0].VolumeName
+	runner := &fakeDockerRunner{
+		outputs: map[string][]byte{
+			"volume inspect " + shared:               sharedStagingVolumeInspect(plan, staged[0]),
+			"volume inspect " + staged[2].VolumeName: stagingVolumeInspect(plan, staged[2], "run1"),
+			"volume inspect src-shared":              []byte(`[{"Name":"src-shared"}]`),
+			"inspect --type container src-web-id":    []byte(`[{"Id":"src-web-id","Name":"/coolify-web","State":{"Running":false,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"2026-01-02T00:00:00Z"}}]`),
+			"inspect --type container src-worker-id": []byte(`[{"Id":"src-worker-id","Name":"/coolify-worker","State":{"Running":false,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"2026-01-02T00:00:00Z"}}]`),
+		},
+	}
+	if _, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", staged, true); err != nil {
+		t.Fatalf("seed staging volume pin: %v", err)
+	}
+	client := &Client{Docker: runner}
+	actx := &applyContext{cache: map[string]*appCache{}, plan: plan}
+	entry := actx.entry("api")
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{
+		migratedMountKey("web", "/data"):    {Service: "web", Target: "/data", VolumeName: shared},
+		migratedMountKey("worker", "/work"): {Service: "worker", Target: "/work", VolumeName: shared},
+	}
+	entry.StagingTransferStarted = true
+
+	if err := client.applyStep(context.Background(), actx, plan.Steps[0]); err != nil {
+		t.Fatalf("applyStep(pause): %v", err)
+	}
+	if len(entry.MigratedVolumeMounts) != 0 {
+		t.Fatalf("records from the previous attempt must not survive a re-executed pause, got %#v", entry.MigratedVolumeMounts)
+	}
+	if !entry.StagingTransferStarted {
+		t.Fatal("staging transfer evidence must survive the invalidation")
+	}
+	path, err := migratedVolumeMountsPath(plan.RunDir)
+	if err != nil {
+		t.Fatalf("migrated volume state path: %v", err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migrated volume state: %v", err)
+	}
+	var state migratedVolumeMountsState
+	if err := json.Unmarshal(contents, &state); err != nil {
+		t.Fatalf("decode migrated volume state: %v", err)
+	}
+	if len(state.Apps["api"]) != 0 {
+		t.Fatalf("persisted records must not survive a re-executed pause, got %#v", state.Apps["api"])
+	}
+	if !slices.Contains(state.StartedApps, "api") {
+		t.Fatalf("persisted staging transfer evidence must survive, got %#v", state.StartedApps)
+	}
+
+	if err := client.applySyncVolume(context.Background(), actx, steps[0]); err != nil {
+		t.Fatalf("applySyncVolume(web): %v", err)
+	}
+	if len(runner.runs) != 1 || !strings.Contains(strings.Join(runner.runs[0].Args, " "), "src-shared:/from:ro -v "+shared+":/to") {
+		t.Fatalf("stale records must not suppress the re-copy, got %#v", runner.runs)
+	}
+}
+
 func TestSyncVolumeToStagingRefusesRunningSource(t *testing.T) {
 	_, plan, step, staged := stagedSyncFixture(t)
 	runner := &fakeDockerRunner{
@@ -2541,7 +2731,7 @@ func TestRewriteComposeStagedVolumesRefusesSharedKey(t *testing.T) {
 	}
 }
 
-func TestValidatePlanReadyForLiveApplyRefusesSharedKeyBeforeAnyMutation(t *testing.T) {
+func TestValidatePlanReadyForLiveApplyStagesSharedVolumeWithinApp(t *testing.T) {
 	runDir := t.TempDir()
 	bundleDir := t.TempDir()
 	appDir := filepath.Join(bundleDir, "api")
@@ -2571,8 +2761,88 @@ func TestValidatePlanReadyForLiveApplyRefusesSharedKeyBeforeAnyMutation(t *testi
 	plan.Prepare.BundleDir = bundleDir
 	plan.BundleFiles = map[string][]byte{filepath.Clean(composePath): []byte(compose)}
 	err := validatePlanReadyForLiveApply(plan)
-	if err == nil || !strings.Contains(err.Error(), "compose volume shared is mounted by") || !strings.Contains(err.Error(), "choose a recreate or managed data store strategy or change the source compose before live apply") {
-		t.Fatalf("expected shared key refusal before live apply starts, got %v", err)
+	if err != nil {
+		t.Fatalf("expected a shared source volume within one app to stage as one volume, got %v", err)
+	}
+	staged := stagedVolumesForApp(plan, "api")
+	if len(staged) != 2 {
+		t.Fatalf("expected both mounts to stage, got %#v", staged)
+	}
+	if staged[0].VolumeName != staged[1].VolumeName {
+		t.Fatalf("expected one shared staging volume, got %q and %q", staged[0].VolumeName, staged[1].VolumeName)
+	}
+	if want := stagingSharedVolumeName(plan, "api", "src-shared"); staged[0].VolumeName != want {
+		t.Fatalf("expected shared staging volume %q, got %q", want, staged[0].VolumeName)
+	}
+	out, err := rewriteComposeStagedVolumes(compose, staged)
+	if err != nil {
+		t.Fatalf("rewriteComposeStagedVolumes: %v", err)
+	}
+	def := composeVolumeDef(t, decodeCompose(t, out), "shared")
+	if def["name"] != staged[0].VolumeName || def["external"] != true {
+		t.Fatalf("expected compose volume shared to hand off the shared staging volume, got %#v", def)
+	}
+}
+
+func stagedRestoreSharedVolumePlan(t *testing.T, compose string, volumes []preparer.VolumeResource, steps ...Step) Plan {
+	t.Helper()
+	runDir := t.TempDir()
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(appDir, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte(compose), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := preparer.AppPlan{
+		Name:            "api",
+		Directory:       "api",
+		TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}},
+	}
+	app.Resources.Volumes = volumes
+	app.Resources.DataStores = []preparer.DataStoreResource{{Kind: "postgres", Service: "db", Strategy: "migrate"}}
+	plan := stagedPlan(t, app, runDir, steps...)
+	plan.Prepare.BundleDir = bundleDir
+	plan.BundleFiles = map[string][]byte{filepath.Clean(composePath): []byte(compose)}
+	return plan
+}
+
+func TestValidateStagedTransferRefusesRestoreSharingStagedVolume(t *testing.T) {
+	compose := "services:\n  db:\n    image: postgres:16\n    volumes:\n      - shared:/var/lib/postgresql/data\n  web:\n    image: example/web\n    volumes:\n      - shared:/data\nvolumes:\n  shared:\n"
+	plan := stagedRestoreSharedVolumePlan(t, compose,
+		[]preparer.VolumeResource{
+			{Service: "db", Type: "volume", Name: "src-shared", Target: "/var/lib/postgresql/data"},
+			{Service: "web", Type: "volume", Name: "src-shared", Target: "/data"},
+		},
+		Step{Kind: StepCreateVolume, App: "api", Ref: "shared"},
+		Step{Kind: StepPauseSource, App: "api"},
+		Step{Kind: StepRestoreDataStore, App: "api", Ref: "data-store:db"},
+		Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"},
+	)
+	err := ValidateStagedTransfer(plan)
+	if err == nil || !strings.Contains(err.Error(), "a data store restore replaces the whole staged volume") {
+		t.Fatalf("expected a shared-restore refusal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "db /var/lib/postgresql/data and web /data in app api") {
+		t.Fatalf("expected the refusal to name both mounts, got %v", err)
+	}
+}
+
+func TestValidateStagedTransferAllowsRestoreSharingWithinStoreService(t *testing.T) {
+	compose := "services:\n  db:\n    image: postgres:16\n    volumes:\n      - shared:/var/lib/postgresql/data\n      - shared:/backups\nvolumes:\n  shared:\n"
+	plan := stagedRestoreSharedVolumePlan(t, compose,
+		[]preparer.VolumeResource{
+			{Service: "db", Type: "volume", Name: "src-shared", Target: "/var/lib/postgresql/data"},
+			{Service: "db", Type: "volume", Name: "src-shared", Target: "/backups"},
+		},
+		Step{Kind: StepCreateVolume, App: "api", Ref: "shared"},
+		Step{Kind: StepPauseSource, App: "api"},
+		Step{Kind: StepRestoreDataStore, App: "api", Ref: "data-store:db"},
+	)
+	if err := ValidateStagedTransfer(plan); err != nil {
+		t.Fatalf("expected a store's own mounts of one volume to share its staging volume, got %v", err)
 	}
 }
 
@@ -2621,6 +2891,129 @@ func TestValidatePlanReadyForLiveApplyRefusesSourceVolumeSharedAcrossApps(t *tes
 	plan.Prepare.Apps[1].Resources.Volumes[0].Name = "src-worker"
 	if err := validatePlanReadyForLiveApply(plan); err != nil {
 		t.Fatalf("distinct source volumes were refused: %v", err)
+	}
+}
+
+func TestStagedVolumesForAppStagesEachSourceVolumeOnce(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "web", Type: "volume", Name: "src-shared", Target: "/data"},
+		{Service: "worker", Type: "volume", Name: "src-shared", Target: "/work"},
+		{Service: "web", Type: "volume", Target: "/cache"},
+	}
+	plan := stagedPlan(t, app, t.TempDir(),
+		Step{Kind: StepPauseSource, App: "api"},
+		Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"},
+		Step{Kind: StepSyncVolume, App: "api", Ref: "volume:worker -> /work"},
+		Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /cache"},
+	)
+	staged := stagedVolumesForApp(plan, "api")
+	if len(staged) != 3 {
+		t.Fatalf("expected three staged mounts, got %#v", staged)
+	}
+	if staged[0].VolumeName != staged[1].VolumeName {
+		t.Fatalf("expected the shared source to stage as one volume, got %q and %q", staged[0].VolumeName, staged[1].VolumeName)
+	}
+	if want := stagingSharedVolumeName(plan, "api", "src-shared"); staged[0].VolumeName != want || staged[1].VolumeName != want {
+		t.Fatalf("expected shared staging volume %q, got %q and %q", want, staged[0].VolumeName, staged[1].VolumeName)
+	}
+	if !staged[0].Shared || !staged[1].Shared {
+		t.Fatalf("expected the shared mounts to be marked shared, got %#v", staged[:2])
+	}
+	if want := stagingVolumeName(plan, "api", "web", "/cache"); staged[2].VolumeName != want || staged[2].Shared {
+		t.Fatalf("expected the unnamed source to keep its per-mount staging volume %q, got %#v", want, staged[2])
+	}
+}
+
+func TestSharedStagingVolumeOwnershipUsesSourceLabel(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "web", Type: "volume", Name: "src-shared", Target: "/data"},
+		{Service: "worker", Type: "volume", Name: "src-shared", Target: "/work"},
+	}
+	plan := stagedPlan(t, app, t.TempDir(),
+		Step{Kind: StepPauseSource, App: "api"},
+		Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"},
+		Step{Kind: StepSyncVolume, App: "api", Ref: "volume:worker -> /work"},
+	)
+	staged := stagedVolumesForApp(plan, "api")
+	wantLabels := []string{"bort.run=run1", "bort.run-id=run1", "bort.app=api", "bort.source=src-shared"}
+	if got := stagingVolumeLabels(plan, "api", staged[0]); !reflect.DeepEqual(got, wantLabels) {
+		t.Fatalf("expected shared staging labels %v, got %v", wantLabels, got)
+	}
+	if got := stagingVolumeLabels(plan, "api", staged[1]); !reflect.DeepEqual(got, wantLabels) {
+		t.Fatalf("expected shared staging labels %v, got %v", wantLabels, got)
+	}
+
+	ownedState, _ := json.Marshal([]stagingVolumeState{{Name: staged[0].VolumeName, Labels: map[string]string{
+		"bort.run":    "run1",
+		"bort.run-id": "run1",
+		"bort.app":    "api",
+		"bort.source": "other-src",
+	}}})
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged[0].VolumeName: ownedState,
+	}}
+	err := requireStagingVolumeOwned(context.Background(), runner, plan, "api", staged[0])
+	if err == nil || !strings.Contains(err.Error(), "is not the staged copy of source volume src-shared for app api in run \"run1\"") {
+		t.Fatalf("expected a shared ownership refusal naming the source volume, got %v", err)
+	}
+}
+
+func TestRequireStagingVolumesOwnedInspectsSharedNameOnce(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{
+		{Service: "web", Type: "volume", Name: "src-shared", Target: "/data"},
+		{Service: "worker", Type: "volume", Name: "src-shared", Target: "/work"},
+	}
+	plan := stagedPlan(t, app, t.TempDir(),
+		Step{Kind: StepPauseSource, App: "api"},
+		Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"},
+		Step{Kind: StepSyncVolume, App: "api", Ref: "volume:worker -> /work"},
+	)
+	staged := stagedVolumesForApp(plan, "api")
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + staged[0].VolumeName: sharedStagingVolumeInspect(plan, staged[0]),
+	}}
+	if err := requireStagingVolumesOwned(context.Background(), runner, plan, "api", staged); err != nil {
+		t.Fatalf("requireStagingVolumesOwned: %v", err)
+	}
+	var inspected []string
+	for _, args := range runner.outputArgs {
+		if len(args) >= 3 && args[0] == "volume" && args[1] == "inspect" && args[2] != "--format" {
+			inspected = append(inspected, args[2:]...)
+		}
+	}
+	if len(inspected) != 1 || inspected[0] != staged[0].VolumeName {
+		t.Fatalf("expected one ownership inspect of the shared staging volume, got %v", inspected)
+	}
+}
+
+func TestStagingVolumePinBindsSharedNameOnce(t *testing.T) {
+	_, plan, _, _ := stagedSyncFixture(t)
+	shared := stagedVolume{Service: "web", Target: "/data", VolumeName: "bort-run1-api-shared-aaaaaaaa", Source: preparer.VolumeResource{Name: "src-shared"}, Shared: true}
+	other := stagedVolume{Service: "web", Target: "/cache", VolumeName: "bort-run1-api-web-bbbbbbbb"}
+	if stagingVolumePinName(plan, []stagedVolume{shared, shared, other}) != stagingVolumePinName(plan, []stagedVolume{shared, other}) {
+		t.Fatal("expected duplicate staged volumes to produce one pin name")
+	}
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"volume inspect " + shared.VolumeName: sharedStagingVolumeInspect(plan, shared),
+		"volume inspect " + other.VolumeName:  stagingVolumeInspect(plan, other, "run1"),
+	}}
+	pin, err := acquireStagingVolumePin(context.Background(), runner, plan, "api", []stagedVolume{shared, shared, other}, true)
+	if err != nil {
+		t.Fatalf("acquireStagingVolumePin: %v", err)
+	}
+	created, ok := runner.activePins[pin.containerID]
+	if !ok {
+		t.Fatalf("expected pin %s to be active, got %#v", pin.containerID, runner.activePins)
+	}
+	wantMounts := []dockerMount{
+		{Type: "volume", Name: shared.VolumeName, Destination: "/bort-volume/0", RW: false},
+		{Type: "volume", Name: other.VolumeName, Destination: "/bort-volume/1", RW: false},
+	}
+	if !reflect.DeepEqual(created.Mounts, wantMounts) {
+		t.Fatalf("expected the shared staging volume to be bound once, got %#v", created.Mounts)
 	}
 }
 
