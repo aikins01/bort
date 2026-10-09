@@ -27,6 +27,7 @@ const (
 	stagingVolumeAppLabel     = "bort.app"
 	stagingVolumeServiceLabel = "bort.service"
 	stagingVolumeTargetLabel  = "bort.target"
+	stagingVolumeSourceLabel  = "bort.source"
 	stagingVolumePinLabel     = "bort.staging-pin"
 )
 
@@ -45,6 +46,7 @@ type stagedVolume struct {
 	Target     string
 	VolumeName string
 	Source     preparer.VolumeResource
+	Shared     bool
 }
 
 // appStateIsStaged reports whether the app's persistent state is
@@ -114,6 +116,20 @@ func stagedVolumesForApp(plan Plan, appName string) []stagedVolume {
 			}
 		}
 	}
+	sharedSources := map[string]int{}
+	for _, volume := range staged {
+		if name := strings.TrimSpace(volume.Source.Name); name != "" {
+			sharedSources[name]++
+		}
+	}
+	for index, volume := range staged {
+		name := strings.TrimSpace(volume.Source.Name)
+		if name == "" || sharedSources[name] < 2 {
+			continue
+		}
+		staged[index].VolumeName = stagingSharedVolumeName(plan, appName, name)
+		staged[index].Shared = true
+	}
 	return staged
 }
 
@@ -143,6 +159,16 @@ func stagingVolumeName(plan Plan, appName, service, target string) string {
 		dockerNameSegment(appName, 24),
 		dockerNameSegment(service, 24),
 		stagingHash(stagingOwner(plan), appName, service, target),
+	}, "-")
+}
+
+func stagingSharedVolumeName(plan Plan, appName, sourceName string) string {
+	return strings.Join([]string{
+		"bort",
+		dockerNameSegment(plan.RunName, 24),
+		dockerNameSegment(appName, 24),
+		"shared",
+		stagingHash(stagingOwner(plan), appName, "shared", sourceName),
 	}, "-")
 }
 
@@ -181,6 +207,14 @@ func dockerNameSegment(value string, limit int) string {
 }
 
 func stagingVolumeLabels(plan Plan, appName string, volume stagedVolume) []string {
+	if volume.Shared {
+		return []string{
+			stagingVolumeRunLabel + "=" + plan.RunName,
+			stagingVolumeRunIDLabel + "=" + stagingOwner(plan),
+			stagingVolumeAppLabel + "=" + appName,
+			stagingVolumeSourceLabel + "=" + volume.Source.Name,
+		}
+	}
 	return []string{
 		stagingVolumeRunLabel + "=" + plan.RunName,
 		stagingVolumeRunIDLabel + "=" + stagingOwner(plan),
@@ -214,9 +248,18 @@ func requireStagingVolumesOwned(ctx context.Context, runner dockerRunner, plan P
 	if len(volumes) == 0 {
 		return nil
 	}
-	args := []string{"volume", "inspect"}
+	names := make([]string, 0, len(volumes))
+	seen := map[string]struct{}{}
 	for _, volume := range volumes {
-		args = append(args, volume.VolumeName)
+		if _, dup := seen[volume.VolumeName]; dup {
+			continue
+		}
+		seen[volume.VolumeName] = struct{}{}
+		names = append(names, volume.VolumeName)
+	}
+	args := []string{"volume", "inspect"}
+	for _, name := range names {
+		args = append(args, name)
 	}
 	out, err := runner.Output(ctx, args...)
 	if err != nil {
@@ -251,6 +294,9 @@ func validateStagingVolumeOwnership(plan Plan, appName string, volumes []stagedV
 		for _, expectedLabel := range stagingVolumeLabels(plan, appName, volume) {
 			key, value, _ := strings.Cut(expectedLabel, "=")
 			if state.Labels[key] != value {
+				if volume.Shared {
+					return fmt.Errorf("docker volume %s is not the staged copy of source volume %s for app %s in run %q (label %s=%q, want %q)", name, volume.Source.Name, appName, plan.RunName, key, state.Labels[key], value)
+				}
 				return fmt.Errorf("docker volume %s is not the staged %s:%s volume for app %s in run %q (label %s=%q, want %q)", name, volume.Service, volume.Target, appName, plan.RunName, key, state.Labels[key], value)
 			}
 		}
@@ -346,8 +392,13 @@ func acquireStagingVolumePin(ctx context.Context, runner dockerRunner, plan Plan
 		"--label", stagingVolumeRunIDLabel + "=" + stagingOwner(plan),
 		"--label", stagingVolumeAppLabel + "=" + appName,
 	}
-	for index, volume := range volumes {
-		args = append(args, "-v", volume.VolumeName+":/bort-volume/"+strconv.Itoa(index)+":ro")
+	bound := map[string]struct{}{}
+	for _, volume := range volumes {
+		if _, dup := bound[volume.VolumeName]; dup {
+			continue
+		}
+		bound[volume.VolumeName] = struct{}{}
+		args = append(args, "-v", volume.VolumeName+":/bort-volume/"+strconv.Itoa(len(bound)-1)+":ro")
 	}
 	args = append(args, volumeCopyImage, "sh", "-c", "while :; do sleep 2147483647; done")
 	out, err := runner.Output(ctx, args...)
@@ -374,7 +425,12 @@ func acquireStagingVolumePin(ctx context.Context, runner dockerRunner, plan Plan
 
 func stagingVolumePinName(plan Plan, volumes []stagedVolume) string {
 	names := make([]string, 0, len(volumes))
+	seen := map[string]struct{}{}
 	for _, volume := range volumes {
+		if _, dup := seen[volume.VolumeName]; dup {
+			continue
+		}
+		seen[volume.VolumeName] = struct{}{}
 		names = append(names, volume.VolumeName)
 	}
 	slices.Sort(names)
@@ -1301,7 +1357,7 @@ func rewriteComposeStagedVolumes(composeFile string, staged []stagedVolume) (str
 			return "", fmt.Errorf("compose service %s has no named volume mounted at %s; cannot hand staged volume %s to Dokploy", volume.Service, volume.Target, volume.VolumeName)
 		}
 		if other, dup := assigned[key]; dup && other.VolumeName != volume.VolumeName {
-			return "", fmt.Errorf("compose volume %s is mounted by %s:%s and %s:%s, which would stage as separate volumes %s and %s; a shared named volume cannot be transferred before deploy", key, other.Service, other.Target, volume.Service, volume.Target, other.VolumeName, volume.VolumeName)
+			return "", fmt.Errorf("compose volume %s is mounted by %s:%s and %s:%s, which would stage as separate volumes %s and %s; mounts that share one compose volume must stage the same source volume, so change the source compose before live apply", key, other.Service, other.Target, volume.Service, volume.Target, other.VolumeName, volume.VolumeName)
 		}
 		assigned[key] = volume
 		setMappingNode(topLevel, key, externalVolumeNode(volume.VolumeName))

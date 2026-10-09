@@ -82,10 +82,6 @@ func (c *Client) syncVolumeToStaging(ctx context.Context, runner dockerRunner, a
 	if err := actx.forgetMigratedVolumeMount(appName, staged.Service, staged.Target); err != nil {
 		return err
 	}
-	srcVolName, err := resolveSourceVolume(ctx, runner, staged.Source)
-	if err != nil {
-		return err
-	}
 	allStaged, pin, err := ensureAppStagingVolumePin(ctx, runner, actx, appName, allowPinCreate)
 	if err != nil {
 		return err
@@ -94,6 +90,17 @@ func (c *Client) syncVolumeToStaging(ctx context.Context, runner dockerRunner, a
 		return err
 	}
 	if err := actx.markStagingTransferStarted(appName); err != nil {
+		return err
+	}
+	if sharedStagingVolumeSynced(entry, staged) {
+		return actx.recordMigratedVolumeMount(appName, migratedVolumeMount{
+			Service:    staged.Service,
+			Target:     staged.Target,
+			VolumeName: staged.VolumeName,
+		})
+	}
+	srcVolName, err := resolveSourceVolume(ctx, runner, staged.Source)
+	if err != nil {
 		return err
 	}
 	before, err := inspectSourceQuiesceTargets(ctx, runner, app)
@@ -127,6 +134,23 @@ func (c *Client) syncVolumeToStaging(ctx context.Context, runner dockerRunner, a
 		Target:     staged.Target,
 		VolumeName: staged.VolumeName,
 	})
+}
+
+// sharedStagingVolumeSynced reports whether another mount of the same
+// source volume already recorded a completed transfer into this app's
+// shared staging volume, so this mount must not copy the same source
+// bytes a second time.
+func sharedStagingVolumeSynced(entry *appCache, staged stagedVolume) bool {
+	if !staged.Shared {
+		return false
+	}
+	own := migratedMountKey(staged.Service, staged.Target)
+	for key, mount := range entry.MigratedVolumeMounts {
+		if key != own && mount.VolumeName == staged.VolumeName {
+			return true
+		}
+	}
+	return false
 }
 
 type plannedVolumeCopy struct {
@@ -199,6 +223,22 @@ func (a *applyContext) forgetMigratedVolumeMount(appName, service, target string
 		return nil
 	}
 	delete(entry.MigratedVolumeMounts, key)
+	return a.persistMigratedVolumeMounts()
+}
+
+// invalidateMigratedVolumeMounts drops every recorded transfer for the app.
+// a pause step that executes again rewinds the app's state transfer: the
+// previous attempt ended with its source resumed, so staged copies recorded
+// before it are stale and must not suppress a fresh transfer.
+func (a *applyContext) invalidateMigratedVolumeMounts(appName string) error {
+	if a == nil {
+		return nil
+	}
+	entry := a.entry(appName)
+	if len(entry.MigratedVolumeMounts) == 0 {
+		return nil
+	}
+	entry.MigratedVolumeMounts = map[string]migratedVolumeMount{}
 	return a.persistMigratedVolumeMounts()
 }
 
