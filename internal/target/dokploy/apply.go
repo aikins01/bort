@@ -467,7 +467,11 @@ func ValidateStagedTransfer(plan Plan) error {
 		if isPlatformAppRole(app.Role) {
 			continue
 		}
-		for _, volume := range stagedVolumesForApp(plan, app.Name) {
+		staged := stagedVolumesForApp(plan, app.Name)
+		if err := validateStagedSourceConsumers(app, staged); err != nil {
+			return err
+		}
+		for _, volume := range staged {
 			name := strings.TrimSpace(volume.Source.Name)
 			if name == "" {
 				continue
@@ -493,6 +497,34 @@ func ValidateStagedTransfer(plan Plan) error {
 	})
 }
 
+// the compose handoff points every mount of a staged source volume at the
+// staged copy, but an untransferred mount's service is neither paused for the
+// copy nor allowed to attach at handoff.
+func validateStagedSourceConsumers(app preparer.AppPlan, staged []stagedVolume) error {
+	stagedSources := map[string]stagedVolume{}
+	stagedMounts := map[string]struct{}{}
+	for _, volume := range staged {
+		stagedMounts[migratedMountKey(volume.Service, volume.Target)] = struct{}{}
+		if name := strings.TrimSpace(volume.Source.Name); name != "" {
+			stagedSources[name] = volume
+		}
+	}
+	for _, volume := range app.Resources.Volumes {
+		if volume.Type != "volume" {
+			continue
+		}
+		other, ok := stagedSources[strings.TrimSpace(volume.Name)]
+		if !ok {
+			continue
+		}
+		if _, transferred := stagedMounts[migratedMountKey(volume.Service, volume.Target)]; transferred {
+			continue
+		}
+		return fmt.Errorf("source volume %s is staged for %s %s but also mounted by %s %s in app %s, which live apply does not transfer; every mount of a staged volume must transfer it, so change the source compose so %s does not share the volume, or choose a migrate strategy for its data store if it is not Postgres, before live apply", volume.Name, other.Service, other.Target, volume.Service, volume.Target, app.Name, volume.Service)
+	}
+	return nil
+}
+
 // validatePlannedSharedRestoreVolumes refuses a logical data store restore
 // into a staging volume shared with another service's mount. the restore
 // replaces the whole staged volume, so the sibling mount's recorded transfer
@@ -513,7 +545,7 @@ func validatePlannedSharedRestoreVolumes(plan Plan, restore plannedStagedRestore
 			if other.Service == volume.Service {
 				continue
 			}
-			return fmt.Errorf("source volume %s is mounted by %s %s and %s %s in app %s; a data store restore replaces the whole staged volume, so a restored store cannot share one with another mount; choose a recreate or managed data store strategy or change the source compose before live apply", name, volume.Service, volume.Target, other.Service, other.Target, restore.app.Name)
+			return fmt.Errorf("source volume %s is mounted by %s %s and %s %s in app %s; a data store restore replaces the whole staged volume, so a restored store cannot share one with another service; change the source compose so the store does not share the volume before live apply", name, volume.Service, volume.Target, other.Service, other.Target, restore.app.Name)
 		}
 	}
 	return nil

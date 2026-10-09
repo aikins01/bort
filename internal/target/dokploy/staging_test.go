@@ -2830,6 +2830,26 @@ func TestValidateStagedTransferRefusesRestoreSharingStagedVolume(t *testing.T) {
 	}
 }
 
+func TestValidateStagedTransferRefusesStagedVolumeSharedWithUntransferredMount(t *testing.T) {
+	compose := "services:\n  web:\n    image: example/web\n    volumes:\n      - shared:/data\n  worker:\n    image: example/worker\n    volumes:\n      - shared:/work\n  cache:\n    image: redis:7\n    volumes:\n      - shared:/redis\nvolumes:\n  shared:\n"
+	plan := stagedRestoreSharedVolumePlan(t, compose,
+		[]preparer.VolumeResource{
+			{Service: "web", Type: "volume", Name: "src-shared", Target: "/data"},
+			{Service: "worker", Type: "volume", Name: "src-shared", Target: "/work"},
+			{Service: "cache", Type: "volume", Name: "src-shared", Target: "/redis"},
+		},
+		Step{Kind: StepCreateVolume, App: "api", Ref: "shared"},
+		Step{Kind: StepPauseSource, App: "api"},
+		Step{Kind: StepSyncVolume, App: "api", Ref: "volume:web -> /data"},
+		Step{Kind: StepSyncVolume, App: "api", Ref: "volume:worker -> /work"},
+	)
+	plan.Prepare.Apps[0].Resources.DataStores = []preparer.DataStoreResource{{Kind: "redis", Service: "cache", Strategy: "recreate"}}
+	err := ValidateStagedTransfer(plan)
+	if err == nil || !strings.Contains(err.Error(), "also mounted by cache /redis in app api, which live apply does not transfer") {
+		t.Fatalf("expected a refusal for the untransferred sibling mount, got %v", err)
+	}
+}
+
 func TestValidateStagedTransferAllowsRestoreSharingWithinStoreService(t *testing.T) {
 	compose := "services:\n  db:\n    image: postgres:16\n    volumes:\n      - shared:/var/lib/postgresql/data\n      - shared:/backups\nvolumes:\n  shared:\n"
 	plan := stagedRestoreSharedVolumePlan(t, compose,
