@@ -571,6 +571,40 @@ func TestPlanFromArtifactsPausesWritableBindMountAppBeforeTargetDeployment(t *te
 	}
 }
 
+func TestLiveApplyRefusesWritableBindsOwnedByUnpausedStores(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		kind        string
+		strategy    string
+		readWrite   bool
+		wantRefusal bool
+	}{
+		{"recreated Redis", "redis", "recreate", true, true},
+		{"managed Redis", "redis", "managed", true, true},
+		{"recreated Postgres", "postgres", "recreate", true, true},
+		{"read-only bind", "redis", "recreate", false, false},
+		{"paused Redis", "redis", "migrate", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := preparer.AppPlan{Name: "api"}
+			app.Resources.DataStores = []preparer.DataStoreResource{{Service: "db", Kind: tc.kind, Strategy: tc.strategy}}
+			app.Resources.Volumes = []preparer.VolumeResource{{Service: "db", Type: "bind", Source: "/srv/data", Target: "/data", ReadWrite: tc.readWrite}}
+			plan := Plan{Prepare: preparer.Result{Apps: []preparer.AppPlan{app}}, Steps: []Step{{Kind: StepPushImage, App: "api"}}}
+			err := ValidateStagedTransfer(plan)
+			if (err != nil) != tc.wantRefusal {
+				t.Fatalf("want refusal=%t, got %v", tc.wantRefusal, err)
+			}
+			if !tc.wantRefusal {
+				return
+			}
+			client := &Client{}
+			if err := client.Apply(context.Background(), plan); !errors.Is(err, ErrRunningStoreBind) {
+				t.Fatalf("expected pre-mutation bind refusal, got %v", err)
+			}
+		})
+	}
+}
+
 func TestBindMountDeploymentRefusesRestartedSource(t *testing.T) {
 	app := preparer.AppPlan{Name: "api"}
 	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/uploads", Target: "/uploads", ReadWrite: true, SourceContainerID: "web-id"}}

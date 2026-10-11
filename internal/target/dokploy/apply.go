@@ -473,6 +473,21 @@ func validatePlanReadyForLiveApply(plan Plan) error {
 
 func ValidateStagedTransfer(plan Plan) error {
 	for _, step := range plan.Steps {
+		if step.Kind != StepPushImage || shouldSkipApplyStep(plan, step) {
+			continue
+		}
+		app, ok := findPrepareApp(plan.Prepare, step.App)
+		if !ok {
+			continue
+		}
+		for _, volume := range app.Resources.Volumes {
+			store, owned := dataStoreForVolume(app, volume)
+			if volume.Type == "bind" && volume.ReadWrite && owned && dataStoreMigrationKind(store) == dataStoreMigrationSkip {
+				return fmt.Errorf("writable bind mount %s for service %s in app %s %w; move the source data to a supported named-volume layout and create a new migration run", volume.Target, volume.Service, app.Name, ErrRunningStoreBind)
+			}
+		}
+	}
+	for _, step := range plan.Steps {
 		if step.Kind != StepSyncVolume || shouldSkipApplyStep(plan, step) || !appStateIsStaged(plan, step.App) {
 			continue
 		}

@@ -563,6 +563,26 @@ func TestLegacyCutoverHandoffIsAmbiguous(t *testing.T) {
 	}
 }
 
+func TestLegacyFirstProjectCreationRequiresKnownOutcome(t *testing.T) {
+	knownRejected, ambiguous := false, true
+	for _, tc := range []struct {
+		status    dokploy.StepStatus
+		ambiguous *bool
+		wantError bool
+	}{
+		{dokploy.StepStatusStarted, nil, true},
+		{dokploy.StepStatusError, nil, true},
+		{dokploy.StepStatusError, &ambiguous, true},
+		{dokploy.StepStatusError, &knownRejected, false},
+		{dokploy.StepStatusOK, nil, false},
+	} {
+		applied := runApplied{PlanVersion: appliedPlanV1Alpha2, Steps: []appliedStep{{Index: 0, Kind: string(dokploy.StepCreateProject), App: "api", Status: string(tc.status), MutationAmbiguous: tc.ambiguous}}}
+		if err := validateApplyResumeAuthority(applied); (err != nil) != tc.wantError {
+			t.Fatalf("status=%s ambiguity=%v want refusal=%t, got %v", tc.status, tc.ambiguous, tc.wantError, err)
+		}
+	}
+}
+
 func TestLegacyCutoverHandoffSurvivesCurrentPlanReordering(t *testing.T) {
 	applied := runApplied{Steps: []appliedStep{{
 		Index:  1,

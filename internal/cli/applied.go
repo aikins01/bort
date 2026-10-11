@@ -446,6 +446,9 @@ func appliedAuthorityAmbiguity(applied runApplied) applyAuthorityAmbiguity {
 	}
 	ambiguity := applyAuthorityUnambiguous
 	for _, recorded := range applied.Steps {
+		if recorded.Kind == string(dokploy.StepCreateProject) && appliedTargetMutationAmbiguous(recorded) {
+			return applyWriterAuthorityAmbiguous
+		}
 		if recorded.Kind == string(dokploy.StepStartDokployProxy) && recorded.Ref == "dokploy-traefik" &&
 			appliedStepMayHaveRun(recorded) {
 			ambiguity = applyTrafficAuthorityAmbiguous

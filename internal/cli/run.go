@@ -2550,6 +2550,9 @@ func nextSafeStepContextWithSourceProbe(ctx context.Context, run loadedMigration
 		return runNextStep{Action: fmt.Sprintf("run `%s` to resume the interrupted apply", liveApplyCommand(run)), Reason: "the apply ledger contains incomplete work"}
 	}
 	if err := stagedTransferRefusal(run); err != nil {
+		if errors.Is(err, dokploy.ErrRunningStoreBind) {
+			return runNextStep{Action: "move the source data store's data to a supported named-volume layout, then scan a new run", Reason: err.Error()}
+		}
 		return runNextStep{
 			Action: fmt.Sprintf("for a data store volume, choose `%s`, then %s; otherwise change the source compose and scan a new run", bortCommand("data <app> <store> --recreate|--managed"), reviewedMigrationBundleRecovery(run)),
 			Reason: err.Error(),
