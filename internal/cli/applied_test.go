@@ -678,6 +678,30 @@ func TestRecordAppliedStepPersistsExplicitMutationAmbiguity(t *testing.T) {
 	}
 }
 
+func TestAuthorityRecoveryRequirementSurvivesLedgerRestart(t *testing.T) {
+	run := migrationRun{Name: "bind-deploy", RunDir: t.TempDir(), Target: "dokploy"}
+	path := filepath.Join(run.RunDir, "applied.json")
+	ledger, err := newAppliedLedger(path, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, progress := range []dokploy.StepProgress{
+		{Index: 0, Step: dokploy.Step{Kind: dokploy.StepPauseSource, App: "api"}, Status: dokploy.StepStatusOK},
+		{Index: 1, Step: dokploy.Step{Kind: dokploy.StepPushImage, App: "api"}, Status: dokploy.StepStatusError, Err: errors.New("bind deployment failed"), AuthorityRecoveryRequired: true},
+	} {
+		if err := ledger.Record(progress); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restarted, err := newAppliedLedger(path, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateApplyResumeAuthority(restarted.Snapshot()); err == nil {
+		t.Fatal("bind deployment failure allowed automatic retry after ledger restart")
+	}
+}
+
 func TestRecordAppliedStepPersistsTargetIdentity(t *testing.T) {
 	applied := recordAppliedStep(runApplied{}, dokploy.StepProgress{
 		Index:  1,
@@ -736,8 +760,8 @@ func TestPersistedV1Alpha3StateTransferUsesLegacyPlanAndRequiresAuthorityRecover
 	if err := ledger.PrepareRetry(safePrefix); err != nil {
 		t.Fatal(err)
 	}
-	if got := ledger.Snapshot().PlanVersion; got != appliedPlanCurrent {
-		t.Fatalf("prepared legacy ledger planVersion=%q, want %q", got, appliedPlanCurrent)
+	if got := ledger.Snapshot().PlanVersion; got != appliedPlanV1Alpha4 {
+		t.Fatalf("prepared legacy ledger planVersion=%q, want %q", got, appliedPlanV1Alpha4)
 	}
 	if err := ledger.Record(dokploy.StepProgress{Index: safePrefix, Step: safePlan.Steps[safePrefix], Status: dokploy.StepStatusStarted}); err != nil {
 		t.Fatal(err)
@@ -746,7 +770,7 @@ func TestPersistedV1Alpha3StateTransferUsesLegacyPlanAndRequiresAuthorityRecover
 	if err != nil {
 		t.Fatal(err)
 	}
-	if restarted.PlanVersion != appliedPlanCurrent || len(restarted.Steps) != len(preTransfer.Steps)+1 || restarted.Steps[len(restarted.Steps)-1].Kind != string(dokploy.StepSyncVolume) {
+	if restarted.PlanVersion != appliedPlanV1Alpha4 || len(restarted.Steps) != len(preTransfer.Steps)+1 || restarted.Steps[len(restarted.Steps)-1].Kind != string(dokploy.StepSyncVolume) {
 		t.Fatalf("restarted ledger lost its current-plan transfer: %#v", restarted)
 	}
 	restartedPlan := livePlanForApplied(run, restarted)
@@ -781,5 +805,69 @@ func TestPersistedV1Alpha3StateTransferUsesLegacyPlanAndRequiresAuthorityRecover
 	}
 	if err := validateApplyResumeAuthority(loaded); err == nil || !strings.Contains(err.Error(), "establish writer and traffic authority manually") {
 		t.Fatalf("v1alpha3 transfer without a durable pin was allowed to resume: %v", err)
+	}
+}
+
+func TestPersistedV1Alpha4LedgerReplaysItsHistoricalPlan(t *testing.T) {
+	app := preparer.AppPlan{
+		Name: "uploads",
+		TargetResources: &preparer.TargetResources{Dokploy: &preparer.DokployResources{
+			ComposeApp: preparer.DokployComposeApp{Name: "uploads"},
+		}},
+	}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/uploads", Target: "/uploads", ReadWrite: true}}
+	run := loadedMigrationRun{
+		Run:     migrationRun{Name: "legacy-bind", RunDir: t.TempDir(), Target: "dokploy"},
+		Prepare: preparer.Result{Apps: []preparer.AppPlan{app}},
+		Sync: syncplan.Result{Apps: []syncplan.AppPlan{{Name: "uploads", Steps: []syncplan.Step{{
+			ResourceType: "volume",
+			ResourceRef:  "volume:web -> /uploads",
+			Strategy:     syncplan.StrategyNone,
+			TargetAction: "preserve_vps_file_mount",
+		}}}}},
+		Cutover: gateway.Result{},
+	}
+	legacy := dokploy.LegacyPlanFromArtifactsV1Alpha4(run.Prepare, run.Sync, run.Cutover)
+	if slices.ContainsFunc(legacy.Steps, func(step dokploy.Step) bool { return step.Kind == dokploy.StepPauseSource }) {
+		t.Fatalf("v1alpha4 plan must not pause the bind-only source: %#v", legacy.Steps)
+	}
+	applied := runApplied{APIVersion: appliedAPIVersion, RecoveryProtocol: appliedRecoveryProtocol, PlanVersion: appliedPlanV1Alpha4, RunName: run.Run.Name, Target: run.Run.Target}
+	recorded := 0
+	for index, step := range legacy.Steps {
+		applied = recordAppliedStep(applied, dokploy.StepProgress{Index: index, Step: step, Status: dokploy.StepStatusOK})
+		recorded++
+		if step.Kind == dokploy.StepPushImage {
+			break
+		}
+	}
+	plan := livePlanForApplied(run, applied)
+	if !slices.Equal(plan.Steps, legacy.Steps) {
+		t.Fatalf("v1alpha4 ledger did not reconstruct its historical plan: got %#v want %#v", plan.Steps, legacy.Steps)
+	}
+	if prefix := completedApplyPrefix(plan.Steps, applied); prefix != recorded {
+		t.Fatalf("v1alpha4 history lost its step alignment: prefix=%d recorded=%d steps=%#v", prefix, recorded, plan.Steps)
+	}
+	applied.PlanVersion = appliedPlanV1Alpha3
+	plan = livePlanForApplied(run, applied)
+	if !slices.Equal(plan.Steps, legacy.Steps) || completedApplyPrefix(plan.Steps, applied) != recorded {
+		t.Fatalf("v1alpha3 bind deployment lost its completed prefix: %#v", plan.Steps)
+	}
+	path := filepath.Join(run.Run.RunDir, "applied.json")
+	if err := writeRunApplied(path, applied); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := newAppliedLedger(path, run.Run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.PrepareRetry(recorded); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := readRunApplied(path, run.Run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.PlanVersion != appliedPlanV1Alpha4 || !slices.Equal(livePlanForApplied(run, restarted).Steps, legacy.Steps) {
+		t.Fatalf("v1alpha3 bind deployment did not persist its v1alpha4 promotion: %#v", restarted)
 	}
 }

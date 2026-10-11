@@ -21,8 +21,20 @@ const coolifyControlPlaneContainer = "coolify"
 func RequiresCoolifyDeploymentFence(plan Plan) bool {
 	source := strings.ToLower(strings.TrimSpace(plan.Prepare.Source))
 	coolifySource := source == "coolify-local" || source == "coolify-local-traefik" || source == "coolify-local-caddy"
+	stateSeen := map[string]bool{}
+	staged := map[string]bool{}
 	for _, step := range plan.Steps {
-		if (step.Kind != StepRestoreDataStore && step.Kind != StepSyncVolume) || shouldSkipApplyStep(plan, step) {
+		switch step.Kind {
+		case StepPauseSource, StepDumpDataStore, StepRestoreDataStore, StepSyncVolume:
+			stateSeen[step.App] = true
+			staged[step.App] = false
+		case StepPushImage:
+			staged[step.App] = stateSeen[step.App]
+		}
+	}
+	for _, step := range plan.Steps {
+		bindHandoff := step.Kind == StepPushImage && staged[step.App] && appBindStateOnly(plan.Prepare, plan.Sync, step.App)
+		if (step.Kind != StepRestoreDataStore && step.Kind != StepSyncVolume && !bindHandoff) || shouldSkipApplyStep(plan, step) {
 			continue
 		}
 		if coolifySource {

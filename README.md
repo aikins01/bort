@@ -279,9 +279,10 @@ Bort's safety model defaults to “look first.”
   recovery, an accepted target, the exact confirmation phrase, a recheck of
   Docker IDs, and a private backup.
 - **Fail-closed rollback:** `bort rollback --live` can swap traffic back only
-  when the run transferred no database or volume state. Dokploy v0.30.7 cannot
-  durably block queued or future deployments, so Bort refuses automatic
-  stateful rollback before changing either side. Preserve both sides and
+  when the run transferred no database or volume state and paused no
+  writable bind-mount app. Dokploy v0.30.7 cannot durably block queued or
+  future deployments, so Bort refuses automatic stateful rollback before
+  changing either side. Preserve both sides and
   establish writer and traffic authority manually if a stateful target fails
   validation. When the durable host owner still belongs to the run,
   `bort recover-authority` records the verified source or target decision and
@@ -303,6 +304,10 @@ Bort's safety model defaults to “look first.”
 - Stateful live apply transfers named volumes and Postgres dumps only. A
   stateful app whose plan needs a bind-mount copy is refused; same-host bind
   mounts that stay at their existing paths do not require a transfer.
+  An app whose only writable state is such a same-host bind mount is treated
+  as stateful: its source pauses before the target deploys, stays stopped if
+  that deployment fails, and cannot use automatic rollback. Read-only bind
+  mounts leave the app stateless.
 - A named volume shared by services within one app stages once and is handed
   to Dokploy as one external volume. Every service that mounts it must
   transfer it, so a recreated or managed data store cannot share it, and a

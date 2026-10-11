@@ -21,7 +21,8 @@ const (
 	appliedPlanV1Alpha2     = "v1alpha2"
 	appliedPlanV1Alpha3     = "v1alpha3"
 	appliedPlanV1Alpha4     = "v1alpha4"
-	appliedPlanCurrent      = appliedPlanV1Alpha4
+	appliedPlanV1Alpha5     = "v1alpha5"
+	appliedPlanCurrent      = appliedPlanV1Alpha5
 )
 
 // runApplied is the per-run audit ledger. it captures the outcome of every
@@ -80,7 +81,7 @@ func readRunApplied(path string, run migrationRun) (runApplied, error) {
 		return runApplied{}, fmt.Errorf("%s has unsupported apiVersion %q (want %q or %q)", path, applied.APIVersion, appliedAPIVersion, appliedLegacyAPIVersion)
 	}
 	switch applied.PlanVersion {
-	case "", appliedPlanV1Alpha1, appliedPlanV1Alpha2, appliedPlanV1Alpha3, appliedPlanV1Alpha4:
+	case "", appliedPlanV1Alpha1, appliedPlanV1Alpha2, appliedPlanV1Alpha3, appliedPlanV1Alpha4, appliedPlanV1Alpha5:
 	default:
 		return runApplied{}, fmt.Errorf("%s has unsupported planVersion %q", path, applied.PlanVersion)
 	}
@@ -221,7 +222,9 @@ func (l *appliedLedger) PrepareRetry(index int) error {
 			next.Steps = append(next.Steps, step)
 		}
 	}
-	if (index == 0 && !appliedHasHistory(next)) || appliedV1Alpha3UsesCurrentPlan(l.state) {
+	if appliedV1Alpha3UsesV1Alpha4Plan(l.state) {
+		next.PlanVersion = appliedPlanV1Alpha4
+	} else if index == 0 && !appliedHasHistory(next) {
 		next.PlanVersion = appliedPlanCurrent
 	}
 	if len(next.Steps) == len(l.state.Steps) && next.RecoveryProtocol == appliedRecoveryProtocol && next.APIVersion == appliedAPIVersion && next.PlanVersion == l.state.PlanVersion {
@@ -373,16 +376,18 @@ func livePlanForApplied(run loadedMigrationRun, applied runApplied) dokploy.Plan
 	case appliedPlanV1Alpha2:
 		return dokploy.PlanFromArtifactsV1Alpha2(run.Prepare, run.Sync, run.Cutover)
 	case appliedPlanV1Alpha3:
-		if appliedV1Alpha3UsesCurrentPlan(applied) {
-			return dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
+		if appliedV1Alpha3UsesV1Alpha4Plan(applied) {
+			return dokploy.LegacyPlanFromArtifactsV1Alpha4(run.Prepare, run.Sync, run.Cutover)
 		}
 		return dokploy.LegacyPlanFromArtifactsV1Alpha3(run.Prepare, run.Sync, run.Cutover)
+	case appliedPlanV1Alpha4:
+		return dokploy.LegacyPlanFromArtifactsV1Alpha4(run.Prepare, run.Sync, run.Cutover)
 	default:
 		return dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover)
 	}
 }
 
-func appliedV1Alpha3UsesCurrentPlan(applied runApplied) bool {
+func appliedV1Alpha3UsesV1Alpha4Plan(applied runApplied) bool {
 	return appliedPlanVersion(applied) == appliedPlanV1Alpha3 &&
 		applied.SucceededAt == nil &&
 		!appliedV1Alpha3StateTransferMayHaveRun(applied)

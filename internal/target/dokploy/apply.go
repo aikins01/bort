@@ -127,11 +127,18 @@ type Plan struct {
 type planStateOrder int
 
 const (
-	// planStateStagedV1Alpha4 transfers state into Bort-owned staging volumes
+	// planStateStagedV1Alpha5 transfers state into Bort-owned staging volumes
 	// before the Dokploy deployment exists, then deploys a compose file
 	// that mounts those volumes. no target writer ever runs during a
-	// copy, so Dokploy needs no fence it cannot provide.
-	planStateStagedV1Alpha4 planStateOrder = iota
+	// copy, so Dokploy needs no fence it cannot provide. an app whose
+	// only writable state is a preserved host path (bind mount) gets the
+	// same fence: its source pauses before the target can write those
+	// paths.
+	planStateStagedV1Alpha5 planStateOrder = iota
+	// planStateStagedV1Alpha4 reproduces the previous staged order, which
+	// deployed apps whose only writable state is bind mounts without
+	// pausing their source first.
+	planStateStagedV1Alpha4
 	// planStateStagedV1Alpha3 reproduces the first staged-transfer order,
 	// which resumed unrouted source writers before deploying the target.
 	planStateStagedV1Alpha3
@@ -143,6 +150,10 @@ const (
 )
 
 func PlanFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result) Plan {
+	return planFromArtifacts(prepare, sync, cutover, planStateStagedV1Alpha5)
+}
+
+func LegacyPlanFromArtifactsV1Alpha4(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result) Plan {
 	return planFromArtifacts(prepare, sync, cutover, planStateStagedV1Alpha4)
 }
 
@@ -191,15 +202,45 @@ func appStateSteps(prepare preparer.Result, app syncplan.AppPlan) (dataStoreStep
 	return dataStoreSteps, volumeSteps
 }
 
+func appPreservesWritableBindMounts(prepare preparer.Result, appName string) bool {
+	app, ok := findPrepareApp(prepare, appName)
+	if !ok {
+		return false
+	}
+	for _, volume := range app.Resources.Volumes {
+		if volume.Type == "bind" && volume.ReadWrite {
+			return true
+		}
+	}
+	return false
+}
+
+func appBindStateOnly(prepare preparer.Result, sync syncplan.Result, appName string) bool {
+	for _, app := range sync.Apps {
+		if app.Name != appName {
+			continue
+		}
+		if dataStoreSteps, volumeSteps := appStateSteps(prepare, app); len(dataStoreSteps) > 0 || len(volumeSteps) > 0 {
+			return false
+		}
+		return appPreservesWritableBindMounts(prepare, appName)
+	}
+	return false
+}
+
 func planFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover gateway.Result, order planStateOrder) Plan {
 	plan := Plan{Prepare: prepare, Sync: sync, Cutover: cutover}
-	staged := order == planStateStagedV1Alpha4 || order == planStateStagedV1Alpha3
+	staged := order == planStateStagedV1Alpha5 || order == planStateStagedV1Alpha4 || order == planStateStagedV1Alpha3
 	legacyStaged := order == planStateStagedV1Alpha3
+	bindPause := order == planStateStagedV1Alpha5
 	legacyOrder := order == planStateInPlaceV1Alpha1
 	statefulApps := map[string]struct{}{}
+	bindStateApps := map[string]struct{}{}
 	for _, app := range sync.Apps {
 		if dataStoreSteps, volumeSteps := appStateSteps(prepare, app); len(dataStoreSteps) > 0 || len(volumeSteps) > 0 {
 			statefulApps[app.Name] = struct{}{}
+		} else if bindPause && appBindStateOnly(prepare, sync, app.Name) {
+			bindStateApps[app.Name] = struct{}{}
 		}
 	}
 	deferredPushSteps := map[string]Step{}
@@ -212,7 +253,9 @@ func planFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 				plan.Steps = append(plan.Steps, Step{Kind: StepUploadEnv, App: app.Name, Ref: composeRef})
 			}
 			pushStep := Step{Kind: StepPushImage, App: app.Name, Ref: composeRef}
-			if _, stateful := statefulApps[app.Name]; staged && stateful {
+			_, stateful := statefulApps[app.Name]
+			_, bindState := bindStateApps[app.Name]
+			if staged && (stateful || bindState) {
 				deferredPushSteps[app.Name] = pushStep
 			} else {
 				plan.Steps = append(plan.Steps, pushStep)
@@ -237,14 +280,19 @@ func planFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 	routedTargetResumeSteps := []Step{}
 	for _, app := range sync.Apps {
 		dataStoreSteps, volumeSteps := appStateSteps(prepare, app)
+		_, bindState := bindStateApps[app.Name]
 		if len(dataStoreSteps) == 0 && len(volumeSteps) == 0 {
-			continue
+			if !bindState {
+				continue
+			}
 		}
 		// pause runs before any state work so app writers stop before
 		// pg_dump captures its snapshot and before raw volume copies
 		// see the on-disk format. logical-dump stores stay live (they
 		// are excluded from quiesce targets); only the app's writers
-		// and volume-strategy stores actually stop here.
+		// and volume-strategy stores actually stop here. a bind-only
+		// app has no state steps, but its deployment writes the host
+		// paths its source writers own, so the same pause fences them.
 		plan.Steps = append(plan.Steps, Step{Kind: StepPauseSource, App: app.Name, Ref: app.Name})
 		plan.Steps = append(plan.Steps, dataStoreSteps...)
 		plan.Steps = append(plan.Steps, volumeSteps...)
@@ -293,6 +341,9 @@ func planFromArtifacts(prepare preparer.Result, sync syncplan.Result, cutover ga
 				continue
 			}
 			if _, stateful := statefulApps[appName]; stateful {
+				continue
+			}
+			if _, bindState := bindStateApps[appName]; bindState {
 				continue
 			}
 			plan.Steps = append(plan.Steps, Step{Kind: StepPauseSource, App: appName, Ref: appName})
@@ -992,7 +1043,7 @@ func (c *Client) Apply(ctx context.Context, plan Plan) error {
 			}
 			return errors.Join(stepErr, cleanupErr)
 		}
-		pausedApps.observeCompleted(step, handedOff)
+		pausedApps.observeCompleted(actx.plan, step, handedOff)
 		completed := StepProgress{Index: index, Total: total, Step: step, Status: StepStatusOK}
 		if step.App != "" {
 			entry := actx.entry(step.App)
@@ -1031,7 +1082,7 @@ func isPlatformAppRole(role string) bool {
 // recorded before the containers start.
 type pausedSources map[string]bool
 
-func (p pausedSources) observeCompleted(step Step, handedOff map[string]struct{}) {
+func (p pausedSources) observeCompleted(plan Plan, step Step, handedOff map[string]struct{}) {
 	switch step.Kind {
 	case StepDumpDataStore, StepRestoreDataStore, StepSyncVolume:
 		if _, paused := p[step.App]; paused {
@@ -1042,8 +1093,9 @@ func (p pausedSources) observeCompleted(step Step, handedOff map[string]struct{}
 	case StepPushImage:
 		// a staged deployment now owns the transferred state; the source
 		// stays stopped until cutover retires it, so the handoff is the
-		// durable boundary and no retry may rewind past it.
-		if p[step.App] {
+		// durable boundary and no retry may rewind past it. a bind-only
+		// app hands its host paths over at the same point.
+		if p[step.App] || (appStateIsStaged(plan, step.App) && appBindStateOnly(plan.Prepare, plan.Sync, step.App)) {
 			handedOff[step.App] = struct{}{}
 		}
 		delete(p, step.App)
@@ -1051,22 +1103,25 @@ func (p pausedSources) observeCompleted(step Step, handedOff map[string]struct{}
 }
 
 func (c *Client) requireTransferredSourceStillPaused(ctx context.Context, actx *applyContext, step Step, pausedApps pausedSources, handedOff map[string]struct{}) error {
-	if RequiresCoolifyDeploymentFence(actx.plan) &&
-		(step.Kind == StepPauseSource || step.Kind == StepPushImage || step.Kind == StepActivateRoutes) {
+	if (step.Kind == StepPauseSource || step.Kind == StepPushImage || step.Kind == StepActivateRoutes) &&
+		RequiresCoolifyDeploymentFence(actx.plan) {
 		if err := requireCoolifyDeploymentFence(ctx, c.dockerRunner()); err != nil {
 			return err
 		}
 	}
 	switch step.Kind {
 	case StepPushImage:
-		if !pausedApps[step.App] {
+		if !pausedApps[step.App] && !(appStateIsStaged(actx.plan, step.App) && appBindStateOnly(actx.plan.Prepare, actx.plan.Sync, step.App)) {
 			return nil
 		}
 		ran, err := c.sourceRanSincePause(ctx, actx, step.App)
 		if err != nil {
-			return fmt.Errorf("verify source app %s stayed paused before deploying its transferred state: %w", step.App, err)
+			return fmt.Errorf("verify source app %s stayed paused before target deployment: %w", step.App, err)
 		}
 		if ran {
+			if appBindStateOnly(actx.plan.Prepare, actx.plan.Sync, step.App) {
+				return fmt.Errorf("source app %s ran after its pause; retry the live apply to pause it again before the target can write the shared bind-mount paths", step.App)
+			}
 			return fmt.Errorf("source app %s ran after its state was transferred, which invalidated the transfer; retry the live apply to pause and transfer it again", step.App)
 		}
 	case StepActivateRoutes:
@@ -1086,14 +1141,17 @@ func (c *Client) requireTransferredSourceStillPaused(ctx context.Context, actx *
 			return nil
 		}
 		if _, off := handedOff[ran]; off || pausedApps[ran] {
-			return unsafeSourceResumeError{err: staleStagedHandoffError(ran)}
+			return unsafeSourceResumeError{err: staleStagedHandoffError(actx.plan, ran)}
 		}
 		return unsafeSourceResumeError{err: fmt.Errorf("source app %s ran after its cutover pause, so its source routes would compete with the activated target routes; retry the live apply to pause it again before activating routes", ran)}
 	}
 	return nil
 }
 
-func staleStagedHandoffError(app string) error {
+func staleStagedHandoffError(plan Plan, app string) error {
+	if appBindStateOnly(plan.Prepare, plan.Sync, app) {
+		return authorityRecoveryRequiredError{err: fmt.Errorf("source app %s ran after target deployment and may have competed with target writers on shared bind-mount paths; leaving the source untouched, follow `%s` to establish writer and traffic authority manually", app, recoveryStatusCommand(plan))}
+	}
 	return fmt.Errorf("source app %s ran after its state was handed to the staged Dokploy deployment, so the staged data is stale; leaving the source untouched, start a new migration run to transfer it again", app)
 }
 
@@ -1131,7 +1189,7 @@ func (c *Client) primeResumeState(ctx context.Context, actx *applyContext, compl
 		if shouldSkipApplyStep(actx.plan, step) {
 			continue
 		}
-		pausedApps.observeCompleted(step, handedOff)
+		pausedApps.observeCompleted(actx.plan, step, handedOff)
 		switch step.Kind {
 		case StepCreateProject:
 			if actx.plan.TargetIdentities[step.App].ProjectID != "" {
@@ -1162,7 +1220,7 @@ func (c *Client) primeResumeState(ctx context.Context, actx *applyContext, compl
 				return fmt.Errorf("verify completed source pause for resume app %s: %w", step.App, err)
 			}
 			if ran && history.pushed {
-				return unsafeSourceResumeError{err: staleStagedHandoffError(step.App)}
+				return unsafeSourceResumeError{err: staleStagedHandoffError(actx.plan, step.App)}
 			}
 			if ran && history.transferred {
 				pausedApps[step.App] = true
@@ -1521,8 +1579,12 @@ func (c *Client) applyPushImage(ctx context.Context, actx *applyContext, step St
 	}
 	staged := stagedVolumesForApp(actx.plan, step.App)
 	if len(staged) == 0 {
-		if err := c.deployComposeForApply(ctx, actx, step.App, composeFile, envContent); err != nil {
-			return err
+		deployErr := c.deployComposeForApply(ctx, actx, step.App, composeFile, envContent)
+		if deployErr != nil && appStateIsStaged(actx.plan, step.App) && appBindStateOnly(actx.plan.Prepare, actx.plan.Sync, step.App) {
+			return authorityRecoveryRequiredError{err: unsafeSourceResumeError{err: fmt.Errorf("target deployment for app %s failed; its paused source stays stopped because the deployment may still write the bind-mount paths they share; follow `%s` for the required recovery: %w", step.App, recoveryStatusCommand(actx.plan), deployErr)}}
+		}
+		if deployErr != nil {
+			return deployErr
 		}
 		return c.pauseTargetWritersForState(ctx, c.dockerRunner(), actx, step.App)
 	}
