@@ -870,4 +870,47 @@ func TestPersistedV1Alpha4LedgerReplaysItsHistoricalPlan(t *testing.T) {
 	if restarted.PlanVersion != appliedPlanV1Alpha4 || !slices.Equal(livePlanForApplied(run, restarted).Steps, legacy.Steps) {
 		t.Fatalf("v1alpha3 bind deployment did not persist its v1alpha4 promotion: %#v", restarted)
 	}
+	t.Run("retry after rejected first project creation", func(t *testing.T) {
+		failed := runApplied{APIVersion: appliedAPIVersion, RecoveryProtocol: appliedRecoveryProtocol, PlanVersion: appliedPlanV1Alpha4}
+		failed = recordAppliedStep(failed, dokploy.StepProgress{Index: 0, Step: legacy.Steps[0], Status: dokploy.StepStatusError, Err: errors.New("creation rejected")})
+		if err := validateApplyResumeAuthority(failed); err != nil {
+			t.Fatal(err)
+		}
+		plan := livePlanForApplied(run, failed)
+		if !slices.Equal(plan.Steps, dokploy.PlanFromArtifacts(run.Prepare, run.Sync, run.Cutover).Steps) {
+			t.Fatal("rejected first creation did not select the current plan")
+		}
+		path := filepath.Join(t.TempDir(), "applied.json")
+		if err := writeJSONArtifact(path, failed); err != nil {
+			t.Fatal(err)
+		}
+		ledger, err := newAppliedLedger(path, run.Run)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ledger.PrepareRetry(0); err != nil {
+			t.Fatal(err)
+		}
+		reloaded, err := readRunApplied(path, run.Run)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reloaded.PlanVersion != appliedPlanCurrent || !slices.Equal(plan.Steps, livePlanForApplied(run, reloaded).Steps) {
+			t.Fatalf("retry persisted a different plan: %#v", reloaded)
+		}
+		for _, progress := range []dokploy.StepProgress{
+			{Status: dokploy.StepStatusStarted},
+			{Status: dokploy.StepStatusOK},
+			{Status: dokploy.StepStatusError},
+			{Status: dokploy.StepStatusError, Err: errors.New("response lost"), MutationAmbiguous: true},
+			{Status: dokploy.StepStatusError, Err: errors.New("recovery required"), AuthorityRecoveryRequired: true},
+			{Status: dokploy.StepStatusError, Err: errors.New("creation rejected"), Target: &dokploy.TargetIdentity{ProjectID: "existing-project"}},
+		} {
+			progress.Step = legacy.Steps[0]
+			retained := recordAppliedStep(failed, progress)
+			if !slices.Equal(livePlanForApplied(run, retained).Steps, legacy.Steps) {
+				t.Fatalf("completed or uncertain work lost its historical plan: %#v", progress)
+			}
+		}
+	})
 }
