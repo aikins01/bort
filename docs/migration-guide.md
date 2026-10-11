@@ -858,6 +858,12 @@ refuses such an app like any stateful app, because both sides write the shared
 paths and Bort cannot fence them apart. Read-only bind mounts leave the app
 stateless.
 
+Writable binds owned by a data store selected for `recreate` or `managed`
+are refused before live apply: that source service stays running, so the
+target must not mount the same writable host paths. Move the source data
+to a supported named-volume layout and create a new run; do not hide the
+mount in the manifest to bypass the refusal.
+
 A named volume mounted by more than one compose service in the same app stages
 once and is handed to Dokploy as one external volume, so those services keep
 sharing it. A named volume mounted by more than one app cannot be staged. Bort
@@ -1038,7 +1044,12 @@ recovery through that run:
 - To return to the source, reverse target traffic and remove every target app
   container attached to a transferred staging volume. Stopping a container is
   not enough because the stopped container remains attached. Before recreating
-  the target, change it to use fresh volumes or no transferred volumes. Verify
+  the target, change it to use fresh volumes or no transferred volumes. For
+  preserved bind mounts, remove every target container mounting the shared
+  host paths before restarting the source, and prevent queued or future target
+  deployments from mounting those paths again. A stopped container can restart
+  and write the same files. Preserve the shared data before choosing which side
+  will own it; source recovery does not undo target writes to those paths. Verify
   that the source is healthy and authoritative, then run:
 
   ```sh

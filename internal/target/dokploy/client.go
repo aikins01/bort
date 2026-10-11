@@ -23,7 +23,10 @@ const (
 	defaultTimeout = 30 * time.Second
 )
 
-var ErrNotImplemented = errors.New("dokploy live mode is not implemented")
+var (
+	ErrNotImplemented   = errors.New("dokploy live mode is not implemented")
+	ErrRunningStoreBind = errors.New("cannot be preserved on the target because its source data store stays running")
+)
 
 type Client struct {
 	BaseURL    string
