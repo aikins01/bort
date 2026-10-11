@@ -55,6 +55,27 @@ func TestPlanForRollbackRefusesStatefulAppsWithoutDurableTargetFence(t *testing.
 	}
 }
 
+func TestPlanForRollbackRefusesBindMountOnlyApps(t *testing.T) {
+	prepare := rollbackPrepareFixture()
+	prepare.Apps[0].Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/uploads", Target: "/uploads", ReadWrite: true}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{{
+		Name: "api",
+		Steps: []syncplan.Step{{
+			ResourceType: "volume",
+			ResourceRef:  "volume:web -> /uploads",
+			Strategy:     syncplan.StrategyNone,
+			TargetAction: "preserve_vps_file_mount",
+		}},
+	}}}
+	plan, err := PlanForRollback(prepare, sync, rollbackCutoverFixture())
+	if err == nil || !strings.Contains(err.Error(), "no durable application fence") || !strings.Contains(err.Error(), "api") {
+		t.Fatalf("expected bind-mount rollback refusal, got plan=%#v err=%v", plan, err)
+	}
+	if len(plan.Steps) != 0 {
+		t.Fatalf("unsafe bind-mount rollback returned executable steps: %#v", plan.Steps)
+	}
+}
+
 func TestPlanForRollbackReturnsTrafficOnlyForStatelessApps(t *testing.T) {
 	plan, err := PlanForRollback(rollbackPrepareFixture(), syncplan.Result{}, rollbackCutoverFixture())
 	if err != nil {

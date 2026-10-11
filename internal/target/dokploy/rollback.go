@@ -22,6 +22,11 @@ func PlanForRollback(prepare preparer.Result, sync syncplan.Result, cutover gate
 	for _, app := range sync.Apps {
 		if dataStoreSteps, volumeSteps := appStateSteps(prepare, app); len(dataStoreSteps) > 0 || len(volumeSteps) > 0 {
 			statefulApps[app.Name] = struct{}{}
+		} else if appBindStateOnly(prepare, sync, app.Name) {
+			// a bind-only app's source and target share writable host
+			// paths, so resuming the source while the deployed target
+			// exists is never an automatic-rollback decision.
+			statefulApps[app.Name] = struct{}{}
 		}
 	}
 	statefulPauses := []string{}

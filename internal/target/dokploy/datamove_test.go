@@ -18,6 +18,7 @@ import (
 
 	"github.com/aikins01/bort/internal/gateway"
 	"github.com/aikins01/bort/internal/preparer"
+	syncplan "github.com/aikins01/bort/internal/sync"
 	"gopkg.in/yaml.v3"
 )
 
@@ -847,6 +848,96 @@ func TestApplyPushImageTagsMissingComposeImageFromSourceContainer(t *testing.T) 
 	}
 	if !fakeOutputCalled(runner, "tag", "sha256:worker-image", "example/worker:local") {
 		t.Fatalf("expected missing image to be tagged from source container, calls=%#v", runner.outputArgs)
+	}
+}
+
+func TestApplyPushImageFailedBindMountDeployKeepsSourceStopped(t *testing.T) {
+	bundleDir := t.TempDir()
+	appDir := filepath.Join(bundleDir, "api")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatalf("mkdir app dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "compose.yaml"), []byte("services:\n  web:\n    image: redis:7\n"), 0o600); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/project.one":
+			_ = json.NewEncoder(w).Encode(Project{ProjectID: "project-1", Environments: []ProjectEnvironment{{EnvironmentID: "environment-1"}}})
+		case r.URL.Path == "/api/compose.one":
+			_ = json.NewEncoder(w).Encode(Compose{ComposeID: "compose-1", EnvironmentID: "environment-1", AppName: "stack-1"})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.update":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/compose.deploy":
+			http.Error(w, "deploy rejected", http.StatusBadRequest)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	runner := &fakeDockerRunner{outputs: map[string][]byte{
+		"image inspect redis:7":  []byte(`[{}]`),
+		"ps --format {{.Names}}": []byte("dokploy-postgres.1.task\n"),
+	}, runOutputs: map[string][]byte{
+		"exec -i dokploy-postgres.1.task psql -U dokploy -d dokploy -v ON_ERROR_STOP=1 -At": {},
+	}}
+	client := &Client{BaseURL: server.URL, Token: "secret", HTTPClient: server.Client(), Docker: runner}
+	app := preparer.AppPlan{Name: "api", Directory: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/uploads", Target: "/uploads", ReadWrite: true}}
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{ComposePath: "compose.yaml"}}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{{
+		Name:  "api",
+		Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "volume:web -> /uploads", Strategy: syncplan.StrategyNone, TargetAction: "preserve_vps_file_mount"}},
+	}}}
+	plan := PlanFromArtifacts(preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}, sync, gateway.Result{})
+	legacy := LegacyPlanFromArtifactsV1Alpha4(plan.Prepare, sync, gateway.Result{})
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/uploads", Target: "/uploads", ReadWrite: false}}
+	readOnly := PlanFromArtifacts(preparer.Result{BundleDir: bundleDir, Apps: []preparer.AppPlan{app}}, sync, gateway.Result{})
+	for _, tc := range []struct {
+		name   string
+		plan   Plan
+		unsafe bool
+	}{
+		{"writable bind", plan, true},
+		{"read-only bind", readOnly, false},
+		{"legacy writable bind", legacy, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actx := &applyContext{cache: map[string]*appCache{}, plan: tc.plan}
+			actx.entry("api").ComposeID = "compose-1"
+			err := client.applyPushImage(context.Background(), actx, Step{Kind: StepPushImage, App: "api"})
+			if err == nil || isUnsafeSourceResumeError(err) != tc.unsafe || requiresAuthorityRecovery(err) != tc.unsafe || mutationResponseMayHaveSucceeded(err) {
+				t.Fatalf("unexpected recovery classification for unsafe=%t: %v", tc.unsafe, err)
+			}
+			if tc.unsafe && (!strings.Contains(err.Error(), "bind-mount paths") || !strings.Contains(err.Error(), "bort status")) {
+				t.Fatalf("expected bind-mount recovery guidance, got %v", err)
+			}
+		})
+	}
+	plan.RunDir = t.TempDir()
+	plan.Prepare.Apps[0].Resources.SourceServices = []preparer.SourceServiceRef{{ServiceName: "web", ContainerID: "src-id"}}
+	plan.Steps = []Step{{Kind: StepPauseSource, App: "api"}, {Kind: StepPushImage, App: "api"}}
+	plan.ResumeFrom = 1
+	plan.TargetIdentities = map[string]TargetIdentity{"api": {ProjectID: "project-1", EnvironmentID: "environment-1", ComposeID: "compose-1", ComposeAppName: "stack-1"}}
+	seed := &applyContext{plan: plan, cache: map[string]*appCache{}}
+	seed.entry("api").SourcePauseRecorded = true
+	seed.entry("api").SourcePausedContainers = []sourcePausedContainer{{ID: "src-id", Stopped: true, StartedAt: "2026-01-01T00:00:00Z", FinishedAt: "2026-01-02T00:00:00Z"}}
+	if err := seed.persistSourcePauseState(); err != nil {
+		t.Fatal(err)
+	}
+	runner.outputs["inspect --type container src-id"] = stoppedSourceInspect("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")
+	var failure StepProgress
+	onProgress := func(progress StepProgress) {
+		if progress.Status == StepStatusError {
+			failure = progress
+		}
+	}
+	plan.OnProgress = &onProgress
+	if err := client.Apply(context.Background(), plan); err == nil || !requiresAuthorityRecovery(err) {
+		t.Fatalf("expected Apply to require authority recovery: %v", err)
+	}
+	if !failure.AuthorityRecoveryRequired || fakeOutputCalled(runner, "start", "src-id") {
+		t.Fatalf("Apply lost source authority: failure=%#v calls=%v", failure, runner.outputArgs)
 	}
 }
 

@@ -850,6 +850,14 @@ A stateful app whose plan needs a bind-mount copy is refused. Same-host bind
 mounts that keep their existing paths need no transfer. Do not remove real
 storage from an app's manifest merely to bypass a refusal.
 
+An app whose only writable state is a same-host bind mount is treated as
+stateful even though nothing transfers for it: its target deployment writes
+the same host paths its source writers own, so its source pauses before the
+target deploys and stays stopped if that deployment fails. Automatic rollback
+refuses such an app like any stateful app, because both sides write the shared
+paths and Bort cannot fence them apart. Read-only bind mounts leave the app
+stateless.
+
 A named volume mounted by more than one compose service in the same app stages
 once and is handed to Dokploy as one external volume, so those services keep
 sharing it. A named volume mounted by more than one app cannot be staged. Bort
@@ -989,10 +997,10 @@ sudo bort rollback --live
 ```
 
 The command is available only when the run transferred no database or volume
-state. Routed source applications are paused when the cutover takes traffic
-and stay stopped until retirement, so rollback restarts them, then stops the
-Dokploy proxy and starts the Coolify proxy. An interrupted stateless
-rollback can be re-run.
+state and paused no writable bind-mount app. Routed source applications are
+paused when the cutover takes traffic and stay stopped until retirement, so
+rollback restarts them, then stops the Dokploy proxy and starts the Coolify
+proxy. An interrupted stateless rollback can be re-run.
 
 An interrupted stateful run with the current plan version resumes from its
 saved progress like a stateless run. For a run applied with an older plan

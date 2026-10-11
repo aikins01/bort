@@ -440,7 +440,8 @@ func TestPlanFromArtifactsPausesRoutedStatelessSourceInEveryPlanOrder(t *testing
 		name string
 		plan Plan
 	}{
-		{"v1alpha4", PlanFromArtifacts(prepare, sync, cutover)},
+		{"v1alpha5", PlanFromArtifacts(prepare, sync, cutover)},
+		{"v1alpha4", LegacyPlanFromArtifactsV1Alpha4(prepare, sync, cutover)},
 		{"v1alpha3", LegacyPlanFromArtifactsV1Alpha3(prepare, sync, cutover)},
 		{"v1alpha2", PlanFromArtifactsV1Alpha2(prepare, sync, cutover)},
 		{"v1alpha1", LegacyPlanFromArtifactsV1Alpha1(prepare, sync, cutover)},
@@ -505,6 +506,188 @@ func TestPlanFromArtifactsPreservesBindMountsWithoutStateWork(t *testing.T) {
 		case StepCreateVolume, StepPauseSource, StepSyncVolume:
 			t.Fatalf("did not expect state work for preserved bind mount, got step=%#v plan=%v", step, plan.Steps)
 		}
+	}
+}
+
+func TestPlanFromArtifactsPausesWritableBindMountAppBeforeTargetDeployment(t *testing.T) {
+	uploads := preparer.AppPlan{Name: "uploads"}
+	uploads.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/uploads", Target: "/uploads", ReadWrite: true}}
+	uploads.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "uploads"}}}
+	static := preparer.AppPlan{Name: "static"}
+	static.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/static", Target: "/static"}}
+	static.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "static"}}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{uploads, static}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{
+		{Name: "uploads", Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "volume:web -> /uploads", Strategy: syncplan.StrategyNone, TargetAction: "preserve_vps_file_mount"}}},
+		{Name: "static", Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "volume:web -> /static", Strategy: syncplan.StrategyNone, TargetAction: "preserve_vps_file_mount"}}},
+	}}
+	plan := PlanFromArtifacts(prepare, sync, gatewayResultEmpty())
+	pause, push := -1, -1
+	for index, step := range plan.Steps {
+		switch {
+		case step.Kind == StepPauseSource && step.App == "uploads":
+			pause = index
+		case step.Kind == StepPauseSource && step.App == "static":
+			t.Fatalf("read-only bind mount must stay stateless, got plan=%v", stepKinds(plan.Steps))
+		case step.Kind == StepPushImage && step.App == "uploads":
+			push = index
+		}
+	}
+	if pause < 0 || push < 0 || pause > push {
+		t.Fatalf("expected writable bind app pause before its push, pause=%d push=%d steps=%v", pause, push, stepKinds(plan.Steps))
+	}
+	if !appStateIsStaged(plan, "uploads") || appStateIsStaged(plan, "static") {
+		t.Fatalf("only the writable bind app is staged, steps=%v", stepKinds(plan.Steps))
+	}
+	for _, tc := range []struct {
+		name     string
+		source   string
+		platform string
+		legacy   bool
+		readOnly bool
+		want     bool
+	}{
+		{"Coolify source", "coolify-local", "", false, false, true},
+		{"Docker-scanned Coolify", "docker", "coolify", false, false, true},
+		{"plain Docker", "docker", "docker", false, false, false},
+		{"legacy", "coolify-local", "coolify", true, false, false},
+		{"read-only", "coolify-local", "coolify", false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := uploads
+			if tc.readOnly {
+				app = static
+			}
+			app.Platform = tc.platform
+			prep := preparer.Result{Source: tc.source, Apps: []preparer.AppPlan{app}}
+			p := PlanFromArtifacts(prep, sync, gateway.Result{})
+			if tc.legacy {
+				p = LegacyPlanFromArtifactsV1Alpha4(prep, sync, gateway.Result{})
+			}
+			if got := RequiresCoolifyDeploymentFence(p); got != tc.want {
+				t.Fatalf("requires fence=%t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBindMountDeploymentRefusesRestartedSource(t *testing.T) {
+	app := preparer.AppPlan{Name: "api"}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/uploads", Target: "/uploads", ReadWrite: true, SourceContainerID: "web-id"}}
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "api"}}}
+	plan := PlanFromArtifacts(preparer.Result{Apps: []preparer.AppPlan{app}}, syncplan.Result{Apps: []syncplan.AppPlan{{Name: "api"}}}, gateway.Result{})
+	for _, restarted := range []bool{false, true} {
+		runner := &sourceOwnershipRunner{running: map[string]bool{"web-id": restarted}}
+		client := &Client{Docker: runner}
+		actx := &applyContext{plan: plan, cache: map[string]*appCache{}}
+		actx.entry("api").SourcePauseRecorded = true
+		actx.entry("api").SourcePausedContainers = []sourcePausedContainer{{ID: "web-id", Stopped: true}}
+		err := client.requireTransferredSourceStillPaused(context.Background(), actx, Step{Kind: StepPushImage, App: "api"}, pausedSources{"api": false}, map[string]struct{}{})
+		if (err != nil) != restarted {
+			t.Fatalf("restarted=%t: %v", restarted, err)
+		}
+		if restarted && (!strings.Contains(err.Error(), "shared bind-mount paths") || requiresAuthorityRecovery(err)) {
+			t.Fatalf("pre-deployment source restart should allow retry: %v", err)
+		}
+		err = client.requireTransferredSourceStillPaused(context.Background(), actx, Step{Kind: StepActivateRoutes, App: "api"}, nil, map[string]struct{}{"api": {}})
+		if (err != nil) != restarted || requiresAuthorityRecovery(err) != restarted {
+			t.Fatalf("post-deployment restart=%t must require recovery: %v", restarted, err)
+		}
+	}
+}
+
+func TestPlanFromArtifactsKeepsRoutedBindMountAppPausedThroughCutover(t *testing.T) {
+	app := preparer.AppPlan{Name: "web"}
+	app.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/uploads", Target: "/uploads", ReadWrite: true}}
+	app.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "web"}}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{app}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{{
+		Name:  "web",
+		Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "volume:web -> /uploads", Strategy: syncplan.StrategyNone, TargetAction: "preserve_vps_file_mount"}},
+	}}}
+	cutover := gateway.Result{Apps: []gateway.AppPlan{{Name: "web", Routes: []gateway.Route{{Host: "web.example.com"}}}}}
+	plan := PlanFromArtifacts(prepare, sync, cutover)
+	pause, push, activate := -1, -1, -1
+	pauses := 0
+	for index, step := range plan.Steps {
+		switch {
+		case step.Kind == StepPauseSource && step.App == "web":
+			pauses++
+			pause = index
+		case step.Kind == StepPushImage && step.App == "web":
+			push = index
+		case step.Kind == StepActivateRoutes && step.App == "web":
+			activate = index
+		case (step.Kind == StepResumeSource || step.Kind == StepResumeTarget) && step.App == "web":
+			t.Fatalf("routed bind app must not resume writers before retirement, got plan=%v", stepKinds(plan.Steps))
+		}
+	}
+	if pauses != 1 || pause < 0 || push < 0 || activate < 0 || !(pause < push && push < activate) {
+		t.Fatalf("expected one pause < push < activate for the routed bind app, pauses=%d pause=%d push=%d activate=%d steps=%v", pauses, pause, push, activate, stepKinds(plan.Steps))
+	}
+}
+
+func TestLegacyPlanFromArtifactsV1Alpha4KeepsBindMountAppsStateless(t *testing.T) {
+	uploads := preparer.AppPlan{Name: "uploads"}
+	uploads.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/uploads", Target: "/uploads", ReadWrite: true}}
+	uploads.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "uploads"}}}
+	db := preparer.AppPlan{Name: "db"}
+	db.Resources.Volumes = []preparer.VolumeResource{{Service: "db", Type: "volume", Target: "/data"}}
+	db.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "db"}}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{uploads, db}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{
+		{Name: "uploads", Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "volume:web -> /uploads", Strategy: syncplan.StrategyNone, TargetAction: "preserve_vps_file_mount"}}},
+		{Name: "db", Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "volume:db -> /data", Strategy: syncplan.StrategyDockerVolumeArchive}}},
+	}}
+	legacy := LegacyPlanFromArtifactsV1Alpha4(prepare, sync, gatewayResultEmpty())
+	bindPush, dbPause := -1, -1
+	for index, step := range legacy.Steps {
+		switch {
+		case step.Kind == StepPushImage && step.App == "uploads":
+			bindPush = index
+		case step.Kind == StepPauseSource && step.App == "uploads":
+			t.Fatalf("v1alpha4 must keep the bind-only source stateless, got plan=%v", stepKinds(legacy.Steps))
+		case step.Kind == StepPauseSource && step.App == "db":
+			dbPause = index
+		}
+	}
+	if bindPush < 0 || dbPause < 0 || bindPush > dbPause {
+		t.Fatalf("v1alpha4 must deploy the bind app before the stateful pause, bindPush=%d dbPause=%d steps=%v", bindPush, dbPause, stepKinds(legacy.Steps))
+	}
+}
+
+func TestPausedSourcesObserveCompletedHandsOffBindMountApp(t *testing.T) {
+	uploads := preparer.AppPlan{Name: "uploads"}
+	uploads.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/uploads", Target: "/uploads", ReadWrite: true}}
+	uploads.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "uploads"}}}
+	static := preparer.AppPlan{Name: "static"}
+	static.Resources.Volumes = []preparer.VolumeResource{{Service: "web", Type: "bind", Source: "/srv/static", Target: "/static"}}
+	static.TargetResources = &preparer.TargetResources{Dokploy: &preparer.DokployResources{ComposeApp: preparer.DokployComposeApp{Name: "static"}}}
+	prepare := preparer.Result{Apps: []preparer.AppPlan{uploads, static}}
+	sync := syncplan.Result{Apps: []syncplan.AppPlan{
+		{Name: "uploads", Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "volume:web -> /uploads", Strategy: syncplan.StrategyNone, TargetAction: "preserve_vps_file_mount"}}},
+		{Name: "static", Steps: []syncplan.Step{{ResourceType: "volume", ResourceRef: "volume:web -> /static", Strategy: syncplan.StrategyNone, TargetAction: "preserve_vps_file_mount"}}},
+	}}
+	current := PlanFromArtifacts(prepare, sync, gatewayResultEmpty())
+	legacy := LegacyPlanFromArtifactsV1Alpha4(prepare, sync, gatewayResultEmpty())
+	for _, tc := range []struct {
+		name        string
+		plan        Plan
+		app         string
+		wantHandoff bool
+	}{
+		{"writable bind", current, "uploads", true},
+		{"read-only bind", current, "static", false},
+		{"v1alpha4 bind", legacy, "uploads", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			paused := pausedSources{}
+			handedOff := map[string]struct{}{}
+			paused.observeCompleted(tc.plan, Step{Kind: StepPushImage, App: tc.app}, handedOff)
+			if _, handed := handedOff[tc.app]; handed != tc.wantHandoff {
+				t.Fatalf("handoff=%v, want %v (steps=%v)", handed, tc.wantHandoff, stepKinds(tc.plan.Steps))
+			}
+		})
 	}
 }
 
@@ -1132,17 +1315,18 @@ func TestPrimeResumeStateRefusesStaleStagedDeployWhenSourceRan(t *testing.T) {
 func TestPausedSourcesObserveCompleted(t *testing.T) {
 	paused := pausedSources{"api": false, "other": false, "untransferred": false}
 	handedOff := map[string]struct{}{}
-	paused.observeCompleted(Step{Kind: StepSyncVolume, App: "api"}, handedOff)
-	paused.observeCompleted(Step{Kind: StepDumpDataStore, App: "stateless"}, handedOff)
+	plan := Plan{}
+	paused.observeCompleted(plan, Step{Kind: StepSyncVolume, App: "api"}, handedOff)
+	paused.observeCompleted(plan, Step{Kind: StepDumpDataStore, App: "stateless"}, handedOff)
 	if !paused["api"] || paused["other"] {
 		t.Fatalf("transfer must mark only the transferred app: %#v", paused)
 	}
 	if _, tracked := paused["stateless"]; tracked {
 		t.Fatalf("transfer for an unpaused app must not track it: %#v", paused)
 	}
-	paused.observeCompleted(Step{Kind: StepPushImage, App: "api"}, handedOff)
-	paused.observeCompleted(Step{Kind: StepPushImage, App: "untransferred"}, handedOff)
-	paused.observeCompleted(Step{Kind: StepResumeSource, App: "other"}, handedOff)
+	paused.observeCompleted(plan, Step{Kind: StepPushImage, App: "api"}, handedOff)
+	paused.observeCompleted(plan, Step{Kind: StepPushImage, App: "untransferred"}, handedOff)
+	paused.observeCompleted(plan, Step{Kind: StepResumeSource, App: "other"}, handedOff)
 	if len(paused) != 0 {
 		t.Fatalf("deploy and resume must release their apps: %#v", paused)
 	}
