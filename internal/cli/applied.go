@@ -130,6 +130,16 @@ func appliedHasHistory(applied runApplied) bool {
 	return len(applied.Steps) > 0 || len(applied.Apps) > 0 || applied.SucceededAt != nil
 }
 
+func appliedFirstProjectCreationRejected(applied runApplied) bool {
+	if len(applied.Apps) != 0 || applied.SucceededAt != nil || len(applied.Steps) != 1 {
+		return false
+	}
+	step := applied.Steps[0]
+	return step.Index == 0 && step.Kind == string(dokploy.StepCreateProject) &&
+		step.Status == string(dokploy.StepStatusError) &&
+		!appliedTargetMutationAmbiguous(step) && !step.AuthorityRecoveryRequired
+}
+
 // upgradeRunAppliedSchema pins a ledger with history to the plan order it
 // was recorded against; step indexes only line up under that order. an
 // empty ledger has nothing to preserve and moves to the current order.
@@ -356,7 +366,7 @@ func completedApplyPrefix(steps []dokploy.Step, applied runApplied) int {
 // follows the current order.
 func appliedPlanVersion(applied runApplied) string {
 	switch {
-	case !appliedHasHistory(applied):
+	case !appliedHasHistory(applied) || appliedFirstProjectCreationRejected(applied):
 		return appliedPlanCurrent
 	case applied.APIVersion == appliedLegacyAPIVersion || applied.PlanVersion == appliedPlanV1Alpha1:
 		return appliedPlanV1Alpha1
